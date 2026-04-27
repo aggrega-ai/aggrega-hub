@@ -171,6 +171,26 @@ spec:
     ...
 ```
 
+### Managed-service credentials
+
+For Recipes targeting cloud-managed services (AWS RDS, Azure Database, GCP
+Cloud SQL, etc.), prefer the provider's native managed-secret flag over an
+Aggrega credential FeatureRecipe. Terraform Recipes for RDS set
+`manage_master_user_password = true` so RDS auto-manages the password via AWS
+Secrets Manager; CloudFormation Recipes set `ManageMasterUserPassword: true`
+for the same effect. The cloud provider already owns the password lifecycle,
+and introducing an Aggrega credential FeatureRecipe alongside duplicates that
+lifecycle and adds synchronization risk.
+
+The canonical examples are
+[`recipe/terraform/mariadb-rds/recipe.yaml`](../aggrega-catalog/recipe/terraform/mariadb-rds/recipe.yaml)
+and
+[`recipe/cloudformation/mariadb-rds/recipe.yaml`](../aggrega-catalog/recipe/cloudformation/mariadb-rds/recipe.yaml).
+This guidance applies to managed services only — Recipes targeting
+self-managed datastores (Helm Bitnami chart, Compose container) still use the
+credential FeatureRecipe path because no upstream managed-secret flag exists
+for those targets.
+
 ## 6. OCI Registry
 
 The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
