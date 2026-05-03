@@ -3,7 +3,7 @@
 
 package core
 
-// Topological Selectors (Instructs Intent 005 Linter to verify edges)
+// Topological selectors govern cross-component edge routing
 #ModelRef:     string @selector("component.aggrega.ai/type=ai-model")
 #ToolRef:      string @selector("component.aggrega.ai/type=ai-tool")
 #DatastoreRef: string @selector("component.aggrega.ai/type=ai-datastore")
