@@ -9,7 +9,7 @@
 URI segments map 1:1 to filesystem path segments. The compiler resolves
 `type: core/database/mariadb:1.0.0` to `component/core/database/mariadb.yaml`.
 
-```
+```text
 aggrega-catalog/
 ├── component/{namespace}/{category}/{name}.yaml
 ├── feature/{namespace}/{name}.yaml
@@ -21,15 +21,18 @@ aggrega-catalog/
 ```
 
 ### Namespace
+
 The first path segment after the entity type. Identifies the vendor/author.
+
 - `core` — official Aggrega standard library (maintained by Cognitio S.r.l.)
 - Third-party namespaces: use your organization name (e.g., `acme`, `enterprise`)
 
 ### Component Categories
+
 Components use a second path segment for human-navigable categorization:
 
 | Category | Contains | Ontology labels |
-|---|---|---|
+| --- | --- | --- |
 | `database` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server |
 | `model` | AI model providers and inference runtimes | server |
 | `agent` | AI agent frameworks and patterns | worker, server |
@@ -44,16 +47,18 @@ Components use a second path segment for human-navigable categorization:
 Features do NOT use categories (25 files, flat under `feature/core/`).
 
 ### Recipe/FeatureRecipe Provider Namespace
+
 Domain 3 entities use the execution engine as the first path segment:
 `helm`, `terraform`, `cloudformation`, `compose`, `eval`.
 
 ## 2. Naming Conventions
 
 ### metadata.name
+
 Must match the filesystem path segments after the entity type directory:
 
 | Entity | Example filesystem path | metadata.name |
-|---|---|---|
+| --- | --- | --- |
 | Component | `component/core/database/mariadb.yaml` | `core/database/mariadb` |
 | Feature | `feature/core/data-masking.yaml` | `core/data-masking` |
 | Recipe | `recipe/helm/mariadb-bitnami/recipe.yaml` | `mariadb-bitnami` |
@@ -65,19 +70,23 @@ the provider is already the parent directory and `spec.provider` field.
 The `ops/` prefix is NOT used. All Recipes are Domain 3 (Ops) by definition.
 
 ### Name shortening
+
 When a component's filename would repeat the category, strip the suffix:
+
 - `anthropic-agent.yaml` in `agent/` → `anthropic.yaml` (name: `core/agent/anthropic`)
 - `openai-model.yaml` in `model/` → `openai.yaml` (name: `core/model/openai`)
 
 ## 3. YAML Formatting
 
 ### License header (required on every .yaml file)
+
 ```yaml
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Cognitio S.r.l.
 ```
 
 ### Label values: unquoted
+
 ```yaml
 # CORRECT
 labels:
@@ -89,6 +98,7 @@ labels:
 ```
 
 ### Version values: unquoted
+
 ```yaml
 # CORRECT
 version: 1.0.0
@@ -98,6 +108,7 @@ version: "1.0.0"
 ```
 
 ### Maintainer block
+
 ```yaml
 maintainers:
   - name: Massimiliano Ferrero
@@ -133,7 +144,9 @@ spec:
 ```
 
 ### The `overrides` escape hatch
+
 Stateful components with provider-specific knobs should include:
+
 ```cue
 infra: {
   // ... universal fields ...
@@ -145,8 +158,10 @@ infra: {
 ```
 
 ### The `source_version` field
+
 Components backed by versioned upstream artifacts (Helm charts, Terraform modules)
 should include:
+
 ```cue
 infra: {
   // Overrides the Recipe's default source artifact version.
@@ -194,6 +209,7 @@ for those targets.
 ## 6. OCI Registry
 
 The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
+
 - `hub.aggrega.ai/component/core/database/mariadb:1.0.0`
 - `hub.aggrega.ai/recipe/helm/mariadb-bitnami:1.0.0`
 - `hub.aggrega.ai/feature-recipe/helm/k8s-secret-from-parameter:1.0.0`
