@@ -16,9 +16,11 @@ aggrega-catalog/
 ├── recipe/{provider}/{name}/recipe.yaml
 ├── feature-recipe/{provider}/{name}/recipe.yaml
 ├── aggregate/{namespace}/{name}/aggregate.yaml
-├── cue/core/
-└── cue.mod/
+├── schemalibrary/{name}.yaml
+└── mappinglibrary/{name}.yaml
 ```
+
+`schemalibrary/` carries reusable JSON Schema 2020-12 fragments other Components and Features reference via `$ref:`. `mappinglibrary/` carries reusable Go template fragments Recipes and FeatureRecipes consume via `valuesMapping: { $import: ... }`. See the "Shared schema and mapping reuse" section below.
 
 ### Namespace
 
@@ -117,60 +119,119 @@ maintainers:
 
 ### Comment syntax
 
-- YAML context (outside `cueSchema: |`): use `#`
-- CUE context (inside `cueSchema: |` blocks): use `//`
-- Standalone `.cue` files: use `//`
-
-CUE's parser rejects `#` as a comment character, and YAML's parser rejects `//`. A `cueSchema: |` block is CUE code embedded in a YAML literal scalar — the inner content follows CUE conventions.
+Use `#` for comments throughout — every catalog file is YAML, and YAML's comment character is `#`. Schema bodies live under `spec.schema:` as JSON Schema 2020-12 declarations (compact form by default; full JSON Schema YAML via `$jsonschema:` when needed), so the inner content is YAML too and follows the same `#` convention.
 
 ## 4. Component Schema Pattern
 
-Every Component cueSchema must document its pillars with section headers:
+Every Component declares its data pillars under `spec.schema:` in JSON Schema 2020-12 compact form. Three pillars cover the per-domain ownership split: `values:` (developer intent), `infra:` (operational sizing), `provides:` (public API contract):
 
 ```yaml
 spec:
-  cueSchema: |
-    // values — Developer Intent
-    // Filled by the Developer in the Aggregate.
-    values: { ... }
+  schema:
+    # values — Developer Intent
+    # Filled by the Developer in the Aggregate.
+    values:
+      database_name: { type: string, required: true }
+      charset: { type: string, default: utf8mb4 }
 
-    // infra — Operational Sizing
-    // Filled by Ops in the Release. Developer never sees this.
-    infra: { ... }
+    # infra — Operational Sizing
+    # Filled by Ops in the Release. Developer never sees this.
+    infra:
+      compute:
+        type: object
+        properties:
+          cpu: { type: string }
+          memory: { type: string }
+      storage:
+        type: object
+        properties:
+          size: { type: string }
+          type: { type: string }
 
-    // provides — Public API Contract
-    // Keys exported to consumers via `uses` topology edges.
-    provides: { ... }
+    # provides — Public API Contract
+    # Keys exported to consumers via `uses` topology edges.
+    provides:
+      host: { type: string }
+      port: { type: integer }
 ```
+
+The compact form (about 15 keywords) covers the common case in a fraction of the line count of full JSON Schema; the `$jsonschema:` escape hatch admits full JSON Schema 2020-12 at any node boundary when the compact form does not carry the needed keyword. See [`aggrega-docs/language-reference/vocabulary/compact-form-authoring.md`](https://github.com/aggrega/aggrega-docs/blob/main/language-reference/vocabulary/compact-form-authoring.md) for the keyword vocabulary and [`aggrega-docs/language-reference/entities/component.md`](https://github.com/aggrega/aggrega-docs/blob/main/language-reference/entities/component.md) for the per-pillar authoring framing.
 
 ### The `overrides` escape hatch
 
-Stateful components with provider-specific knobs should include:
+Stateful components with provider-specific knobs should include an open-map field under `infra:`:
 
-```cue
-infra: {
-  // ... universal fields ...
+```yaml
+spec:
+  schema:
+    infra:
+      # ... universal fields ...
 
-  // Provider-specific overrides. Accepts any nested structure.
-  // Each Recipe documents which keys it reads.
-  overrides?: _
-}
+      # Provider-specific overrides. Accepts any nested structure.
+      # Each Recipe documents which keys it reads.
+      overrides:
+        type: object
+        additionalProperties: true
 ```
 
 ### The `source_version` field
 
-Components backed by versioned upstream artifacts (Helm charts, Terraform modules)
-should include:
+Components backed by versioned upstream artifacts (Helm charts, Terraform modules) should include an `infra.source_version` override:
 
-```cue
-infra: {
-  // Overrides the Recipe's default source artifact version.
-  // Changing from default does not guarantee value mapping compatibility.
-  source_version?: string
-}
+```yaml
+spec:
+  schema:
+    infra:
+      # Overrides the Recipe's default source artifact version.
+      # Changing from default does not guarantee value mapping compatibility.
+      source_version: { type: string }
 ```
 
-## 5. Recipe Pattern
+## 5. Shared schema and mapping reuse
+
+Schema fragments shared across multiple Components or Features live in **SchemaLibrary** entries under `schemalibrary/`. Go template fragments shared across multiple Recipes or FeatureRecipes live in **MappingLibrary** entries under `mappinglibrary/`. Reuse via cross-document references — `$ref:` for schemas, `$import:` for mappings — replaces the inline-duplication pattern.
+
+A SchemaLibrary entry carries one or more named schema definitions under `spec.schemas:`. A consumer Component references the entry by library name and definition name:
+
+```yaml
+# schemalibrary/base-components.yaml — the library
+apiVersion: aggrega.ai/v1alpha1
+kind: SchemaLibrary
+metadata:
+  name: BaseComponents
+spec:
+  schemas:
+    BaseComponentParameter:
+      type: object
+      properties:
+        displayName: { type: string }
+        description: { type: string }
+```
+
+```yaml
+# component/core/database/mariadb.yaml — the consumer
+spec:
+  schema:
+    values:
+      $ref: "BaseComponents#/schemas/BaseComponentParameter"
+      properties:
+        database_name: { type: string, required: true }
+```
+
+A MappingLibrary entry carries one or more named Go-template fragments under `spec.mappings:`. A consumer Recipe imports the entry inside `valuesMapping:`:
+
+```yaml
+# recipe/helm/postgres-bitnami/recipe.yaml — the consumer
+spec:
+  valuesMapping:
+    $import: oci://hub.aggrega.ai/aggrega/bitnami-helpers@1.0.0#/mappings/PostgresBitnamiCore
+```
+
+**Heuristic for when to factor.** A schema or mapping fragment that appears across three or more Components / Recipes is a candidate for a library entry; single-Component or single-Recipe content stays inline.
+
+**Retired pre-migration keywords.** The pre-migration model used CUE for shared schema content under a `cue/` directory and embedded CUE inside `cueSchema: |` blocks. The post-migration model retires the `cueSchema:` keyword (use `spec.schema:` instead), the `parametersFrom:` array form on Releases (use `parameters: { $import: ... }`), the `workloadFrom:` keyword on Recipes (use `workload: { $import: ... }`), the `artifactsFrom:` keyword (use `artifacts:` with per-entry `$import:`), and the CUE-attribute `@selector(...)` syntax (use the `selector:` field under `usesSchema[]` entries, which the compiler synthesises into the JSON Schema as the `x-aggrega-selector:` extension keyword). Catalog authors migrating older content swap the keyword and rewrite the body in JSON Schema 2020-12 compact form.
+
+## 6. Recipe Pattern
 
 Every Recipe valuesMapping should document which `infra.overrides` keys it reads
 in a header comment block inside the spec:
@@ -206,7 +267,7 @@ self-managed datastores (Helm Bitnami chart, Compose container) still use the
 credential FeatureRecipe path because no upstream managed-secret flag exists
 for those targets.
 
-## 6. OCI Registry
+## 7. OCI Registry
 
 The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
 
