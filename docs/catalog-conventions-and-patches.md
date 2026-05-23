@@ -229,8 +229,6 @@ spec:
 
 **Heuristic for when to factor.** A schema or mapping fragment that appears across three or more Components / Recipes is a candidate for a library entry; single-Component or single-Recipe content stays inline.
 
-**Retired pre-migration keywords.** The pre-migration model used CUE for shared schema content under a `cue/` directory and embedded CUE inside `cueSchema: |` blocks. The post-migration model retires the `cueSchema:` keyword (use `spec.schema:` instead), the `parametersFrom:` array form on Releases (use `parameters: { $import: ... }`), the `workloadFrom:` keyword on Recipes (use `workload: { $import: ... }`), the `artifactsFrom:` keyword (use `artifacts:` with per-entry `$import:`), and the CUE-attribute `@selector(...)` syntax (use the `selector:` field under `usesSchema[]` entries, which the compiler synthesises into the JSON Schema as the `x-aggrega-selector:` extension keyword). Catalog authors migrating older content swap the keyword and rewrite the body in JSON Schema 2020-12 compact form.
-
 ## 6. Recipe Pattern
 
 Every Recipe valuesMapping should document which `infra.overrides` keys it reads
