@@ -224,7 +224,7 @@ A MappingLibrary entry carries one or more named Go-template fragments under `sp
 # recipe/helm/postgres-bitnami/recipe.yaml — the consumer
 spec:
   valuesMapping:
-    $import: oci://hub.aggrega.ai/aggrega/bitnami-helpers@1.0.0#/mappings/PostgresBitnamiCore
+    $import: BitnamiHelpers#/mappings/PostgresBitnamiCore
 ```
 
 **Heuristic for when to factor.** A schema or mapping fragment that appears across three or more Components / Recipes is a candidate for a library entry; single-Component or single-Recipe content stays inline.
