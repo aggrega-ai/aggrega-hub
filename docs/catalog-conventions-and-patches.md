@@ -36,17 +36,52 @@ Components use a second path segment for human-navigable categorization:
 | Category | Contains | Ontology labels |
 | --- | --- | --- |
 | `database` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server |
-| `model` | AI model providers and inference runtimes | server |
-| `agent` | AI agent frameworks and patterns | worker, server |
-| `tool` | AI tools invoked by agents | ai-tool |
+| `model` | AI model providers and inference runtimes | server, resource |
+| `agent` | AI agent frameworks and patterns | worker, server, resource |
+| `tool` | AI tools invoked by agents | function, server, resource |
 | `server` | Long-running HTTP/gRPC endpoints, gateways, UIs | server |
 | `worker` | Background processors, consumers | worker |
 | `messaging` | Event buses, queues, streams | messaging |
 | `storage` | Object/file storage, managed cloud resources | resource |
 | `compute` | Tasks, functions, serverless | task, function |
-| `pipeline` | Data and AI pipelines | ai-pipeline |
+| `pipeline` | Data and AI pipelines | worker, task |
 
 Features do NOT use categories (25 files, flat under `feature/core/`).
+
+### The `component.aggrega.ai/category` label
+
+Every Component under `core/` carries `component.aggrega.ai/category`, the
+cognitive browse axis of the catalog's three-axis label scheme:
+
+- **Axis 1 — operational `type`** (`component.aggrega.ai/type`): one of the
+  7 cloud-native primitives. Describes how infrastructure treats the
+  component (state, ingress, lifecycle). Never carries cognitive vocabulary.
+- **Axis 2 — cognitive `category`** (`component.aggrega.ai/category`): a
+  closed, single-valued set of 15:
+  `ai-agent`, `ai-model`, `ai-tool`, `ai-pipeline`, `datastore`, `gateway`,
+  `mesh`, `network`, `messaging`, `storage`, `compute`, `observability`,
+  `security`, `bigdata`, `devtool`. The value matches the component's
+  top-level directory name 1:1 — same word, no translation table. AI-pure
+  categories carry the `ai-` prefix; dual-use categories (`datastore`,
+  `gateway`, `mesh`, `network`, `messaging`, `storage`) appear bare, with
+  AI flavor expressed by capability labels, not a category prefix.
+- **Axis 3 — per-category capability labels** (`<role>.aggrega.ai/<dimension>`):
+  e.g. `agent.aggrega.ai/autonomy`, `model.aggrega.ai/capability` +
+  `/hosting`, `tool.aggrega.ai/impact`, `gateway.aggrega.ai/intelligence`,
+  `datastore.aggrega.ai/engine`, `pipeline.aggrega.ai/mode`. These carry
+  the behavioral subsets selectors and policies discriminate on.
+
+Multi-membership is expressed through capability labels, never a
+multi-valued category: a Postgres-with-pgvector is `category: datastore`
+plus `datastore.aggrega.ai/engine: vector`, discoverable from both axes.
+There is no stored "is-AI" boolean — tooling derives AI-relevance from any
+`ai-`-prefixed category or AI-relevant capability value.
+
+The category-vs-directory mirror is checked by the publishing linter's
+`category-matches-directory` rule (warning at `aggrega lint`, error at
+pre-publish, per-workspace opt-out for enterprise layouts). The compiler
+itself is blind to all label vocabulary; the closed set is a standard-library
+convention enterprises may extend or replace in their own catalogs.
 
 ### Recipe/FeatureRecipe Provider Namespace
 
