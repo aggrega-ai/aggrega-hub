@@ -7,7 +7,7 @@
 ## 1. Directory Structure
 
 URI segments map 1:1 to filesystem path segments. The compiler resolves
-`type: core/database/mariadb:1.0.0` to `component/core/database/mariadb.yaml`.
+`type: core/datastore/mariadb:1.0.0` to `component/core/datastore/mariadb.yaml`.
 
 ```text
 aggrega-catalog/
@@ -31,22 +31,47 @@ The first path segment after the entity type. Identifies the vendor/author.
 
 ### Component Categories
 
-Components use a second path segment for human-navigable categorization:
+A Component's second path segment is its cognitive category — the same
+word as its `component.aggrega.ai/category` label (the 1:1 mirror; see
+the label section below). The 15 categories:
 
-| Category | Contains | Ontology labels |
-| --- | --- | --- |
-| `database` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server |
-| `model` | AI model providers and inference runtimes | server, resource |
-| `agent` | AI agent frameworks and patterns | worker, server, resource |
-| `tool` | AI tools invoked by agents | function, server, resource |
-| `server` | Long-running HTTP/gRPC endpoints, gateways, UIs | server |
-| `worker` | Background processors, consumers | worker |
-| `messaging` | Event buses, queues, streams | messaging |
-| `storage` | Object/file storage, managed cloud resources | resource |
-| `compute` | Tasks, functions, serverless | task, function |
-| `pipeline` | Data and AI pipelines | worker, task |
+| Category | Contains | Typical ontology labels | On disk |
+| --- | --- | --- | --- |
+| `ai-agent` | AI agent frameworks, platforms, and patterns | worker, server, resource | populated |
+| `ai-model` | Model providers and inference runtimes | server, resource | populated |
+| `ai-tool` | Tools agents invoke | function, server, resource | populated |
+| `ai-pipeline` | AI data/processing pipelines | worker, task | populated |
+| `datastore` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server, resource | populated |
+| `gateway` | API and AI gateways | server | populated |
+| `mesh` | Service meshes | server | created when the first entity lands |
+| `network` | Network primitives | server, resource | created when the first entity lands |
+| `messaging` | Event buses, queues, streams | messaging | populated |
+| `storage` | Object/file storage, managed cloud resources | resource | populated |
+| `compute` | Generic compute primitives (server, worker, task, function bases) | server, worker, task, function | populated |
+| `observability` | Telemetry, tracing, monitoring | varies | created when the first entity lands |
+| `security` | Security and compliance components | varies | created when the first entity lands |
+| `bigdata` | Large-scale data processing | varies | created when the first entity lands |
+| `devtool` | Developer tooling | varies | created when the first entity lands |
 
-Features do NOT use categories (25 files, flat under `feature/core/`).
+Directory-presence discipline:
+
+- **The first segment is the category — mandatory and lint-enforced.** The
+  publishing linter's `category-matches-directory` rule checks the 1:1
+  mirror (warning at `aggrega lint`, error at pre-publish). This is a
+  standard-library convention (class C) with a per-workspace opt-out for
+  enterprise layouts; the compiler itself never checks it.
+- **Unpopulated categories have no on-disk placeholder.** Git does not
+  track empty directories and the catalog carries no placeholder files;
+  a category directory is created when its first entity lands. The
+  closed set above — not the filesystem — is the category authority.
+- **Sub-grouping below the top level is free.** `datastore/relational/…`
+  is permitted filesystem tidiness as a category grows; the category
+  label never reflects sub-segments.
+- **Enterprise Exception.** Third-party namespaces may organize their
+  trees however they choose; the conventions bind the `core/` standard
+  library, and the linter rule is opt-out per workspace.
+
+Features do NOT use categories (flat under `feature/core/`).
 
 ### The `component.aggrega.ai/category` label
 
@@ -96,7 +121,7 @@ Must match the filesystem path segments after the entity type directory:
 
 | Entity | Example filesystem path | metadata.name |
 | --- | --- | --- |
-| Component | `component/core/database/mariadb.yaml` | `core/database/mariadb` |
+| Component | `component/core/datastore/mariadb.yaml` | `core/datastore/mariadb` |
 | Feature | `feature/core/data-masking.yaml` | `core/data-masking` |
 | Recipe | `recipe/helm/mariadb-bitnami/recipe.yaml` | `mariadb-bitnami` |
 | FeatureRecipe | `feature-recipe/helm/k8s-dns-patcher/recipe.yaml` | `k8s-dns-patcher` |
@@ -110,8 +135,8 @@ The `ops/` prefix is NOT used. All Recipes are Domain 3 (Ops) by definition.
 
 When a component's filename would repeat the category, strip the suffix:
 
-- `anthropic-agent.yaml` in `agent/` → `anthropic.yaml` (name: `core/agent/anthropic`)
-- `openai-model.yaml` in `model/` → `openai.yaml` (name: `core/model/openai`)
+- `anthropic-agent.yaml` in `ai-agent/` → `anthropic.yaml` (name: `core/ai-agent/anthropic`)
+- `openai-model.yaml` in `ai-model/` → `openai.yaml` (name: `core/ai-model/openai`)
 
 ## 3. YAML Formatting
 
@@ -244,7 +269,7 @@ spec:
 ```
 
 ```yaml
-# component/core/database/mariadb.yaml — the consumer
+# component/core/datastore/mariadb.yaml — the consumer
 spec:
   schema:
     values:
@@ -304,6 +329,6 @@ for those targets.
 
 The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
 
-- `hub.aggrega.ai/component/core/database/mariadb:1.0.0`
+- `hub.aggrega.ai/component/core/datastore/mariadb:1.0.0`
 - `hub.aggrega.ai/recipe/helm/mariadb-bitnami:1.0.0`
 - `hub.aggrega.ai/feature-recipe/helm/k8s-secret-from-parameter:1.0.0`
