@@ -113,18 +113,48 @@ convention enterprises may extend or replace in their own catalogs.
 Domain 3 entities use the execution engine as the first path segment:
 `helm`, `terraform`, `cloudformation`, `compose`, `eval`.
 
+### Per-version directory layout
+
+**Every** publishable kind — Component, Feature, Provider, Aggregate, Recipe,
+FeatureRecipe, SchemaLibrary, MappingLibrary — lives in a per-version
+subdirectory:
+
+```text
+<kind>/<namespace-or-provider>/.../<name>/<version>/<entity>.yaml
+```
+
+The `<version>` directory segment MUST equal the entity's `metadata.version`; the
+publish-time bundler rejects a mismatch (`ErrEntityVersionPathMismatch`). One
+published version is one directory, so the source tree holds every version of an
+entity side by side rather than relying on git history for older versions. The
+`<entity>.yaml` filename is kind-conventional:
+
+| Kind | Filename |
+| --- | --- |
+| Component | `component.yaml` |
+| Feature | `feature.yaml` |
+| Provider | `provider.yaml` |
+| Aggregate | `aggregate.yaml` |
+| Recipe / FeatureRecipe | `recipe.yaml` (co-located `source/`, `mappings/`, `artifacts/` sit beside it inside the version dir) |
+| SchemaLibrary / MappingLibrary | `library.yaml` |
+
+Recipe and FeatureRecipe deliberately share the `recipe.yaml` filename. The walker
+is layout-agnostic (it indexes by authored `name:version`), so this layout is an
+authoring + publishing convention enforced by the bundler, not a load-time rule.
+
 ## 2. Naming Conventions
 
 ### metadata.name
 
-Must match the filesystem path segments after the entity type directory:
+Must match the filesystem path segments after the entity type directory and before
+the `<version>/` segment:
 
 | Entity | Example filesystem path | metadata.name |
 | --- | --- | --- |
-| Component | `component/core/datastore/mariadb.yaml` | `core/datastore/mariadb` |
-| Feature | `feature/core/data-masking.yaml` | `core/data-masking` |
-| Recipe | `recipe/helm/mariadb-bitnami/recipe.yaml` | `mariadb-bitnami` |
-| FeatureRecipe | `feature-recipe/helm/k8s-dns-patcher/recipe.yaml` | `k8s-dns-patcher` |
+| Component | `component/core/datastore/mariadb/1.0.0/component.yaml` | `core/datastore/mariadb` |
+| Feature | `feature/core/data-masking/1.0.0/feature.yaml` | `core/data-masking` |
+| Recipe | `recipe/helm/mariadb-bitnami/1.0.0/recipe.yaml` | `mariadb-bitnami` |
+| FeatureRecipe | `feature-recipe/helm/k8s-dns-patcher/1.0.0/recipe.yaml` | `k8s-dns-patcher` |
 
 Recipes and FeatureRecipes do NOT include namespace or provider in their name —
 the provider is already the parent directory and `spec.provider` field.
