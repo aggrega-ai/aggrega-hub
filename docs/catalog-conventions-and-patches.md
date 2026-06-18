@@ -355,6 +355,56 @@ self-managed datastores (Helm Bitnami chart, Compose container) still use the
 credential FeatureRecipe path because no upstream managed-secret flag exists
 for those targets.
 
+### Optional credential slots for self-managed datastores
+
+A self-managed datastore Component declares its password as an **optional**
+credential slot in `spec.secretsSchema`, and its Recipes wire that slot
+**conditionally** — the credential subsystem when a credential is attached, an
+inline development default when none is. This keeps the slot non-breaking: a
+deployment that attaches no credential still renders and runs, byte-identically
+to a Recipe with no slot at all.
+
+The shared Component declares an optional, transparent slot — no `required:`,
+and `inject: [env]` so a synthesized Workload may reference it as an env secret.
+The selector is secret-kind-pinned but family-agnostic
+(`feature.aggrega.ai/kind=secret`), so either an inject-value credential or a
+referenceable credential may fill it per provider:
+
+```yaml
+spec:
+  secretsSchema:
+    password:
+      selector: "feature.aggrega.ai/kind=secret"
+      inject: [env]
+```
+
+Each Recipe guards the credential wiring with a presence test on the slot. The
+live `secrets` pillar is **absent** (not an empty map) when nothing is attached,
+so coerce it before the key test: `hasKey (default dict .secrets) "<slot>"`. The
+helm Recipe renders an env `secretKeyRef` via `containers.<n>.secrets` when
+attached (a referenceable credential); the compose Recipe reads the value its
+credential delivers on the inject pipe (an inject-value credential). When
+unattached, both fall back to the inline default:
+
+```gotemplate
+variables:
+  DB_USER: appuser
+{{- if not (hasKey (default dict .secrets) "password") }}
+  DB_PASSWORD: devdefault
+{{- end }}
+{{- if hasKey (default dict .secrets) "password" }}
+secrets:
+  DB_PASSWORD:
+    from: password
+    as: env
+{{- end }}
+```
+
+The canonical examples are
+[`recipe/helm/postgres/recipe.yaml`](../aggrega-catalog/recipe/helm/postgres/1.0.0/recipe.yaml)
+and
+[`recipe/compose/postgres/recipe.yaml`](../aggrega-catalog/recipe/compose/postgres/1.0.0/recipe.yaml).
+
 ## 7. OCI Registry
 
 The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
