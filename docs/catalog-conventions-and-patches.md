@@ -134,6 +134,7 @@ entity side by side rather than relying on git history for older versions. The
 | Component | `component.yaml` |
 | Feature | `feature.yaml` |
 | Provider | `provider.yaml` |
+| Plugin | `plugin.yaml` |
 | Aggregate | `aggregate.yaml` |
 | Recipe / FeatureRecipe | `recipe.yaml` (co-located `source/`, `mappings/`, `artifacts/` sit beside it inside the version dir) |
 | SchemaLibrary / MappingLibrary | `library.yaml` |
