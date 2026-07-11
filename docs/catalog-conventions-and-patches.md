@@ -412,4 +412,33 @@ The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
 
 - `hub.aggrega.ai/component/core/datastore/mariadb:1.0.0`
 - `hub.aggrega.ai/recipe/helm/mariadb-bitnami:1.0.0`
-- `hub.aggrega.ai/feature-recipe/helm/k8s-secret-from-parameter:1.0.0`
+- `hub.aggrega.ai/featurerecipe/helm/k8s-secret-from-parameter:1.0.0`
+
+### Registry repository segments
+
+Every artifact in the registry lives under a top-level repository segment. There
+are three classes of segment.
+
+**Entity-kind segments.** A catalog entity publishes under its kind name,
+lowercased: a `Component` at `component/`, a `Feature` at `feature/`, a
+`SchemaLibrary` at `schemalibrary/`, a `MappingLibrary` at `mappinglibrary/`, an
+`Aggregate` at `aggregate/`. Recipes and FeatureRecipes additionally carry their
+execution engine as a scope segment, because two engines may ship a recipe of the
+same name: a `Recipe` at `recipe/<provider>/`, a `FeatureRecipe` at
+`featurerecipe/<provider>/`. The full repository path is the segment followed by
+the entity's lowercased identity path (`component/core/datastore/mariadb`).
+
+**The plugin segment.** A `Plugin` publishes under `wasm/`, not a literal
+`plugin/`, and its socket is part of its identity. The convention is
+`wasm/<socket>/<name>`: the socket the plugin attaches to is path-encoded into the
+plugin's `metadata.name`, mirroring the catalog filesystem layout
+`plugin/<socket>/<name>`. The same name attached to a different socket is a
+different plugin, so the socket segment travels with the plugin everywhere its
+identity does. The raw `.wasm` binary the entity pins by digest is published as
+its own artifact alongside the entity.
+
+**Reserved non-kind segments.** Two top-level segments are reserved for
+artifacts that are not catalog entities: `tools/` holds tooling container images,
+and `docs/` holds documentation bundles. These names are reserved so that no
+future entity kind can lowercase into a collision with them — no entity kind is
+named `tool` or `docs`, and none may be introduced.
