@@ -428,14 +428,24 @@ same name: a `Recipe` at `recipe/<provider>/`, a `FeatureRecipe` at
 `featurerecipe/<provider>/`. The full repository path is the segment followed by
 the entity's lowercased identity path (`component/core/datastore/mariadb`).
 
-**The plugin segment.** A `Plugin` publishes under `wasm/`, not a literal
-`plugin/`, and its socket is part of its identity. The convention is
-`wasm/<socket>/<name>`: the socket the plugin attaches to is path-encoded into the
-plugin's `metadata.name`, mirroring the catalog filesystem layout
-`plugin/<socket>/<name>`. The same name attached to a different socket is a
-different plugin, so the socket segment travels with the plugin everywhere its
-identity does. The raw `.wasm` binary the entity pins by digest is published as
-its own artifact alongside the entity.
+**The plugin segment.** A `Plugin` publishes under `plugin/`, and its socket is
+part of its identity. The convention is `plugin/<socket>/<name>`: the socket the
+plugin attaches to is path-encoded into the plugin's `metadata.name`, mirroring
+the catalog filesystem layout `plugin/<socket>/<name>`. The same name attached to
+a different socket is a different plugin, so the socket segment travels with the
+plugin everywhere its identity does. The raw `.wasm` binary the entity pins by
+digest is published as its own artifact alongside the entity.
+
+The core provider and linter plugin entities under `plugin/provider/` and
+`plugin/linter/` are **generated, not hand-authored**: the CLI derives each
+entity's contract fields (plugin type, ABI version, targets, exports,
+capabilities) directly from the compiled guest's self-report and merges them with
+a small authored overlay (identity, runtime limits, and the provider block) under
+`plugin-overlays/`. The entity version is the compiler build that produced it.
+The tag-driven publishing CI regenerates and signs this set from the released
+binary, so a generated entity can never promise a capability the shipped guest
+does not provide. Each generated file carries a `generated; DO NOT EDIT` header —
+edit the overlay, then regenerate.
 
 **Reserved non-kind segments.** Two top-level segments are reserved for
 artifacts that are not catalog entities: `tools/` holds tooling container images,
