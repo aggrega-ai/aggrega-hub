@@ -1,0 +1,154 @@
+name: Publish and sign catalog
+
+# Differential catalog publisher. On a catalog change it publishes only the
+# ENTITIES THAT CHANGED and signs each pushed reference with an offline key.
+# Plugins are never published from here: the Plugin kind is generated and
+# published by the CLI-tag pipeline, not from this repository, and the publish
+# script already excludes it.
+#
+# NOT YET LIVE. The destination registry, its pull/push credentials, the offline
+# signing key, the tooling image tag, and the self-hosted runner are all
+# operator-configured and are not wired here. Until they exist this workflow is
+# authored but unexercised — it has never run against a real registry. The
+# manual-dispatch entry defaults to a dry run, so an unconfigured or accidental
+# invocation prints what it would do without publishing, signing, or moving the
+# marker.
+
+on:
+  # A merge that lands catalog changes publishes them (a real, non-dry-run
+  # differential publish). The path filter keeps unrelated commits from
+  # triggering a publish.
+  push:
+    branches: [main]
+    paths:
+      - "aggrega-catalog/**"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute and print the reference set (and the sign command) without any publish, signing, or marker move."
+        required: false
+        default: true
+        type: boolean
+      mode:
+        description: "diff = publish entities changed since the marker; full = reconcile the whole catalog (also how the marker is first established)."
+        required: false
+        default: diff
+        type: choice
+        options: [diff, full]
+
+# Keyed (offline-key) signing only. No id-token / keyless path: a public
+# transparency log would leak the existence and metadata of private artifacts.
+# The one write this workflow needs is advancing the publish marker tag (see the
+# final step); nothing else here writes to the repository.
+permissions:
+  contents: write
+
+jobs:
+  publish-sign:
+    # Configurable runner label. The default hosted runner is fine for a light
+    # catalog diff; point the CATALOG_PUBLISH_RUNNER repository variable at a
+    # self-hosted label to move heavy work off metered hosted minutes.
+    runs-on: ${{ vars.CATALOG_PUBLISH_RUNNER || 'ubuntu-latest' }}
+
+    # Run inside the published tooling image so `aggrega` is already on PATH —
+    # no toolchain build here. The image must also provide git, bash and awk,
+    # which the publish script uses to select, push and mark the changed
+    # entities.
+    #
+    # PIN SEAM: the tag below is a placeholder. Replace it with a real published
+    # tooling-image tag. Tag bumps are meant to land through a reviewed pull
+    # request rather than auto-adopting every new tag, paired with a
+    # compatibility check that fails loudly on a real ABI break. The registry is
+    # authenticated even on pull, so the image is pulled with the same registry
+    # credentials used to push.
+    container:
+      image: hub.aggrega.ai/tools/aggrega:v0.0.0-placeholder
+      credentials:
+        username: ${{ secrets.REGISTRY_USERNAME }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+
+    env:
+      # Destination registry host:port. A repository variable the operator sets
+      # once; the placeholder default cannot publish anywhere real.
+      REGISTRY: ${{ vars.CATALOG_REGISTRY || 'registry.invalid:0' }}
+      # Registry credentials — needed on EVERY job because the registry is
+      # authenticated on push AND pull. Read via the environment (not
+      # interpolated into a run script) to avoid expression injection. The
+      # username feeds `aggrega login`; the password is read by login from
+      # AGGREGA_REGISTRY_PASSWORD.
+      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+      AGGREGA_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      # Offline signing key material, supplied as a secret and written to a
+      # private file for the --key path. Empty until configured, which makes a
+      # real signing run fail safely rather than publish unsigned.
+      SIGNING_KEY: ${{ secrets.CATALOG_SIGNING_KEY }}
+      # Dispatch inputs surfaced as env so the run script reads them from the
+      # environment rather than interpolating expressions into shell.
+      EVENT_NAME: ${{ github.event_name }}
+      DISPATCH_DRY_RUN: ${{ inputs.dry_run }}
+      DISPATCH_MODE: ${{ inputs.mode }}
+
+    steps:
+      - name: Check out the catalog with full history and tags
+        uses: actions/checkout@v4
+        with:
+          # The differential publish diffs from a marker tag to HEAD, so the
+          # marker tag and the history between it and HEAD must be present.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Authenticate to the registry
+        # Only a real publish contacts the registry. A dry run does no network,
+        # so it skips login and stays runnable without live credentials.
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
+        run: |
+          # login reads the password from AGGREGA_REGISTRY_PASSWORD; the username
+          # comes from the environment. No secret is placed on the command line
+          # or interpolated from an expression.
+          aggrega login "$REGISTRY" --username "$REGISTRY_USERNAME"
+
+      - name: Publish and sign the changed catalog entities
+        run: |
+          set -euo pipefail
+
+          # A push event is always a real differential publish; a manual dispatch
+          # honors its dry-run and mode inputs. Both are read from the
+          # environment, never interpolated into this script.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            DRY="$DISPATCH_DRY_RUN"
+            MODE="$DISPATCH_MODE"
+          else
+            DRY="false"
+            MODE="diff"
+          fi
+
+          # Write the offline signing key to a private file for --key.
+          KEY_PATH="$RUNNER_TEMP/catalog-signing.key"
+          umask 077
+          printf '%s' "$SIGNING_KEY" > "$KEY_PATH"
+
+          args=(--registry "$REGISTRY" --sign --key "$KEY_PATH")
+          if [ "$MODE" = "full" ]; then
+            # A full reconcile re-pushes every catalog entity; --yes bypasses the
+            # script's interactive confirm for non-interactive CI.
+            args+=(--full --yes)
+          fi
+          if [ "$DRY" = "true" ]; then
+            args+=(--dry-run)
+          fi
+
+          scripts/publish-diff.sh "${args[@]}"
+
+      - name: Persist the publish marker
+        # MARKER SEAM: the publish script advances a local git tag (the marker it
+        # diffs from) to HEAD on a fully successful real publish. Push that moved
+        # tag back so the next run diffs from where this one finished; the
+        # leading '+' force-updates only that one ref. Skipped on a dry run
+        # (which moves nothing). A missed push is safe, not corrupting: the
+        # publish is idempotent, so the next run merely re-diffs a wider range
+        # and re-confirms already-published entities as no-ops.
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
+        env:
+          MARKER: catalog-published
+        run: |
+          git push origin "+refs/tags/${MARKER}"
