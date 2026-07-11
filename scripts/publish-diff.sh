@@ -37,12 +37,15 @@
 #
 # Usage:
 #   ./publish-diff.sh [--registry <host:port>] [--catalog <dir>]
-#                     [--marker <tag>] [--full] [--dry-run] [--no-advance]
+#                     [--marker <tag>] [--full] [--yes] [--dry-run] [--no-advance]
 #                     [--sign [--key <path>] [--identity-token <token>]]
 #
 # Modes:
 #   (default)     differential — publish entities changed since the marker.
-#   --full        reconcile — enumerate and push every catalog entity.
+#   --full        reconcile — enumerate and push every catalog entity. A real
+#                 --full run is a full re-push and prompts for confirmation;
+#                 --yes bypasses the prompt (CI) and a non-interactive stdin
+#                 without --yes refuses rather than hanging.
 #   --dry-run     print the selected references and the sign command (token
 #                 redacted); no network, no OIDC, no marker advance.
 #
@@ -61,10 +64,11 @@ NO_ADVANCE=""
 SIGN=""
 KEY=""
 IDTOKEN=""
+YES=""
 AGGREGA="${AGGREGA_BIN:-aggrega}"
 
 usage() {
-  echo "usage: $0 [--registry <host:port>] [--catalog <dir>] [--marker <tag>] [--full] [--dry-run] [--no-advance] [--sign [--key <path>] [--identity-token <token>]]" >&2
+  echo "usage: $0 [--registry <host:port>] [--catalog <dir>] [--marker <tag>] [--full] [--yes] [--dry-run] [--no-advance] [--sign [--key <path>] [--identity-token <token>]]" >&2
 }
 
 while [ $# -gt 0 ]; do
@@ -78,12 +82,47 @@ while [ $# -gt 0 ]; do
     --sign)           SIGN="1"; shift ;;
     --key)            KEY="$2"; shift 2 ;;
     --identity-token) IDTOKEN="$2"; shift 2 ;;
+    --yes)            YES="1"; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
 done
 
 [ -d "$CATALOG" ] || { echo "publish-diff: catalog dir not found: $CATALOG" >&2; exit 1; }
+
+# --- Destructive-op confirm (full reconcile) ---------------------------------
+# A real --full reconcile re-pushes every catalog entity. Guard it: --yes
+# bypasses (CI), an interactive terminal prompts [y/N], and a non-interactive
+# stdin without --yes refuses rather than hanging. This mirrors the shared
+# confirm contract used by the sibling full-repush scripts; it is inlined here
+# because this script also runs from a standalone hub checkout that has no
+# access to the umbrella script tree.
+confirm_destructive() {
+  local summary="$1"
+  if [ -n "$YES" ]; then
+    return 0
+  fi
+  if [ ! -t 0 ]; then
+    echo "publish-diff: refusing a destructive full re-push on non-interactive stdin without --yes." >&2
+    echo "  Pass --yes to proceed (CI), or --dry-run to preview safely." >&2
+    return 1
+  fi
+  printf '%s\n' "$summary" >&2
+  printf 'Proceed with the full re-push? [y/N] ' >&2
+  local reply=""
+  read -r reply || reply=""
+  case "$reply" in
+    [yY]|[yY][eE][sS]) return 0 ;;
+    *) echo "publish-diff: aborted." >&2; return 1 ;;
+  esac
+}
+
+if [ "$MODE" = "full" ] && [ -z "$DRYRUN" ]; then
+  if ! confirm_destructive \
+      "publish-diff: about to reconcile EVERY catalog entity to $REGISTRY (a full re-push)."; then
+    exit 1
+  fi
+fi
 
 # --- Marker seam --------------------------------------------------------------
 # The ONLY two places the marker mechanism is touched. Default mechanism is a
