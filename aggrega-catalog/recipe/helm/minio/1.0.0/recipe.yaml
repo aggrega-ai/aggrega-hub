@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: minio
+  version: 1.0.0
+  description: >
+    MinIO S3-compatible object-storage server on Kubernetes via the helm
+    provider's Workload synthesis, running the official upstream minio/minio
+    image directly (no external Helm chart). MinIO stores objects under /data, so
+    the workload mounts a persistent volume at that path; it runs as a single
+    replica serving the S3 API, so it renders a Deployment plus a ClusterIP
+    Service. The server is started with `minio server /data --address :<port>`.
+    The root username is a developer value. The root password is wired through the
+    optional `root_password` credential slot: when a credential is attached it
+    renders as an env secretKeyRef (MINIO_ROOT_PASSWORD), so the plaintext never
+    lands in the Deployment manifest; when none is attached the Recipe falls back
+    to a deterministic development default so the render stays byte-identical
+    across runs. provides.host is the bare, self-contained in-cluster service name
+    of the synthesized Service — it carries no namespace, so the recipe is
+    independent of where it is deployed; a consumer in another namespace qualifies
+    the host with the target namespace on its own side (caller-side routing). The
+    packaged MinIO server is AGPL-3.0.
+  license: AGPL-3.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  target: helm
+  implements: core/storage/minio:1.0.0
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
+  # (here "<instance_id>-default"), with no namespace segment. A same-namespace
+  # consumer reaches it under this name directly; a cross-namespace consumer
+  # qualifies it with the target namespace caller-side. protocol is "s3" — the
+  # S3-compatible object-storage API.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "s3"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # MinIO runs as a single replica whose object data lives on the mounted
+    # volume, so the default stateless form (a Deployment on the helm engine) is
+    # correct — no form: stateful, no per-replica volume template.
+    replicas: 1
+    containers:
+      main:
+        image: minio/minio:{{ .infra.engine_version }}
+        # `minio server /data` starts the object store; --address binds the S3
+        # API to the infra port, with object data on the mounted volume.
+        command:
+          - minio
+          - server
+          - /data
+          - --address
+          - ":{{ .infra.port }}"
+        # MINIO_ROOT_USER is a developer value. MINIO_ROOT_PASSWORD is wired
+        # through the optional `root_password` credential slot: when a credential
+        # is attached it renders as an env secretKeyRef so the plaintext never
+        # lands in the manifest; with none attached the Recipe falls back to a
+        # deterministic development default. MinIO keeps its object data under
+        # /data on the data volume.
+        variables:
+          MINIO_ROOT_USER: {{ .values.root_user }}
+    {{- if not (hasKey (default dict .secrets) "root_password") }}
+          MINIO_ROOT_PASSWORD: dev-minio-root-change-me
+    {{- end }}
+    {{- if hasKey (default dict .secrets) "root_password" }}
+        secrets:
+          MINIO_ROOT_PASSWORD:
+            from: root_password
+            as: env
+    {{- end }}
+        ports:
+          api: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+        volumeMounts:
+          - name: data
+            path: /data
+    volumes:
+      data:
+        persistent:
+          size: "{{ if .infra.storage }}{{ .infra.storage.size | default "8Gi" }}{{ else }}8Gi{{ end }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          api: {{ .infra.port }}

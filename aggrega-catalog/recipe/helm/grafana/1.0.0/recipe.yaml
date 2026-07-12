@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: grafana
+  version: 1.0.0
+  description: >
+    Grafana dashboards server on Kubernetes via the helm provider's Workload
+    synthesis, running the official upstream grafana/grafana image directly (no
+    external Helm chart). Grafana keeps its own state — users, saved dashboards,
+    preferences — under /var/lib/grafana, so the workload mounts a persistent
+    volume at that path; the process itself is a single stateless replica, so it
+    renders a Deployment plus a ClusterIP Service. The admin username is a
+    developer value. The admin password is wired through the optional
+    `admin_password` credential slot: when a credential is attached it renders as
+    an env secretKeyRef (GF_SECURITY_ADMIN_PASSWORD), so the plaintext never lands
+    in the Deployment manifest; when none is attached the Recipe falls back to a
+    deterministic development default so the render stays byte-identical across
+    runs. provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service — it carries no namespace, so the recipe is independent of
+    where it is deployed; a consumer in another namespace qualifies the host with
+    the target namespace on its own side (caller-side routing). The packaged
+    Grafana server is AGPL-3.0.
+  license: AGPL-3.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  target: helm
+  implements: core/observability/grafana:1.0.0
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
+  # (here "<instance_id>-default"), with no namespace segment. A same-namespace
+  # consumer reaches it under this name directly; a cross-namespace consumer
+  # qualifies it with the target namespace caller-side. protocol is "http" — the
+  # Grafana web and query endpoint.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # Grafana runs as a single stateless replica whose durable state lives on the
+    # mounted volume, so the default stateless form (a Deployment on the helm
+    # engine) is correct — no form: stateful, no per-replica volume template. The
+    # official grafana/grafana image entrypoint starts the server, so no command
+    # is set.
+    replicas: 1
+    containers:
+      main:
+        image: grafana/grafana:{{ .infra.engine_version }}
+        # GF_SECURITY_ADMIN_USER is a developer value. GF_SECURITY_ADMIN_PASSWORD
+        # is wired through the optional `admin_password` credential slot: when a
+        # credential is attached it renders as an env secretKeyRef so the
+        # plaintext never lands in the manifest; with none attached the Recipe
+        # falls back to a deterministic development default. Grafana keeps its
+        # state under /var/lib/grafana on the data volume.
+        variables:
+          GF_SECURITY_ADMIN_USER: {{ .values.admin_user }}
+    {{- if not (hasKey (default dict .secrets) "admin_password") }}
+          GF_SECURITY_ADMIN_PASSWORD: dev-grafana-admin-change-me
+    {{- end }}
+    {{- if hasKey (default dict .secrets) "admin_password" }}
+        secrets:
+          GF_SECURITY_ADMIN_PASSWORD:
+            from: admin_password
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+        volumeMounts:
+          - name: data
+            path: /var/lib/grafana
+    volumes:
+      data:
+        persistent:
+          size: "{{ if .infra.storage }}{{ .infra.storage.size | default "10Gi" }}{{ else }}10Gi{{ end }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
