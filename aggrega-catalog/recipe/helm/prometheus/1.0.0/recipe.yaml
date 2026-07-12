@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: prometheus
+  version: 1.0.0
+  description: >
+    Prometheus metrics server on Kubernetes via the helm provider's Workload
+    synthesis, running the official upstream prom/prometheus image (no external
+    Helm chart). Prometheus persists its time-series database to disk, so it
+    renders as a StatefulSet with a per-replica data volume, a Headless Service
+    for stable network identity, and a ClusterIP Service for queries. The
+    scrape-target host and port resolved from the `scrape_target` uses-edge
+    arrive on the injection context and are written into a minimal
+    prometheus.yml scrape job at start-up, so the server scrapes that target.
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized ClusterIP Service — it carries no namespace, so the recipe is
+    independent of where it is deployed. A consumer in another namespace
+    qualifies the host with the target namespace on its own side (caller-side
+    routing).
+  license: Apache-2.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  target: helm
+  implements: core/observability/prometheus:1.0.0
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
+  # (here "<instance_id>-default"), with no namespace segment. A same-namespace
+  # consumer reaches it under this name directly; a cross-namespace consumer
+  # qualifies it with the target namespace caller-side.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # form: stateful selects a StatefulSet on the helm engine; the
+    # persistentTemplate volume below is a companion of this form (rendered as a
+    # volumeClaimTemplate), and the Headless service supplies the StatefulSet's
+    # stable network identity.
+    form: stateful
+    replicas: 1
+    containers:
+      main:
+        image: prom/prometheus:{{ .infra.engine_version }}
+        # The scrape target resolved from the `scrape_target` uses-edge arrives
+        # on the inject pipe (.context.inject.env) and is written into the
+        # prometheus.yml scrape config at start-up, then Prometheus is exec'd
+        # against that config with the time-series database on the data volume.
+        command:
+          - /bin/sh
+          - -c
+          - |-
+            cat > /tmp/prometheus.yml <<'EOF'
+            global:
+              scrape_interval: 15s
+            scrape_configs:
+              - job_name: {{ .values.scrape_job_name }}
+                metrics_path: {{ .values.metrics_path }}
+                static_configs:
+                  - targets:
+                      - {{ .context.inject.env.PROM_SCRAPE_HOST }}:{{ .context.inject.env.PROM_SCRAPE_PORT }}
+            EOF
+            exec /bin/prometheus --config.file=/tmp/prometheus.yml --storage.tsdb.path=/prometheus --web.listen-address=0.0.0.0:{{ .infra.port }}
+        ports:
+          http: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+        volumeMounts:
+          - name: data
+            path: /prometheus
+    volumes:
+      data:
+        persistentTemplate:
+          size: "{{ if .infra.storage }}{{ .infra.storage.size | default "8Gi" }}{{ else }}8Gi{{ end }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
+      headless:
+        type: Headless
+        ports:
+          http: {{ .infra.port }}
