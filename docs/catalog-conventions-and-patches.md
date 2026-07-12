@@ -406,6 +406,96 @@ The canonical examples are
 and
 [`recipe/compose/postgres/recipe.yaml`](../aggrega-catalog/recipe/compose/postgres/1.0.0/recipe.yaml).
 
+### Credential-slot models — match the chart's auth surface
+
+Self-managed datastore families use one of two principled credential-slot
+conventions. The convention is chosen by what the upstream chart's
+authentication surface demands, **not** by author preference: the Recipe adapts
+to the chart, and the compiler is unopinionated about which model a Component
+declares. The standard library does not force convergence on one model — the two
+coexist because they are dictated by the charts, and an author picks the one the
+chart's auth surface requires.
+
+**Model A — bundled multi-key `existingSecret`.** For charts that authenticate
+**only** from a single Kubernetes Secret carrying several fixed keys (the Bitnami
+`mariadb` and `mysql` charts), the Component declares a Black-Box `root_password`
+slot (`required: true`, `inject: []`) plus a transparent `user_password` slot. A
+multi-key credential producer — the `referenced-secret-set` Feature via the
+`k8s-secret-set` FeatureRecipe — emits one Secret carrying the caller-named keys
+(e.g. `<engine>-root-password` and `<engine>-password`), and the chart reads it
+through `auth.existingSecret` bound to `{{ .secrets.root_password.provides.name }}`:
+
+```yaml
+spec:
+  secretsSchema:
+    root_password:
+      required: true
+      inject: []          # Black-Box — the Recipe controls delivery
+    user_password:
+      inject: [env, file] # transparent — developer may dictate delivery
+```
+
+The canonical example is
+[`recipe/helm/mariadb-bitnami/recipe.yaml`](../aggrega-catalog/recipe/helm/mariadb-bitnami/1.0.0/recipe.yaml).
+
+**Model B — granular transparent inject-value.** For charts that accept a single
+password **value** (`postgres`, `valkey`, `redis`, `memcached`), the Component
+declares one optional transparent `password` slot
+(`selector: feature.aggrega.ai/kind=secret`, `inject: [env]`), filled by an
+inject-value credential, with a deterministic inline development default when the
+slot is unattached (the conditional-wiring pattern documented in the previous
+subsection):
+
+```yaml
+spec:
+  secretsSchema:
+    password:
+      selector: "feature.aggrega.ai/kind=secret"
+      inject: [env]
+```
+
+The canonical example is
+[`recipe/helm/postgres/recipe.yaml`](../aggrega-catalog/recipe/helm/postgres/1.0.0/recipe.yaml).
+
+The two models are principled, not arbitrary: Model A is required whenever the
+chart reads credentials **only** from a named multi-key Secret; Model B fits
+charts that take a single password value. Match the model to the chart's auth
+surface.
+
+### Presence parametrization — expose an enable-parameter per component
+
+A published Aggregate exposes an enable/disable parameter per optional component
+so a deployment can toggle that component's presence per environment. The
+convention: declare a boolean parameter such as `enable_cache` in the Aggregate's
+`parameters`, and have the component's presence expression reference it. A
+deployment then flips the component on or off by fulfilling the parameter,
+without editing the Aggregate's topology.
+
+Per-component presence toggling is documentation-only today; it becomes
+authorable in a future iteration when the optional-component capability ships.
+Author the Aggregate's `parameters` with the enable-flag in place now so the
+intent is captured; the `active:` expression that consumes it takes the following
+shape once the capability lands:
+
+```yaml
+# authorable once the optional-component capability ships
+spec:
+  parameters:
+    enable_cache:
+      type: boolean
+      default: true
+  components:
+    cache:
+      type: core/datastore/valkey:1.0.0
+      # active: "{{ .parameters.enable_cache }}"
+      #   the active expression gates whether this component
+      #   enters the graph; authorable in a future iteration
+```
+
+Until the capability ships, declare the enable-parameter as the intended
+convention and document which component it is meant to gate; do not author the
+`active:` expression itself yet.
+
 ## 7. OCI Registry
 
 The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
