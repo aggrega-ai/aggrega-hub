@@ -1,0 +1,148 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: fluentd-bitnami
+  version: 1.0.0
+  description: >
+    Fluentd log aggregator via the Bitnami Fluentd Helm chart
+    (bitnami/fluentd). The chart is rendered in aggregator mode: the forwarder
+    daemonset is disabled so the chart renders only the aggregator — a
+    StatefulSet, its primary and headless Services, its configuration
+    ConfigMap, a NetworkPolicy, a PodDisruptionBudget, and a ServiceAccount.
+    The aggregator listens for forwarded records on the `forward` input at
+    infra.port, and routes records matching the developer's output match to its
+    output. The buffer is in-memory by default; when infra.storage.size is set
+    a persistent volume backs it. The chart publishes a resolvable image tag for
+    this appVersion; the Recipe pins that tag explicitly for a reproducible
+    render. Default chart version in source.version; override via
+    infra.source_version. The packaged Fluentd server is Apache-2.0.
+  license: Apache-2.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  target: helm
+  implements: core/observability/fluentd:1.0.0
+
+  source:
+    kind: helm-oci-chart
+    url: oci://registry-1.docker.io/bitnamicharts/fluentd
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"7.2.5\" }}"
+
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    protocol: "forward"
+
+  # This Recipe reads from infra.overrides:
+  #   image         - map[string]string (chart image.* fields; overrides the tag pin)
+  #   service_type  - string (chart aggregator.service.type)
+  #   requests      - { cpu: string, memory: string } (resource requests)
+  #   storage_class - string (persistence storageClass for the buffer PVC)
+  #   nodeSelector  - map[string]string
+  #   tolerations   - []object
+  valuesMapping: |
+    ## ── Image pin ──────────────────────────────────────────────
+    ## The chart publishes a resolvable image tag for this appVersion;
+    ## pin the same tag explicitly for a reproducible render. Override
+    ## the whole block via infra.overrides.image.
+    {{- if and .infra.overrides .infra.overrides.image }}
+    image:
+      {{- range $k, $v := .infra.overrides.image }}
+      {{ $k }}: "{{ $v }}"
+      {{- end }}
+    {{- else }}
+    image:
+      registry: docker.io
+      repository: bitnami/fluentd
+      tag: "1.19.0-debian-12-r1"
+    {{- end }}
+
+    ## ── Aggregator mode ────────────────────────────────────────
+    ## Disable the forwarder daemonset so the chart renders only the
+    ## aggregator StatefulSet and its supporting resources. Enabling
+    ## the forwarder is a separate role (a log forwarder), not this
+    ## component's aggregator role.
+    forwarder:
+      enabled: false
+
+    aggregator:
+      enabled: true
+      replicaCount: 1
+
+      ## ── Forward input port ───────────────────────────────────
+      ## The port the `forward` input source binds and the port the
+      ## primary and headless Services expose for incoming records.
+      port: {{ .infra.port }}
+      service:
+        {{- if and .infra.overrides .infra.overrides.service_type }}
+        type: "{{ .infra.overrides.service_type }}"
+        {{- else }}
+        type: ClusterIP
+        {{- end }}
+        ports:
+          tcp:
+            port: {{ .infra.port }}
+            targetPort: tcp
+            protocol: TCP
+
+      ## ── Output routing (developer intent) ────────────────────
+      ## Records whose tag matches the developer's output match are
+      ## routed to the aggregator's output. The chart writes these
+      ## config files into the Fluentd configuration ConfigMap.
+      configMapFiles:
+        fluentd-output.conf: |
+          # Throw the healthcheck to the standard output
+          <match fluentd.healthcheck>
+            @type stdout
+          </match>
+
+          # Route matched records to the standard output
+          <match {{ .values.output_match }}>
+            @type stdout
+          </match>
+
+      ## ── Resources ────────────────────────────────────────────
+      resources:
+        limits:
+          cpu: "{{ .infra.compute.cpu }}"
+          memory: "{{ .infra.compute.memory }}"
+        {{- if and .infra.overrides .infra.overrides.requests }}
+        requests:
+          cpu: "{{ .infra.overrides.requests.cpu }}"
+          memory: "{{ .infra.overrides.requests.memory }}"
+        {{- end }}
+
+      ## ── Buffer persistence (optional) ─────────────────────────
+      ## The buffer is in-memory by default. When infra.storage.size
+      ## is set, a persistent volume backs it so buffered records
+      ## survive restarts.
+      {{- if and .infra.storage .infra.storage.size }}
+      persistence:
+        enabled: true
+        size: "{{ .infra.storage.size }}"
+        {{- if and .infra.overrides .infra.overrides.storage_class }}
+        storageClass: "{{ .infra.overrides.storage_class }}"
+        {{- end }}
+      {{- end }}
+
+      ## ── Scheduling overrides ──────────────────────────────────
+      {{- if .infra.overrides }}
+      {{- if .infra.overrides.nodeSelector }}
+      nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+      {{- end }}
+      {{- if .infra.overrides.tolerations }}
+      tolerations: {{ toJson .infra.overrides.tolerations }}
+      {{- end }}
+      {{- end }}
+
+  sourceDigests:
+    - kind: helm-oci-chart
+      url: oci://registry-1.docker.io/bitnamicharts/fluentd
+      version: 7.2.5
+      digest: sha256:dfdd1837cfeb4545e796c5f0d6503b9a0a04090d0111af7eb46320e8dcca49a5
+      manifestDigest: sha256:3475bc5053a1c9d60840e108625680c7f566228abc74a5485db8c1020c9e6b5a
