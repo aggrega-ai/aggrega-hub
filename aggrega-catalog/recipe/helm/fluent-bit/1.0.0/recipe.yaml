@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: fluent-bit
+  version: 1.0.0
+  description: >
+    Fluent Bit log forwarder on Kubernetes via the helm provider's Workload
+    synthesis, running the official upstream fluent/fluent-bit image directly
+    (no external Helm chart). The sink host and port resolved from the
+    `forward_target` uses-edge arrive on .context.inject.env and are written into
+    a minimal fluent-bit.conf `forward` output at start-up, so the forwarder
+    ships records to that sink; Fluent Bit is then exec'd against that config
+    with its monitoring endpoint bound to the infra port. Fluent Bit holds no
+    persistent state, so it renders as a stateless Deployment. provides.host is
+    the bare, self-contained in-cluster service name of the synthesized ClusterIP
+    Service — it carries no namespace, so the recipe is independent of where it
+    is deployed; a consumer in another namespace qualifies the host with the
+    target namespace on its own side (caller-side routing). The Fluent Bit server
+    is Apache-2.0.
+  license: Apache-2.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  target: helm
+  implements: core/observability/fluent-bit:1.0.0
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
+  # (here "<instance_id>-default"), with no namespace segment. A same-namespace
+  # consumer reaches it under this name directly; a cross-namespace consumer
+  # qualifies it with the target namespace caller-side. protocol is "http" — the
+  # Fluent Bit monitoring endpoint speaks HTTP.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # Fluent Bit holds no durable state, so the default stateless form (a
+    # Deployment on the helm engine) is correct — no persistent volume.
+    replicas: 1
+    containers:
+      main:
+        image: "fluent/fluent-bit:{{ .infra.engine_version }}"
+        # The sink resolved from the `forward_target` uses-edge arrives on the
+        # inject pipe (.context.inject.env) and is written into the
+        # fluent-bit.conf forward output at start-up, then Fluent Bit is exec'd
+        # against that config with its monitoring endpoint bound to the infra
+        # port.
+        command:
+          - /bin/sh
+          - -c
+          - |-
+            cat > /tmp/fluent-bit.conf <<'EOF'
+            [SERVICE]
+                Flush        1
+                Log_Level    info
+                HTTP_Server  On
+                HTTP_Listen  0.0.0.0
+                HTTP_Port    {{ .infra.port }}
+            [INPUT]
+                Name   dummy
+                Dummy  {"message": "log record from fluent-bit"}
+            [OUTPUT]
+                Name   forward
+                Match  {{ .values.forward_match }}
+                Host   {{ .context.inject.env.FLUENT_FORWARD_HOST }}
+                Port   {{ .context.inject.env.FLUENT_FORWARD_PORT }}
+            EOF
+            exec /fluent-bit/bin/fluent-bit -c /tmp/fluent-bit.conf
+        ports:
+          http: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
