@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: openbao
+  version: 1.0.0
+  description: >
+    OpenBao secrets-management server on Kubernetes via the official OpenBao
+    Helm chart (openbao/openbao). The chart is configured for a lean,
+    single-workload deployment: the agent injector is disabled, the server runs
+    in standalone mode with a single replica, and its state is kept in the
+    built-in file storage backend on a persistent volume. Under this
+    configuration the chart renders a StatefulSet for the server, a ConfigMap
+    carrying the server configuration, the main and internal (headless)
+    Services, a ServiceAccount, and a ClusterRoleBinding. OpenBao is initialized
+    and unsealed at runtime inside the cluster, so no credential is wired at
+    render time and no secret is materialized. The server image is pinned to a
+    resolvable release tag for reproducible renders. Default chart version in
+    source.version; override via infra.source_version. provides.host is the
+    bare, self-contained in-cluster Service name — it carries no namespace, so
+    the recipe is independent of where it is deployed; a consumer in another
+    namespace qualifies the host with the target namespace on its own side
+    (caller-side routing). OpenBao is distributed under the MPL-2.0 license.
+  license: MPL-2.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  target: helm
+  implements: core/security/openbao:1.0.0
+
+  source:
+    kind: helm-oci-chart
+    url: oci://ghcr.io/openbao/charts/openbao
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"0.28.4\" }}"
+
+  # provides.host pins the chart's fullnameOverride to the instance id, so the
+  # main OpenBao Service is named exactly "<instance_id>"; the headless service
+  # the StatefulSet uses for peer discovery is "<instance_id>-internal". A
+  # same-namespace consumer reaches the API under this name directly; a
+  # cross-namespace consumer qualifies it caller-side. Port 8200 is the fixed
+  # OpenBao API port. The lean render terminates TLS outside the cluster and
+  # serves the API over plain HTTP in-cluster, so protocol is "http".
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: 8200
+    protocol: "http"
+
+  # This Recipe reads from infra.overrides:
+  #   image         - map[string]string (server.image.* fields; overrides the tag pin)
+  #   requests      - { cpu: string, memory: string } (server resource requests)
+  #   storage_class - string (server.dataStorage.storageClass for the data PVC)
+  #   nodeSelector  - map[string]string (server pod scheduling)
+  #   tolerations   - []object (server pod scheduling)
+  valuesMapping: |
+    ## ── Agent injector ─────────────────────────────────────────
+    ## Disabled for a lean single-workload secrets server; the sidecar
+    ## injector and its webhook are not part of this deployment.
+    injector:
+      enabled: false
+
+    ## ── Pin the chart's resource names to the instance id ──────
+    ## Names the main Service exactly "<instance_id>", matching provides.host.
+    fullnameOverride: "{{ .context.instance_id }}"
+
+    server:
+      ## ── Server image pin ─────────────────────────────────────
+      ## The chart defaults the tag to its appVersion; pin explicitly for a
+      ## reproducible render. Override the whole block via infra.overrides.image.
+      image:
+        {{- if and .infra.overrides .infra.overrides.image }}
+        {{- range $k, $v := .infra.overrides.image }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+        {{- else }}
+        registry: quay.io
+        repository: openbao/openbao
+        tag: "2.5.5"
+        {{- end }}
+
+      ## ── Standalone mode + file storage backend ───────────────
+      ## Single-replica standalone server keeping its encrypted state in the
+      ## built-in file backend on the mounted data volume. The developer's
+      ## ui_enabled value gates the built-in web UI. OpenBao listens for the
+      ## API on 8200 and for cluster traffic on 8201; TLS is terminated
+      ## outside the cluster, so the in-cluster listener is plain HTTP.
+      standalone:
+        enabled: true
+        config: |
+          ui = {{ .values.ui_enabled }}
+
+          listener "tcp" {
+            tls_disable = 1
+            address = "[::]:8200"
+            cluster_address = "[::]:8201"
+          }
+
+          storage "file" {
+            path = "/openbao/data"
+          }
+
+      ## High-availability multi-node mode is not modelled by this Recipe.
+      ha:
+        enabled: false
+
+      ## ── Data volume (file storage backend) ───────────────────
+      ## The StatefulSet mounts a PersistentVolumeClaim at /openbao/data where
+      ## the file backend keeps the server's encrypted state.
+      dataStorage:
+        enabled: true
+        size: "{{ .infra.storage.size }}"
+        {{- if and .infra.overrides .infra.overrides.storage_class }}
+        storageClass: "{{ .infra.overrides.storage_class }}"
+        {{- end }}
+
+      ## ── Server resources ─────────────────────────────────────
+      resources:
+        limits:
+          cpu: "{{ .infra.compute.cpu }}"
+          memory: "{{ .infra.compute.memory }}"
+        {{- if and .infra.overrides .infra.overrides.requests }}
+        requests:
+          cpu: "{{ .infra.overrides.requests.cpu }}"
+          memory: "{{ .infra.overrides.requests.memory }}"
+        {{- end }}
+
+      ## ── Scheduling overrides ─────────────────────────────────
+      {{- if .infra.overrides }}
+      {{- if .infra.overrides.nodeSelector }}
+      nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+      {{- end }}
+      {{- if .infra.overrides.tolerations }}
+      tolerations: {{ toJson .infra.overrides.tolerations }}
+      {{- end }}
+      {{- end }}
+
+  sourceDigests:
+    - kind: helm-oci-chart
+      url: oci://ghcr.io/openbao/charts/openbao
+      version: 0.28.4
+      digest: sha256:783177e7925cb0d91ec3d5317a80826cb1e265ce17ba176d7a7ad578234c8a4e
+      manifestDigest: sha256:aba6c746e45a2dd55f27ea39ff9de4d528edccb7b3f108344f20154c0724cc22
