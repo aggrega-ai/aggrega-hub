@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: kong
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Kong, a database-backed API gateway, on Kubernetes via the helm provider's
+    Workload synthesis (a stateless Deployment plus a ClusterIP Service on the
+    proxy port). Kong holds no local state — the PostgreSQL backend is the
+    system of record — so it renders stateless. The backend identity resolved
+    from the `backend` uses-edge (host, port, user, database) arrives on
+    .context.inject.env and composes Kong's KONG_PG_* connection. A migrations
+    step runs to completion before the gateway serves, provisioning the database
+    schema against the same backend and credentials. The connection is rendered
+    password-free where possible: with no credential attached the Recipe uses an
+    inline development default, and with one attached the password is supplied on
+    KONG_PG_PASSWORD via the credential subsystem. provides.host is the bare,
+    self-contained in-cluster service name of the synthesized Service — it
+    carries no namespace, so the recipe is independent of where it is deployed. A
+    consumer in another namespace qualifies the host with the target namespace on
+    its own side (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  target: helm
+  implements: core/gateway/kong:1.0.0
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
+  # (here "<instance_id>-default"), with no namespace segment. A same-namespace
+  # consumer reaches it under this name directly; a cross-namespace consumer
+  # qualifies it with the target namespace caller-side.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.proxy_port }}"
+    protocol: "http"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # Kong holds no durable state — the PostgreSQL backend is the system of
+    # record — so the default stateless form (a Deployment on the helm engine)
+    # is correct: no form: stateful, no persistentTemplate volume, no PVC.
+    replicas: 1
+    # The migrations step runs to completion before the gateway serves,
+    # provisioning the database schema. It uses the same image, the same
+    # backend connection composed from the `backend` uses-edge, and the same
+    # password handling as the main container; only its entrypoint arguments
+    # differ (the image default entrypoint with `migrations bootstrap`). The
+    # bootstrap is idempotent, so a re-run against an already-provisioned
+    # database is a no-op.
+    initContainers:
+      - image: "kong:{{ .infra.engine_version }}"
+        args: [kong, migrations, bootstrap]
+        variables:
+          KONG_DATABASE: postgres
+          KONG_PG_HOST: "{{ .context.inject.env.KONG_PG_HOST }}"
+          KONG_PG_PORT: "{{ .context.inject.env.KONG_PG_PORT }}"
+          KONG_PG_USER: "{{ .context.inject.env.KONG_PG_USER }}"
+          KONG_PG_DATABASE: "{{ .context.inject.env.KONG_PG_DATABASE }}"
+    {{- if not (hasKey (default dict .secrets) "password") }}
+          KONG_PG_PASSWORD: apppass
+    {{- end }}
+    {{- if hasKey (default dict .secrets) "password" }}
+        secrets:
+          KONG_PG_PASSWORD:
+            from: password
+            as: env
+    {{- end }}
+    containers:
+      main:
+        image: "kong:{{ .infra.engine_version }}"
+        # No command/args override — the image default entrypoint runs
+        # `kong docker-start`. The backend identity resolved from the `backend`
+        # uses-edge arrives on the inject pipe (.context.inject.env) and composes
+        # the KONG_PG_* connection. KONG_PG_PASSWORD is delivered via the optional
+        # `password` credential slot (env secret when attached) or an inline
+        # development default when unattached. The admin API listens in-cluster
+        # only — the synthesized Service is a ClusterIP.
+        variables:
+          KONG_DATABASE: postgres
+          KONG_PG_HOST: "{{ .context.inject.env.KONG_PG_HOST }}"
+          KONG_PG_PORT: "{{ .context.inject.env.KONG_PG_PORT }}"
+          KONG_PG_USER: "{{ .context.inject.env.KONG_PG_USER }}"
+          KONG_PG_DATABASE: "{{ .context.inject.env.KONG_PG_DATABASE }}"
+          KONG_PROXY_LISTEN: "0.0.0.0:{{ .infra.proxy_port }}, 0.0.0.0:8443 ssl"
+          KONG_ADMIN_LISTEN: "0.0.0.0:{{ .infra.admin_port }}"
+    {{- if not (hasKey (default dict .secrets) "password") }}
+          KONG_PG_PASSWORD: apppass
+    {{- end }}
+    {{- if hasKey (default dict .secrets) "password" }}
+        secrets:
+          KONG_PG_PASSWORD:
+            from: password
+            as: env
+    {{- end }}
+        ports:
+          tcp: {{ .infra.proxy_port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          tcp: {{ .infra.proxy_port }}
