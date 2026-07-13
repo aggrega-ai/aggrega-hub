@@ -312,7 +312,7 @@ spec:
 A MappingLibrary entry carries one or more named Go-template fragments under `spec.mappings:`. A consumer Recipe imports the entry inside `valuesMapping:`:
 
 ```yaml
-# recipe/helm/postgres-bitnami/recipe.yaml — the consumer
+# recipe/helm/mariadb-bitnami/recipe.yaml — the consumer
 spec:
   valuesMapping:
     $import: BitnamiHelpers#/mappings/PostgresBitnamiCore
