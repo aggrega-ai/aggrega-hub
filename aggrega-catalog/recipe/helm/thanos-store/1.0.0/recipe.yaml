@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: thanos-store
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Thanos Store Gateway, the read side of a Thanos metrics stack, on Kubernetes
+    via the helm provider's Workload synthesis (a stateless Deployment plus a
+    ClusterIP Service exposing the StoreAPI gRPC port and the HTTP port). The
+    Store Gateway keeps only an ephemeral local cache of index data under a
+    data-dir — the object store is the system of record — so it renders
+    stateless, with no persistent volume. The object-store identity resolved from
+    the `objstore` uses-edge (host, port) arrives on .context.inject.env and
+    composes the S3 endpoint in the inline object-store configuration passed on
+    the `--objstore.config` flag. That configuration selects the AWS SDK
+    credential chain, so it carries no secret; the access key is a developer value
+    delivered on AWS_ACCESS_KEY_ID and the secret key is delivered on
+    AWS_SECRET_ACCESS_KEY — rendered as an env secretKeyRef when the optional
+    `s3_secret_key` credential is attached, or an inline development default when
+    unattached, so the render stays byte-identical across runs. provides.host is
+    the bare, self-contained in-cluster service name of the synthesized Service —
+    it carries no namespace, so the recipe is independent of where it is deployed.
+    A consumer in another namespace qualifies the host with the target namespace
+    on its own side (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  target: helm
+  implements: core/observability/thanos-store:1.0.0
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
+  # (here "<instance_id>-default"), with no namespace segment. provides.port is
+  # the StoreAPI gRPC port queriers dial; protocol is "grpc".
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.grpc_port }}"
+    protocol: "grpc"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The Store Gateway keeps only an ephemeral local cache under its data-dir —
+    # the object store is the system of record — so the default stateless form
+    # (a Deployment on the helm engine) is correct: no form: stateful, no
+    # persistentTemplate volume, no PVC.
+    replicas: 1
+    containers:
+      main:
+        image: "quay.io/thanos/thanos:{{ .infra.engine_version }}"
+        # `thanos store` serves the StoreAPI on gRPC and health/metrics on HTTP.
+        # The object-store identity resolved from the `objstore` uses-edge arrives
+        # on the inject pipe (.context.inject.env) and composes the S3 endpoint in
+        # the inline object-store configuration. The final args entry is a single
+        # `--objstore.config=<yaml>` flag whose value is the multi-line S3 stanza;
+        # aws_sdk_auth selects the AWS SDK credential chain so the configuration
+        # holds no secret.
+        args:
+          - store
+          - --grpc-address
+          - 0.0.0.0:{{ .infra.grpc_port }}
+          - --http-address
+          - 0.0.0.0:{{ .infra.http_port }}
+          - --data-dir
+          - /var/thanos/store
+          - |-
+            --objstore.config=type: S3
+            config:
+              bucket: {{ .values.bucket }}
+              endpoint: {{ .context.inject.env.THANOS_S3_HOST }}:{{ .context.inject.env.THANOS_S3_PORT }}
+              insecure: true
+              aws_sdk_auth: true
+        # AWS_ACCESS_KEY_ID is a developer value. AWS_SECRET_ACCESS_KEY is wired
+        # through the optional `s3_secret_key` credential slot: when a credential
+        # is attached it renders as an env secretKeyRef so the plaintext never
+        # lands in the manifest; with none attached the Recipe falls back to a
+        # deterministic development default.
+        variables:
+          AWS_ACCESS_KEY_ID: {{ .values.s3_access_key }}
+    {{- if not (hasKey (default dict .secrets) "s3_secret_key") }}
+          AWS_SECRET_ACCESS_KEY: dev-minio-root-change-me
+    {{- end }}
+    {{- if hasKey (default dict .secrets) "s3_secret_key" }}
+        secrets:
+          AWS_SECRET_ACCESS_KEY:
+            from: s3_secret_key
+            as: env
+    {{- end }}
+        ports:
+          grpc: {{ .infra.grpc_port }}
+          http: {{ .infra.http_port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          grpc: {{ .infra.grpc_port }}
+          http: {{ .infra.http_port }}
