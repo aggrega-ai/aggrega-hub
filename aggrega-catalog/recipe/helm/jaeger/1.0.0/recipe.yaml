@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: jaeger
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Jaeger single-node tracing on Kubernetes via the helm provider's Workload
+    synthesis (a StatefulSet with a per-replica data volume, plus a ClusterIP
+    Service exposing the OTLP receivers and the query UI). Jaeger v2 is an
+    OpenTelemetry Collector distribution configured by a YAML config file rather
+    than the legacy environment variables. That config is delivered as a file:
+    the recipe emits it as a ConfigMap via artifacts: and mounts it into the
+    container through a configmap volume at /etc/jaeger, and the container reads
+    it with --config /etc/jaeger/config.yaml. The embedded key-value store writes
+    to the persistent volume at /badger (keys under /badger/key, values under
+    /badger/data) so trace data survives restarts. The OTLP receiver endpoints in
+    the config track the recipe's OTLP port sizing so the process listens on the
+    same ports the Service publishes. provides.host is the bare, self-contained
+    in-cluster service name of the synthesized Service — it carries no namespace,
+    so the recipe is independent of where it is deployed. A consumer in another
+    namespace qualifies the host with the target namespace on its own side
+    (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  target: helm
+  implements: core/observability/jaeger:1.0.0
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
+  # (here "<instance_id>-default"), with no namespace segment. provides.port is
+  # the OTLP gRPC receiver port trace producers push to; protocol is "grpc".
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.otlp_grpc_port }}"
+    protocol: "grpc"
+  # The Jaeger v2 config is delivered as a file: this ConfigMap carries the
+  # full config under config.yaml and is mounted into the container at
+  # /etc/jaeger by the configmap volume below. The ConfigMap name matches the
+  # volume's source. The OTLP receiver endpoints track the OTLP port sizing so
+  # the listeners and the published Service ports stay in lockstep; at the
+  # default ports this renders the minimal single-store badger config verbatim.
+  artifacts:
+    jaeger-config.yaml: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-jaeger-config
+      data:
+        config.yaml: |
+          service:
+            extensions: [jaeger_storage, jaeger_query, healthcheckv2]
+            pipelines:
+              traces:
+                receivers: [otlp]
+                processors: [batch]
+                exporters: [jaeger_storage_exporter]
+          extensions:
+            healthcheckv2:
+              use_v2: true
+              http:
+            jaeger_query:
+              storage:
+                traces: main_store
+            jaeger_storage:
+              backends:
+                main_store:
+                  badger:
+                    directories:
+                      keys: "/badger/key"
+                      values: "/badger/data"
+                    ephemeral: false
+                    ttl:
+                      spans: 48h
+          receivers:
+            otlp:
+              protocols:
+                grpc:
+                  endpoint: 0.0.0.0:{{ .infra.otlp_grpc_port }}
+                http:
+                  endpoint: 0.0.0.0:{{ .infra.otlp_http_port }}
+          processors:
+            batch:
+          exporters:
+            jaeger_storage_exporter:
+              trace_storage: main_store
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # form: stateful selects a StatefulSet on the helm engine; the embedded
+    # trace store persists to the per-replica persistentTemplate volume at
+    # /badger, so the stateful shape (and its per-replica claim) is correct.
+    form: stateful
+    replicas: 1
+    containers:
+      main:
+        image: "cr.jaegertracing.io/jaegertracing/jaeger:{{ .infra.engine_version }}"
+        # Jaeger v2 reads its OTel-Collector config from the mounted file. The
+        # config ConfigMap is emitted via artifacts: and mounted at /etc/jaeger.
+        args:
+          - --config
+          - /etc/jaeger/config.yaml
+        ports:
+          otlp-grpc: {{ .infra.otlp_grpc_port }}
+          otlp-http: {{ .infra.otlp_http_port }}
+          query: {{ .infra.query_port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+        volumeMounts:
+          - name: data
+            path: /badger
+          - name: config
+            path: /etc/jaeger
+    volumes:
+      data:
+        persistentTemplate:
+          size: {{ .infra.storage.size }}
+      config:
+        configmap:
+          source: "{{ .context.instance_id }}-jaeger-config"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          otlp-grpc: {{ .infra.otlp_grpc_port }}
+          otlp-http: {{ .infra.otlp_http_port }}
+          query: {{ .infra.query_port }}
+      headless:
+        type: Headless
+        ports:
+          otlp-grpc: {{ .infra.otlp_grpc_port }}
+          otlp-http: {{ .infra.otlp_http_port }}
+          query: {{ .infra.query_port }}
