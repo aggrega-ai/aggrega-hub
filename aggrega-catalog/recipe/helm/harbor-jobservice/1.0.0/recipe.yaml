@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: harbor-jobservice
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The Harbor job service on Kubernetes via the helm provider's Workload
+    synthesis (a stateless Deployment plus a ClusterIP Service on the API port).
+    The service runs a Redis-backed worker pool: the cache identity resolved from
+    the `cache` uses-edge (host, port) arrives on .context.inject.env and
+    composes the worker pool's redis_url, and the core identity resolved from the
+    `core` edge composes the CORE_URL the service calls back on. Its work queue
+    lives in the shared cache and its logs land on a scratch volume, so it keeps
+    no durable state and renders stateless. Its configuration is delivered as a
+    file: the recipe emits config.yml as a ConfigMap via artifacts: and mounts it
+    whole-directory at /etc/jobservice, and the image reads it from there. The
+    internal service secrets that authenticate the service and the core to each
+    other, and the registry credential it presents, are pinned shared development
+    literals. provides.host is the bare, self-contained in-cluster service name
+    of the synthesized Service — it carries no namespace, so the recipe is
+    independent of where it is deployed. A consumer in another namespace
+    qualifies the host with the target namespace on its own side (caller-side
+    routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  target: helm
+  implements: core/devtool/harbor-jobservice:1.0.0
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  # The job-service config is delivered as a ConfigMap and mounted
+  # whole-directory at /etc/jobservice. The worker pool's redis_url tracks the
+  # cache uses-edge; the service writes job logs to the scratch volume at
+  # /var/log/jobs.
+  artifacts:
+    harbor-jobservice-config.yaml: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-jobservice-config
+      data:
+        config.yml: |
+          protocol: "http"
+          port: {{ .infra.port }}
+          worker_pool:
+            backend: "redis"
+            workers: 10
+            redis_pool:
+              redis_url: "redis://{{ .context.inject.env.HARBOR_REDIS_HOST }}:{{ .context.inject.env.HARBOR_REDIS_PORT }}/2"
+              namespace: "harbor_job_service_namespace"
+              idle_timeout_second: 3600
+          job_loggers:
+            - name: "STD_OUTPUT"
+              level: "INFO"
+          loggers:
+            - name: "STD_OUTPUT"
+              level: "INFO"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The job service holds no durable state — its work queue lives in the shared
+    # cache — so the default stateless form (a Deployment on the helm engine) is
+    # correct. The scratch log volume is an ephemeral emptyDir.
+    replicas: 1
+    containers:
+      main:
+        image: "goharbor/harbor-jobservice:{{ .infra.engine_version }}"
+        # The image default entrypoint reads /etc/jobservice/config.yml, which
+        # the mounted ConfigMap supplies. CORE_URL is composed from the core
+        # uses-edge; the shared internal secrets and the registry credential are
+        # pinned development literals.
+        variables:
+          CORE_URL: "http://{{ .context.inject.env.HARBOR_CORE_HOST }}:{{ .context.inject.env.HARBOR_CORE_PORT }}"
+          CORE_SECRET: harborcoresecret0
+          JOBSERVICE_SECRET: harborjobsvcsecr0
+          REGISTRY_CREDENTIAL_USERNAME: harbor_registry_user
+          REGISTRY_CREDENTIAL_PASSWORD: harbor_registry_password
+          LOG_LEVEL: info
+          JOBSERVICE_WEBHOOK_JOB_MAX_RETRY: "3"
+        ports:
+          http: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+        volumeMounts:
+          - name: logs
+            path: /var/log/jobs
+          - name: config
+            path: /etc/jobservice
+    volumes:
+      logs:
+        ephemeral:
+          sizeLimit: 1Gi
+      config:
+        configmap:
+          source: "{{ .context.instance_id }}-jobservice-config"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
