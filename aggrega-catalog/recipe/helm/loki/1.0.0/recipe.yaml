@@ -1,0 +1,200 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: loki
+  version: 1.0.0
+  description: >
+    Grafana Loki log-aggregation server on Kubernetes via the official Grafana
+    Loki Helm chart (grafana/loki), driven in single-binary mode. Every Loki
+    subsystem runs inside one process backed by a filesystem object store, so
+    the chart renders one StatefulSet with a per-replica data volume, its
+    read/write/backend scaling paths held at zero replicas. The auxiliary
+    services the chart bundles by default — the ingress gateway, the chunk and
+    result caches, and the canary probe DaemonSet — are turned off so this wrap
+    stays a single workload; those are separate services modelled on their own.
+    The Loki server image and the config-reload sidecar image are pinned to
+    resolvable tags for reproducible renders. The developer's retention_period
+    flows into the in-process compactor, which deletes log streams once they age
+    past it. provides.host is the bare, self-contained in-cluster service name
+    the chart assigns from the release name — it carries no namespace, so the
+    recipe is independent of where it is deployed; a consumer in another
+    namespace qualifies the host with the target namespace on its own side
+    (caller-side routing). Default chart version in source.version; override via
+    infra.source_version. The packaged Loki server is AGPL-3.0.
+  license: AGPL-3.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  target: helm
+  implements: core/observability/loki:1.0.0
+
+  source:
+    kind: helm-oci-chart
+    url: oci://ghcr.io/grafana/helm-charts/loki
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"7.0.0\" }}"
+
+  # provides.host is the bare Service name the chart derives from the release
+  # name (here .context.instance_id), with no namespace segment. A same-namespace
+  # consumer reaches it under this name directly; a cross-namespace consumer
+  # qualifies it with the target namespace caller-side. protocol is "http" — the
+  # Loki push-and-query endpoint. The chart serves that endpoint on its fixed
+  # port 3100, so provides.port is that fixed value.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "3100"
+    protocol: "http"
+
+  # This Recipe reads from infra.overrides:
+  #   loki_image    - map[string]string (loki.image.* fields; overrides the tag pin)
+  #   sidecar_image - map[string]string (sidecar.image.* fields; overrides the tag pin)
+  #   requests      - { cpu: string, memory: string } (resource requests on the single-binary pod)
+  #   storage_class - string (singleBinary.persistence.storageClass)
+  #   nodeSelector  - map[string]string (singleBinary.nodeSelector)
+  #   tolerations   - []object (singleBinary.tolerations)
+  valuesMapping: |
+    ## ── Deployment mode ────────────────────────────────────────
+    ## SingleBinary runs every Loki target in one process. The read/write/
+    ## backend scaling paths are held at zero replicas so no distributed
+    ## workloads render.
+    deploymentMode: SingleBinary
+
+    ## ── Loki server configuration ──────────────────────────────
+    ## Single-tenant (auth off), replication factor 1, a TSDB schema over a
+    ## filesystem object store, and an in-process compactor that enforces the
+    ## developer's retention window.
+    loki:
+      auth_enabled: false
+      commonConfig:
+        replication_factor: 1
+      schemaConfig:
+        configs:
+          - from: "2024-04-01"
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              period: 24h
+      storage:
+        type: filesystem
+      limits_config:
+        retention_period: "{{ .values.retention_period }}"
+      compactor:
+        retention_enabled: true
+        delete_request_store: filesystem
+      ## Loki server image pin. The chart ships a resolvable tag; pin explicitly
+      ## for a reproducible render. Override the whole block via
+      ## infra.overrides.loki_image.
+      {{- if and .infra.overrides .infra.overrides.loki_image }}
+      image:
+        {{- range $k, $v := .infra.overrides.loki_image }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+      {{- else }}
+      image:
+        registry: docker.io
+        repository: grafana/loki
+        tag: "3.6.7"
+      {{- end }}
+
+    ## ── Single-binary workload ─────────────────────────────────
+    ## One replica, a persistent data volume sized from infra.storage, and
+    ## resource limits from infra.compute (requests optional via
+    ## infra.overrides.requests).
+    singleBinary:
+      replicas: 1
+      persistence:
+        enabled: true
+        size: "{{ if .infra.storage }}{{ .infra.storage.size | default "10Gi" }}{{ else }}10Gi{{ end }}"
+        {{- if and .infra.overrides .infra.overrides.storage_class }}
+        storageClass: "{{ .infra.overrides.storage_class }}"
+        {{- end }}
+      resources:
+        limits:
+          cpu: "{{ .infra.compute.cpu }}"
+          memory: "{{ .infra.compute.memory }}"
+        {{- if and .infra.overrides .infra.overrides.requests }}
+        requests:
+          cpu: "{{ .infra.overrides.requests.cpu }}"
+          memory: "{{ .infra.overrides.requests.memory }}"
+        {{- end }}
+      {{- if .infra.overrides }}
+      {{- if .infra.overrides.nodeSelector }}
+      nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+      {{- end }}
+      {{- if .infra.overrides.tolerations }}
+      tolerations: {{ toJson .infra.overrides.tolerations }}
+      {{- end }}
+      {{- end }}
+
+    ## ── Distributed scaling paths (off) ────────────────────────
+    ## Held at zero replicas so only the single binary runs.
+    write:
+      replicas: 0
+    read:
+      replicas: 0
+    backend:
+      replicas: 0
+
+    ## ── Auxiliary services and bundled subcharts (off) ─────────
+    ## The gateway, caches, canary probe, and test hook are separate workloads
+    ## modelled on their own; the bundled object-store, self-monitoring, and
+    ## rollout-operator subcharts are likewise separate services. Every toggle is
+    ## set explicitly — the chart gates each bundled subchart on a condition
+    ## value, and an unset condition falls back to on, so disabling them
+    ## explicitly is what keeps this wrap a single workload.
+    gateway:
+      enabled: false
+    chunksCache:
+      enabled: false
+    resultsCache:
+      enabled: false
+    lokiCanary:
+      enabled: false
+    test:
+      enabled: false
+    minio:
+      enabled: false
+    rollout_operator:
+      enabled: false
+    monitoring:
+      selfMonitoring:
+        enabled: false
+        grafanaAgent:
+          installOperator: false
+      dashboards:
+        enabled: false
+      rules:
+        enabled: false
+      serviceMonitor:
+        enabled: false
+      lokiCanary:
+        enabled: false
+
+    ## ── Config-reload sidecar image pin ────────────────────────
+    ## The sidecar container inside the Loki pod watches for config changes. Pin
+    ## its image explicitly; override via infra.overrides.sidecar_image.
+    sidecar:
+      {{- if and .infra.overrides .infra.overrides.sidecar_image }}
+      image:
+        {{- range $k, $v := .infra.overrides.sidecar_image }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+      {{- else }}
+      image:
+        registry: docker.io
+        repository: kiwigrid/k8s-sidecar
+        tag: "2.5.0"
+      {{- end }}
+
+  sourceDigests:
+    - kind: helm-oci-chart
+      url: oci://ghcr.io/grafana/helm-charts/loki
+      version: 7.0.0
+      digest: sha256:5eaa28e3535069de2a7ac1f7087ff558e5b4b4a24f0e158072a97e2391132f81
+      manifestDigest: sha256:9b0f44213a16fea700852402ea05f45ce685fddb5a2fbe0d7e932e1a94610707
