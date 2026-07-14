@@ -28,6 +28,38 @@ spec:
     host: "{{ .context.instance_id }}-default"
     port: "{{ .infra.port }}"
     protocol: "postgres"
+  # Two ConfigMaps carry the developer's bootstrap scripts and custom server
+  # configuration for the synthesized container. They are kept separate because
+  # each mounts whole into a different container path, and each is
+  # presence-guarded independently: an entry renders empty — and is therefore
+  # skipped, emitting no file — when its source value is unset. A deployment that
+  # sets neither value emits no ConfigMap at all, byte-identical to one with no
+  # ConfigMap. init_scripts keys become files under /docker-entrypoint-initdb.d;
+  # custom_config becomes a postgresql.conf the container's config_file argument
+  # points at.
+  artifacts:
+    initdb-configmap.yaml: |
+      {{- if .values.init_scripts -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-initdb
+      data:
+      {{- range $name, $content := .values.init_scripts }}
+        {{ $name }}: |
+      {{ $content | indent 4 }}
+      {{- end }}
+      {{- end }}
+    config-configmap.yaml: |
+      {{- if .values.custom_config -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-config
+      data:
+        postgresql.conf: |
+      {{ .values.custom_config | indent 4 }}
+      {{- end }}
   workload: |
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
@@ -38,6 +70,12 @@ spec:
     containers:
       main:
         image: postgres:{{ .infra.engine_version }}
+    {{- if .values.custom_config }}
+        # custom_config renders a postgresql.conf mounted at /etc/postgresql; the
+        # config_file argument makes the server read it. Settings the file omits
+        # keep their built-in defaults, so a fragment is enough.
+        command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    {{- end }}
         # POSTGRES_USER / POSTGRES_DB are developer values (configurable, with
         # defaults matching the historical inline values). POSTGRES_PASSWORD is
         # wired through the optional `password` credential slot: when a credential
@@ -71,11 +109,29 @@ spec:
         volumeMounts:
           - name: data
             path: /var/lib/postgresql/data
+    {{- if .values.init_scripts }}
+          - name: initdb
+            path: /docker-entrypoint-initdb.d
+    {{- end }}
+    {{- if .values.custom_config }}
+          - name: pgconf
+            path: /etc/postgresql
+    {{- end }}
     volumes:
       data:
         persistentTemplate:
           size: {{ .infra.storage.size }}
           class: {{ .infra.storage.type }}
+    {{- if .values.init_scripts }}
+      initdb:
+        configmap:
+          source: {{ .context.instance_id }}-initdb
+    {{- end }}
+    {{- if .values.custom_config }}
+      pgconf:
+        configmap:
+          source: {{ .context.instance_id }}-config
+    {{- end }}
     services:
       default:
         type: ClusterIP
