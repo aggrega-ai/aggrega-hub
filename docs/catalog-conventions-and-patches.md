@@ -265,16 +265,22 @@ spec:
         additionalProperties: true
 ```
 
-### The `source_version` field
+### Version knobs: `engine_version` and `source_version`
 
-Components backed by versioned upstream artifacts (Helm charts, Terraform modules) should include an `infra.source_version` override:
+Two `infra` fields carry version selection, and they are distinct. Both are provider-neutral conventions — the compiler reads neither; each Recipe decides which it honors and how.
+
+- **`engine_version`** — the running server or binary version. Every component carries it. On synthesized and Compose targets it selects the container image tag; on managed-service targets (Terraform, CloudFormation) it selects the provider's engine version — an RDS `engine_version`, for example. It is the live version knob for the software the component runs.
+- **`source_version`** — the version of the *source artifact* a Recipe pulls: a Helm chart version, a Terraform module version. Only artifact-backed Recipes (a chart wrap, a module wrap) pull such an artifact, so `source_version` belongs only on components whose Recipes are artifact-backed. A pure-synth Recipe assembles its workload directly and pulls no chart or module, so it has no source artifact to version — it exposes `engine_version` alone.
+
+Declare `source_version` only where an artifact-backed Recipe reads it:
 
 ```yaml
 spec:
   schema:
     infra:
-      # Overrides the Recipe's default source artifact version.
-      # Changing from default does not guarantee value mapping compatibility.
+      # Selects the version of the source artifact (Helm chart, Terraform
+      # module) the Recipe pulls. Changing it away from the Recipe's default
+      # does not guarantee value-mapping compatibility with the new artifact.
       source_version: { type: string }
 ```
 
