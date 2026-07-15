@@ -154,7 +154,7 @@ the `<version>/` segment:
 | --- | --- | --- |
 | Component | `component/core/datastore/mariadb/1.0.0/component.yaml` | `core/datastore/mariadb` |
 | Feature | `feature/core/data-masking/1.0.0/feature.yaml` | `core/data-masking` |
-| Recipe | `recipe/helm/mariadb-bitnami/1.0.0/recipe.yaml` | `mariadb-bitnami` |
+| Recipe | `recipe/helm/postgres/1.0.0/recipe.yaml` | `postgres` |
 | FeatureRecipe | `feature-recipe/helm/k8s-dns-patcher/1.0.0/recipe.yaml` | `k8s-dns-patcher` |
 
 Recipes and FeatureRecipes do NOT include namespace or provider in their name —
@@ -318,10 +318,10 @@ spec:
 A MappingLibrary entry carries one or more named Go-template fragments under `spec.mappings:`. A consumer Recipe imports the entry inside `valuesMapping:`:
 
 ```yaml
-# recipe/helm/mariadb-bitnami/recipe.yaml — the consumer
+# recipe/helm/mariadb/recipe.yaml — the consumer
 spec:
   valuesMapping:
-    $import: BitnamiHelpers#/mappings/PostgresBitnamiCore
+    $import: DatastoreHelpers#/mappings/MariaDBCore
 ```
 
 **Heuristic for when to factor.** A schema or mapping fragment that appears across three or more Components / Recipes is a candidate for a library entry; single-Component or single-Recipe content stays inline.
@@ -423,13 +423,13 @@ coexist because they are dictated by the charts, and an author picks the one the
 chart's auth surface requires.
 
 **Model A — bundled multi-key `existingSecret`.** For charts that authenticate
-**only** from a single Kubernetes Secret carrying several fixed keys (the Bitnami
-`mariadb` and `mysql` charts), the Component declares a Black-Box `root_password`
-slot (`required: true`, `inject: []`) plus a transparent `user_password` slot. A
-multi-key credential producer — the `referenced-secret-set` Feature via the
-`k8s-secret-set` FeatureRecipe — emits one Secret carrying the caller-named keys
-(e.g. `<engine>-root-password` and `<engine>-password`), and the chart reads it
-through `auth.existingSecret` bound to `{{ .secrets.root_password.provides.name }}`:
+**only** from a single Kubernetes Secret carrying several fixed keys, the Component
+declares a Black-Box `root_password` slot (`required: true`, `inject: []`) plus a
+transparent `user_password` slot. A multi-key credential producer — the
+`referenced-secret-set` Feature via the `k8s-secret-set` FeatureRecipe — emits one
+Secret carrying the caller-named keys (e.g. `<engine>-root-password` and
+`<engine>-password`), and the chart reads it through `auth.existingSecret` bound to
+`{{ .secrets.root_password.provides.name }}`:
 
 ```yaml
 spec:
@@ -441,8 +441,18 @@ spec:
       inject: [env, file] # transparent — developer may dictate delivery
 ```
 
-The canonical example is
-[`recipe/helm/mariadb-bitnami/recipe.yaml`](../aggrega-catalog/recipe/helm/mariadb-bitnami/1.0.0/recipe.yaml).
+The Recipe binds the chart's `existingSecret` knob to the producer's published
+Secret name — the shape a Model-A Recipe's `valuesMapping` takes:
+
+```yaml
+spec:
+  valuesMapping: |
+    auth:
+      existingSecret: "{{ .secrets.root_password.provides.name }}"
+```
+
+For a runnable end-to-end walkthrough of this model, see
+[`language-reference/examples/mariadb-bitnami-credential-set/`](https://github.com/aggrega/aggrega-docs/blob/main/language-reference/examples/mariadb-bitnami-credential-set/).
 
 **Model B — granular transparent inject-value.** For charts that accept a single
 password **value** (`postgres`, `valkey`, `redis`, `memcached`), the Component
@@ -507,7 +517,7 @@ convention and document which component it is meant to gate; do not author the
 The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
 
 - `hub.aggrega.ai/component/core/datastore/mariadb:1.0.0`
-- `hub.aggrega.ai/recipe/helm/mariadb-bitnami:1.0.0`
+- `hub.aggrega.ai/recipe/helm/mariadb:1.0.0`
 - `hub.aggrega.ai/featurerecipe/helm/k8s-secret-from-parameter:1.0.0`
 
 ### Registry repository segments
