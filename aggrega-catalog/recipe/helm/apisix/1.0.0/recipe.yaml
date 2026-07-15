@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: apisix
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Apache APISIX on Kubernetes via the helm provider's Workload synthesis (a
+    stateless Deployment plus a ClusterIP Service on the proxy port), running the
+    official upstream image (no external Helm chart). APISIX holds no local state
+    — the etcd store is the system of record — so it renders stateless. The etcd
+    identity resolved from the `etcd` uses-edge (host, port) arrives on
+    .context.inject.env and composes the configuration-store connection written
+    into APISIX's config.yaml, alongside the static Admin API key and the Admin
+    API listen port. The config.yaml is delivered as a ConfigMap mounted as a
+    single file into the container's populated conf directory, so it configures
+    APISIX without masking the files APISIX writes there at startup.
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service — it carries no namespace, so the recipe is independent
+    of where it is deployed. A consumer in another namespace qualifies the host
+    with the target namespace on its own side (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/gateway/apisix:1.0.0
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
+  # (here "<instance_id>-default"), with no namespace segment. A same-namespace
+  # consumer reaches it under this name directly; a cross-namespace consumer
+  # qualifies it with the target namespace caller-side.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.http_port }}"
+    protocol: "http"
+  # config.yaml carries APISIX's runtime configuration: the proxy listen port,
+  # the static Admin API key and listen port, and the etcd configuration-store
+  # host composed from the `etcd` uses-edge (.context.inject.env). It is emitted
+  # as a ConfigMap and mounted as a single file into the container's conf
+  # directory via subPath, so it does not mask the files APISIX writes alongside
+  # it at startup.
+  artifacts:
+    config-configmap.yaml: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-config
+      data:
+        config.yaml: |
+          apisix:
+            node_listen: {{ .infra.http_port }}
+          deployment:
+            role: traditional
+            role_traditional:
+              config_provider: etcd
+            admin:
+              allow_admin:
+                - 0.0.0.0/0
+              admin_key:
+                - name: admin
+                  key: {{ .values.admin_key }}
+                  role: admin
+              admin_listen:
+                ip: 0.0.0.0
+                port: {{ .infra.admin_port }}
+            etcd:
+              host:
+                - "http://{{ .context.inject.env.APISIX_ETCD_HOST }}:{{ .context.inject.env.APISIX_ETCD_PORT }}"
+              prefix: "/apisix"
+              timeout: 30
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # APISIX holds no durable state — etcd is the system of record — so the
+    # default stateless form (a Deployment on the helm engine) is correct: no
+    # form: stateful, no persistentTemplate volume, no PVC.
+    replicas: 1
+    containers:
+      main:
+        image: "apache/apisix:{{ .infra.engine_version }}"
+        # The etcd identity resolved from the `etcd` uses-edge arrives on the
+        # inject pipe (.context.inject.env) and is written into config.yaml. The
+        # config is mounted as a single file via subPath so APISIX's startup
+        # writes into the same conf directory (for example nginx.conf) are not
+        # masked.
+        ports:
+          http: {{ .infra.http_port }}
+          admin: {{ .infra.admin_port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+        volumeMounts:
+          - name: config
+            path: /usr/local/apisix/conf/config.yaml
+            subPath: config.yaml
+    volumes:
+      config:
+        configmap:
+          source: {{ .context.instance_id }}-config
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.http_port }}
