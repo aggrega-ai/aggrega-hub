@@ -558,3 +558,14 @@ artifacts that are not catalog entities: `tools/` holds tooling container images
 and `docs/` holds documentation bundles. These names are reserved so that no
 future entity kind can lowercase into a collision with them — no entity kind is
 named `tool` or `docs`, and none may be introduced.
+
+### Searchable manifest annotations
+
+Every publish stamps a small set of searchable annotations onto the artifact's
+OCI manifest so a registry index or a catalog browser can filter artifacts by
+their catalog metadata without fetching and parsing each entity body. Every
+entity carries its human-readable description plus its catalog category and
+kind; a Plugin additionally carries its socket type and the capabilities it
+serves. `aggrega registry update` reads these annotations back into a local
+searchable index — the deterministic, offline-after-refresh index a later
+search consults.
