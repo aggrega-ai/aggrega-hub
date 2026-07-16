@@ -160,6 +160,14 @@ the `<version>/` segment:
 Recipes and FeatureRecipes do NOT include namespace or provider in their name —
 the provider is already the parent directory and `spec.provider` field.
 
+Plugins are the one exception to the "`metadata.name` equals the path segments"
+rule: a Plugin's `metadata.name` is **bare** and its socket lives in
+`metadata.pluginType`. The filesystem location `plugin/<pluginType>/<name>` is
+**derived** from the `<pluginType>/<name>` coordinate rather than mirrored from a
+socket-prefixed name — so the `plugin/terraform` entity is at
+`plugin/provider/terraform/<version>/plugin.yaml` with `metadata.name: terraform`
+and `metadata.pluginType: provider`.
+
 The `ops/` prefix is NOT used. All Recipes are Domain 3 (Ops) by definition.
 
 ### Name shortening
@@ -535,19 +543,25 @@ same name: a `Recipe` at `recipe/<provider>/`, a `FeatureRecipe` at
 the entity's lowercased identity path (`component/core/datastore/mariadb`).
 
 **The plugin segment.** A `Plugin` publishes under `plugin/`, and its socket is
-part of its identity. The convention is `plugin/<socket>/<name>`: the socket the
-plugin attaches to is path-encoded into the plugin's `metadata.name`, mirroring
-the catalog filesystem layout `plugin/<socket>/<name>`. The same name attached to
-a different socket is a different plugin, so the socket segment travels with the
-plugin everywhere its identity does. The raw `.wasm` binary the entity pins by
-digest is published as its own artifact alongside the entity.
+part of its identity. A plugin's `metadata.name` is **bare** — the plugin's own
+name with no socket prefix — and the socket it attaches to is carried separately
+in `metadata.pluginType`. The identity coordinate is the pair
+`<pluginType>/<name>`, and the location and catalog layout `plugin/<pluginType>/<name>`
+are **derived** from that pair. The same bare name under a different
+`pluginType` is a different plugin, so the socket travels with the plugin's
+identity through its `metadata.pluginType`, and the derived coordinate places it
+at a distinct location. The raw `.wasm` binary the entity pins by digest is
+published as its own artifact alongside the entity.
 
 The core provider and linter plugin entities under `plugin/provider/` and
 `plugin/linter/` are **generated, not hand-authored**: the CLI derives each
-entity's contract fields (plugin type, ABI version, targets, exports,
+entity's contract fields (`metadata.pluginType`, ABI version, targets, exports,
 capabilities) directly from the compiled guest's self-report and merges them with
-a small authored overlay (identity, runtime limits, and the provider block) under
-`plugin-overlays/`. The entity version is the compiler build that produced it.
+a small authored overlay (bare identity, runtime limits, and the provider block)
+under `plugin-overlays/`. The generator writes the derived `metadata.pluginType`
+into the entity and computes the entity's location from the `<pluginType>/<name>`
+coordinate; the overlay carries only the bare `metadata.name` and never a
+`pluginType` of its own. The entity version is the compiler build that produced it.
 The tag-driven publishing CI regenerates and signs this set from the released
 binary, so a generated entity can never promise a capability the shipped guest
 does not provide. Each generated file carries a `generated; DO NOT EDIT` header —
