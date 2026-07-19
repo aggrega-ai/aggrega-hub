@@ -1,14 +1,14 @@
 name: Publish and sign catalog
 
 # Differential catalog publisher. On a catalog change it publishes only the
-# ENTITIES THAT CHANGED and signs each pushed reference with an offline key.
-# Plugins are never published from here: the Plugin kind is generated and
-# published by the CLI-tag pipeline, not from this repository, and the publish
-# script already excludes it.
+# ENTITIES THAT CHANGED and signs each pushed reference keyless via the GitHub
+# Actions OIDC identity against public Sigstore. Plugins are never published from
+# here: the Plugin kind is generated and published by the CLI-tag pipeline, not
+# from this repository, and the publish script already excludes it.
 #
-# NOT YET LIVE. The destination registry, its pull/push credentials, the offline
-# signing key, the tooling image tag, and the self-hosted runner are all
-# operator-configured and are not wired here. Until they exist this workflow is
+# NOT YET LIVE. The destination registry, its pull/push credentials, the tooling
+# image tag, and the self-hosted runner are all operator-configured and are not
+# wired here. Until they exist this workflow is
 # authored but unexercised — it has never run against a real registry. The
 # manual-dispatch entry defaults to a dry run, so an unconfigured or accidental
 # invocation prints what it would do without publishing, signing, or moving the
@@ -36,12 +36,16 @@ on:
         type: choice
         options: [diff, full]
 
-# Keyed (offline-key) signing only. No id-token / keyless path: a public
-# transparency log would leak the existence and metadata of private artifacts.
-# The one write this workflow needs is advancing the publish marker tag (see the
-# final step); nothing else here writes to the repository.
+# Keyless signing via the GitHub Actions OIDC identity. The workflow mints a
+# short-lived identity token from the Actions runtime and signs against public
+# Sigstore (Fulcio + Rekor); no offline key is stored. The catalog publishes to
+# the public hub, so recording references in the public transparency log is
+# expected, not a leak. id-token:write lets the job mint the OIDC token. The one
+# git write this workflow needs is advancing the publish marker tag (see the
+# final step); nothing else here writes to the repository, hence contents:write.
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   publish-sign:
@@ -53,7 +57,8 @@ jobs:
     # Run inside the published tooling image so `aggrega` is already on PATH —
     # no toolchain build here. The image must also provide git, bash and awk,
     # which the publish script uses to select, push and mark the changed
-    # entities.
+    # entities, plus curl, which the OIDC-token step uses to mint the keyless
+    # signing identity from the Actions runtime.
     #
     # PIN SEAM — the single reviewed home for the tooling-image version. The tag
     # below is the one place the pinned version lives; the job derives its
@@ -71,7 +76,7 @@ jobs:
     container:
       image: hub.aggrega.ai/tools/aggrega:v0.0.0-placeholder
       credentials:
-        username: ${{ secrets.REGISTRY_USERNAME }}
+        username: ${{ vars.REGISTRY_USERNAME }}
         password: ${{ secrets.REGISTRY_PASSWORD }}
 
     env:
@@ -83,12 +88,8 @@ jobs:
       # interpolated into a run script) to avoid expression injection. The
       # username feeds `aggrega login`; the password is read by login from
       # AGGREGA_REGISTRY_PASSWORD.
-      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+      REGISTRY_USERNAME: ${{ vars.REGISTRY_USERNAME }}
       AGGREGA_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-      # Offline signing key material, supplied as a secret and written to a
-      # private file for the --key path. Empty until configured, which makes a
-      # real signing run fail safely rather than publish unsigned.
-      SIGNING_KEY: ${{ secrets.CATALOG_SIGNING_KEY }}
       # Dispatch inputs surfaced as env so the run script reads them from the
       # environment rather than interpolating expressions into shell.
       EVENT_NAME: ${{ github.event_name }}
@@ -130,6 +131,23 @@ jobs:
           # or interpolated from an expression.
           aggrega login "$REGISTRY" --username "$REGISTRY_USERNAME"
 
+      - name: Mint the Sigstore OIDC identity token
+        # Keyless signing needs a short-lived OIDC identity token. Request one
+        # from the Actions runtime (available because id-token:write is granted),
+        # audience-scoped to sigstore, and export it as SIGSTORE_ID_TOKEN so the
+        # publish script signs non-interactively — no browser, no offline key.
+        # Only a real publish signs, so a dry run skips this.
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
+        run: |
+          set -euo pipefail
+          token_json="$(curl -sSL \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sigstore")"
+          id_token="$(printf '%s' "$token_json" | grep -o '"value":"[^"]*"' | head -1 | cut -d'"' -f4)"
+          [ -n "$id_token" ] || { echo "OIDC: runtime returned no token value" >&2; exit 1; }
+          echo "::add-mask::$id_token"
+          echo "SIGSTORE_ID_TOKEN=$id_token" >> "$GITHUB_ENV"
+
       - name: Publish and sign the changed catalog entities
         run: |
           set -euo pipefail
@@ -145,12 +163,11 @@ jobs:
             MODE="diff"
           fi
 
-          # Write the offline signing key to a private file for --key.
-          KEY_PATH="$RUNNER_TEMP/catalog-signing.key"
-          umask 077
-          printf '%s' "$SIGNING_KEY" > "$KEY_PATH"
-
-          args=(--registry "$REGISTRY" --sign --key "$KEY_PATH")
+          # Keyless signing: publish-diff.sh batch-signs each pushed reference
+          # through `aggrega sign`, which reads the identity token from
+          # SIGSTORE_ID_TOKEN (minted above) and uses the binary's public
+          # Sigstore defaults for Fulcio and Rekor.
+          args=(--registry "$REGISTRY" --sign)
           if [ "$MODE" = "full" ]; then
             # A full reconcile re-pushes every catalog entity; --yes bypasses the
             # script's interactive confirm for non-interactive CI.
