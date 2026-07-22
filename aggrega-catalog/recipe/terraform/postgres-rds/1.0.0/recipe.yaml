@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: postgres-rds
+  version: 1.0.0
+  description: >
+    PostgreSQL via AWS RDS, rendered as a Terraform HCL body. Authored as a
+    full-body artifact named main.tf that emits verbatim as a standalone file
+    alongside any other artifacts contributed at the same boundary. The
+    managed-service realization: RDS operates the instance, so the operator's
+    ha and backup sizing map onto the instance's native multi-AZ, read-replica,
+    and backup-window settings, and RDS owns the master password.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: terraform
+  implements: core/datastore/postgres:1.0.0
+
+  locals:
+    db_identifier: "{{ .context.instance_id }}"
+
+  # The String Pipe (Invariant 2): the compiler does not know these are
+  # Terraform references. It pipes the strings; Terraform resolves them at
+  # `terraform apply` time. user/database mirror the developer values so a
+  # consumer reads the same connection identity the synth realization exports.
+  provides:
+    host: "aws_db_instance.{{ .locals.db_identifier }}.endpoint"
+    port: "aws_db_instance.{{ .locals.db_identifier }}.port"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "postgres"
+
+  artifacts:
+    main.tf: |
+      resource "aws_db_instance" "{{ .locals.db_identifier }}" {
+        identifier     = "{{ .locals.db_identifier }}"
+        engine         = "postgres"
+        engine_version = "{{ .infra.engine_version }}"
+        port           = {{ .infra.port }}
+
+        ## ── Compute ──────────────────────────────────────────────
+        {{- if .infra.overrides }}
+        {{- if .infra.overrides.instance_class }}
+        instance_class = "{{ .infra.overrides.instance_class }}"
+        {{- else }}
+        instance_class = "db.t3.small"
+        {{- end }}
+        {{- else }}
+        instance_class = "db.t3.small"
+        {{- end }}
+
+        ## ── Storage ──────────────────────────────────────────────
+        allocated_storage = {{ trimSuffix "Gi" .infra.storage.size }}
+        storage_type      = "{{ .infra.storage.type }}"
+
+        ## ── Database ─────────────────────────────────────────────
+        db_name  = "{{ .values.database }}"
+        username = "{{ .values.user }}"
+
+        ## Black-Box: RDS manages the password via Secrets Manager.
+        manage_master_user_password = true
+
+        ## ── HA ───────────────────────────────────────────────────
+        {{- if .infra.overrides }}
+        multi_az = {{ .infra.overrides.multi_az | default .infra.ha.enabled }}
+        {{- else }}
+        multi_az = {{ .infra.ha.enabled }}
+        {{- end }}
+
+        ## ── Backup ───────────────────────────────────────────────
+        backup_retention_period = {{ .infra.backup.retention_days }}
+        {{- if not .infra.backup.enabled }}
+        skip_final_snapshot     = true
+        {{- end }}
+
+        ## ── Provider-specific overrides ──────────────────────────
+        {{- if .infra.overrides }}
+        {{- if .infra.overrides.subnet_group }}
+        db_subnet_group_name = "{{ .infra.overrides.subnet_group }}"
+        {{- end }}
+        {{- if .infra.overrides.parameter_group }}
+        parameter_group_name = "{{ .infra.overrides.parameter_group }}"
+        {{- end }}
+        {{- if .infra.overrides.vpc_security_groups }}
+        vpc_security_group_ids = {{ toJson .infra.overrides.vpc_security_groups }}
+        {{- end }}
+        {{- if .infra.overrides.kms_key_id }}
+        storage_encrypted = true
+        kms_key_id        = "{{ .infra.overrides.kms_key_id }}"
+        {{- end }}
+        {{- if .infra.overrides.deletion_protection }}
+        deletion_protection = {{ .infra.overrides.deletion_protection }}
+        {{- end }}
+        {{- if .infra.overrides.tags }}
+        tags = {{ toJson .infra.overrides.tags }}
+        {{- end }}
+        {{- end }}
+      }
+
+      {{- if gt (int .infra.ha.read_replicas) 0 }}
+      {{- range $i := until (int .infra.ha.read_replicas) }}
+      resource "aws_db_instance" "{{ $.locals.db_identifier }}_replica_{{ $i }}" {
+        identifier          = "{{ $.locals.db_identifier }}-replica-{{ $i }}"
+        replicate_source_db = aws_db_instance.{{ $.locals.db_identifier }}.identifier
+        instance_class      = aws_db_instance.{{ $.locals.db_identifier }}.instance_class
+      }
+      {{- end }}
+      {{- end }}
