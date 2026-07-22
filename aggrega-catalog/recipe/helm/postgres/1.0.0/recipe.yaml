@@ -45,10 +45,18 @@ spec:
   # sets neither value emits no ConfigMap at all, byte-identical to one with no
   # ConfigMap. init_scripts keys become files under /docker-entrypoint-initdb.d;
   # custom_config becomes a postgresql.conf the container's config_file argument
-  # points at.
+  # points at. When an application-user credential is attached (the optional
+  # app_user_password slot), the initdb ConfigMap also carries a role-creation
+  # script (00-aggrega-app-role.sh) that runs first on initialization and creates
+  # a non-superuser login role named by values.app_user, reading its password from
+  # the APP_USER_PASSWORD env the slot delivers as a secretKeyRef; the role name is
+  # a render-time value while the password stays a runtime env, so it never renders
+  # into the manifest. The initdb ConfigMap and its mount are presence-guarded on
+  # init_scripts OR the app-user slot, so a deployment attaching neither emits no
+  # ConfigMap and renders byte-identically.
   artifacts:
     initdb-configmap.yaml: |
-      {{- if .values.init_scripts -}}
+      {{- if or .values.init_scripts (hasKey (default dict .secrets) "app_user_password") -}}
       apiVersion: v1
       kind: ConfigMap
       metadata:
@@ -57,6 +65,16 @@ spec:
       {{- range $name, $content := .values.init_scripts }}
         {{ $name }}: |
       {{ $content | indent 4 }}
+      {{- end }}
+      {{- if hasKey (default dict .secrets) "app_user_password" }}
+        00-aggrega-app-role.sh: |
+          #!/bin/sh
+          set -e
+          psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<EOSQL
+          CREATE ROLE "{{ .values.app_user }}" WITH LOGIN PASSWORD '$APP_USER_PASSWORD';
+          GRANT ALL PRIVILEGES ON DATABASE "{{ .values.database }}" TO "{{ .values.app_user }}";
+          GRANT ALL ON SCHEMA public TO "{{ .values.app_user }}";
+          EOSQL
       {{- end }}
       {{- end }}
     config-configmap.yaml: |
@@ -90,7 +108,10 @@ spec:
         # wired through the optional `password` credential slot: when a credential
         # is attached it renders as an env secretKeyRef; with none attached the
         # Recipe falls back to an inline development default. POSTGRES_INITDB_ARGS
-        # is emitted only when encoding/locale are set.
+        # is emitted only when encoding/locale are set. APP_USER_PASSWORD renders
+        # as an env secretKeyRef only when the optional app_user_password slot is
+        # attached; the role-creation init script reads it to set the application
+        # role's password.
         variables:
           POSTGRES_USER: {{ .values.user }}
     {{- if not (hasKey (default dict .secrets) "password") }}
@@ -100,11 +121,18 @@ spec:
     {{- if or .values.encoding .values.locale }}
           POSTGRES_INITDB_ARGS: "{{ with .values.encoding }}--encoding={{ . }}{{ end }}{{ with .values.locale }} --locale={{ . }}{{ end }}"
     {{- end }}
-    {{- if hasKey (default dict .secrets) "password" }}
+    {{- if or (hasKey (default dict .secrets) "password") (hasKey (default dict .secrets) "app_user_password") }}
         secrets:
+    {{- if hasKey (default dict .secrets) "password" }}
           POSTGRES_PASSWORD:
             from: password
             as: env
+    {{- end }}
+    {{- if hasKey (default dict .secrets) "app_user_password" }}
+          APP_USER_PASSWORD:
+            from: app_user_password
+            as: env
+    {{- end }}
     {{- end }}
         ports:
           tcp: {{ .infra.port }}
@@ -118,7 +146,7 @@ spec:
         volumeMounts:
           - name: data
             path: /var/lib/postgresql/data
-    {{- if .values.init_scripts }}
+    {{- if or .values.init_scripts (hasKey (default dict .secrets) "app_user_password") }}
           - name: initdb
             path: /docker-entrypoint-initdb.d
     {{- end }}
@@ -131,7 +159,7 @@ spec:
         persistentTemplate:
           size: {{ .infra.storage.size }}
           class: {{ .infra.storage.type }}
-    {{- if .values.init_scripts }}
+    {{- if or .values.init_scripts (hasKey (default dict .secrets) "app_user_password") }}
       initdb:
         configmap:
           source: {{ .context.instance_id }}-initdb
