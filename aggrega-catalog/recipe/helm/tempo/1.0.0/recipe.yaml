@@ -7,21 +7,23 @@ metadata:
   name: tempo
   version: 1.0.0
   description: >
-    Grafana Tempo distributed-tracing server on Kubernetes via the official
-    Grafana Tempo Helm chart (grafana/tempo), driven in its single-binary shape.
-    Every Tempo subsystem runs inside one process backed by a local trace store,
-    so the chart renders one StatefulSet with a data volume, one ConfigMap
-    carrying the Tempo config, one Service exposing the trace receivers and the
-    HTTP query API, and a ServiceAccount. The Tempo server image is pinned to a
+    Grafana Tempo distributed-tracing server on Kubernetes via the helm
+    provider's Workload synthesis, running the official upstream grafana/tempo
+    image (no external Helm chart). Tempo is driven in its single-binary shape:
+    every subsystem — distributor, ingester, querier, compactor — runs inside
+    one process backed by a local trace store, so it renders as one StatefulSet
+    with a per-replica data volume, a ConfigMap carrying the Tempo config, a
+    ClusterIP Service and a Headless Service exposing the OTLP gRPC and HTTP
+    receivers alongside the HTTP query API. The Tempo server image is pinned to a
     resolvable tag for reproducible renders. The developer's retention_period
     flows into the in-process compactor, which deletes stored trace blocks once
     they age past it. provides.host is the bare, self-contained in-cluster
-    service name the chart assigns from the release name — it carries no
-    namespace, so the recipe is independent of where it is deployed; a consumer
-    in another namespace qualifies the host with the target namespace on its own
-    side (caller-side routing). provides.port is the OTLP gRPC receiver port, the
-    endpoint a trace producer wires to. Default chart version in source.version;
-    override via infra.source_version. The packaged Tempo server is AGPL-3.0.
+    service name of the synthesized ClusterIP Service — it carries no namespace,
+    so the recipe is independent of where it is deployed; a consumer in another
+    namespace qualifies the host with the target namespace on its own side
+    (caller-side routing). provides.port is the OTLP gRPC receiver port, the
+    endpoint a trace producer wires to. Image tag from infra.engine_version. The
+    packaged Tempo server is AGPL-3.0.
   license: AGPL-3.0
   maintainers:
     - name: Massimiliano Ferrero
@@ -29,81 +31,102 @@ metadata:
 spec:
   capability: helm
   implements: core/observability/tempo:1.0.0
-
-  source:
-    kind: helm-oci-chart
-    url: oci://ghcr.io/grafana/helm-charts/tempo
-    # Default chart version. Override via infra.source_version.
-    version: "{{ optional .infra `source_version` \"1.24.4\" }}"
-
-  # provides.host is the bare Service name the chart derives from the release
-  # name (here .context.instance_id), with no namespace segment. A same-namespace
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
+  # (here "<instance_id>-default"), with no namespace segment. A same-namespace
   # consumer reaches it under this name directly; a cross-namespace consumer
   # qualifies it with the target namespace caller-side. protocol is "grpc" and
-  # the chart serves the OTLP gRPC receiver on its fixed port 4317, so
+  # the container serves the OTLP gRPC receiver on its fixed port 4317, so
   # provides.port is that fixed value.
   provides:
-    host: "{{ .context.instance_id }}"
+    host: "{{ .context.instance_id }}-default"
     port: "4317"
     protocol: "grpc"
-
-  # This Recipe reads from infra.overrides:
-  #   tempo_image   - map[string]string (tempo.* image fields: registry/repository/tag; overrides the tag pin)
-  #   requests      - { cpu: string, memory: string } (resource requests on the Tempo pod)
-  #   storage_class - string (persistence.storageClassName)
-  #   nodeSelector  - map[string]string (nodeSelector)
-  #   tolerations   - []object (tolerations)
-  valuesMapping: |
-    ## ── Tempo server ───────────────────────────────────────────
-    ## Single-binary Tempo. The image is pinned to a resolvable tag for a
-    ## reproducible render (override the block via infra.overrides.tempo_image);
-    ## the developer's retention_period drives the compactor's block retention;
-    ## resource limits come from infra.compute (requests optional via
-    ## infra.overrides.requests).
-    tempo:
-      {{- if and .infra.overrides .infra.overrides.tempo_image }}
-      {{- range $k, $v := .infra.overrides.tempo_image }}
-      {{ $k }}: "{{ $v }}"
-      {{- end }}
-      {{- else }}
-      registry: docker.io
-      repository: grafana/tempo
-      tag: "2.9.0"
-      {{- end }}
-      retention: "{{ .values.retention_period }}"
-      resources:
-        limits:
-          cpu: "{{ .infra.compute.cpu }}"
-          memory: "{{ .infra.compute.memory }}"
-        {{- if and .infra.overrides .infra.overrides.requests }}
-        requests:
-          cpu: "{{ .infra.overrides.requests.cpu }}"
-          memory: "{{ .infra.overrides.requests.memory }}"
-        {{- end }}
-
-    ## ── Trace store volume ─────────────────────────────────────
-    ## A persistent volume backs the single-binary trace store, sized from
-    ## infra.storage.
-    persistence:
-      enabled: true
-      size: "{{ if .infra.storage }}{{ .infra.storage.size | default "10Gi" }}{{ else }}10Gi{{ end }}"
-      {{- if and .infra.overrides .infra.overrides.storage_class }}
-      storageClassName: "{{ .infra.overrides.storage_class }}"
-      {{- end }}
-
-    ## ── Scheduling overrides ───────────────────────────────────
-    {{- if .infra.overrides }}
-    {{- if .infra.overrides.nodeSelector }}
-    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
-    {{- end }}
-    {{- if .infra.overrides.tolerations }}
-    tolerations: {{ toJson .infra.overrides.tolerations }}
-    {{- end }}
-    {{- end }}
-
-  sourceDigests:
-    - kind: helm-oci-chart
-      url: oci://ghcr.io/grafana/helm-charts/tempo
-      version: 1.24.4
-      digest: sha256:f1f6e318d5bca3b5097cb676077796cdf8135beb2c1f71c4d14614ccf9b0081b
-      manifestDigest: sha256:c7940dbd7c79f2f362131d467dbc5749825d7b2fb22cd3f57c946527b5025d30
+  # A single ConfigMap carries the single-binary Tempo configuration for the
+  # synthesized container. It mounts whole into /etc/tempo, where the server's
+  # -config.file argument reads tempo.yaml. The developer's retention_period
+  # drives the compactor's block retention; the OTLP gRPC and HTTP receivers are
+  # served on their conventional ports; traces and the write-ahead log live under
+  # the mounted data volume at /var/tempo.
+  artifacts:
+    config-configmap.yaml: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-config
+      data:
+        tempo.yaml: |
+          server:
+            http_listen_port: 3200
+          distributor:
+            receivers:
+              otlp:
+                protocols:
+                  grpc:
+                    endpoint: "0.0.0.0:4317"
+                  http:
+                    endpoint: "0.0.0.0:4318"
+          ingester:
+            max_block_duration: 5m
+          compactor:
+            compaction:
+              block_retention: "{{ .values.retention_period }}"
+          storage:
+            trace:
+              backend: local
+              wal:
+                path: /var/tempo/wal
+              local:
+                path: /var/tempo/blocks
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # form: stateful selects a StatefulSet on the helm engine; the
+    # persistentTemplate volume below is a companion of this form (rendered as a
+    # volumeClaimTemplate), and the Headless service supplies the StatefulSet's
+    # stable network identity.
+    form: stateful
+    replicas: 1
+    containers:
+      main:
+        image: grafana/tempo:{{ .infra.engine_version }}
+        # The single-binary server reads its whole configuration from the
+        # ConfigMap mounted at /etc/tempo; the trace store and write-ahead log
+        # live on the data volume at /var/tempo.
+        command: ["/tempo", "-config.file=/etc/tempo/tempo.yaml"]
+        ports:
+          otlp-grpc: 4317
+          otlp-http: 4318
+          http: 3200
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+        volumeMounts:
+          - name: data
+            path: /var/tempo
+          - name: config
+            path: /etc/tempo
+    volumes:
+      data:
+        persistentTemplate:
+          size: "{{ if .infra.storage }}{{ .infra.storage.size | default "10Gi" }}{{ else }}10Gi{{ end }}"
+      config:
+        configmap:
+          source: {{ .context.instance_id }}-config
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          otlp-grpc: 4317
+          otlp-http: 4318
+          http: 3200
+      headless:
+        type: Headless
+        ports:
+          otlp-grpc: 4317
+          otlp-http: 4318
+          http: 3200
