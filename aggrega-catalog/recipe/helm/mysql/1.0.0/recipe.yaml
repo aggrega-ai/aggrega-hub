@@ -30,6 +30,40 @@ spec:
     host: "{{ .context.instance_id }}-default"
     port: "{{ .infra.port }}"
     protocol: "mysql"
+  # Two ConfigMaps carry the developer's bootstrap scripts and custom server
+  # configuration for the synthesized container. Each mounts whole into a
+  # dedicated path and is presence-guarded independently: an entry renders empty
+  # — and is therefore skipped, emitting no file — when its source value is unset.
+  # A deployment that sets neither value emits no ConfigMap at all, byte-identical
+  # to one with no ConfigMap. init_scripts keys become files under
+  # /docker-entrypoint-initdb.d, which the official image executes on first
+  # initialization in alphabetical key order. custom_config becomes a custom.cnf
+  # the server reads via --defaults-extra-file; it mounts into a dedicated
+  # directory the image does not populate, so it never masks the image's own
+  # configuration files.
+  artifacts:
+    initdb-configmap.yaml: |
+      {{- if .values.init_scripts -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-initdb
+      data:
+      {{- range $name, $content := .values.init_scripts }}
+        {{ $name }}: |
+      {{ $content | indent 4 }}
+      {{- end }}
+      {{- end }}
+    config-configmap.yaml: |
+      {{- if .values.custom_config -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-config
+      data:
+        custom.cnf: |
+      {{ .values.custom_config | indent 4 }}
+      {{- end }}
   workload: |
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
@@ -48,6 +82,13 @@ spec:
         # honored as container args while the image's own initialization runs
         # unchanged.
         args:
+    {{- if .values.custom_config }}
+          # --defaults-extra-file must be the server's first argument; it makes
+          # mysqld read custom_config's custom.cnf in addition to the image
+          # defaults. It mounts in a dedicated dir so it never masks the image's
+          # own configuration files.
+          - "--defaults-extra-file=/etc/aggrega/config/custom.cnf"
+    {{- end }}
           - "--character-set-server={{ .values.charset }}"
           - "--collation-server={{ .values.collation }}"
         # MYSQL_DATABASE / MYSQL_USER are developer values. The two credential
@@ -88,11 +129,29 @@ spec:
         volumeMounts:
           - name: data
             path: /var/lib/mysql
+    {{- if .values.init_scripts }}
+          - name: initdb
+            path: /docker-entrypoint-initdb.d
+    {{- end }}
+    {{- if .values.custom_config }}
+          - name: dbconf
+            path: /etc/aggrega/config
+    {{- end }}
     volumes:
       data:
         persistentTemplate:
           size: {{ .infra.storage.size }}
           class: {{ .infra.storage.type }}
+    {{- if .values.init_scripts }}
+      initdb:
+        configmap:
+          source: {{ .context.instance_id }}-initdb
+    {{- end }}
+    {{- if .values.custom_config }}
+      dbconf:
+        configmap:
+          source: {{ .context.instance_id }}-config
+    {{- end }}
     services:
       default:
         type: ClusterIP
