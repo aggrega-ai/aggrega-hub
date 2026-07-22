@@ -91,8 +91,8 @@ cognitive browse axis of the catalog's three-axis label scheme:
   `gateway`, `mesh`, `network`, `messaging`, `storage`) appear bare, with
   AI flavor expressed by capability labels, not a category prefix.
 - **Axis 3 — per-category capability labels** (`<role>.aggrega.ai/<dimension>`):
-  e.g. `agent.aggrega.ai/autonomy`, `model.aggrega.ai/capability` +
-  `/hosting`, `tool.aggrega.ai/impact`, `gateway.aggrega.ai/intelligence`,
+  e.g. `agent.aggrega.ai/autonomy`, `model.aggrega.ai/capability`,
+  `tool.aggrega.ai/impact`, `gateway.aggrega.ai/intelligence`,
   `datastore.aggrega.ai/engine`, `pipeline.aggrega.ai/mode`. These carry
   the behavioral subsets selectors and policies discriminate on.
 
@@ -107,6 +107,46 @@ The category-vs-directory mirror is checked by the publishing linter's
 pre-publish, per-workspace opt-out for enterprise layouts). The compiler
 itself is blind to all label vocabulary; the closed set is a standard-library
 convention enterprises may extend or replace in their own catalogs.
+
+### The `component.aggrega.ai/hosting` label
+
+`component.aggrega.ai/hosting` records who operates a component's underlying
+resource — the trust-boundary axis a policy engine reads to reason about data
+exfiltration and ownership. It is a **cross-cutter**: the same three values
+describe a managed database, a managed LLM API, and a self-run inference server
+alike, so the label lives under the shared `component.aggrega.ai/` namespace
+rather than any one category's `<role>.aggrega.ai/` capability namespace. The
+value set is a standard-library convention (the compiler is blind to it):
+
+- **`self-hosted`** — the deployment runs the compute itself, as containers in
+  its own cluster. The operator owns the process lifecycle.
+- **`managed`** — the deployment consumes a managed service it does not run:
+  a managed instance in the operator's own cloud account, or a third-party
+  managed / SaaS API. The provider owns the process lifecycle; the deployment
+  holds a contract and credentials.
+- **`external`** — the deployment references a pre-existing resource it neither
+  provisions nor operates. The resource's lifecycle sits entirely outside the
+  deployment; the Recipe emits only the wiring to reach it.
+
+**Where the value lives — the home rule.** The same `hosting` name has two
+homes, chosen by whether the trait is invariant for the component:
+
+- **Static identity label** (`metadata.labels`) when hosting is **invariant
+  across every Recipe the component can bind** — the component *is* one hosting
+  posture by identity. Each standard-library AI model is exactly one value
+  (a self-run server, or a managed API), fixed the way `component.aggrega.ai/type`
+  is fixed; the label states that identity.
+- **Recipe output label** (`spec.outputLabels.hosting`) when hosting **varies
+  across the component's realizations** — one component with several Recipes that
+  differ in who operates the resource (a datastore realized self-hosted in one
+  environment, managed in another, or referenced in a third). The trait is a
+  property of the chosen realization, not of the component's identity, so the
+  Recipe that renders that realization stamps it onto the output.
+
+One name, one value set; the home follows invariance. A single-realization
+component carries the static label; a multi-realization component carries no
+hosting identity label and lets each Recipe declare its own via
+`spec.outputLabels`.
 
 ### Recipe/FeatureRecipe Provider Namespace
 
@@ -519,6 +559,49 @@ spec:
 Until the capability ships, declare the enable-parameter as the intended
 convention and document which component it is meant to gate; do not author the
 `active:` expression itself yet.
+
+### Reference-realization Recipes
+
+A component's `provides` contract can be fulfilled by a Recipe that provisions
+**nothing** — a *reference realization* that emits only the wiring a consumer
+needs to reach a pre-existing resource. A Recipe requires only `capability` and
+`implements`; `workload`, `artifacts`, and `source` are all optional, so a
+Recipe carrying only `provides` (plus the small amount of wiring each engine
+needs) validates and renders. This is the shape a `component.aggrega.ai/hosting:
+external` realization takes.
+
+The reference realization fulfils the **same `provides` contract** as a
+provisioning Recipe for the same component, so a single component can offer
+several realizations — self-hosted, managed, referenced — selected per
+deployment through the Manifest's component-type mapping. The consumer's wiring
+is identical regardless of which realization answers it, because it reads the
+component's `provides` outputs, not the realization behind them.
+
+Per engine, the wiring the reference Recipe emits:
+
+- **helm** — a `Secret` carrying the connection material and, where the resource
+  is addressed by name, an `ExternalName` Service that maps an in-cluster DNS
+  name onto the external endpoint. No `Deployment`/`StatefulSet` — nothing runs.
+- **terraform** — a `data` source that reads the existing resource, or input
+  variables carrying its coordinates. No `resource` block — nothing is created.
+- **compose** — environment variables carrying the endpoint and credentials into
+  the consuming service. No service definition for the referenced resource.
+
+The credential slot is filled by a referenced credential — the
+`core/referenced-secret` Feature — rather than a provisioned one, so the secret
+material comes from outside the deployment. An optional governance Feature can
+ride the same edge to carry policy context for the referenced resource without
+coupling it to provisioning.
+
+**Reference is not adoption.** Hosting (`self-hosted | managed | external`) is
+the who-operates axis; the resource *lifecycle* — provision → adopt → reference
+— is a separate axis. A reference realization (provides-only, emits no compute)
+ships with the conventions above. *Adoption* — taking an existing resource under
+management so subsequent changes flow through the deployment, via the engine's
+own take-ownership syntax (Terraform `import` blocks, Crossplane observe-only
+management) — is a distinct capability delivered by a FeatureRecipe transform,
+not by the hosting label. A referenced resource stays externally owned; an
+adopted resource becomes deployment-managed.
 
 ## 7. OCI Registry
 
