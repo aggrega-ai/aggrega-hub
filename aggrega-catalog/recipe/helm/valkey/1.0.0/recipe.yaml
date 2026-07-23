@@ -40,27 +40,49 @@ spec:
   workload: |
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
-    # A cache holds no durable state, so the default stateless form (a
-    # Deployment on the helm engine) is correct — no form: stateful, no
-    # persistentTemplate volume, no PVC.
+    # Persistence is a configurable capability, not a separate component: the
+    # form resolves from values.persistence.enabled — a durable StatefulSet (with
+    # a PVC and a headless Service) when set, the default ephemeral Deployment
+    # when not. A bare cache leaves it unset and renders a Deployment.
+    form: "{{ if .values.persistence.enabled }}stateful{{ else }}stateless{{ end }}"
     replicas: 1
     containers:
       main:
         image: valkey/valkey:{{ .infra.engine_version }}
-        # Authentication is wired through the optional `password` credential
-        # slot. When a credential is attached, the password is delivered as an
-        # env secretKeyRef (VALKEY_PASSWORD) and Valkey is started with
-        # --requirepass referencing it through the $(VAR) form, which the
-        # runtime expands from the Secret at container start — the plaintext
-        # never lands in the manifest. The upstream valkey/valkey image does not
-        # read a password from the environment on its own, so the flag is what
-        # actually enables auth. With no credential attached, no args and no
-        # secret are emitted and the cache runs without authentication,
-        # byte-identically to a Recipe with no slot at all.
-    {{- if hasKey (default dict .secrets) "password" }}
+        # Config knobs and authentication are passed as valkey flags — the
+        # official image's entrypoint prepends `valkey-server` to an argument list
+        # that begins with a flag. Authentication is wired through the optional
+        # `password` credential slot: the password is delivered as an env
+        # secretKeyRef (VALKEY_PASSWORD) and referenced through the $(VAR) form,
+        # which the runtime expands from the Secret at container start, so the
+        # plaintext never lands in the manifest; the upstream image does not read
+        # a password from the environment on its own, so --requirepass is what
+        # enables auth. The args block is emitted only when at least one config
+        # knob or the password slot is set, so a bare cache renders no args,
+        # byte-identically to a Recipe with no knobs at all; --requirepass stays
+        # last so a password-only deployment matches exactly.
+    {{- if or .values.maxmemory .values.maxmemory_policy .values.databases .values.appendonly (hasKey (default dict .secrets) "password") }}
         args:
+    {{- with .values.databases }}
+          - "--databases"
+          - "{{ . }}"
+    {{- end }}
+    {{- with .values.maxmemory }}
+          - "--maxmemory"
+          - "{{ . }}"
+    {{- end }}
+    {{- with .values.maxmemory_policy }}
+          - "--maxmemory-policy"
+          - "{{ . }}"
+    {{- end }}
+    {{- if .values.appendonly }}
+          - "--appendonly"
+          - "yes"
+    {{- end }}
+    {{- if hasKey (default dict .secrets) "password" }}
           - "--requirepass"
           - "$(VALKEY_PASSWORD)"
+    {{- end }}
     {{- end }}
         ports:
           valkey: {{ .infra.port }}
@@ -71,14 +93,32 @@ spec:
           limits:
             cpu: {{ .infra.compute.cpu }}
             memory: {{ .infra.compute.memory }}
+    {{- if .values.persistence.enabled }}
+        volumeMounts:
+          - name: data
+            path: /data
+    {{- end }}
     {{- if hasKey (default dict .secrets) "password" }}
         secrets:
           VALKEY_PASSWORD:
             from: password
             as: env
     {{- end }}
+    {{- if .values.persistence.enabled }}
+    volumes:
+      data:
+        persistentTemplate:
+          size: {{ .infra.storage.size }}
+          class: {{ .infra.storage.type }}
+    {{- end }}
     services:
       default:
         type: ClusterIP
         ports:
           valkey: {{ .infra.port }}
+    {{- if .values.persistence.enabled }}
+      headless:
+        type: Headless
+        ports:
+          valkey: {{ .infra.port }}
+    {{- end }}
