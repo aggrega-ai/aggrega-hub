@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: tgi
+  version: 1.0.0
+  description: >
+    Text Generation Inference as a self-hosted inference server on Kubernetes via
+    the helm provider's Workload synthesis, running the official upstream image
+    directly (no external Helm chart). Renders a StatefulSet: a weights-pull
+    initContainer resolves the model pointer into a per-replica model-cache
+    volume, and the serving container mounts the same volume and serves the API
+    behind a ClusterIP Service. The model value is a deterministic pointer the
+    initContainer resolves at pod start; the compiler never fetches weights. When
+    the optional model_pull_token credential slot is attached the token reaches
+    the initContainer as an env secretKeyRef, so it never appears in the rendered
+    manifest; unattached, weights are pulled anonymously, byte-identically to a
+    recipe with no slot. provides.host is the bare, self-contained in-cluster
+    service name; a consumer in another namespace qualifies it on its own side.
+  license: Apache-2.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-model/tgi:1.0.0
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}/v1"
+    model: "{{ .values.model }}"
+    protocol: "http"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateful
+    replicas: {{ .infra.replicas }}
+    initContainers:
+      - name: model-pull
+        image: "ghcr.io/huggingface/text-generation-inference:{{ .infra.engine_version }}"
+        # Pre-downloads the model into the shared model-cache volume via the
+        # runtime's native weights downloader. .values.model is the deterministic
+        # pointer the runtime resolves here; the compiler pipes it unresolved.
+        command: ["/bin/sh"]
+        args:
+          - "-c"
+          - "text-generation-server download-weights {{ .values.model }}"
+        variables:
+          HUGGINGFACE_HUB_CACHE: /models
+    {{- if hasKey (default dict .secrets) "model_pull_token" }}
+        secrets:
+          HF_TOKEN:
+            from: model_pull_token
+            as: env
+    {{- end }}
+        volumeMounts:
+          - name: model-cache
+            path: /models
+    containers:
+      main:
+        image: "ghcr.io/huggingface/text-generation-inference:{{ .infra.engine_version }}"
+        args:
+          - "--model-id"
+          - "{{ .values.model }}"
+          - "--port"
+          - "{{ .infra.port }}"
+    {{- with .values.context_window }}
+          - "--max-total-tokens"
+          - "{{ . }}"
+    {{- end }}
+        variables:
+          HUGGINGFACE_HUB_CACHE: /models
+        ports:
+          http: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+        volumeMounts:
+          - name: model-cache
+            path: /models
+    volumes:
+      model-cache:
+        persistentTemplate:
+          size: {{ .infra.model_cache.size }}
+    {{- with .infra.model_cache.class }}
+          class: {{ . }}
+    {{- end }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
+      headless:
+        type: Headless
+        ports:
+          http: {{ .infra.port }}
