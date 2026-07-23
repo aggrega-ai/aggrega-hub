@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: n8n
+  version: 1.0.0
+  description: >
+    The n8n automation platform on Kubernetes, rendered offline as plain
+    manifests by the helm provider's Workload synthesis. The Workload becomes a
+    Deployment serving the n8n editor and webhook endpoint on a ClusterIP
+    Service. When a workflow definition is supplied, a flow ConfigMap carries it
+    and an init container seeds it into the platform on start via
+    `n8n import:workflow`; with no definition the platform deploys empty and the
+    ConfigMap and init step are omitted byte-identically. The model endpoint wired
+    into the `model` socket is injected as OPENAI_BASE_URL and an attached model
+    API key as OPENAI_API_KEY, both read by workflow expressions via n8n's $env.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/n8n:1.0.0
+  # The workflow definition is supplied per deployment on .infra. When present it
+  # renders a ConfigMap the init container reads; presence-guarded so a deployment
+  # supplying no definition emits no ConfigMap, byte-identical to a bare deploy.
+  artifacts:
+    n8n-flow.configmap.yaml: |
+      {{- if .infra.flow_definition }}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-flow
+      data:
+        workflow.json: |
+      {{ .infra.flow_definition | indent 6 }}
+      {{- end }}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    {{- if .infra.flow_definition }}
+    # Seed the supplied workflow before the platform starts. The init container
+    # imports the flow from the mounted ConfigMap into the n8n data directory the
+    # main container serves from (both mount the shared data volume).
+    initContainers:
+      - name: import-flow
+        image: "{{ .infra.image }}"
+        command: ["n8n"]
+        args: ["import:workflow", "--input=/flows/workflow.json"]
+        volumeMounts:
+          - name: data
+            path: /home/node/.n8n
+          - name: flow
+            path: /flows
+    {{- end }}
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        # The model endpoint arrives on the `model` uses-edge; the recipe ranges
+        # the outbound edges and matches on the socket name, then reads the model
+        # recipe's published endpoint and model name. n8n workflow expressions read
+        # these via $env.
+        variables:
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "model" }}
+          OPENAI_BASE_URL: "{{ $edge.provides.endpoint }}"
+          OPENAI_MODEL: "{{ $edge.provides.model }}"
+    {{- end }}
+    {{- end }}
+        # An attached model API key is delivered as OPENAI_API_KEY via a
+        # secretKeyRef; the key value never renders into the manifest.
+    {{- if hasKey (default dict .secrets) "model_api_key" }}
+        secrets:
+          OPENAI_API_KEY:
+            from: model_api_key
+            as: env
+    {{- end }}
+        ports:
+          http: 5678
+        volumeMounts:
+          - name: data
+            path: /home/node/.n8n
+    volumes:
+      data:
+        ephemeral: {}
+    {{- if .infra.flow_definition }}
+      flow:
+        configmap:
+          source: {{ .context.instance_id }}-flow
+    {{- end }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: 5678
