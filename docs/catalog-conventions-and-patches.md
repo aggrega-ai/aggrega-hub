@@ -128,25 +128,29 @@ value set is a standard-library convention (the compiler is blind to it):
   provisions nor operates. The resource's lifecycle sits entirely outside the
   deployment; the Recipe emits only the wiring to reach it.
 
-**Where the value lives — the home rule.** The same `hosting` name has two
-homes, chosen by whether the trait is invariant for the component:
+**Where the value lives — hosting is a static identity label.** `hosting` is a
+selector-only component identity label (`metadata.labels`); it is never stamped
+onto rendered output. Which value a component carries depends on whether the
+trait is invariant across the component's Recipes:
 
-- **Static identity label** (`metadata.labels`) when hosting is **invariant
-  across every Recipe the component can bind** — the component *is* one hosting
-  posture by identity. Each standard-library AI model is exactly one value
-  (a self-run server, or a managed API), fixed the way `component.aggrega.ai/type`
-  is fixed; the label states that identity.
-- **Recipe output label** (`spec.outputLabels.hosting`) when hosting **varies
-  across the component's realizations** — one component with several Recipes that
-  differ in who operates the resource (a datastore realized self-hosted in one
-  environment, managed in another, or referenced in a third). The trait is a
-  property of the chosen realization, not of the component's identity, so the
-  Recipe that renders that realization stamps it onto the output.
+- A component realized by Recipes that **all share one hosting posture** carries
+  that single value — the component *is* one posture by identity, fixed the way
+  `component.aggrega.ai/type` is fixed. Each standard-library AI model is exactly
+  one value (a self-run server, or a managed API); the label states that identity.
+- A **unified component whose Recipes span more than one posture** carries the
+  value **`mixed`** — for example a datastore realized self-hosted by its Helm
+  and Compose Recipes and managed by its Terraform/CloudFormation RDS Recipes.
+  `mixed` is the honest identity value for a multi-posture component: no single
+  posture *is* its identity, and the actual posture of a deployment follows the
+  Recipe the Manifest selects rather than any stamped trait. The component stays
+  unified (one component, several Recipes); it is not split per posture.
 
-One name, one value set; the home follows invariance. A single-realization
-component carries the static label; a multi-realization component carries no
-hosting identity label and lets each Recipe declare its own via
-`spec.outputLabels`.
+`mixed` generalizes to any `<scope>.aggrega.ai/` identity label on a unified
+component whose Recipes span multiple values of that axis: rather than dropping
+the label or splitting the component, carry `mixed` to state honestly that the
+axis is realization-dependent. Because hosting is a selection concern — read
+from *which* Recipe renders — it belongs on component identity, not on rendered
+output; do not stamp it via `spec.outputLabels`.
 
 ### Recipe/FeatureRecipe Provider Namespace
 
