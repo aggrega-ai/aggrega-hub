@@ -6,6 +6,9 @@ resource "aws_db_instance" "this" {
   multi_az             = var.multi_az
   db_subnet_group_name = var.subnet_id
 
+  db_name  = var.db_name
+  username = "admin"
+
   # RDS manages the master password via AWS Secrets Manager.
   manage_master_user_password = true
 
