@@ -530,6 +530,52 @@ chart reads credentials **only** from a named multi-key Secret; Model B fits
 charts that take a single password value. Match the model to the chart's auth
 surface.
 
+### File-mounted credential delivery
+
+Some clients read their credential from a **file** rather than an environment
+variable — a Google Cloud service-account key, for example, is a JSON file the
+client libraries locate through the `GOOGLE_APPLICATION_CREDENTIALS` environment
+variable. The delivery reuses the referenceable-secret family unchanged: the
+credential is materialized as a Secret by a `core/referenced-secret` attachment,
+and the consuming Recipe mounts that Secret as a file and points the client's
+credential-path variable at the mounted file. No new Secret-emitting Feature is
+authored — the file mount and the credential-path variable are the only additions
+on the consumer.
+
+The consumer Component declares a secret slot that allowlists the file mount:
+
+```yaml
+spec:
+  secretsSchema:
+    gcp_key:
+      required: true
+      inject: [file]     # the slot permits the Recipe's `as: file` mount
+```
+
+The Recipe mounts the whole Secret at a directory and derives the credential
+file's path from the slot's published data key, so the path tracks whatever key
+the attached secret publishes:
+
+```yaml
+spec:
+  workload: |
+    containers:
+      main:
+        variables:
+          GOOGLE_APPLICATION_CREDENTIALS: "/var/secrets/google/{{ .secrets.gcp_key.provides.key }}"
+        secrets:
+          gcp-service-account-key:
+            from: gcp_key
+            as: file
+            path: /var/secrets/google
+```
+
+The whole Secret mounts as a directory, so each data key becomes a file named by
+the key. For a runnable end-to-end walkthrough, see the worked example
+[`component/example/compute/gcp-credentialed-service/`](../aggrega-catalog/component/example/compute/gcp-credentialed-service/1.0.0/component.yaml)
+and its Recipe
+[`recipe/helm/gcp-credentialed-service/`](../aggrega-catalog/recipe/helm/gcp-credentialed-service/1.0.0/recipe.yaml).
+
 ### Presence parametrization — expose an enable-parameter per component
 
 A published Aggregate exposes an enable/disable parameter per optional component
