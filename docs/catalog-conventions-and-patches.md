@@ -653,6 +653,68 @@ management) — is a distinct capability delivered by a FeatureRecipe transform,
 not by the hosting label. A referenced resource stays externally owned; an
 adopted resource becomes deployment-managed.
 
+### Gateway / operator-driven (custom-resource-emitting) Recipes
+
+The production way to run complex software on Kubernetes is often an **operator**:
+a controller that reconciles a **custom resource** into running infrastructure
+(a message broker becomes a Strimzi `Kafka`; a model-serving path becomes an
+Envoy AI Gateway `AIServiceBackend`). A Recipe realizes this by emitting the
+custom resource — one more realization of an existing component, selected per
+deployment through the Manifest's component-type mapping, coexisting with that
+component's synthesis, reference, and cloud-native realizations.
+
+The custom resource carries in `artifacts:`, one map entry per emitted file. The
+recipe fulfils the **same `provides` contract** as the component's other
+realizations, so consumers are realization-agnostic: an operator-driven Kafka
+publishes `provides.host` as the operator-created client bootstrap Service, and a
+gateway-mediated model publishes `provides.endpoint` as the in-cluster gateway
+Service — the consumer's wiring is unchanged from the synthesized or managed form.
+
+**The runtime-prerequisite discipline.** A custom resource only reconciles if its
+**control plane** — the custom-resource definition and its controller — already
+exists in the target cluster; emitted into a cluster that lacks it, the resource
+is an orphan that never becomes infrastructure. The compiler is ahead-of-time and
+cannot inspect cluster state, so it cannot check the control plane is present.
+The prerequisite is therefore made an **explicit, declared part of the model** —
+never a silent emit. Two shapes, both explicit:
+
+- **Ambient-assumed** — the control plane is platform-provided (installed
+  cluster-wide). The recipe emits only the custom resource, and declares the
+  prerequisite: the component carries an operator-affirmed `infra` boolean (a
+  `control_plane_present` flag, defaulting false), and the recipe guards emission
+  with a build-time `assertions` entry that halts loudly when the flag is
+  unaffirmed. The operator sets the flag in the Release once the control plane is
+  in place, consciously acknowledging the requirement.
+- **Bundled-deploy** — the deployment ships the control plane too. The operator
+  install is a first-class **companion component** (a `server` component whose
+  Recipe emits the ServiceAccount, cluster RBAC, and controller Deployment, or
+  wraps the project's upstream install chart), declared in the same Aggregate
+  alongside the custom-resource-emitting component, so the custom resource and the
+  controller that reconciles it are deployed together.
+
+Both make the prerequisite a declared thing the reader can see. The shape to
+avoid is the third, silent one: emitting a custom resource with the control plane
+merely hoped to be present and nothing in the model saying so.
+
+**Credential custody.** A gateway holds the provider credential and authenticates
+upstream on the application's behalf, so the credential never reaches the
+application. The credential is a referenceable Secret filled through the
+`core/referenced-secret` credential Feature on the component's credential slot; a
+security-policy custom resource binds it to the backend. A black-box credential
+slot still publishes its produced resource's locator to the Recipe, so the recipe
+reads the Secret's name for the security policy without exposing the value.
+
+**The exemplar.** Strimzi Kafka is the template for this pattern: `core/messaging/kafka`
+offers an operator-driven realization emitting a `Kafka` and `KafkaNodePool`
+custom resource alongside its synthesized StatefulSet realization, and ships both
+prerequisite modes (the Strimzi Cluster Operator as an ambient assumption or as a
+bundled companion component). The same shape carries to further operators —
+Elasticsearch, HA Postgres, additional AI gateways. The Envoy AI Gateway path
+(`AIServiceBackend` plus a `BackendSecurityPolicy` for the provider credential) is
+the AI-gateway instance of the pattern. Author custom-resource fields against the
+target project's current API documentation, since custom-resource schemas evolve
+independently of the catalog.
+
 ## 7. OCI Registry
 
 The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
