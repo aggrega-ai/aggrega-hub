@@ -6,11 +6,116 @@ kind: Component
 metadata:
   name: core/ai-model/nvidia-nim
   version: 1.0.0
+  description: >
+    NVIDIA Inference Microservice (NIM) running in-cluster as a self-hosted,
+    GPU-native inference server. A Recipe synthesizes the runtime directly: the
+    NIM container resolves the model profile into a model-cache volume at start
+    and serves the OpenAI-compatible API behind a ClusterIP Service. The model
+    value is a deterministic pointer resolved at pod start, never fetched at
+    compile time. GPU-native — the serving container always requests a GPU, so a
+    GPU-capable cluster is required. Exports its host, port, endpoint, model, and
+    protocol to consumers via the uses topology, so an agent reaches the model
+    without hardcoding an endpoint.
   labels:
     component.aggrega.ai/type: server
     component.aggrega.ai/category: ai-model
+    model.aggrega.ai/capability: generative
     component.aggrega.ai/hosting: self-hosted
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
 spec:
+  # Self-inject allowlist: the component may inject its own provides keys into
+  # the env delivery mechanism.
+  inject: [env]
+  secretsSchema:
+    # NGC API key for authenticating the model-profile download from NVIDIA GPU
+    # Cloud. When a deployment attaches a credential here, the Recipe delivers it
+    # to the serving container as an environment variable; when unattached, the
+    # container starts without it, byte-identically to a Recipe with no slot (a
+    # profile that needs authentication then fails at pod start, not compile
+    # time). `required` omitted → optional. Transparent (inject: [env]); the
+    # selector is secret-kind-pinned but family-agnostic.
+    ngc_api_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      inject: [env]
+      description: "Optional NGC API key for authenticating the model-profile download. When attached, the serving container receives it as an environment variable; unattached, the container starts without it."
   schema:
     values:
+      # Developer Intent — filled by the Developer in the Aggregate. `model` is
+      # the deterministic model pointer (a NIM model identifier such as
+      # meta/llama-3.1-8b-instruct); the runtime resolves it at pod start.
       $ref: "BaseComponents#/schemas/BaseModelParameter"
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 8000
+        description: Server listen port for the model API. Most operators should omit this and let the Recipe assign the default (8000).
+      engine_version:
+        type: string
+        default: "1.0.0"
+        description: NIM runtime image tag. Selects the image tag on the synthesized serving container.
+      replicas:
+        type: integer
+        min: 1
+        default: 1
+        description: Number of serving replicas. Each replica holds its own model-cache volume and resolves the model profile independently.
+      min_replicas:
+        type: integer
+        min: 1
+        description: Lower bound for the replica count when horizontal autoscaling is configured. Declared ahead of rendering — the synth recipe serves a fixed replica count and does not yet emit an autoscaler; set it to record the intended lower bound.
+      max_replicas:
+        type: integer
+        min: 1
+        description: Upper bound for the replica count when horizontal autoscaling is configured. Declared ahead of rendering — the synth recipe serves a fixed replica count and does not yet emit an autoscaler; set it to record the intended upper bound.
+      compute:
+        cpu:
+          type: string
+          default: "4"
+        memory:
+          type: string
+          default: 16Gi
+      model_cache:
+        type: object
+        description: Per-replica model-profile cache volume. Sized for the resolved profile; each serving replica gets its own claim.
+        properties:
+          size:
+            type: string
+            default: 50Gi
+          class:
+            type: string
+      model_artifact:
+        type: string
+        description: Optional OCI reference to the model weights, an alternative weights source to the model id in values.model. A deterministic pointer the runtime resolves at pod start; the compiler never fetches it. Declared ahead of rendering — the synth recipe resolves the model from values.model and does not yet consume this pointer.
+      gpu:
+        type: object
+        description: GPU scheduling for the serving container. NIM is GPU-native, so the serving container always requests at least one GPU; this object tunes the count and selects a GPU runtime class. Requires a GPU-capable cluster and, for runtime_class, a matching RuntimeClass configured in the cluster.
+        properties:
+          count:
+            type: integer
+            min: 1
+            default: 1
+            description: Number of GPUs requested for the serving container, delivered as the extended resource nvidia.com/gpu. Defaults to 1 GPU.
+          runtime_class:
+            type: string
+            description: Name of the RuntimeClass selecting the GPU-enabled container runtime (for example nvidia). Omit to use the cluster default runtime.
+      image_pull_secret:
+        type: string
+        description: Name of a pre-created image-pull Secret granting access to the NIM container registry. Set this when the NIM image is pulled from a private registry; omit when the cluster can pull it without credentials.
+      overrides:
+        type: object
+        additionalProperties: true
+        description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      # endpoint and model are the family contract an ai-agent consumer reads;
+      # host, port, and protocol expose the raw in-cluster serving location.
+      host: { type: string, required: true }
+      port: { type: integer, required: true }
+      endpoint: { type: string, required: true }
+      model: { type: string, required: true }
+      protocol: { type: string }

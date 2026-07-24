@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: nvidia-nim
+  version: 1.0.0
+  description: >
+    NVIDIA Inference Microservice as a self-hosted, GPU-native inference server
+    on Kubernetes via the helm provider's Workload synthesis, running the NIM
+    container directly (no external Helm chart). Renders a StatefulSet: the NIM
+    serving container resolves the model profile into a per-replica model-cache
+    volume at start and serves the OpenAI-compatible API behind a ClusterIP
+    Service. The model value is a deterministic pointer the container resolves at
+    pod start; the compiler never fetches the profile. GPU-native — the serving
+    container always requests a GPU (nvidia.com/gpu), and when a runtime class is
+    named the pod is scheduled under it. When the optional ngc_api_key credential
+    slot is attached the key reaches the container as an env secretKeyRef, so it
+    never appears in the rendered manifest; unattached, the container starts
+    without it, byte-identically to a recipe with no slot. provides.host is the
+    bare, self-contained in-cluster service name; a consumer in another namespace
+    qualifies it on its own side.
+  license: Apache-2.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-model/nvidia-nim:1.0.0
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}/v1"
+    model: "{{ .values.model }}"
+    protocol: "http"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # form: stateful gives each replica a stable per-replica model-cache claim
+    # (persistentTemplate below); the NIM container resolves the model profile
+    # into it at start.
+    form: stateful
+    replicas: {{ .infra.replicas }}
+    {{- with (default dict .infra.gpu).runtime_class }}
+    runtimeClassName: {{ . }}
+    {{- end }}
+    {{- with .infra.image_pull_secret }}
+    imagePullSecrets:
+      - {{ . }}
+    {{- end }}
+    containers:
+      main:
+        # The NIM image is model-specific; .values.model is the deterministic
+        # NGC model-path pointer the runtime resolves at pod start. The compiler
+        # pipes the string unresolved (AOT).
+        image: "nvcr.io/nim/{{ .values.model }}:{{ .infra.engine_version }}"
+        variables:
+          NIM_CACHE_PATH: /opt/nim/.cache
+    {{- if hasKey (default dict .secrets) "ngc_api_key" }}
+        # NGC API key, delivered as an env secretKeyRef so the value never lands
+        # in the manifest. Emitted only when the slot is attached.
+        secrets:
+          NGC_API_KEY:
+            from: ngc_api_key
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+            "nvidia.com/gpu": "{{ (default dict .infra.gpu).count | default 1 }}"
+        volumeMounts:
+          - name: model-cache
+            path: /opt/nim/.cache
+    volumes:
+      model-cache:
+        persistentTemplate:
+          size: {{ .infra.model_cache.size }}
+    {{- with .infra.model_cache.class }}
+          class: {{ . }}
+    {{- end }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
+      headless:
+        type: Headless
+        ports:
+          http: {{ .infra.port }}
