@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: vllm-kubeai
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    vLLM realized as a KubeAI Model the KubeAI operator reconciles, rather than a
+    directly synthesized StatefulSet — a second controller-driven realization of the
+    same model component, selectable in the Manifest alongside the synthesis recipe
+    and the KServe realization. The recipe emits a Model custom resource whose url is
+    the model pointer; the operator serves it behind its OpenAI-compatible proxy and
+    autoscales it. The model value is a deterministic pointer the operator resolves
+    at reconcile time; the compiler never fetches weights. GPU and CPU sizing carry
+    through resourceProfile. provides is filled from the operator's proxy, which
+    addresses a model by its resource name, so a consumer wires to it exactly as it
+    would to the synthesized realization. The KubeAI control plane is a runtime
+    prerequisite: the build halts unless the operator affirms it is installed
+    (infra.control_plane_present), so no custom resource is emitted into a cluster
+    that cannot reconcile it.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-model/vllm:1.0.0
+  # KubeAI serves every model through one OpenAI-compatible proxy Service and
+  # addresses a model by its resource name, so provides.model is the resource name
+  # (not the weights id), and endpoint is the operator's proxy under /openai/v1.
+  # This fills the same five-key contract as the synthesis and KServe realizations,
+  # so consumers are realization-agnostic; the value each realization supplies is the
+  # one its runtime requires. The proxy Service address is install-namespace
+  # dependent; a consumer in another namespace qualifies the host on its own side.
+  provides:
+    host: "kubeai"
+    port: "80"
+    endpoint: "http://kubeai/openai/v1"
+    model: "{{ .context.instance_id }}"
+    protocol: "http"
+  # The KubeAI control plane must exist in the target cluster before a Model can
+  # reconcile. The compiler cannot inspect cluster state, so the prerequisite is
+  # declared: an operator affirms it in the Release, and an unaffirmed build halts
+  # here rather than emitting an orphan custom resource. The assertion context binds
+  # Go struct fields, so the pillar is .Infra.
+  assertions:
+    kubeai_control_plane_prerequisite: >-
+      {{- if not .Infra.control_plane_present -}}
+      {{- fail "the KubeAI control plane must be installed in the target cluster before this realization emits its Model custom resource; once KubeAI is present, affirm the prerequisite by setting infra.control_plane_present to true in the Release" -}}
+      {{- end -}}
+  # The KubeAI Model. url is the deterministic model pointer (an hf:// reference the
+  # operator resolves at reconcile time). resourceProfile names a profile the operator
+  # defined in the cluster; verify the profile names and the Model schema against the
+  # KubeAI version installed, as custom-resource schemas evolve independently of the
+  # catalog.
+  artifacts:
+    model.yaml: |
+      apiVersion: kubeai.org/v1
+      kind: Model
+      metadata:
+        name: {{ .context.instance_id }}
+      spec:
+        features: ["TextGeneration"]
+        url: "hf://{{ .values.model }}"
+        engine: VLLM
+        {{- if (default dict .infra.gpu).count }}
+        resourceProfile: "nvidia-gpu:{{ .infra.gpu.count }}"
+        {{- else }}
+        resourceProfile: "cpu:{{ .infra.compute.cpu }}"
+        {{- end }}
+        minReplicas: {{ default .infra.replicas .infra.min_replicas }}
+        {{- with .infra.max_replicas }}
+        maxReplicas: {{ . }}
+        {{- end }}

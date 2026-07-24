@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: vllm-kserve
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    vLLM realized as a KServe InferenceService the KServe controller reconciles,
+    rather than a directly synthesized StatefulSet — the controller-driven
+    realization of the same model component, selectable in the Manifest alongside
+    the synthesis recipe. The recipe emits an InferenceService custom resource
+    whose predictor resolves the model pointer as a storage URI; the controller
+    turns it into a running serving workload and its predictor Service. The model
+    value is a deterministic pointer the controller resolves at reconcile time; the
+    compiler never fetches weights. GPU is requested directly on the predictor as
+    the extended resource nvidia.com/gpu, with an optional runtime class. provides
+    is filled from the predictor Service the controller creates, so a consumer wires
+    to it exactly as it would to the synthesized realization. The KServe control
+    plane is a runtime prerequisite: the build halts unless the operator affirms it
+    is installed (infra.control_plane_present), so no custom resource is emitted into
+    a cluster that cannot reconcile it.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-model/vllm:1.0.0
+  # provides is the predictor Service the KServe controller creates for the
+  # InferenceService: a Service named "<name>-predictor" listening on port 80,
+  # serving the OpenAI-compatible API under /v1. This matches the synthesis
+  # realization's five-key contract so consumers are realization-agnostic. The
+  # host is the bare in-cluster Service name; a consumer in another namespace
+  # qualifies it on its own side (caller-side routing).
+  provides:
+    host: "{{ .context.instance_id }}-predictor"
+    port: "80"
+    endpoint: "http://{{ .context.instance_id }}-predictor/v1"
+    model: "{{ default .values.model .values.served_model_name }}"
+    protocol: "http"
+  # The KServe control plane must exist in the target cluster before an
+  # InferenceService can reconcile. The compiler cannot inspect cluster state, so
+  # the prerequisite is declared: an operator affirms it in the Release, and an
+  # unaffirmed build halts here rather than emitting an orphan custom resource.
+  # The assertion context binds Go struct fields, so the pillar is .Infra.
+  assertions:
+    kserve_control_plane_prerequisite: >-
+      {{- if not .Infra.control_plane_present -}}
+      {{- fail "the KServe control plane must be installed in the target cluster before this realization emits its InferenceService; once KServe is present, affirm the prerequisite by setting infra.control_plane_present to true in the Release" -}}
+      {{- end -}}
+  # The KServe InferenceService. Its predictor.model.storageUri is the deterministic
+  # model pointer (an hf:// storage URI resolved by the controller's storage
+  # initializer at reconcile time). modelFormat.name selects the serving runtime the
+  # cluster provides for vLLM; verify it against the ServingRuntimes installed in the
+  # target cluster, as custom-resource schemas evolve independently of the catalog.
+  artifacts:
+    inferenceservice.yaml: |
+      apiVersion: serving.kserve.io/v1beta1
+      kind: InferenceService
+      metadata:
+        name: {{ .context.instance_id }}
+      spec:
+        predictor:
+          minReplicas: {{ default .infra.replicas .infra.min_replicas }}
+          {{- with .infra.max_replicas }}
+          maxReplicas: {{ . }}
+          {{- end }}
+          {{- with (default dict .infra.gpu).runtime_class }}
+          runtimeClassName: {{ . }}
+          {{- end }}
+          model:
+            modelFormat:
+              name: vllm
+            storageUri: "hf://{{ .values.model }}"
+            resources:
+              requests:
+                cpu: "{{ .infra.compute.cpu }}"
+                memory: "{{ .infra.compute.memory }}"
+              limits:
+                cpu: "{{ .infra.compute.cpu }}"
+                memory: "{{ .infra.compute.memory }}"
+                {{- if (default dict .infra.gpu).count }}
+                nvidia.com/gpu: "{{ .infra.gpu.count }}"
+                {{- end }}

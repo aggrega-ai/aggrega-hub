@@ -715,6 +715,51 @@ the AI-gateway instance of the pattern. Author custom-resource fields against th
 target project's current API documentation, since custom-resource schemas evolve
 independently of the catalog.
 
+### Self-hosted inference: dual realization (synthesis and controller-driven)
+
+A self-hosted inference runtime — a model server run on the cluster's own
+compute, marked `component.aggrega.ai/hosting: self-hosted` in the `ai-model`
+category (`ollama`, `vllm`, `tgi`, `tei`, `nvidia-nim`) — is deployed two
+genuinely different ways in the field, and each is a Recipe realizing the same
+component, selected per deployment through the Manifest:
+
+- **Direct synthesis.** The Recipe synthesizes the server itself as a `Workload`:
+  a weights-pull initContainer resolves the model pointer into a per-replica
+  model-cache volume, and the serving container mounts that volume and fronts the
+  API behind a ClusterIP Service. The model value (a Hugging Face id, or an OCI
+  reference) is a deterministic pointer the initContainer resolves at pod start;
+  the compiler never fetches weights. This realization needs no serving control
+  plane, so it is the default where the cluster runs none. CPU and GPU are both
+  expressible: GPU requests the extended resource `nvidia.com/gpu` on the serving
+  container and, when a runtime class is named, schedules the pod under it.
+- **Controller-driven.** The Recipe emits a model-serving controller's custom
+  resource — a KServe `InferenceService` or a KubeAI `Model` — in `artifacts:`,
+  and the controller owns the serving workload. GPU carries through the custom
+  resource directly. This realization suits a cluster that already runs a serving
+  control plane, and carries the **runtime-prerequisite discipline** described
+  under "Gateway / operator-driven (custom-resource-emitting) Recipes" above —
+  the same `control_plane_present` affirmation and build-time assertion, so a
+  serving custom resource is never emitted as an orphan. It is one discipline, not
+  two; the self-hosted controller-driven recipes reuse it rather than defining
+  their own.
+
+Both realizations fulfil the **same `provides` contract** — `host`, `port`,
+`endpoint`, `model`, `protocol` — so a consumer that `uses` the model reads the
+same keys regardless of realization; only the values differ, each supplied as its
+runtime requires. A synthesized server publishes its own ClusterIP Service and the
+weights id as the model name; a KServe realization publishes the predictor Service
+the controller creates; a KubeAI realization publishes the operator's shared proxy
+and the resource name the operator routes on. The contract is one of keys, not
+values: the consumer's wiring is unchanged across all of them.
+
+Which realization to choose follows the cluster: with no serving control plane,
+synthesize directly; with KServe or KubeAI installed, emit its custom resource and
+let the controller serve. Custom-resource field names and service-naming
+conventions here (for example a predictor Service name, or an operator's resource
+profile names) follow each project's current API and installation, which evolve
+independently of the catalog — verify them against the target cluster, per the
+note above.
+
 ## 7. OCI Registry
 
 The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
