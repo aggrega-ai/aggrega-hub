@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: litellm
+  version: 1.0.0
+  description: >
+    LiteLLM as a self-hosted, OpenAI-compatible model proxy on Kubernetes via
+    the helm provider's Workload synthesis, running the official upstream image
+    directly (no external Helm chart). Renders a Deployment plus a ConfigMap: the
+    ConfigMap carries the proxy's configuration body, which publishes the alias
+    in values.model and points it at the provider-qualified target in
+    values.upstream_model, and the proxy container reads that file through the
+    --config flag. A ClusterIP Service fronts the API. When the optional
+    master_key credential slot is attached the administrative key reaches the
+    proxy as an env secretKeyRef, so its value never appears in the rendered
+    manifest; unattached, the proxy starts with no administrative key. When the
+    optional provider_key slot is attached the upstream credential reaches the
+    proxy the same way, under the variable named in values.provider_key_variable,
+    and the configuration body names that variable rather than carrying the
+    credential. The bookkeeping database connection string is emitted only when
+    infra.database_url is set; with none the proxy runs stateless.
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized ClusterIP Service — it carries no namespace, so the recipe is
+    independent of where it is deployed. A consumer in another namespace
+    qualifies the host with the target namespace on its own side (caller-side
+    routing). The configuration contract is authored against LiteLLM v1.85.1.
+  license: MIT
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-model/litellm:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Each entry below is the single authored home for a value the artifacts
+  # template and the workload template both have to agree on. They are separate
+  # templates, so a template variable bound in one is not visible in the other,
+  # and these entries are what keeps the emitted ConfigMap and the container that
+  # reads it from drifting apart: config_file is the ConfigMap's data key and the
+  # filename the proxy is pointed at, config_map_name is the resource name the
+  # ConfigMap declares and the volume sources.
+  locals:
+    config_file: config.yaml
+    config_map_name: "{{ .context.instance_id }}-config"
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the proxy's own listen-port argument, the
+  # container port and the Service; the literal is never repeated. endpoint is the
+  # OpenAI-compatible base URL an ai-agent consumer reads (mapped to
+  # OPENAI_BASE_URL), assembled from the same host and port as the other keys.
+  #
+  # host and endpoint spell the Service name out twice on purpose. A provides
+  # entry cannot read another provides entry, and the name has to match the
+  # Service the engine derives from the service key below, so there is no home
+  # either could dereference instead — the repetition is forced, not a choice,
+  # and the two must be edited together.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}/v1"
+    model: "{{ .values.model }}"
+    protocol: "http"
+  artifacts:
+    # The proxy's configuration body. This body is deliberately near-duplicated
+    # by the compose recipe for the same component rather than shared, because
+    # the per-target mechanics genuinely differ: helm carries the body in a
+    # ConfigMap resource this recipe emits, while compose has no config-resource
+    # primitive and passes the same routing decision on the proxy's command line.
+    # An ArtifactsLibrary bundle is the future single-source home for a body both
+    # targets can emit unchanged; it is not that today, so do not consolidate the
+    # two into a shape one target cannot express.
+    #
+    # No credential value appears here. The upstream credential is named through
+    # the proxy's own environment indirection — the body carries the variable
+    # name and the runtime reads the value from the environment — and the
+    # administrative key is not named here at all, because the proxy reads its
+    # variable directly from the environment at startup.
+    litellm-config.configmap.yaml: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .locals.config_map_name }}
+      data:
+        {{ .locals.config_file }}: |
+          model_list:
+            - model_name: {{ .values.model }}
+              litellm_params:
+                model: {{ .values.upstream_model }}
+      {{- if hasKey (default dict .secrets) "provider_key" }}
+                api_key: os.environ/{{ .values.provider_key_variable }}
+      {{- end }}
+  workload: |
+    {{- $configDir := "/etc/litellm" -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "ghcr.io/berriai/litellm:{{ .infra.engine_version }}"
+        # $configDir is the single authored home for the directory the
+        # configuration is mounted at: the path the proxy is pointed at and the
+        # volume mount that decides what is mounted there both read the binding,
+        # so a future move cannot relocate one and leave the other behind. The
+        # filename within it is the ConfigMap's own data key, so it is read from
+        # the entry the emitted ConfigMap shares.
+        # The image entrypoint execs the proxy with the container args as its
+        # command line, and supplying args replaces the image's own default
+        # arguments — so the listen port is passed here explicitly rather than
+        # inherited, dereferencing its single authored home.
+        args:
+          - "--config"
+          - "{{ $configDir }}/{{ .locals.config_file }}"
+          - "--port"
+          - "{{ .infra.port }}"
+    {{- if .infra.database_url }}
+        variables:
+          DATABASE_URL: "{{ .infra.database_url }}"
+    {{- end }}
+    {{- if or (hasKey (default dict .secrets) "master_key") (hasKey (default dict .secrets) "provider_key") }}
+        secrets:
+    {{- end }}
+    {{- if hasKey (default dict .secrets) "master_key" }}
+          # The variable the proxy itself reads at startup. Delivered as an env
+          # secretKeyRef, so the key's value never lands in the manifest.
+          LITELLM_MASTER_KEY:
+            from: master_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .secrets) "provider_key" }}
+          # The same variable the configuration body names through the proxy's
+          # environment indirection, so the two agree by construction.
+          {{ .values.provider_key_variable }}:
+            from: provider_key
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+        volumeMounts:
+          - name: config
+            path: {{ $configDir }}
+    volumes:
+      config:
+        configmap:
+          source: {{ .locals.config_map_name }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

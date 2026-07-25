@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: litellm
+  version: 1.0.0
+  description: >
+    LiteLLM as a self-hosted, OpenAI-compatible model proxy for local
+    development via Docker Compose. Synthesized-mode Workload: image, command
+    line, environment and the published port are translated from the Workload
+    kind by the compose provider.
+    The routing decision reaches the proxy differently here than on Kubernetes,
+    and the difference is worth stating plainly. Compose has no config-resource
+    primitive, so this target carries no configuration file: it names the
+    provider-qualified target from values.upstream_model on the proxy's own
+    command line, which is the proxy's supported single-model route. Two
+    consequences follow. The proxy forwards every request to that one upstream
+    model whatever model name the caller sends, so the alias in values.model is
+    honoured for a caller and stays the value published on the edge, while the
+    proxy's own model listing reports the upstream target rather than the alias.
+    And a second model cannot be added on this target — a multi-model proxy is
+    realized by the helm target, which carries a configuration body in a
+    ConfigMap. On compose, run one proxy per upstream model.
+    Compose has no env-from-secret primitive, so an attached credential arrives
+    on the inject pipe and is rendered as a plain environment variable: the
+    administrative key under the variable the proxy reads at startup, and the
+    upstream credential under the variable named in values.provider_key_variable
+    — which is therefore also the key the attached credential must publish under.
+    Unattached, neither variable is emitted. The bookkeeping database connection
+    string is emitted only when infra.database_url is set; with none the proxy
+    runs stateless. The command-line contract is authored against LiteLLM v1.85.1.
+  license: MIT
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/ai-model/litellm:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the proxy's own listen-port argument, the
+  # container port and the service entry; the literal is never repeated. The
+  # contract is key-for-key the one the helm realization publishes, so a consumer
+  # reads the same keys on either target.
+  #
+  # host is the name the compose provider gives the synthesized service, which is
+  # the component instance's own name, so a consumer on the same compose network
+  # resolves it directly. host and endpoint spell it out twice on purpose: a
+  # provides entry cannot read another provides entry, so there is no home either
+  # could dereference instead — the repetition is forced, not a choice, and the
+  # two must be edited together.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}/v1"
+    model: "{{ .values.model }}"
+    protocol: "http"
+  workload: |
+    {{- $masterKeyVar := "LITELLM_MASTER_KEY" -}}
+    {{- $providerKeyVar := .values.provider_key_variable -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    containers:
+      main:
+        image: "ghcr.io/berriai/litellm:{{ .infra.engine_version }}"
+        # The image entrypoint execs the proxy with the container args as its
+        # command line, and supplying args replaces the image's own default
+        # arguments — so the listen port is passed here explicitly rather than
+        # inherited.
+        # The routing decision travels on this command line instead of in a
+        # configuration file. That is the deliberate near-duplicate of the helm
+        # realization's configuration body: the same authored values reach the
+        # proxy, by the only route this target has. An ArtifactsLibrary bundle is
+        # the future single-source home for a body both targets can emit
+        # unchanged; it is not that today, so do not consolidate the two into a
+        # shape this target cannot express.
+        args:
+          - "--model"
+          - "{{ .values.upstream_model }}"
+          - "--port"
+          - "{{ .infra.port }}"
+        # $masterKeyVar and $providerKeyVar are each bound once, so the variable
+        # a value is rendered under and the inject-pipe entry it is read from
+        # cannot drift apart. No credential value is authored here — each is
+        # read from the pipe the attached credential fills.
+    {{- if or .infra.database_url (hasKey (default dict .secrets) "master_key") (hasKey (default dict .secrets) "provider_key") }}
+        variables:
+    {{- end }}
+    {{- if .infra.database_url }}
+          DATABASE_URL: "{{ .infra.database_url }}"
+    {{- end }}
+    {{- if hasKey (default dict .secrets) "master_key" }}
+          {{ $masterKeyVar }}: "{{ index .context.inject.env $masterKeyVar }}"
+    {{- end }}
+    {{- if hasKey (default dict .secrets) "provider_key" }}
+          {{ $providerKeyVar }}: "{{ index .context.inject.env $providerKeyVar }}"
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+    # A ClusterIP service entry keeps the proxy internal to the compose network,
+    # which is where its consumers sit: the agent wired to it resolves the service
+    # name and the port straight from the edge. Nothing is published to the host,
+    # so the proxy is not reachable from outside the network on this target.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
