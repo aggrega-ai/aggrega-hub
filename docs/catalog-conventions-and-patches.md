@@ -17,10 +17,25 @@ aggrega-catalog/
 ├── feature-recipe/{provider}/{name}/recipe.yaml
 ├── aggregate/{namespace}/{name}/aggregate.yaml
 ├── schemalibrary/{name}.yaml
-└── mappinglibrary/{name}.yaml
+├── mappinglibrary/{name}.yaml
+├── workloadlibrary/{name}.yaml
+└── artifactslibrary/{name}.yaml
 ```
 
-`schemalibrary/` carries reusable JSON Schema 2020-12 fragments other Components and Features reference via `$ref:`. `mappinglibrary/` carries reusable Go template fragments Recipes and FeatureRecipes consume via `valuesMapping: { $import: ... }`. See the "Shared schema and mapping reuse" section below.
+The four library kinds carry reusable fragments other entities reference by
+identity:
+
+| Kind | Directory | Carries | Consumed via |
+| --- | --- | --- | --- |
+| SchemaLibrary | `schemalibrary/` | Reusable JSON Schema 2020-12 fragments | `$ref:` from a Component or Feature |
+| MappingLibrary | `mappinglibrary/` | Reusable Go template fragments | `valuesMapping: { $import: <Library>#/mappings/<entry> }` |
+| WorkloadLibrary | `workloadlibrary/` | Reusable Workload template fragments | `workload: { $import: <Library>#/workloads/<entry> }` on a Recipe |
+| ArtifactsLibrary | `artifactslibrary/` | Named artifact bundles — a set of output files imported as one unit | `artifacts.<name>: { $import: <Library>#/artifacts/<entry> }` on a Recipe or FeatureRecipe |
+
+SchemaLibrary and MappingLibrary are the baseline tier. WorkloadLibrary and
+ArtifactsLibrary are opt-in for catalogs that need cross-Recipe workload or
+artifact reuse; both accept Go templates as their only authoring mode. See the
+"Shared schema and mapping reuse" section below.
 
 ### Namespace
 
@@ -160,8 +175,8 @@ Domain 3 entities use the execution engine as the first path segment:
 ### Per-version directory layout
 
 **Every** publishable kind — Component, Feature, Provider, Aggregate, Recipe,
-FeatureRecipe, SchemaLibrary, MappingLibrary — lives in a per-version
-subdirectory:
+FeatureRecipe, SchemaLibrary, MappingLibrary, WorkloadLibrary, ArtifactsLibrary —
+lives in a per-version subdirectory:
 
 ```text
 <kind>/<namespace-or-provider>/.../<name>/<version>/<entity>.yaml
@@ -181,7 +196,7 @@ entity side by side rather than relying on git history for older versions. The
 | Plugin | `plugin.yaml` |
 | Aggregate | `aggregate.yaml` |
 | Recipe / FeatureRecipe | `recipe.yaml` (co-located `source/`, `mappings/`, `artifacts/` sit beside it inside the version dir) |
-| SchemaLibrary / MappingLibrary | `library.yaml` |
+| SchemaLibrary / MappingLibrary / WorkloadLibrary / ArtifactsLibrary | `library.yaml` |
 
 Recipe and FeatureRecipe deliberately share the `recipe.yaml` filename. The walker
 is layout-agnostic (it indexes by authored `name:version`), so this layout is an
@@ -213,6 +228,31 @@ socket-prefixed name — so the `plugin/terraform` entity is at
 and `metadata.pluginType: provider`.
 
 The `ops/` prefix is NOT used. All Recipes are Domain 3 (Ops) by definition.
+
+### Library-kind names are bare PascalCase
+
+The four library kinds — SchemaLibrary, MappingLibrary, WorkloadLibrary,
+ArtifactsLibrary — follow their own naming rule, and it differs from Components
+and Features on two counts: the name carries **no namespace prefix** (not even
+`core/`), and it is **PascalCase** while its directory segment is kebab-case.
+
+| Entity | Example filesystem path | metadata.name |
+| --- | --- | --- |
+| SchemaLibrary | `schemalibrary/base-components/1.0.0/library.yaml` | `BaseComponents` |
+| SchemaLibrary | `schemalibrary/ai-datastores/1.0.0/library.yaml` | `AIDatastores` |
+| WorkloadLibrary | `workloadlibrary/base-workloads/1.0.0/library.yaml` | `BaseWorkloads` |
+
+The directory segment is the kebab-case transliteration of the PascalCase name;
+an acronym stays fully uppercase in the name (`ai-datastores` → `AIDatastores`).
+
+The reason for the difference is that a library is referenced **by identity, not
+by location**: a consumer writes `$import: BaseWorkloads#/workloads/http-service`
+and the per-Release lockfile supplies the version. Since the reference carries no
+namespace and no registry host, a namespace prefix on the name would be
+decoration the reference could never use. Library names are therefore
+catalog-global and must be unique across every namespace publishing into the same
+consumer's closure — pick a name specific enough not to collide (`AcmeBaseWorkloads`
+rather than `Base`).
 
 ### Name shortening
 
@@ -559,6 +599,8 @@ the attached secret publishes:
 ```yaml
 spec:
   workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
     containers:
       main:
         variables:
@@ -575,6 +617,53 @@ the key. For a runnable end-to-end walkthrough, see the worked example
 [`component/example/compute/gcp-credentialed-service/`](../aggrega-catalog/component/example/compute/gcp-credentialed-service/1.0.0/component.yaml)
 and its Recipe
 [`recipe/helm/gcp-credentialed-service/`](../aggrega-catalog/recipe/helm/gcp-credentialed-service/1.0.0/recipe.yaml).
+
+### The `workload:` authoring contract
+
+Three rules govern every synthesised Recipe. Each is enforced at load or render
+time, so getting one wrong is a build failure rather than a silent difference.
+
+**1. `workload:` is a template string, never an inline map.** Author it as a block
+scalar (`workload: |`). The Recipe envelope accepts a string or a single-key
+`$import:` map, so an inline YAML map fails validation with a type error naming
+`string` as the expected shape:
+
+```yaml
+# CORRECT
+spec:
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+
+# WRONG — an inline map is rejected
+spec:
+  workload:
+    form: stateless
+```
+
+**2. The template's output must carry `apiVersion` and `kind` at its head.** The
+rendered text is parsed as a standalone Workload document, so the first two lines
+of the template are always:
+
+```yaml
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+```
+
+Omitting them fails workload validation at render. Every snippet in this document
+that shows a partial `workload:` body still requires this header in the authored
+file.
+
+**3. `provides` cannot read the workload.** `provides` is self-contained: it
+evaluates before any caller is resolved, and its template context offers only
+`.context.instance_id`, `.values`, `.infra`, `.locals`, and static text. There is
+no `.workload` in scope, so `provides.endpoint` cannot derive itself from the
+workload's endpoint. Where a Recipe needs to publish an endpoint, declare it as a
+static value or as an `.infra` / `.values` reference, and treat the workload's own
+endpoint as a separate declaration. When both express the same address, that
+duplication is a single-sourcing hazard — put the address in one `infra` or
+`values` key and have both read it, rather than repeating the literal twice.
 
 ### Presence parametrization — expose an enable-parameter per component
 
@@ -760,7 +849,153 @@ profile names) follow each project's current API and installation, which evolve
 independently of the catalog — verify them against the target cluster, per the
 note above.
 
-## 7. OCI Registry
+### Persistence, HA, active-passive and backup are options, not separate components
+
+**A user must never change component to turn on persistence, high availability,
+active-passive or backup.** A datastore with persistence enabled is still that
+datastore. These capabilities are configurable values on the single component's
+surface, realized per target by whatever mechanism that target has: a chart's HA
+options, an operator custom resource's HA spec, a cloud provider's multi-AZ flag,
+or a synthesised StatefulSet with a PersistentVolumeClaim. Splitting a component
+or recipe family by stateful-ness is an antipattern — it doubles the catalog and
+forces a deployment to re-author its topology to change an operational setting.
+
+Two consequences for authors:
+
+- **Where enabling persistence flips the controller shape** between a stateless
+  and a stateful workload, drive `form` from the persistence value rather than
+  forking the recipe:
+
+  ```yaml
+  form: "{{ if .values.persistence.enabled }}stateful{{ else }}stateless{{ end }}"
+  ```
+
+  `form` is normalized and validated after template rendering, so a template that
+  resolves to a legal form value is accepted. Prove the conditional end to end
+  before a component leans on it: a persistence-on build must render the stateful
+  shape and a persistence-off build the stateless one, both byte-identical across
+  repeated runs.
+
+- **A stateful form needs its governing Service declared.** The engine never
+  auto-generates a headless Service, so the branch that resolves to
+  `form: stateful` must always declare the headless Service alongside it.
+
+This rule also settles a trap worth naming: a knob a component's surface exposes
+must **do something** on every target that component ships. A value that is
+declared, validated and then silently dropped on one target is a defect, not a
+gap — either realize it for that target per the target's own pattern, or do not
+expose it for that target at all.
+
+### The datastore family template
+
+Every datastore component targets the same shape, distilled from the PostgreSQL
+exemplar. A new family member is authored against this template rather than by
+copying whichever sibling happens to be nearest.
+
+- **`values`** — the engine-specific subset of logical bootstrap names plus engine
+  configuration, each key carrying a `description` and a sensible default so a bare
+  deployment renders unchanged: the logical `database`, `user` (or `app_user` where
+  an application-role split applies), `encoding` / `locale`, `init_scripts` (an
+  object whose values are strings), and `custom_config` for a raw configuration
+  block. Plus the persistence, HA and backup toggles as configurable knobs, per the
+  rule above, wherever the engine has them.
+- **`infra`** — `port`, `engine_version`, `compute.{cpu,memory}`, and for stateful
+  engines `storage.{size,type}`; `ha.{enabled,read_replicas}`;
+  `backup.{enabled,retention_days}`; and `overrides` as the open bag for the
+  operational side.
+- **`provides`** — `host` and `port` are required; `user`, `database` and
+  `protocol` are declared **only where the engine has the concept**. Redis, Valkey
+  and Memcached have no user or database — do not invent them to make the family
+  look uniform.
+- **`secretsSchema`** — an optional transparent `password` slot carrying an inline
+  development default when nothing is attached, so an unattached deployment stays
+  byte-identical to its pre-slot output; plus an optional `app_user_password` where
+  the application-role split applies.
+- **Realizations** — helm synthesis (the workload `form`, a PersistentVolumeClaim
+  and a headless Service for stateful engines), compose for local development, and
+  the managed cloud equivalents where one exists, with HA and backup honored there
+  through the provider's native flags rather than re-implemented.
+- **Output labels** — declare the hosting label through `spec.outputLabels` per the
+  label conventions above.
+
+## 7. Feature Pattern
+
+Features are how the operational ecosystem *wraps* a workload, and the Feature
+track is co-equal with the component track rather than an afterthought. A Feature
+attaches to any workload by selector, is authored once, and is reused across every
+component it matches. That is what keeps each component's own surface at a
+service-specific few dozen values instead of accumulating a dial for every
+operational concern.
+
+### Component installs the machinery; Feature attaches the resource
+
+The distinction to hold, because it decides which kind you are authoring:
+
+- Installing a controller or operator — cert-manager, ingress-nginx,
+  external-secrets — is a **component**, usually a source-input helm recipe.
+- The per-workload resource that controller reconciles — a `Certificate` for this
+  workload, an `Ingress` or `HTTPRoute` for this workload, a `ServiceMonitor` for
+  this workload, an `ExternalSecret` for this workload — is a **Feature**.
+
+A runtime guardrail or gateway binding to a node is a Feature (or its annotation
+shortcut), **not** a `uses` edge. A `uses` edge is dumb string-routing between
+components that already exist; a guardrail is new runtime configuration to attach,
+which is exactly what a Feature is for.
+
+### The Feature taxonomy
+
+- **secrets management** — external-secrets-operator, sealed-secrets, vault
+  injector, secrets-store CSI
+- **sidecars** — generic, logging and proxy injection
+- **service meshes** — Istio, Linkerd
+- **load balancers and ingresses** — ingress-nginx, Contour, Traefik, Gateway API,
+  cloud load balancers
+- **TLS and certificates** — cert-manager Issuer and Certificate
+- **network policies** — NetworkPolicy, Cilium
+- **runtime policies** — Kyverno, OPA Gatekeeper
+- **runtime AI controls** — prompt and response guardrails, PII filters,
+  rate limiting, model firewalls
+- **autoscaling** — HPA, VPA, KEDA
+- **availability** — PodDisruptionBudget, priorityClass
+- **observability** — ServiceMonitor and PodMonitor, OpenTelemetry collector or
+  sidecar, dashboards
+- **backup** — cluster backup tooling, database backup custom resources
+- **RBAC**, and storage or volume snapshots
+
+### Authoring tiers
+
+The tiers order the taxonomy by what unblocks a production deployment soonest.
+They are an authoring priority, not a dependency graph — a catalog may author any
+Feature at any time.
+
+| Tier | Scope | Members |
+| --- | --- | --- |
+| 1 | The production floor every real service needs | TLS and certificates; ingress or load balancer; observability; secrets management |
+| 2 | Availability and scale | autoscaling; PodDisruptionBudget and priorityClass; network policy |
+| 3 | Advanced operations | backup; RBAC beyond a ServiceAccount; sidecars; service mesh |
+| 4 | Runtime AI controls | prompt and response guardrails; PII filters; rate limiting; model firewalls |
+
+Tier 1 is the highest-leverage Feature work for any catalog, because it is the
+wrap a shipped component needs before it is production-grade.
+
+### Two realization realms for policy — and why guardrails are Features
+
+Two realms, never conflated:
+
+- **Compiler policy is the governance socket.** It runs ahead of time, inside the
+  compilation pipeline, as a verdict or transform over the compiler's graph or
+  rendered output. It regulates what the compiler may *produce*.
+- **A runtime guardrail is a Feature.** It is rendered, deployed, and then active
+  at runtime on the workload — filtering what a user may ask a model, or what the
+  model may answer. It may emit a custom resource a controller reconciles, inject a
+  sidecar, or call an external service.
+
+The boundary is where the thing acts: pipeline and output for the first, output
+and runtime for the second. This is why the runtime AI-control tier above, and
+operator-driven custom resources generally, are Features and artifacts rather than
+workload dials or edges.
+
+## 8. OCI Registry
 
 The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
 
