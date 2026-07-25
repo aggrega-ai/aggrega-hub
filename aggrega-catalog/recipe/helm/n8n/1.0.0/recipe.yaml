@@ -13,9 +13,17 @@ metadata:
     Service. When a workflow definition is supplied, a flow ConfigMap carries it
     and an init container seeds it into the platform on start via
     `n8n import:workflow`; with no definition the platform deploys empty and the
-    ConfigMap and init step are omitted byte-identically. The model endpoint wired
-    into the `model` socket is injected as OPENAI_BASE_URL and an attached model
-    API key as OPENAI_API_KEY, both read by workflow expressions via n8n's $env.
+    ConfigMap and init step are omitted byte-identically. On this target the
+    supplied definition is the source of truth for the workflow and the platform's
+    data directory is derived from it: the directory is a scratch volume that does
+    not survive a restart, and the workflow returns because the init container
+    re-imports it, not because it was stored. Everything else authored in the
+    editor — further workflows, and the credentials entered there — lives only in
+    that scratch directory and does not survive a restart. Author the workflow as
+    a supplied definition rather than in the editor when it needs to outlive the
+    pod. The model endpoint wired into the `model` socket is injected as
+    OPENAI_BASE_URL and an attached model API key as OPENAI_API_KEY, both read by
+    workflow expressions via n8n's $env.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -37,6 +45,8 @@ spec:
       {{ .infra.flow_definition | indent 6 }}
       {{- end }}
   workload: |
+    {{- $dataPath := "/home/node/.n8n" -}}
+    {{- $seedPath := "/flows" -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     form: stateless
@@ -45,20 +55,28 @@ spec:
     # Seed the supplied workflow before the platform starts. The init container
     # imports the flow from the mounted ConfigMap into the n8n data directory the
     # main container serves from (both mount the shared data volume).
+    # $seedPath is the single authored home for the seed directory: the import
+    # argument and the mount that puts the file there both read it, so a future
+    # move cannot relocate one and leave the other pointing at the old path.
     initContainers:
       - name: import-flow
         image: "{{ .infra.image }}"
         command: ["n8n"]
-        args: ["import:workflow", "--input=/flows/workflow.json"]
+        args: ["import:workflow", "--input={{ $seedPath }}/workflow.json"]
         volumeMounts:
           - name: data
-            path: /home/node/.n8n
+            path: {{ $dataPath }}
           - name: flow
-            path: /flows
+            path: {{ $seedPath }}
     {{- end }}
     containers:
       main:
         image: "{{ .infra.image }}"
+        # $dataPath is the single authored home for the platform's data
+        # directory. Both this container's mount and the seeding init container's
+        # mount read the binding — they have to name the same directory for an
+        # imported workflow to be visible to the platform — so a future move
+        # cannot relocate one and leave the other behind.
         # The model endpoint arrives on the `model` uses-edge; the recipe ranges
         # the outbound edges and matches on the socket name, then reads the model
         # recipe's published endpoint and model name. n8n workflow expressions read
@@ -82,9 +100,13 @@ spec:
           http: 5678
         volumeMounts:
           - name: data
-            path: /home/node/.n8n
+            path: {{ $dataPath }}
     volumes:
       data:
+        # A scratch volume by design on this target: the supplied definition is
+        # the source of truth for the workflow and the init container re-imports
+        # it on every start, so the data directory is derived rather than
+        # authoritative. State authored in the editor does not survive here.
         ephemeral: {}
     {{- if .infra.flow_definition }}
       flow:
