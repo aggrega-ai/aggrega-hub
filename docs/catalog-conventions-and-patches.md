@@ -457,7 +457,7 @@ for those targets.
 ### Optional credential slots for self-managed datastores
 
 A self-managed datastore Component declares its password as an **optional**
-credential slot in `spec.secretsSchema`, and its Recipes wire that slot
+credential slot in `spec.featuresSchema`, and its Recipes wire that slot
 **conditionally** — the credential subsystem when a credential is attached, an
 inline development default when none is. This keeps the slot non-breaking: a
 deployment that attaches no credential still renders and runs, byte-identically
@@ -471,7 +471,7 @@ referenceable credential may fill it per provider:
 
 ```yaml
 spec:
-  secretsSchema:
+  featuresSchema:
     password:
       selector: "feature.aggrega.ai/kind=secret"
       inject: [env]
@@ -525,7 +525,7 @@ Secret carrying the caller-named keys (e.g. `<engine>-root-password` and
 
 ```yaml
 spec:
-  secretsSchema:
+  featuresSchema:
     root_password:
       required: true
       inject: []          # Black-Box — the Recipe controls delivery
@@ -556,7 +556,7 @@ subsection):
 
 ```yaml
 spec:
-  secretsSchema:
+  featuresSchema:
     password:
       selector: "feature.aggrega.ai/kind=secret"
       inject: [env]
@@ -586,7 +586,7 @@ The consumer Component declares a secret slot that allowlists the file mount:
 
 ```yaml
 spec:
-  secretsSchema:
+  featuresSchema:
     gcp_key:
       required: true
       inject: [file]     # the slot permits the Recipe's `as: file` mount
@@ -907,7 +907,7 @@ copying whichever sibling happens to be nearest.
   `protocol` are declared **only where the engine has the concept**. Redis, Valkey
   and Memcached have no user or database — do not invent them to make the family
   look uniform.
-- **`secretsSchema`** — an optional transparent `password` slot carrying an inline
+- **`featuresSchema`** — an optional transparent `password` slot carrying an inline
   development default when nothing is attached, so an unattached deployment stays
   byte-identical to its pre-slot output; plus an optional `app_user_password` where
   the application-role split applies.
