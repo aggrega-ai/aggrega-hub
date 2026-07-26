@@ -434,6 +434,33 @@ spec:
     ...
 ```
 
+### Target-expected names are the Recipe's translation
+
+A Component publishes a value once, under the name that reads best on Aggrega's
+own surface — `model`, `host`, `endpoint`. The target that consumes it rarely
+expects that spelling: one agent framework resolves its model name from `MODEL`,
+another from `OPENAI_CHAT_MODEL_ID`, a third reads no model variable at all.
+Mapping the one published value onto whatever spelling the target expects is the
+Recipe's job, and it belongs nowhere else. A Recipe therefore states, in the
+comment block around the environment map it renders, which variable its target
+reads and why that one — and where a target's own documentation names several
+aliases, it delivers the documented-canonical one rather than carrying a second
+variable for insurance.
+
+This is not a naming fracture. One concept keeps one name on the surface Aggrega
+defines — the keys authored in an Aggregate, the values a Component publishes,
+the diagnostic codes and CLI flags a user reads. A third party's
+environment-variable spelling is not that surface; it is the target's, and no
+convention here can change it. The Component publishes one `model`, and each
+Recipe translates it, exactly as every Recipe already translates an attached
+credential into `OPENAI_API_KEY`.
+
+Where a target reads no variable for the value at all, the Recipe still delivers
+it under a stable name for the application's own code to read, and says so. A
+value with a named consumer is not an inert declaration, even when the framework
+itself is not the consumer; what makes it inert is nothing reading it, and that is
+the claim a Recipe's comment has to get right.
+
 ### Managed-service credentials
 
 For Recipes targeting cloud-managed services (AWS RDS, Azure Database, GCP
