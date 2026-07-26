@@ -464,18 +464,40 @@ the claim a Recipe's comment has to get right.
 ### Managed-service credentials
 
 For Recipes targeting cloud-managed services (AWS RDS, Azure Database, GCP
-Cloud SQL, etc.), prefer the provider's native managed-secret flag over an
-Aggrega credential FeatureRecipe. Terraform Recipes for RDS set
+Cloud SQL, etc.), prefer the provider's native managed-secret flag over a
+credential FeatureRecipe that *renders* a secret. Terraform Recipes for RDS set
 `manage_master_user_password = true` so RDS auto-manages the password via AWS
 Secrets Manager; CloudFormation Recipes set `ManageMasterUserPassword: true`
 for the same effect. The cloud provider already owns the password lifecycle,
-and introducing an Aggrega credential FeatureRecipe alongside duplicates that
-lifecycle and adds synchronization risk.
+and a FeatureRecipe that renders a secret beside it duplicates that lifecycle
+and adds synchronization risk.
+
+Preferring the native flag does not mean leaving the credential slot unbound.
+Where the Component declares that slot with `required: true`, nothing binding it
+halts the build — so "do not attach a credential here" is not an option the
+deployment has. The form that binds the slot without reintroducing a second
+lifecycle is `core/generated-secret`, the credential Feature that states the
+target engine owns the material. Its FeatureRecipes are pure wiring: each
+declares only the capability it binds to and the Feature it implements, and
+renders nothing. A deployment that binds the slot this way emits output
+byte-identical to the same deployment with no attachment at all — the slot is
+satisfied, and no second secret exists to drift out of step.
+
+The standard library ships that wiring for both managed-database capabilities:
+[`feature-recipe/terraform/generated-secret`](../aggrega-catalog/feature-recipe/terraform/generated-secret/1.0.0/recipe.yaml)
+and
+[`feature-recipe/cloudformation/generated-secret`](../aggrega-catalog/feature-recipe/cloudformation/generated-secret/1.0.0/recipe.yaml).
+Both carry the FeatureRecipe name `generated-secret`, so a Manifest must
+reference the intended one **provider-qualified** —
+`terraform/generated-secret:1.0.0`, not `generated-secret:1.0.0`. A bare name
+resolves only when exactly one capability in the catalog carries it; with two
+carrying this one, a bare reference matches both, resolves to neither, and the
+attachment is reported unmapped when the build checks resolution completeness.
 
 The canonical examples are
-[`recipe/terraform/mariadb-rds/recipe.yaml`](../aggrega-catalog/recipe/terraform/mariadb-rds/recipe.yaml)
+[`recipe/terraform/mariadb-rds/recipe.yaml`](../aggrega-catalog/recipe/terraform/mariadb-rds/1.0.0/recipe.yaml)
 and
-[`recipe/cloudformation/mariadb-rds/recipe.yaml`](../aggrega-catalog/recipe/cloudformation/mariadb-rds/recipe.yaml).
+[`recipe/cloudformation/mariadb-rds/recipe.yaml`](../aggrega-catalog/recipe/cloudformation/mariadb-rds/1.0.0/recipe.yaml).
 This guidance applies to managed services only — Recipes targeting
 self-managed datastores (Helm Bitnami chart, Compose container) still use the
 credential FeatureRecipe path because no upstream managed-secret flag exists
