@@ -478,9 +478,9 @@ spec:
 ```
 
 Each Recipe guards the credential wiring with a presence test on the slot. The
-live `secrets` pillar is **absent** (not an empty map) when nothing is attached,
-so coerce it before the key test: `hasKey (default dict .secrets) "<slot>"`. The
-helm Recipe renders an env `secretKeyRef` via `containers.<n>.secrets` when
+live `features` pillar is **absent** (not an empty map) when nothing is attached,
+so coerce it before the key test: `hasKey (default dict .features) "<slot>"`. The
+helm Recipe renders an env `secretKeyRef` via `containers.<n>.attachments` when
 attached (a referenceable credential); the compose Recipe reads the value its
 credential delivers on the inject pipe (an inject-value credential). When
 unattached, both fall back to the inline default:
@@ -488,11 +488,11 @@ unattached, both fall back to the inline default:
 ```gotemplate
 variables:
   DB_USER: appuser
-{{- if not (hasKey (default dict .secrets) "password") }}
+{{- if not (hasKey (default dict .features) "password") }}
   DB_PASSWORD: devdefault
 {{- end }}
-{{- if hasKey (default dict .secrets) "password" }}
-secrets:
+{{- if hasKey (default dict .features) "password" }}
+attachments:
   DB_PASSWORD:
     from: password
     as: env
@@ -521,7 +521,7 @@ transparent `user_password` slot. A multi-key credential producer — the
 `referenced-secret-set` Feature via the `k8s-secret-set` FeatureRecipe — emits one
 Secret carrying the caller-named keys (e.g. `<engine>-root-password` and
 `<engine>-password`), and the chart reads it through `auth.existingSecret` bound to
-`{{ .secrets.root_password.provides.name }}`:
+`{{ .features.root_password.provides.name }}`:
 
 ```yaml
 spec:
@@ -540,7 +540,7 @@ Secret name — the shape a Model-A Recipe's `valuesMapping` takes:
 spec:
   valuesMapping: |
     auth:
-      existingSecret: "{{ .secrets.root_password.provides.name }}"
+      existingSecret: "{{ .features.root_password.provides.name }}"
 ```
 
 For a runnable end-to-end walkthrough of this model, see
@@ -604,8 +604,8 @@ spec:
     containers:
       main:
         variables:
-          GOOGLE_APPLICATION_CREDENTIALS: "/var/secrets/google/{{ .secrets.gcp_key.provides.key }}"
-        secrets:
+          GOOGLE_APPLICATION_CREDENTIALS: "/var/secrets/google/{{ .features.gcp_key.provides.key }}"
+        attachments:
           gcp-service-account-key:
             from: gcp_key
             as: file
