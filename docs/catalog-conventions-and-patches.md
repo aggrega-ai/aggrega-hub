@@ -216,8 +216,9 @@ the `<version>/` segment:
 | Recipe | `recipe/helm/postgres/1.0.0/recipe.yaml` | `postgres` |
 | FeatureRecipe | `feature-recipe/helm/k8s-dns-patcher/1.0.0/recipe.yaml` | `k8s-dns-patcher` |
 
-Recipes and FeatureRecipes do NOT include namespace or provider in their name —
-the provider is already the parent directory and `spec.provider` field.
+Recipes and FeatureRecipes do NOT include namespace or capability in their name —
+the capability is the `spec.capability` field, which the parent directory mirrors
+by convention.
 
 Plugins are the one exception to the "`metadata.name` equals the path segments"
 rule: a Plugin's `metadata.name` is **bare** and its socket lives in
