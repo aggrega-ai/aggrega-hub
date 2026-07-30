@@ -165,7 +165,14 @@ component whose Recipes span multiple values of that axis: rather than dropping
 the label or splitting the component, carry `mixed` to state honestly that the
 axis is realization-dependent. Because hosting is a selection concern — read
 from *which* Recipe renders — it belongs on component identity, not on rendered
-output; do not stamp it via `spec.outputLabels`.
+output: `component.aggrega.ai/hosting` is a `metadata.labels` key and never a
+`spec.outputLabels` key. Like the value set, that is convention rather than
+enforcement — the reserved-namespace rule on output labels covers the bare
+`aggrega.ai/` keyspace, not the `component.aggrega.ai/` identity keys, so
+nothing stops a Recipe from stamping the identity label except the author not
+doing it. A Recipe that wants the posture of *its own* realization visible on
+the emitted objects declares its own output-label key for that realization
+trait, which is a separate, Recipe-owned surface.
 
 ### Recipe/FeatureRecipe Provider Namespace
 
@@ -965,8 +972,14 @@ copying whichever sibling happens to be nearest.
   and a headless Service for stateful engines), compose for local development, and
   the managed cloud equivalents where one exists, with HA and backup honored there
   through the provider's native flags rather than re-implemented.
-- **Output labels** — declare the hosting label through `spec.outputLabels` per the
-  label conventions above.
+- **Identity labels** — the component's `metadata.labels` carries all three label
+  axes: `component.aggrega.ai/type`, `component.aggrega.ai/category: datastore`,
+  and the family's capability label `datastore.aggrega.ai/engine` where the engine
+  has a discriminating value. Plus `component.aggrega.ai/hosting` per the hosting
+  rule above — a single posture where every Recipe of the member shares one,
+  `mixed` where the member is realized both self-hosted (helm, compose) and
+  managed (the Terraform/CloudFormation equivalents). These are selector-only
+  identity; the family's Recipes do not stamp them onto rendered output.
 
 ## 7. Feature Pattern
 
