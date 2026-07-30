@@ -174,6 +174,98 @@ doing it. A Recipe that wants the posture of *its own* realization visible on
 the emitted objects declares its own output-label key for that realization
 trait, which is a separate, Recipe-owned surface.
 
+### The `component.aggrega.ai/upstream-licensing` label
+
+`component.aggrega.ai/upstream-licensing` records the licensing class of the
+**product or service the Component wraps** — the third-party software a
+deployment actually runs or calls. Like `hosting` it is a **cross-cutter**: the
+same values describe a datastore engine, a hosted model API and an agent
+framework alike, so it lives under the shared `component.aggrega.ai/` namespace
+rather than under any one category's `<role>.aggrega.ai/` capability namespace.
+
+**It is a different field from `metadata.license`, and the two routinely
+disagree.** `metadata.license` is the licence of **the entity itself** — the
+catalog YAML published from this repository, permissive throughout.
+`upstream-licensing` is the licensing class of **the thing that entity
+describes**. The standard library carries the combination that makes the
+distinction load-bearing: a permissively-licensed Recipe whose workload pins a
+vendor-licensed inference image. Neither field can be derived from the other, so
+both are stated, and `metadata.license` is never widened to carry the second
+meaning — a reader filtering on it would otherwise be reading the catalog's own
+licence and drawing a conclusion about the software they are about to run.
+
+The value set is a closed, single-valued standard-library convention (the
+compiler is blind to it, as it is to every label):
+
+- **`osi-approved`** — the wrapped product is published under an OSI-approved
+  licence, and that licence covers the artifact a deployment runs.
+- **`open-core`** — the wrapped product's core is published under an
+  OSI-approved licence while a named subtree or edition is not, so which terms
+  apply depends on which part a deployment uses.
+- **`source-available`** — the source is published under terms that are not
+  OSI-approved and that restrict use, redistribution or hosting.
+- **`proprietary`** — no source licence is granted to the user. The relationship
+  is a vendor agreement: a hosted service the user contracts for, or a
+  distributed artifact under the vendor's own terms.
+- **`not-applicable`** — the Component wraps no single third-party product, so
+  there is nothing to classify. Protocol shims that reach any implementation of
+  an interface, abstract bases, and the generic compute primitives are this case.
+
+Absence of the label means **not yet classified** — never "nothing to state",
+which is `not-applicable`. Every `core/` Component naming a third-party product
+carries a value; like the rest of the label scheme the field is convention, not
+schema enforcement.
+
+**It composes with `hosting` rather than duplicating it.** Licensing says what
+terms cover the software; hosting says who operates it. A hosted model API is
+`hosting: managed` plus `upstream-licensing: proprietary` — proprietary software
+the user never possesses. A vendor-licensed inference image run in-cluster is
+`hosting: self-hosted` plus that same licensing value, and it is a materially
+different obligation: the user must themselves be entitled to pull and run the
+artifact. Reading either label alone loses that distinction, which is why
+licensing is not folded into the hosting value set.
+
+### What the standard library may wrap
+
+The `core/` catalog applies one admission test to a Component before it is
+authored, and the test is about **redistribution and brokerage** rather than
+about the wrapped product's licence in the abstract:
+
+> Does authoring this entity put the catalog in the position of distributing, or
+> brokering access to, software whose terms do not permit that?
+
+It is answered by inspecting each artifact the entity **pins** — every image
+reference, chart reference and module source the catalog itself names — and the
+answer is taken **per layer**: a permissive packaging artifact never settles the
+software it packages, and where the two differ the packaged software governs.
+
+- A pinned artifact must be obtainable and runnable by any reader on the
+  artifact's own published terms, with no agreement the catalog would be a party
+  to. `osi-approved` passes; `open-core` passes where the pinned artifact is the
+  open core; `source-available` passes only where the pinned artifact's terms
+  permit a reader to run it.
+- **A service a deployment merely calls is not a pinned artifact.** Where the
+  entity pins nothing and its Recipes only wire a deployment to a service the
+  reader contracts for directly — the reference realization of a hosted API — the
+  test does not apply, and the entity is admitted whatever the service's own
+  terms are. That relationship is between the user and the provider; the catalog
+  neither distributes nor resells it.
+- **An artifact the deployment supplies is not pinned either.** A Recipe whose
+  image comes from a required `infra` value with no catalog-authored default
+  names nothing, so the reader supplies an artifact they already hold the right
+  to run.
+
+The two failing shapes are therefore narrow and specific: a pinned artifact under
+terms that forbid a reader running it without a separate agreement, and a pinned
+packaging artifact whose packaged software carries such terms even though the
+packaging itself is permissive.
+
+Admission and disclosure are separate acts. Whatever the verdict, the wrapped
+product's licensing class is recorded through
+`component.aggrega.ai/upstream-licensing`: passing the test is not a claim that
+the wrapped product is open source, and a reader filtering on the label can still
+exclude what their own policy forbids.
+
 ### Recipe/FeatureRecipe Provider Namespace
 
 Domain 3 entities use the execution engine as the first path segment:
