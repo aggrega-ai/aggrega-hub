@@ -142,13 +142,15 @@ marker_advance() {
 }
 # -----------------------------------------------------------------------------
 
-# The eight publishable entity kinds. Manifest / Release are deployment-side and
-# never published; Plugin (provider .wasm) is deliberately excluded here — this
-# is an entities-only publisher. A YAML with no `kind:` (recipe fragments,
-# source/ files) is skipped.
+# The eight entity kinds this publisher pushes — not the complete set of kinds
+# `aggrega push` addresses. Manifest / Release are deployment-side and never
+# published; Plugin (provider .wasm) is deliberately excluded here — this is an
+# entities-only publisher. ArtifactsLibrary is outside the set too: whether that
+# kind is published at all is unsettled, so it is left out rather than silently
+# swept in. A YAML with no `kind:` (recipe fragments, source/ files) is skipped.
 is_publishable() {
   case "$1" in
-    Component|Feature|Provider|Aggregate|Recipe|FeatureRecipe|SchemaLibrary|MappingLibrary) return 0 ;;
+    Component|Feature|Aggregate|Recipe|FeatureRecipe|SchemaLibrary|MappingLibrary|WorkloadLibrary) return 0 ;;
     *) return 1 ;;
   esac
 }
