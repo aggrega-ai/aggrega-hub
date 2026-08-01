@@ -5,7 +5,7 @@
 # Fails loudly when the pinned tooling image speaks a different plugin ABI
 # version than this repository is authored against. The publish workflow runs
 # inside the pinned tooling image, so the `aggrega` on PATH is that image's own
-# binary and its `aggrega version --json` abiVersion is exactly the pinned
+# binary and its `aggrega version -o json` abiVersion is exactly the pinned
 # image's ABI. That actual value is compared against the ABI this repository
 # expects (EXPECTED_ABI_VERSION — a single reviewed value in the publish
 # workflow).
@@ -36,8 +36,8 @@ fi
 # it for local testing without the image on PATH.
 actual="${ACTUAL_ABI_VERSION:-}"
 if [ -z "$actual" ]; then
-  if ! json="$(aggrega version --json)"; then
-    echo "check-tooling-abi: could not read 'aggrega version --json'." >&2
+  if ! json="$(aggrega version -o json)"; then
+    echo "check-tooling-abi: could not read 'aggrega version -o json'." >&2
     exit 2
   fi
   # The CLI emits compact JSON; extract the abiVersion string field. The `|| true`

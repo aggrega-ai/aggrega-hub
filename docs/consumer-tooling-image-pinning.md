@@ -34,7 +34,7 @@ custom matcher is required to track it.
 ### 3. A plugin-ABI compatibility gate
 
 The publish workflow carries a gate step that runs early, inside the pinned
-image. It reads the image's own reported ABI version — `aggrega version --json`
+image. It reads the image's own reported ABI version — `aggrega version -o json`
 reports it, and the image also exposes it as the `ai.aggrega.abi-version`
 manifest label for a registry-level read — and compares it against the ABI
 version this repository is authored against, held as a single reviewed value in
