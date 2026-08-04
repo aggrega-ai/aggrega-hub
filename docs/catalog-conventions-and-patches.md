@@ -11,11 +11,11 @@ URI segments map 1:1 to filesystem path segments. The compiler resolves
 
 ```text
 aggrega-catalog/
-├── component/{namespace}/{category}/{name}.yaml
-├── feature/{namespace}/{name}.yaml
+├── component/{publisher}/{category}/{name}.yaml
+├── feature/{publisher}/{name}.yaml
 ├── recipe/{provider}/{name}/recipe.yaml
 ├── feature-recipe/{provider}/{name}/recipe.yaml
-├── aggregate/{namespace}/{name}/aggregate.yaml
+├── aggregate/{publisher}/{name}/aggregate.yaml
 ├── schemalibrary/{name}.yaml
 ├── mappinglibrary/{name}.yaml
 ├── workloadlibrary/{name}.yaml
@@ -37,12 +37,12 @@ ArtifactsLibrary are opt-in for catalogs that need cross-Recipe workload or
 artifact reuse; both accept Go templates as their only authoring mode. See the
 "Shared schema and mapping reuse" section below.
 
-### Namespace
+### Publisher
 
 The first path segment after the entity type. Identifies the vendor/author.
 
 - `core` — official Aggrega standard library (maintained by Cognitio S.r.l.)
-- Third-party namespaces: use your organization name (e.g., `acme`, `enterprise`)
+- Third-party publishers: use your organization name (e.g., `acme`, `enterprise`)
 
 ### Component Categories
 
@@ -82,7 +82,7 @@ Directory-presence discipline:
 - **Sub-grouping below the top level is free.** `datastore/relational/…`
   is permitted filesystem tidiness as a category grows; the category
   label never reflects sub-segments.
-- **Enterprise Exception.** Third-party namespaces may organize their
+- **Enterprise Exception.** Third-party publishers may organize their
   trees however they choose; the conventions bind the `core/` standard
   library, and the linter rule is opt-out per workspace.
 
@@ -266,7 +266,7 @@ product's licensing class is recorded through
 the wrapped product is open source, and a reader filtering on the label can still
 exclude what their own policy forbids.
 
-### Recipe/FeatureRecipe Provider Namespace
+### Recipe/FeatureRecipe Provider Segment
 
 Domain 3 entities use the execution engine as the first path segment:
 `helm`, `terraform`, `cloudformation`, `compose`, `eval`.
@@ -278,7 +278,7 @@ FeatureRecipe, SchemaLibrary, MappingLibrary, WorkloadLibrary, ArtifactsLibrary 
 lives in a per-version subdirectory:
 
 ```text
-<kind>/<namespace-or-provider>/.../<name>/<version>/<entity>.yaml
+<kind>/<publisher-or-provider>/.../<name>/<version>/<entity>.yaml
 ```
 
 The `<version>` directory segment MUST equal the entity's `metadata.version`; the
@@ -315,7 +315,7 @@ the `<version>/` segment:
 | Recipe | `recipe/helm/postgres/1.0.0/recipe.yaml` | `postgres` |
 | FeatureRecipe | `feature-recipe/helm/k8s-dns-patcher/1.0.0/recipe.yaml` | `k8s-dns-patcher` |
 
-Recipes and FeatureRecipes do NOT include namespace or capability in their name —
+Recipes and FeatureRecipes do NOT include a publisher or capability in their name —
 the capability is the `spec.capability` field, which the parent directory mirrors
 by convention.
 
@@ -333,7 +333,7 @@ The `ops/` prefix is NOT used. All Recipes are Domain 3 (Ops) by definition.
 
 The four library kinds — SchemaLibrary, MappingLibrary, WorkloadLibrary,
 ArtifactsLibrary — follow their own naming rule, and it differs from Components
-and Features on two counts: the name carries **no namespace prefix** (not even
+and Features on two counts: the name carries **no publisher prefix** (not even
 `core/`), and it is **PascalCase** while its directory segment is kebab-case.
 
 | Entity | Example filesystem path | metadata.name |
@@ -348,9 +348,9 @@ an acronym stays fully uppercase in the name (`ai-datastores` → `AIDatastores`
 The reason for the difference is that a library is referenced **by identity, not
 by location**: a consumer writes `$import: BaseWorkloads#/workloads/http-service`
 and the per-Release lockfile supplies the version. Since the reference carries no
-namespace and no registry host, a namespace prefix on the name would be
+publisher and no registry host, a publisher prefix on the name would be
 decoration the reference could never use. Library names are therefore
-catalog-global and must be unique across every namespace publishing into the same
+catalog-global and must be unique across every publisher publishing into the same
 consumer's closure — pick a name specific enough not to collide (`AcmeBaseWorkloads`
 rather than `Base`).
 
