@@ -151,23 +151,25 @@ marker_advance() {
 # push` addresses neither. A YAML with no `kind:` (recipe fragments, source/
 # files) is skipped.
 #
-# WHY THIS IS A COPY, AND WHY IT STAYS ONE. The authoritative statement of which
-# kinds are publishable lives in the CLI, next to the OCI transport that resolves
-# each kind's mediatype and the bundler that packs it. Every other home should
-# read that one rather than restate it — but this script cannot. It is shell, it
-# cannot import Go, and it must keep working from a standalone checkout of this
-# repository that carries no CLI source tree at all. Nor can it ask the binary:
-# no subcommand or flag reports the publishable-kind set, and the nearest thing
-# (`aggrega get-schema --list`) answers a different question — it enumerates
-# schemas, including deployment-side kinds and the plugin socket contracts, so no
-# filter over it yields this answer.
+# WHY THIS IS A COPY. The authoritative statement of which kinds are publishable
+# lives in the CLI, next to the OCI transport that resolves each kind's mediatype
+# and the bundler that packs it. Every other home should read that one rather than
+# restate it. This script cannot read it directly: it is shell, it cannot import
+# Go, and it must keep working from a standalone checkout of this repository that
+# carries no CLI source tree at all. It could ask the binary instead — `aggrega
+# push --list-kinds` reports the set, one kind per line, sorted and undecorated —
+# and whether this publisher should is an open call rather than a settled no.
+# Note that `aggrega get-schema --list` is not that route: it enumerates schemas,
+# including deployment-side kinds and the plugin socket contracts, so no filter
+# over it yields this answer.
 #
-# So the duplication is structural, not laziness, and it must not be "unified"
-# by someone reading this later. What holds two such homes in step is a
-# cross-side comparison of the two sets, run as a build gate above both
-# repositories — the same rung the platform's annotation reservation register
-# uses for the same reason, where a lint rule compiled into a Wasm guest and a
-# public documentation page cannot be generated from each other either.
+# What is settled is that this copy cannot be GENERATED from the authoritative
+# one, in either direction, so it must not be "unified" that way by someone
+# reading this later. What holds two such homes in step is a cross-side
+# comparison of the two sets, run as a build gate above both repositories — the
+# same rung the platform's annotation reservation register uses for the same
+# reason, where a lint rule compiled into a Wasm guest and a public documentation
+# page cannot be generated from each other either.
 #
 # THAT GATE NOW EXISTS: check-publishable-kind-parity.sh, which runs from the
 # combined development workspace holding this repository and the CLI side by side,
