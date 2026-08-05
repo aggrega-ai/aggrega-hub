@@ -142,15 +142,53 @@ marker_advance() {
 }
 # -----------------------------------------------------------------------------
 
-# The eight entity kinds this publisher pushes — not the complete set of kinds
-# `aggrega push` addresses. Manifest / Release are deployment-side and never
-# published; Plugin (provider .wasm) is deliberately excluded here — this is an
-# entities-only publisher. ArtifactsLibrary is outside the set too: whether that
-# kind is published at all is unsettled, so it is left out rather than silently
-# swept in. A YAML with no `kind:` (recipe fragments, source/ files) is skipped.
+# --- The publishable-entity-kind set: a SECOND home, deliberately -------------
+# The entity kinds this publisher pushes. It is every kind `aggrega push`
+# addresses except Plugin, which is outside the set because this is an
+# entities-only publisher: a Plugin's .wasm is a separate artifact with its own
+# mediatype and its own publish path. Manifest / Release are not in the set
+# either, but for a different reason — they are deployment-side and `aggrega
+# push` addresses neither. A YAML with no `kind:` (recipe fragments, source/
+# files) is skipped.
+#
+# WHY THIS IS A COPY, AND WHY IT STAYS ONE. The authoritative statement of which
+# kinds are publishable lives in the CLI, next to the OCI transport that resolves
+# each kind's mediatype and the bundler that packs it. Every other home should
+# read that one rather than restate it — but this script cannot. It is shell, it
+# cannot import Go, and it must keep working from a standalone checkout of this
+# repository that carries no CLI source tree at all. Nor can it ask the binary:
+# no subcommand or flag reports the publishable-kind set, and the nearest thing
+# (`aggrega get-schema --list`) answers a different question — it enumerates
+# schemas, including deployment-side kinds and the plugin socket contracts, so no
+# filter over it yields this answer.
+#
+# So the duplication is structural, not laziness, and it must not be "unified"
+# by someone reading this later. What holds two such homes in step is a
+# cross-side comparison of the two sets, run as a build gate above both
+# repositories — the same rung the platform's annotation reservation register
+# uses for the same reason, where a lint rule compiled into a Wasm guest and a
+# public documentation page cannot be generated from each other either.
+#
+# THAT GATE NOW EXISTS: check-publishable-kind-parity.sh, which runs from the
+# combined development workspace holding this repository and the CLI side by side,
+# and which that workspace's build runs on any test-grade invocation. It compares
+# the authoritative table against this filter and refuses on any difference — in
+# either direction, so naming a kind the transport cannot resolve fails just as
+# loudly as omitting one it can. The comparison subtracts a declared exclusion set
+# in which every entry carries its reason (Plugin's is the paragraph above), and a
+# stale, misspelled or unreasoned exclusion is itself a refusal, so the exclusion
+# list cannot quietly become a place to park a divergence.
+#
+# What it does not cover: it cannot run from a standalone checkout of this
+# repository, which carries no CLI source to compare against. So editing this line
+# in a standalone checkout is unchecked until the change reaches that workspace.
+# Adding a kind to the CLI's transport therefore still means editing this line by
+# hand — but a miss is now a failed build rather than an entity silently not
+# published, which is what it was before: this filter carried a kind the transport
+# does not resolve at all while missing three that it does.
 is_publishable() {
   case "$1" in
-    Component|Feature|Aggregate|Recipe|FeatureRecipe|SchemaLibrary|MappingLibrary|WorkloadLibrary) return 0 ;;
+    Component|Feature|Aggregate|Recipe|FeatureRecipe|SchemaLibrary|MappingLibrary|WorkloadLibrary|ArtifactsLibrary) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -207,7 +245,7 @@ for f in ${FILES[@]+"${FILES[@]}"}; do
   [ -f "$f" ] || continue
   kind="$(peek_kind "$f")"
   [ -n "$kind" ] || continue          # non-entity YAML (no kind:) — skip
-  is_publishable "$kind" || continue  # Manifest/Release/Plugin/unknown — skip
+  is_publishable "$kind" || continue  # Plugin / deployment-side / unknown — skip
   # Capture stdout to recover the resolved reference, then echo it so the push
   # output is still visible. The `if` guards the command substitution against
   # set -e while testing push's exit status.
