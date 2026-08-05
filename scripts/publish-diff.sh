@@ -90,6 +90,93 @@ done
 
 [ -d "$CATALOG" ] || { echo "publish-diff: catalog dir not found: $CATALOG" >&2; exit 1; }
 
+# --- The entity kinds this publisher pushes -----------------------------------
+# The set is not written down here. It is read from the binary that does the
+# pushing: `aggrega push --list-kinds` emits every kind `aggrega push` addresses,
+# one per line, sorted and undecorated, and that is what this script consumes. So
+# this publisher cannot name a kind the push path does not handle, nor silently
+# miss one it does — the failure that motivated asking in the first place, where an
+# entity of a perfectly publishable kind was skipped with no message at all.
+#
+# Minus one kind, named here with its reason: Plugin. This is an entities-only
+# publisher — a Plugin's .wasm is a separate artifact with its own mediatype and
+# its own publish path. Manifest / Release never appear in the answer at all, for
+# a different reason: they are deployment-side and `aggrega push` addresses
+# neither. A YAML with no `kind:` (recipe fragments, source/ files) is skipped.
+#
+# The exclusion is declared in the publisher that applies it, deliberately. What a
+# publisher declines to push is its own call, and one shared exclusion list would
+# let a widening made for a single publisher take effect silently in the others.
+#
+# Asking costs this script nothing it did not already require: it invokes the same
+# binary to push. That holds from a standalone checkout of this repository, which
+# carries no CLI source tree — the query needs a binary, not a source tree. What
+# such a checkout gives up is the chance to publish a wrong set quietly: a binary
+# that is missing, broken, or too old to answer refuses below, before anything is
+# pushed, rather than skipping entities one at a time with no message.
+#
+# Note that `aggrega get-schema --list` is not this route: it enumerates schemas,
+# including deployment-side kinds and the plugin socket contracts, so no filter
+# over it yields this answer.
+#
+# No count is stated anywhere here, on purpose: a count is a third thing to keep
+# in step, and it is the number that rots first.
+PUBLISHABLE_EXCLUDE="Plugin"
+
+# Kinds whose absence means the QUERY broke rather than that the product changed.
+# A plausibility floor expressed as named kinds instead of a minimum count, for
+# the same reason no count appears above — and because a publishable set that has
+# lost Component or Recipe is not a set the platform could have shipped. Retiring
+# one of these genuinely would mean editing this line, which is the correct amount
+# of friction.
+PUBLISHABLE_SENTINELS="Component Feature Recipe FeatureRecipe"
+
+PUBLISHABLE_KINDS=""
+
+# load_publishable_kinds asks the binary ONCE per run and fills
+# PUBLISHABLE_KINDS. It refuses — non-zero, naming what to fix — when the binary
+# is missing, fails, does not understand the query, or answers with a set too
+# small to be real. It never falls back to a built-in list: a hard-coded list is
+# the drift this query removes, and an empty one would publish nothing while
+# reporting success.
+load_publishable_kinds() {
+  local answer kind sentinel
+  if ! answer="$("$AGGREGA" push --list-kinds)"; then
+    echo "publish-diff: cannot read the publishable entity kinds from '$AGGREGA push --list-kinds'." >&2
+    echo "  The binary is missing, failed, or predates that flag. Point AGGREGA_BIN at a current" >&2
+    echo "  build. Refusing rather than guessing which kinds to publish." >&2
+    return 1
+  fi
+  while IFS= read -r kind; do
+    [ -n "$kind" ] || continue
+    [ "$kind" = "$PUBLISHABLE_EXCLUDE" ] && continue
+    PUBLISHABLE_KINDS="${PUBLISHABLE_KINDS:+$PUBLISHABLE_KINDS }$kind"
+  done <<< "$answer"
+  for sentinel in $PUBLISHABLE_SENTINELS; do
+    case " $PUBLISHABLE_KINDS " in
+      *" $sentinel "*) ;;
+      *)
+        echo "publish-diff: the publishable entity kinds reported by the binary are missing '$sentinel'." >&2
+        echo "  Got: ${PUBLISHABLE_KINDS:-(nothing)}" >&2
+        echo "  That kind is load-bearing, so its absence means the query broke rather than that the" >&2
+        echo "  publishable set legitimately shrank. Refusing rather than publishing a partial catalog." >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
+is_publishable() {
+  case " $PUBLISHABLE_KINDS " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Ask before the destructive-op confirm below, so a binary that cannot answer
+# refuses up front rather than after the operator has authorized a full re-push.
+load_publishable_kinds || exit 1
+
 # --- Destructive-op confirm (full reconcile) ---------------------------------
 # A real --full reconcile re-pushes every catalog entity. Guard it: --yes
 # bypasses (CI), an interactive terminal prompts [y/N], and a non-interactive
@@ -141,59 +228,6 @@ marker_advance() {
   git -C "$HUB_ROOT" tag -f "$MARKER" HEAD >/dev/null
 }
 # -----------------------------------------------------------------------------
-
-# --- The publishable-entity-kind set: a SECOND home, deliberately -------------
-# The entity kinds this publisher pushes. It is every kind `aggrega push`
-# addresses except Plugin, which is outside the set because this is an
-# entities-only publisher: a Plugin's .wasm is a separate artifact with its own
-# mediatype and its own publish path. Manifest / Release are not in the set
-# either, but for a different reason — they are deployment-side and `aggrega
-# push` addresses neither. A YAML with no `kind:` (recipe fragments, source/
-# files) is skipped.
-#
-# WHY THIS IS A COPY. The authoritative statement of which kinds are publishable
-# lives in the CLI, next to the OCI transport that resolves each kind's mediatype
-# and the bundler that packs it. Every other home should read that one rather than
-# restate it. This script cannot read it directly: it is shell, it cannot import
-# Go, and it must keep working from a standalone checkout of this repository that
-# carries no CLI source tree at all. It could ask the binary instead — `aggrega
-# push --list-kinds` reports the set, one kind per line, sorted and undecorated —
-# and whether this publisher should is an open call rather than a settled no.
-# Note that `aggrega get-schema --list` is not that route: it enumerates schemas,
-# including deployment-side kinds and the plugin socket contracts, so no filter
-# over it yields this answer.
-#
-# What is settled is that this copy cannot be GENERATED from the authoritative
-# one, in either direction, so it must not be "unified" that way by someone
-# reading this later. What holds two such homes in step is a cross-side
-# comparison of the two sets, run as a build gate above both repositories — the
-# same rung the platform's annotation reservation register uses for the same
-# reason, where a lint rule compiled into a Wasm guest and a public documentation
-# page cannot be generated from each other either.
-#
-# THAT GATE NOW EXISTS: check-publishable-kind-parity.sh, which runs from the
-# combined development workspace holding this repository and the CLI side by side,
-# and which that workspace's build runs on any test-grade invocation. It compares
-# the authoritative table against this filter and refuses on any difference — in
-# either direction, so naming a kind the transport cannot resolve fails just as
-# loudly as omitting one it can. The comparison subtracts a declared exclusion set
-# in which every entry carries its reason (Plugin's is the paragraph above), and a
-# stale, misspelled or unreasoned exclusion is itself a refusal, so the exclusion
-# list cannot quietly become a place to park a divergence.
-#
-# What it does not cover: it cannot run from a standalone checkout of this
-# repository, which carries no CLI source to compare against. So editing this line
-# in a standalone checkout is unchecked until the change reaches that workspace.
-# Adding a kind to the CLI's transport therefore still means editing this line by
-# hand — but a miss is now a failed build rather than an entity silently not
-# published, which is what it was before: this filter carried a kind the transport
-# does not resolve at all while missing three that it does.
-is_publishable() {
-  case "$1" in
-    Component|Feature|Aggregate|Recipe|FeatureRecipe|SchemaLibrary|MappingLibrary|WorkloadLibrary|ArtifactsLibrary) return 0 ;;
-    *) return 1 ;;
-  esac
-}
 
 # peek_kind prints the top-level `kind:` value of a YAML file, or nothing.
 peek_kind() {
