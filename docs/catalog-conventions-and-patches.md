@@ -203,7 +203,10 @@ compiler is blind to it, as it is to every label):
   OSI-approved licence while a named subtree or edition is not, so which terms
   apply depends on which part a deployment uses.
 - **`source-available`** — the source is published under terms that are not
-  OSI-approved and that restrict use, redistribution or hosting.
+  OSI-approved, and those terms attach conditions to redistribution, to hosting,
+  or to offering the software as a service. Whether they also let a given reader
+  obtain and run the artifact varies across the class and is not settled by the
+  value itself — that is the one question the admission test below asks.
 - **`proprietary`** — no source licence is granted to the user. The relationship
   is a vendor agreement: a hosted service the user contracts for, or a
   distributed artifact under the vendor's own terms.
@@ -215,6 +218,17 @@ Absence of the label means **not yet classified** — never "nothing to state",
 which is `not-applicable`. Every `core/` Component naming a third-party product
 carries a value; like the rest of the label scheme the field is convention, not
 schema enforcement.
+
+**It classifies the wrapped product, not this project's own dependencies.** The
+two are separate surfaces with separate rules. This label records the terms
+covering third-party software a deployment runs or calls, and every value in the
+set is available to it. The terms this project accepts for its own third-party
+dependencies — the libraries its compiler and tooling are built from — are
+governed separately, by a dependency-licence gate that is stricter. So a value
+recorded here describes the wrapped product and nothing else: it is never a
+statement that this project's own dependency policy would accept the same terms,
+and whether the `core/` catalog may wrap a given product is settled by the
+admission test below rather than by its value.
 
 **It composes with `hosting` rather than duplicating it.** Licensing says what
 terms cover the software; hosting says who operates it. A hosted model API is
@@ -242,8 +256,10 @@ software it packages, and where the two differ the packaged software governs.
 - A pinned artifact must be obtainable and runnable by any reader on the
   artifact's own published terms, with no agreement the catalog would be a party
   to. `osi-approved` passes; `open-core` passes where the pinned artifact is the
-  open core; `source-available` passes only where the pinned artifact's terms
-  permit a reader to run it.
+  open core; `source-available` passes only where its terms let any reader obtain
+  and run the pinned artifact for themselves — a right terms can grant while
+  still attaching conditions to redistribution, to hosting, or to offering the
+  software as a service.
 - **A service a deployment merely calls is not a pinned artifact.** Where the
   entity pins nothing and its Recipes only wire a deployment to a service the
   reader contracts for directly — the reference realization of a hosted API — the
@@ -256,9 +272,9 @@ software it packages, and where the two differ the packaged software governs.
   to run.
 
 The two failing shapes are therefore narrow and specific: a pinned artifact under
-terms that forbid a reader running it without a separate agreement, and a pinned
-packaging artifact whose packaged software carries such terms even though the
-packaging itself is permissive.
+terms that forbid a reader obtaining and running it without a separate agreement,
+and a pinned packaging artifact whose packaged software carries such terms even
+though the packaging itself is permissive.
 
 Admission and disclosure are separate acts. Whatever the verdict, the wrapped
 product's licensing class is recorded through
