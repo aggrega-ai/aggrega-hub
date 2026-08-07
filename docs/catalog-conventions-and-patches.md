@@ -289,25 +289,25 @@ Domain 3 entities use the execution engine as the first path segment:
 
 ### Per-version directory layout
 
-**Every** publishable kind — Component, Feature, Provider, Aggregate, Recipe,
-FeatureRecipe, SchemaLibrary, MappingLibrary, WorkloadLibrary, ArtifactsLibrary —
-lives in a per-version subdirectory:
+**Every** publishable kind lives in a per-version subdirectory — run
+`aggrega push --list-kinds` for the kinds the installed binary publishes:
 
 ```text
 <kind>/<publisher-or-provider>/.../<name>/<version>/<entity>.yaml
 ```
 
-The `<version>` directory segment MUST equal the entity's `metadata.version`; the
-publish-time bundler rejects a mismatch (`ErrEntityVersionPathMismatch`). One
-published version is one directory, so the source tree holds every version of an
-entity side by side rather than relying on git history for older versions. The
-`<entity>.yaml` filename is kind-conventional:
+The `<version>` directory segment MUST equal the entity's `metadata.version`. The
+publish-time bundler rejects a mismatch (`ErrEntityVersionPathMismatch`); Plugin
+sits outside that check, taking its version from `metadata.version` and its
+repository location from its socket coordinate. One published version is one
+directory, so the source tree holds every version of an entity side by side rather
+than relying on git history for older versions. The `<entity>.yaml` filename is
+kind-conventional:
 
 | Kind | Filename |
 | --- | --- |
 | Component | `component.yaml` |
 | Feature | `feature.yaml` |
-| Provider | `provider.yaml` |
 | Plugin | `plugin.yaml` |
 | Aggregate | `aggregate.yaml` |
 | Recipe / FeatureRecipe | `recipe.yaml` (co-located `source/`, `mappings/`, `artifacts/` sit beside it inside the version dir) |
