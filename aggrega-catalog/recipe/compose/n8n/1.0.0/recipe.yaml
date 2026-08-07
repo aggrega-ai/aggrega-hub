@@ -12,32 +12,77 @@ metadata:
     exposed port are translated from the Workload kind by the compose provider.
     The platform's data directory is a named volume, so the workflows and the
     credentials authored in the editor survive a restart; state written anywhere
-    else in the container does not. The volume is the only home for authored state
-    on this target — nothing re-creates it. The model endpoint wired into the
+    else in the container does not. The volume is the only home for state authored
+    in the editor — nothing re-creates it. The model endpoint wired into the
     `model` socket is rendered as OPENAI_BASE_URL and an attached model API key as
     OPENAI_API_KEY, both read by workflow expressions via n8n's $env. Which model a
     workflow calls is selected in the workflow's own node. The environment carries
     no model name, so there is no model name for a workflow expression to read
-    through $env either. Automated workflow seeding is realized by the helm target
-    only, which carries the definition in a ConfigMap an init container imports on
-    start. Compose runs an init step, but has no way to carry the definition to it,
-    so this target seeds no workflow and does not read
-    `values.flow_definition`: a definition supplied against compose is accepted
-    by the component's schema and has no effect on the rendered output.
-    On compose the workflow is authored or imported through the n8n editor.
+    through $env either. When a workflow definition is supplied on
+    `values.flow_definition`, a compose config carries it and an init service
+    imports it with `n8n import:workflow` before the platform starts; with no
+    definition the config and the init service are both omitted and the platform
+    starts with nothing seeded. The import runs before the platform starts, on every
+    start, so a supplied definition is re-applied rather than seeded once; how the
+    platform reconciles a re-import against a workflow already present in its data
+    directory is the platform's own behaviour.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
 spec:
   capability: compose
   implements: core/ai-agent/n8n:1.0.0
+  # The workflow definition is authored by the developer on .values. When present
+  # it renders a compose config the seeding init container mounts as a file;
+  # presence-guarded so a deployment supplying no definition emits no config and
+  # no init service, byte-identical to a bare deploy.
+  #
+  # The config's name is spelled here and again on the `flow` volume below. The
+  # artifact and the workload are separate template strings with no binding either
+  # could dereference, so the repetition is forced rather than chosen — the two
+  # must be edited together.
+  artifacts:
+    n8n-flow.compose-fragment.yaml: |
+      {{- if .values.flow_definition }}
+      configs:
+        {{ .context.instance_id }}-flow:
+          content: |
+      {{ .values.flow_definition | indent 6 }}
+      {{- end }}
   workload: |
+    {{- $dataPath := "/home/node/.n8n" -}}
+    {{- $seedFile := "/flows/workflow.json" -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     form: stateless
+    {{- if .values.flow_definition }}
+    # Seed the supplied workflow before the platform starts. The init container
+    # imports the flow from the mounted config into the n8n data directory the
+    # main container serves from (both mount the shared data volume).
+    # $seedFile is the single authored home for the seed file: the import argument
+    # and the mount that puts the file there both read it, so a future move cannot
+    # relocate one and leave the other pointing at the old path. It names a file
+    # rather than a directory because this target delivers a configmap volume as
+    # one file at the mount path, so the mount path is the file the import reads.
+    initContainers:
+      - name: import-flow
+        image: "{{ .infra.image }}"
+        command: ["n8n"]
+        args: ["import:workflow", "--input={{ $seedFile }}"]
+        volumeMounts:
+          - name: data
+            path: {{ $dataPath }}
+          - name: flow
+            path: {{ $seedFile }}
+    {{- end }}
     containers:
       main:
         image: "{{ .infra.image }}"
+        # $dataPath is the single authored home for the platform's data
+        # directory. Both this container's mount and the seeding init container's
+        # mount read the binding — they have to name the same directory for an
+        # imported workflow to be visible to the platform — so a future move
+        # cannot relocate one and leave the other behind.
         # The model endpoint arrives on the `model` uses-edge; the recipe ranges
         # the outbound edges and matches on the socket name, then reads the model
         # recipe's published endpoint. n8n workflow expressions read it via $env.
@@ -56,18 +101,24 @@ spec:
           http: 5678
         volumeMounts:
           - name: data
-            path: /home/node/.n8n
+            path: {{ $dataPath }}
     volumes:
       data:
         # The data directory holds the workflows and credentials authored in the
-        # editor, and this target has no import step to re-create them, so the
-        # volume must outlive the container.
+        # editor. The seeding step re-imports only the supplied definition, so
+        # everything else authored here has no other home and the volume must
+        # outlive the container.
         # The size is a literal rather than a knob on the component's surface: the
         # compose target has no volume-size concept and drops the value, and no
         # other target of this component declares a persistent volume, so a
         # component-level size field would be a surface with nothing reading it.
         persistent:
           size: 2Gi
+    {{- if .values.flow_definition }}
+      flow:
+        configmap:
+          source: {{ .context.instance_id }}-flow
+    {{- end }}
     services:
       default:
         type: ClusterIP
