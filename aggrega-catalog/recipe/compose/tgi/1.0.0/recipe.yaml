@@ -1,0 +1,177 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: tgi
+  version: 1.0.0
+  description: >
+    Text Generation Inference as a self-hosted inference server for local
+    development via Docker Compose. Synthesized-mode Workload: the image, the
+    command line, the environment, the model-cache volume and the weights-pull
+    step are translated from the Workload kind by the compose provider. The
+    weights pull is an init container, so it becomes a run-to-completion service
+    that the serving service waits on before it starts. The runtime ships its own
+    weights downloader inside the serving image, so the pull step and the server
+    are the same image at the same tag — one version knob moves both, and no
+    second image has to be kept in step. The model value is a deterministic
+    pointer that step resolves at start; the compiler never fetches weights. Both
+    services mount the same named model-cache volume and point the runtime's
+    cache variable at it, so the weights outlive the containers and a restart
+    re-runs the pull step against an already-populated cache — how the downloader
+    reconciles that is the downloader's own behaviour. The server is started under
+    the weights identifier itself and this component exposes no serving alias, so
+    the model name published to consumers is that same identifier. When the
+    optional model_pull_token credential slot is attached its value arrives on the
+    inject pipe and is rendered as the HF_TOKEN environment variable on the
+    weights-pull service, which is therefore also the key the attached credential
+    must publish under; unattached, no such variable is emitted and weights are
+    pulled anonymously. Compose is single-host, so three operator settings the
+    Kubernetes realization honours cannot be honoured here: the replica count, the
+    GPU count, and the GPU runtime class. Each is authored all the same, so the
+    build reports it as an unsupported-field warning naming the setting rather than
+    dropping it in silence. provides.host is the compose service name, which a
+    consumer on the same compose network resolves directly.
+  license: Apache-2.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/ai-model/tgi:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the server's own listen-port argument,
+  # the container port and the service entry; the literal is never repeated. The
+  # contract is key-for-key the one the Kubernetes realization publishes, so a
+  # consumer reads the same keys on either target.
+  #
+  # host is the name the compose provider gives the synthesized service, which is
+  # the component instance's own name, so a consumer on the same compose network
+  # resolves it directly. host and endpoint spell it out twice on purpose: a
+  # provides entry cannot read another provides entry, so there is no home either
+  # could dereference instead — the repetition is forced, not a choice, and the
+  # two must be edited together.
+  #
+  # model is the weights identifier verbatim. The component exposes no serving
+  # alias alongside it, and the server below is started under that same
+  # identifier, so there is nothing else a consumer could be told to ask for.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}/v1"
+    model: "{{ .values.model }}"
+    protocol: "http"
+  workload: |
+    {{- $modelsPath := "/models" -}}
+    {{- $tokenVar := "HF_TOKEN" -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    # The replica count is authored even though compose serves one instance: the
+    # setting is a real operator knob, and authoring it is what turns a value this
+    # target cannot honour into a named warning instead of a silent loss. An
+    # operator who asks for more than one replica is told the setting was omitted,
+    # rather than counting containers to find out.
+    replicas: {{ .infra.replicas }}
+    # The runtime class here and the GPU count further down are authored exactly as
+    # the Kubernetes realization authors them. Neither has a single-host compose
+    # analog, and the compose target already reports each as an unsupported-field
+    # warning naming the setting — so they are stated once and the target degrades
+    # them, rather than this recipe second-guessing what it can express. Both stay
+    # presence-guarded, so a deployment that asks for no GPU carries no trace of one.
+    {{- with (default dict .infra.gpu).runtime_class }}
+    runtimeClassName: {{ . }}
+    {{- end }}
+    # Pull the weights before the server starts. The init container becomes its
+    # own run-to-completion service, and the serving service waits for it to
+    # finish — so the ordering is the target's, not something this recipe encodes
+    # into a command line where nothing could inspect or diagnose it.
+    # The downloader is the runtime's own, shipped in the serving image, so this
+    # step and the server below select the same tag from the same version knob.
+    # .values.model is the deterministic pointer the downloader resolves here; the
+    # compiler pipes the string through unresolved.
+    initContainers:
+      - name: model-pull
+        image: "ghcr.io/huggingface/text-generation-inference:{{ .infra.engine_version }}"
+        command: ["/bin/sh"]
+        args:
+          - "-c"
+          - "text-generation-server download-weights {{ .values.model }}"
+        # $modelsPath is the single authored home for the cache directory. The
+        # downloader writes there, the server reads from there, and both mounts
+        # put the shared volume there — four readers of one binding, so a future
+        # move cannot relocate one and leave the others pointing at the old path.
+        # The variable naming it is the one this runtime reads; the server below
+        # is given the same one so both halves agree on where the cache lives.
+        # $tokenVar binds the variable the token is rendered under to the
+        # inject-pipe entry it is read from, so the two cannot drift apart. No
+        # credential value is authored here — it is read from the pipe the
+        # attached credential fills. Compose has no env-from-secret primitive, so
+        # a plain environment variable is the delivery this target has.
+        variables:
+          HUGGINGFACE_HUB_CACHE: {{ $modelsPath }}
+    {{- if hasKey (default dict .features) "model_pull_token" }}
+          {{ $tokenVar }}: "{{ index .context.inject.env $tokenVar }}"
+    {{- end }}
+        volumeMounts:
+          - name: model-cache
+            path: {{ $modelsPath }}
+    containers:
+      main:
+        image: "ghcr.io/huggingface/text-generation-inference:{{ .infra.engine_version }}"
+        args:
+          - "--model-id"
+          - "{{ .values.model }}"
+          - "--port"
+          - "{{ .infra.port }}"
+    {{- with .values.context_window }}
+          - "--max-total-tokens"
+          - "{{ . }}"
+    {{- end }}
+        variables:
+          HUGGINGFACE_HUB_CACHE: {{ $modelsPath }}
+        ports:
+          http: {{ .infra.port }}
+        # Each quantity is quoted because it is a string: a value with no unit
+        # suffix — a whole-core cpu count, say — would otherwise be read as a
+        # number and rejected before the target ever sees it.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    {{- if (default dict .infra.gpu).count }}
+            "nvidia.com/gpu": "{{ .infra.gpu.count }}"
+    {{- end }}
+        volumeMounts:
+          - name: model-cache
+            path: {{ $modelsPath }}
+    volumes:
+      model-cache:
+        # One named volume shared by the pull step and the server, which is what a
+        # single-host target has: compose runs one instance of a service, so there
+        # is no per-replica claim to template and nothing a per-replica shape could
+        # apply to here. The Kubernetes realization gives each replica its own
+        # claim; this one keeps a single cache both containers mount.
+        # The size is read from the operator's own sizing knob so one Release
+        # configures either target. Compose has no volume-size concept, so it does
+        # not reach the emitted file; the operator's storage-class knob is left
+        # unread for the same reason, and stating it here would add a line this
+        # target could never act on.
+        persistent:
+          size: "{{ .infra.model_cache.size }}"
+    # A ClusterIP service entry keeps the server internal to the compose network,
+    # which is where its consumers sit: the agent wired to it resolves the service
+    # name and the port straight from the edge. Nothing is published to the host,
+    # so the API is not reachable from outside the network on this target.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
