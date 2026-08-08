@@ -25,7 +25,14 @@ metadata:
     primitive, so this target seeds no flow and does not read
     `values.flow_definition`: a definition supplied against compose is accepted
     by the component's schema and has no effect on the rendered output. On
-    compose the flow is authored through the Langflow editor.
+    compose the flow is authored through the Langflow editor. Reaching that
+    editor requires signing in: the recipe switches the platform's built-in
+    sign-in bypass off and seeds an administrator account from values.admin_user
+    and the password attached to the admin_password slot, so that password is the
+    only way in. A deployment that wants the editor open to anyone who can reach
+    the service sets values.require_authentication to false instead, which leaves
+    the bypass on and needs no credential. Doing neither halts the build, so an
+    editor nobody can sign in to is never deployed.
     The environment-variable contract is authored against langflow-base 0.11.0.
   maintainers:
     - name: Massimiliano Ferrero
@@ -33,8 +40,22 @@ metadata:
 spec:
   capability: compose
   implements: core/ai-agent/langflow:1.0.0
+  # With the sign-in bypass switched off, the seeded administrator account is the
+  # only way into the editor, and its password comes from the attached
+  # credential — there is no fallback the platform can invent. So a deployment
+  # that leaves require_authentication at its default and attaches nothing has
+  # asked for an editor it could not reach. The build halts here, where the fix
+  # is one line in the deployment's own document, rather than at start-up on the
+  # machine running the containers. It halts only on that ambiguity: a deployment
+  # that sets the lever has made its choice and renders exactly what it asked for.
+  assertions:
+    admin_credential_prerequisite: >-
+      {{- if and .values.require_authentication (not (hasKey (default dict .features) "admin_password")) -}}
+      {{- fail "the Langflow editor needs an administrator password to sign in with and this deployment attaches none: attach a secret credential to the admin_password slot to set that password, or set values.require_authentication to false to run the editor with no sign-in required at all" -}}
+      {{- end -}}
   workload: |
     {{- $configDir := "/app/langflow-data" -}}
+    {{- $requireAuth := .values.require_authentication -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     form: stateless
@@ -51,9 +72,34 @@ spec:
         # installed package directory in the image, which the mounted volume does
         # not cover, so without the flag the flows authored in the editor are lost
         # at the first restart.
+        # values.require_authentication is the single authored home for whether
+        # the editor asks for a sign-in; $requireAuth binds it once and both the
+        # variables and the build-time assertion read that binding, so the
+        # sign-in posture cannot be decided twice and disagree. The platform's own
+        # bypass flag is its inverse, which is why each arm writes the opposite
+        # word rather than piping the value through — piping it would make the two
+        # spellings look interchangeable, and they are not.
+        # The two arms are the only two coherent states, and they are kept whole
+        # deliberately: bypass off means the account name and its password travel
+        # with it, and bypass on means neither is authored, so no half-configured
+        # account is ever emitted. The password arrives on the inject pipe, which
+        # is how this target delivers credentials — compose has no
+        # secret-resource primitive for the helm target's reference to point at.
         variables:
           LANGFLOW_CONFIG_DIR: {{ $configDir }}
           LANGFLOW_SAVE_DB_IN_CONFIG_DIR: "true"
+    {{- if $requireAuth }}
+          LANGFLOW_AUTO_LOGIN: "false"
+          # Quoted because a login name is free text. Unquoted, a name spelled
+          # like a number or a boolean is read as one — `007` arrives as the
+          # number 7 and `true` as a boolean — and the variables map, which
+          # takes strings, then refuses the build over a name that was perfectly
+          # legal to choose.
+          LANGFLOW_SUPERUSER: "{{ .values.admin_user }}"
+          LANGFLOW_SUPERUSER_PASSWORD: "{{ .context.inject.env.LANGFLOW_SUPERUSER_PASSWORD }}"
+    {{- else }}
+          LANGFLOW_AUTO_LOGIN: "true"
+    {{- end }}
     {{- range $alias, $edge := .context.uses }}
     {{- if eq $edge.socket "model" }}
           OPENAI_BASE_URL: "{{ $edge.provides.endpoint }}"

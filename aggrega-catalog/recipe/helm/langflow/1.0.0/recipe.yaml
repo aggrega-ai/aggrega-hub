@@ -18,7 +18,14 @@ metadata:
     State written anywhere else in the container does not survive. When a flow
     definition is supplied, a ConfigMap carries it and the platform loads it from
     a mounted directory on startup; with no definition the platform deploys empty
-    and the ConfigMap is omitted byte-identically. The model endpoint wired into
+    and the ConfigMap is omitted byte-identically. Reaching the editor requires
+    signing in: the recipe switches the platform's built-in sign-in bypass off and
+    seeds an administrator account from values.admin_user and the password
+    attached to the admin_password slot, so that password is the only way in. A
+    deployment that wants the editor open to anyone who can reach the service sets
+    values.require_authentication to false instead, which leaves the bypass on and
+    needs no credential. Doing neither halts the build, so an editor nobody can
+    sign in to is never deployed. The model endpoint wired into
     the `model` socket is injected as OPENAI_BASE_URL and an attached model API key
     as OPENAI_API_KEY; the key is delivered as an env secret and is never written
     into a flow artifact. Which model a flow calls is selected in the flow's own
@@ -31,6 +38,19 @@ metadata:
 spec:
   capability: helm
   implements: core/ai-agent/langflow:1.0.0
+  # With the sign-in bypass switched off, the seeded administrator account is the
+  # only way into the editor, and its password comes from the attached
+  # credential — there is no fallback the platform can invent. So a deployment
+  # that leaves require_authentication at its default and attaches nothing has
+  # asked for an editor it could not reach. The build halts here, where the fix
+  # is one line in the deployment's own document, rather than at start-up in a
+  # cluster. It halts only on that ambiguity: a deployment that sets the lever
+  # has made its choice and renders exactly what it asked for.
+  assertions:
+    admin_credential_prerequisite: >-
+      {{- if and .values.require_authentication (not (hasKey (default dict .features) "admin_password")) -}}
+      {{- fail "the Langflow editor needs an administrator password to sign in with and this deployment attaches none: attach a secret credential to the admin_password slot to set that password, or set values.require_authentication to false to run the editor with no sign-in required at all" -}}
+      {{- end -}}
   artifacts:
     langflow-flow.configmap.yaml: |
       {{- if .values.flow_definition }}
@@ -45,6 +65,8 @@ spec:
   workload: |
     {{- $configDir := "/app/langflow-data" -}}
     {{- $flowsPath := "/app/flows" -}}
+    {{- $requireAuth := .values.require_authentication -}}
+    {{- $adminCredential := and $requireAuth (hasKey (default dict .features) "admin_password") -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     form: stateless
@@ -65,9 +87,32 @@ spec:
         # The model endpoint arrives on the `model` uses-edge; the recipe ranges
         # the outbound edges and matches on the socket name to read the published
         # endpoint.
+        # values.require_authentication is the single authored home for whether
+        # the editor asks for a sign-in; $requireAuth binds it once and the
+        # variables, the mounted credential and the build-time assertion all read
+        # that binding, so the sign-in posture cannot be decided twice and
+        # disagree. The platform's own bypass flag is its inverse, which is why
+        # each arm writes the opposite word rather than piping the value through
+        # — piping it would make the two spellings look interchangeable, and they
+        # are not.
+        # The two arms are the only two coherent states, and they are kept whole
+        # deliberately: bypass off means the account name and its password travel
+        # with it, and bypass on means neither is authored, so no half-configured
+        # account is ever emitted.
         variables:
           LANGFLOW_CONFIG_DIR: {{ $configDir }}
           LANGFLOW_SAVE_DB_IN_CONFIG_DIR: "true"
+    {{- if $requireAuth }}
+          LANGFLOW_AUTO_LOGIN: "false"
+          # Quoted because a login name is free text. Unquoted, a name spelled
+          # like a number or a boolean is read as one — `007` arrives as the
+          # number 7 and `true` as a boolean — and the variables map, which
+          # takes strings, then refuses the build over a name that was perfectly
+          # legal to choose.
+          LANGFLOW_SUPERUSER: "{{ .values.admin_user }}"
+    {{- else }}
+          LANGFLOW_AUTO_LOGIN: "true"
+    {{- end }}
     {{- range $alias, $edge := .context.uses }}
     {{- if eq $edge.socket "model" }}
           OPENAI_BASE_URL: "{{ $edge.provides.endpoint }}"
@@ -77,11 +122,18 @@ spec:
           # Load the seeded flow directory on startup.
           LANGFLOW_LOAD_FLOWS_PATH: {{ $flowsPath }}
     {{- end }}
-    {{- if hasKey (default dict .features) "model_api_key" }}
+    {{- if or (hasKey (default dict .features) "model_api_key") $adminCredential }}
         attachments:
+    {{- if hasKey (default dict .features) "model_api_key" }}
           OPENAI_API_KEY:
             from: model_api_key
             as: env
+    {{- end }}
+    {{- if $adminCredential }}
+          LANGFLOW_SUPERUSER_PASSWORD:
+            from: admin_password
+            as: env
+    {{- end }}
     {{- end }}
         ports:
           http: 7860
