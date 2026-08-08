@@ -1,0 +1,175 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: kong
+  version: 1.0.0
+  description: >
+    Kong, a database-backed API gateway, for local development via Docker
+    Compose. Synthesized-mode Workload: the image, the environment, the exposed
+    port and the schema-provisioning step are translated from the Workload kind
+    by the compose provider. Kong holds no local state — the PostgreSQL backend
+    is the system of record — so it renders stateless and declares no volume.
+    The backend identity resolved from the `backend` uses-edge (host, port,
+    user, database) arrives on the inject pipe and composes Kong's KONG_PG_*
+    connection. The schema-provisioning step is an init container, so it becomes
+    a run-to-completion service that the gateway waits on before it starts; it
+    runs the same image and is given the same connection and the same password
+    as the gateway, so the schema is provisioned with the credentials the
+    gateway then connects with. The bootstrap is idempotent, so re-running it
+    against an already-provisioned database is a no-op. One ordering limitation
+    is worth knowing before this is deployed onto a cold host, and it is a
+    property of the target rather than of this Recipe: a dependency derived from
+    a uses-edge is recorded on the component's own service and not on the
+    run-to-completion services synthesized beside it, and it waits on the target
+    having started rather than on it reporting healthy. So the gateway waits
+    both for the provisioning step to complete and for the backend to have
+    started,
+    while the provisioning step itself carries no ordering against the backend
+    at all and may run before the backend is accepting connections. No readiness
+    wait is hidden in a command line to compensate: that would move a lifecycle
+    concern into a string nothing can inspect or diagnose, where a step that
+    fails is a failed service an operator can read. With no credential attached,
+    the provisioning step and the gateway share an inline development default,
+    which is also the default the PostgreSQL Recipe for this target falls back
+    to — so a deployment attaching no credential to either comes up wired. With
+    one attached, its value arrives on the inject pipe and is rendered as
+    KONG_PG_PASSWORD on both, which is therefore also the key the attached
+    credential must publish under; compose has no env-from-secret primitive, so
+    a plain environment variable is the delivery this target has. Nothing is
+    published to the host, so neither the proxy port nor the admin API is
+    reachable from outside the compose network. Compose serves one instance, so
+    the replica count cannot be honoured here; it is authored all the same, so
+    the build reports it as an unsupported-field warning naming the setting
+    rather than dropping it in silence. provides.host is the compose service
+    name, which a consumer on the same compose network resolves directly.
+  license: Apache-2.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/gateway/kong:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides is evaluated before the workload and cannot read it, so the proxy
+  # port has one authored home in .infra.proxy_port that every reader
+  # dereferences — provides.port here, and below the gateway's own proxy listen
+  # address, the container port and the service entry; the literal is never
+  # repeated.
+  #
+  # The contract is key-for-key the one the Kubernetes realization publishes, so
+  # a consumer reads the same keys on either target. Only host is spelled
+  # differently: it is the name the compose provider gives the synthesized
+  # service, which is the component instance's own name, where the Kubernetes
+  # realization names its Service after the instance and the service key.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.proxy_port }}"
+    protocol: "http"
+  workload: |
+    {{- $devPassword := "apppass" -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # Kong holds no durable state — the PostgreSQL backend is the system of
+    # record — so the stateless form is correct: there is nothing for a volume
+    # to outlive the container for, and none is declared.
+    form: stateless
+    # Compose serves one instance, so the replica count cannot be honoured. It
+    # is authored all the same, and the target reports it as an
+    # unsupported-field warning naming the setting rather than dropping it in
+    # silence. The count is the one the Kubernetes realization asks for.
+    replicas: 1
+    # Provision the database schema before the gateway serves. The init
+    # container becomes its own run-to-completion service and the gateway waits
+    # for it to finish — so the ordering is the target's, not something this
+    # recipe encodes into a command line where nothing could inspect or
+    # diagnose it. The step runs the gateway's own image and is given the same
+    # backend connection and the same password, so it provisions the schema
+    # with the credentials the gateway then connects with; only the arguments
+    # differ, and they replace the image's default command rather than its
+    # entrypoint. The bootstrap is idempotent, so re-running it against an
+    # already-provisioned database is a no-op.
+    #
+    # The entry is named so its service is named for its job. An entry with no
+    # name takes a positional one instead, which records the container's place
+    # in the list rather than what it does, and which moves if an entry is ever
+    # added ahead of it.
+    #
+    # What this step does not wait for, because it is a property of the target
+    # rather than of this Recipe: a dependency derived from a uses-edge is
+    # recorded on the component's own service and not on the run-to-completion
+    # services synthesized beside it. The gateway therefore waits both for this
+    # step to complete and for the backend service to have started, while this
+    # step carries no ordering against the backend and may run before the
+    # backend is accepting connections. Nothing is added to the command line to
+    # compensate — a readiness loop would move a lifecycle concern into a
+    # string nothing can inspect, where a step that fails is a failed service
+    # an operator can read.
+    initContainers:
+      - name: migrations
+        image: "kong:{{ .infra.engine_version }}"
+        args: [kong, migrations, bootstrap]
+        # $devPassword is the single authored home for the inline development
+        # default. This step provisions the schema with it and the gateway
+        # below connects with it, so the two have to be the same string — a
+        # drift between them would leave a gateway that cannot reach the
+        # database its own provisioning step created.
+        variables:
+          KONG_DATABASE: postgres
+          KONG_PG_HOST: "{{ .context.inject.env.KONG_PG_HOST }}"
+          KONG_PG_PORT: "{{ .context.inject.env.KONG_PG_PORT }}"
+          KONG_PG_USER: "{{ .context.inject.env.KONG_PG_USER }}"
+          KONG_PG_DATABASE: "{{ .context.inject.env.KONG_PG_DATABASE }}"
+    {{- if hasKey (default dict .features) "password" }}
+          KONG_PG_PASSWORD: "{{ .context.inject.env.KONG_PG_PASSWORD }}"
+    {{- else }}
+          KONG_PG_PASSWORD: "{{ $devPassword }}"
+    {{- end }}
+    containers:
+      main:
+        image: "kong:{{ .infra.engine_version }}"
+        # No command or args override — the image's own default command starts
+        # the gateway. The backend identity resolved from the `backend`
+        # uses-edge arrives on the inject pipe and composes the KONG_PG_*
+        # connection, the same one the provisioning step above was given. The
+        # two listen addresses carry the operator's own port knobs; the admin
+        # API is reachable on the compose network only, because the service
+        # entry below publishes nothing to the host.
+        variables:
+          KONG_DATABASE: postgres
+          KONG_PG_HOST: "{{ .context.inject.env.KONG_PG_HOST }}"
+          KONG_PG_PORT: "{{ .context.inject.env.KONG_PG_PORT }}"
+          KONG_PG_USER: "{{ .context.inject.env.KONG_PG_USER }}"
+          KONG_PG_DATABASE: "{{ .context.inject.env.KONG_PG_DATABASE }}"
+          KONG_PROXY_LISTEN: "0.0.0.0:{{ .infra.proxy_port }}, 0.0.0.0:8443 ssl"
+          KONG_ADMIN_LISTEN: "0.0.0.0:{{ .infra.admin_port }}"
+    {{- if hasKey (default dict .features) "password" }}
+          KONG_PG_PASSWORD: "{{ .context.inject.env.KONG_PG_PASSWORD }}"
+    {{- else }}
+          KONG_PG_PASSWORD: "{{ $devPassword }}"
+    {{- end }}
+        ports:
+          tcp: {{ .infra.proxy_port }}
+        # Each quantity is quoted because it is a string: a value with no unit
+        # suffix — a whole-core cpu count, say — would otherwise be read as a
+        # number and rejected before the target ever sees it.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    # A ClusterIP service entry keeps the gateway on the compose network, which
+    # is where its consumers sit: a consumer wired to it resolves the service
+    # name and the port straight from the edge. Nothing is published to the
+    # host, so neither the proxy port nor the admin API is reachable from
+    # outside the network on this target.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          tcp: {{ .infra.proxy_port }}
