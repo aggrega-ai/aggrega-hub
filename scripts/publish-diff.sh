@@ -129,6 +129,13 @@ PUBLISHABLE_EXCLUDE="Plugin"
 # lost Component or Recipe is not a set the platform could have shipped. Retiring
 # one of these genuinely would mean editing this line, which is the correct amount
 # of friction.
+#
+# The floor is written out here rather than read back from the query below, and
+# that is the one simplification to resist. A floor derived from the binary's own
+# answer would agree with every answer, including an empty one — and agreeing
+# with an empty answer is precisely the failure this floor exists to catch. It is
+# a deliberate independent statement of part of the set, not a second home for
+# it: deriving it from the thing it cross-checks would leave it checking nothing.
 PUBLISHABLE_SENTINELS="Component Feature Recipe FeatureRecipe"
 
 PUBLISHABLE_KINDS=""
