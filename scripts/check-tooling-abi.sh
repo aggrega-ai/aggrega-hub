@@ -40,10 +40,14 @@ if [ -z "$actual" ]; then
     echo "check-tooling-abi: could not read 'aggrega version -o json'." >&2
     exit 2
   fi
-  # The CLI emits compact JSON; extract the abiVersion string field. The `|| true`
-  # keeps a no-match from tripping pipefail so the empty-value check below owns
-  # the diagnostic.
-  actual="$(printf '%s' "$json" | grep -o '"abiVersion":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+  # Extract the abiVersion string field from the reported JSON.
+  # Whitespace is stripped before the match so the extraction is insensitive to
+  # the pretty-printer, and it needs no jq. Stripping the whole payload is safe
+  # only where the extracted value contains no whitespace, which holds for the
+  # version and ABI version strings read here.
+  # The `|| true` keeps a no-match from tripping pipefail so the empty-value
+  # check below owns the diagnostic.
+  actual="$(printf '%s' "$json" | tr -d '[:space:]' | grep -o '"abiVersion":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
 fi
 
 if [ -z "$actual" ]; then
