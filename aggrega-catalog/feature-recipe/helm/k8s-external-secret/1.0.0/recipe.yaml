@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: k8s-external-secret
+  version: 1.0.0
+  description: >
+    Generates a Kubernetes ExternalSecret resource from a co-located Helm chart,
+    so a secret-store operator running in the cluster fetches the credential and
+    reconciles it into a Secret. values.origin is read as the key to fetch from
+    the store, so the rendered output carries the locator rather than the
+    credential value. The reconciled Secret uses the deterministic name pattern
+    {instance_id}-{attachment_name}, with underscores in the slot name normalized
+    to hyphens so the name is a valid RFC-1123 label, and the published provides
+    point a consumer at that Secret and the data key within it.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/referenced-secret:1.0.0
+
+  # The referenceable-secret contract: publish the reconciled Secret's identity as
+  # provides, so a consumer references it (a Kubernetes secretKeyRef) without
+  # re-deriving the name. core/referenced-secret requires both keys; the emitted
+  # ExternalSecret below names its target from these provides — the name is
+  # authored once, here. The slot name is normalized (underscores to hyphens) so
+  # the published name is a valid RFC-1123 label; the consumer and the emitted
+  # ExternalSecret share this one resolved value, so a normalized name cannot
+  # drift between them.
+  #
+  # DELIBERATE NEAR-DUPLICATE, and it must be kept in step by hand. The `name`
+  # expression below is character-for-character the one k8s-secret-from-parameter
+  # publishes, and the two MUST agree: both FeatureRecipes implement
+  # core/referenced-secret at the helm capability, so a Manifest may bind either
+  # one for the same attachment, and a consuming component reads the reference
+  # from .features.<slot>.provides.name either way. If the two expressions
+  # diverged, swapping the bound FeatureRecipe would silently change a consumer's
+  # rendered reference — the deployment would still build, and the reference would
+  # point at a resource under another name. There is no single home available for
+  # this expression: a provides value is a plain string, so the $import: reuse
+  # that valuesMapping, workload and artifacts accept does not apply to a
+  # provides block, and no mapping library could hold it. Change one and change
+  # the other in the same edit.
+  provides:
+    name: '{{ .context.instance_id }}-{{ .attachment_name | replace "_" "-" }}'
+    key: "{{ .values.key }}"
+
+  # Resource Generation via a co-located Helm chart: the chart renders one
+  # ExternalSecret whose target name and data key are fed from the published
+  # provides — so the reconciled Secret and the consumer's
+  # .features.<slot>.provides are one authored source (no drift) — with the
+  # origin input as the key to fetch from the store. valuesMapping reads
+  # .provides (the same resolved values the consumer sees) rather than
+  # re-deriving the name inside the chart.
+  #
+  # The store this recipe reads from is the recipe's own fact and carries no
+  # authoring key: which store a cluster runs, and under which name, is a
+  # property of the target rather than of the application, so a deployment
+  # selects it by binding this FeatureRecipe rather than by filling a field.
+  # A target with a differently-named store is served by a FeatureRecipe of its
+  # own naming that store.
+  source: ./chart
+  # The chart is also passed the scope's namespace, when the scope declares one,
+  # so the emitted ExternalSecret lands beside the workload that references the
+  # Secret it reconciles rather than wherever the applying tool defaults to — a
+  # reference does not resolve a Secret in another namespace. Empty when no scope
+  # declares one, and the chart then omits the field — matching a synthesized
+  # workload, which also emits no namespace and is placed by the applying tool.
+  valuesMapping: |
+    secretName: "{{ .provides.name }}"
+    dataKey: "{{ .provides.key }}"
+    remoteKey: {{ .values.origin | toJson }}
+    secretStore: "platform-secret-store"
+    secretStoreKind: "ClusterSecretStore"
+    refreshInterval: "1h"
+    {{- $ns := "" }}
+    {{- if .context.annotations }}
+      {{- if .context.annotations.release }}
+        {{- $raw := index .context.annotations.release "aggrega.ai/namespace" }}
+        {{- if $raw }}{{- $ns = $raw }}{{- end }}
+      {{- end }}
+    {{- end }}
+    namespace: "{{ $ns }}"
