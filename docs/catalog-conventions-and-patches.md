@@ -1199,12 +1199,17 @@ identity through its `metadata.pluginType`, and the derived coordinate places it
 at a distinct location. The raw `.wasm` binary the entity pins by digest is
 published as its own artifact alongside the entity.
 
-The core provider and linter plugin entities under `plugin/provider/` and
-`plugin/linter/` are **generated, not hand-authored**: the CLI derives each
-entity's contract fields (`metadata.pluginType`, ABI version, targets, exports,
-capabilities) directly from the compiled guest's self-report and merges them with
-a small authored overlay (bare identity, runtime limits, and the provider block)
-under `plugin-overlays/`. The generator writes the derived `metadata.pluginType`
+The core plugin entities are **generated, not hand-authored** — one per guest
+embedded in the compiler, filed under the socket directory its `pluginType`
+derives, so the committed set covers whichever sockets those guests serve rather
+than an enumeration kept by hand. The CLI derives each entity's contract fields
+(`metadata.pluginType`, ABI version, targets, exports, capabilities) directly from
+the compiled guest's self-report and merges them with a small authored overlay
+under `plugin-overlays/`: the bare identity, the runtime limits, and the provider
+block for a plugin that carries one. A guest serving a socket that resolves no
+capability — a `governance`, `linter` or `cli` plugin — declares none, and its
+entity carries none.
+The generator writes the derived `metadata.pluginType`
 into the entity and computes the entity's location from the `<pluginType>/<name>`
 coordinate; the overlay carries only the bare `metadata.name` and never a
 `pluginType` of its own. The entity version is the compiler build that produced it.
