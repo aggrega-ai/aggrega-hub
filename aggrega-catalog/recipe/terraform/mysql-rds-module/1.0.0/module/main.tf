@@ -2,6 +2,7 @@ resource "aws_db_instance" "this" {
   identifier           = var.db_name
   engine               = "mysql"
   engine_version       = var.engine_version
+  instance_class       = var.instance_class
   allocated_storage    = var.allocated_storage
   multi_az             = var.multi_az
   db_subnet_group_name = var.subnet_id

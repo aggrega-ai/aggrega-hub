@@ -8,6 +8,11 @@ variable "engine_version" {
   default = "8.4"
 }
 
+variable "instance_class" {
+  type        = string
+  description = "RDS instance class; supplied by the caller."
+}
+
 variable "allocated_storage" {
   type    = number
   default = 20
