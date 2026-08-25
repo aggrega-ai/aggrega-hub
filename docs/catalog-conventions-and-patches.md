@@ -868,11 +868,14 @@ convention and document which component it is meant to gate; do not author the
 
 A component's `provides` contract can be fulfilled by a Recipe that provisions
 **nothing** — a *reference realization* that emits only the wiring a consumer
-needs to reach a pre-existing resource. A Recipe requires only `capability` and
-`implements`; `workload`, `artifacts`, and `source` are all optional, so a
-Recipe carrying only `provides` (plus the small amount of wiring each engine
-needs) validates and renders. This is the shape a `component.aggrega.ai/hosting:
-external` realization takes.
+needs to reach a pre-existing resource. Provisioning nothing does not mean
+declaring nothing: every Recipe outside the `eval` capability must still carry
+one of the engine input kinds — `source`, `valuesMapping`, `workload` or
+`artifacts` — and a Recipe carrying only `provides` is refused when the document
+is loaded. For `helm` and `compose` the input kind a reference realization
+declares is a `workload` in `form: reference`, which names the endpoint, carries
+no containers, and so runs nothing. This is the shape a
+`component.aggrega.ai/hosting: external` realization takes.
 
 The reference realization fulfils the **same `provides` contract** as a
 provisioning Recipe for the same component, so a single component can offer
@@ -883,9 +886,12 @@ component's `provides` outputs, not the realization behind them.
 
 Per engine, the wiring the reference Recipe emits:
 
-- **helm** — a `Secret` carrying the connection material and, where the resource
-  is addressed by name, an `ExternalName` Service that maps an in-cluster DNS
-  name onto the external endpoint. No `Deployment`/`StatefulSet` — nothing runs.
+- **helm** — where the resource is addressed by name, an `ExternalName` Service
+  that maps an in-cluster DNS name onto the external endpoint. No
+  `Deployment`/`StatefulSet` — nothing runs, and no `Secret`: a reference
+  workload carries no credential of its own, because the environment-variable
+  name belongs to the consumer rather than to the endpoint. The connection
+  material arrives from the attached credential Feature described below.
 - **terraform** — a `data` source that reads the existing resource, or input
   variables carrying its coordinates. No `resource` block — nothing is created.
 - **compose** — environment variables carrying the endpoint and credentials into
