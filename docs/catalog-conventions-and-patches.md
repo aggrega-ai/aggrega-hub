@@ -55,7 +55,7 @@ the label section below). The 15 categories:
 | `ai-agent` | AI agent frameworks, platforms, and patterns | worker, server, resource | populated |
 | `ai-model` | Model providers and inference runtimes | server, resource | populated |
 | `ai-tool` | Tools agents invoke | function, server, resource | populated |
-| `ai-pipeline` | AI data/processing pipelines | worker, task | populated |
+| `ai-pipeline` | AI data/processing pipelines | worker, task | created when the first entity lands |
 | `datastore` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server, resource | populated |
 | `gateway` | API and AI gateways | server | populated |
 | `mesh` | Service meshes | server | created when the first entity lands |
