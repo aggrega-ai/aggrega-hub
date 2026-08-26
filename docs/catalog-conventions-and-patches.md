@@ -188,16 +188,34 @@ same values describe a datastore engine, a hosted model API and an agent
 framework alike, so it lives under the shared `component.aggrega.ai/` namespace
 rather than under any one category's `<role>.aggrega.ai/` capability namespace.
 
-**It is a different field from `metadata.license`, and the two routinely
-disagree.** `metadata.license` is the licence of **the entity itself** — the
-catalog YAML published from this repository, permissive throughout.
-`upstream-licensing` is the licensing class of **the thing that entity
-describes**. The standard library carries the combination that makes the
-distinction load-bearing: a permissively-licensed Recipe whose workload pins a
-vendor-licensed inference image. Neither field can be derived from the other, so
-both are stated, and `metadata.license` is never widened to carry the second
-meaning — a reader filtering on it would otherwise be reading the catalog's own
-licence and drawing a conclusion about the software they are about to run.
+**It is a different field from `metadata.license`, and the two are not
+interchangeable.** Both describe the same subject — the wrapped product — at
+different precisions. `metadata.license` carries that product's SPDX identifier,
+naming exactly the licence of the software the entity packages;
+`upstream-licensing` carries the coarse class that licence falls into. A reader
+filtering on either one is reading about the software they are about to run, so
+which to reach for is a question of precision: the field to match a named
+licence, the label to match a policy category.
+
+**Neither can be derived from the other, so both are stated.** A class does not
+recover a licence — the standard library carries `osi-approved` over Apache-2.0,
+AGPL-3.0, MPL-2.0, MIT and BSD-3-Clause alike, and a policy that turns on
+copyleft cannot read that distinction out of the class. Nor does every wrapped
+product yield a single identifier: `open-core`, `proprietary` and
+`not-applicable` describe situations no one SPDX identifier expresses, and the
+convention is to state the field where a single identifier applies and leave it
+absent where none does — so the label classifies entities the field says nothing
+about. The two also sit on different kinds. The label is a Component-identity
+key, while `metadata.license` is stated on Recipes as well, where it is the only
+surface naming the terms of the software the Recipe realizes.
+
+**The catalog file's own licence is a third surface: the per-file
+`# SPDX-License-Identifier:` header.** It states the terms the YAML itself is
+published under, which is a different question again from the licence, or the
+class, of the software that YAML describes. `core/datastore/redis` carries all
+three, and each says something the other two cannot: an `Apache-2.0` header over
+the file, `metadata.license: AGPL-3.0` over the datastore the file describes, and
+`upstream-licensing: osi-approved` over the class that licence falls into.
 
 The value set is a closed, single-valued standard-library convention (the
 compiler is blind to it, as it is to every label):
@@ -390,6 +408,12 @@ When a component's filename would repeat the category, strip the suffix:
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Cognitio S.r.l.
 ```
+
+The header states the terms **this YAML file** is published under, and it is the
+only surface that can: `metadata.license` names the licence of the software the
+entity describes, not of the file describing it. It is stated per file rather
+than inferred from the repository so that a catalog published by anyone else can
+say what its own terms are.
 
 ### Label values: unquoted
 
