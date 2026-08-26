@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: weaviate
+  version: 1.0.0
+  description: >
+    Weaviate on Kubernetes via the helm provider's Workload synthesis, running
+    the official upstream image from the project's own registry (no external Helm
+    chart). Vector data is the point of this store rather than a cache of
+    something else, so the workload renders as a StatefulSet with a persistent
+    volume mounted at the server's data path, alongside the governing headless
+    Service the stateful form requires and a ClusterIP Service publishing both the
+    HTTP and the gRPC port. The rendered manifest always states its access
+    posture rather than leaving it to a server default: anonymous access is
+    enabled where no credential is attached, and where the optional api_key slot
+    is attached anonymous access is turned off, API-key authentication is turned
+    on and the key is delivered as an env secretKeyRef, so the plaintext key never
+    appears in the rendered manifest. provides.host is the bare, self-contained
+    in-cluster service name of the synthesized ClusterIP Service — it carries no
+    namespace, so the recipe is independent of where it is deployed. A consumer in
+    another namespace qualifies the host with the target namespace on its own side
+    (caller-side routing).
+  license: BSD-3-Clause
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/datastore/weaviate:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
+  # (here "<instance_id>-default"), with no namespace segment. A same-namespace
+  # consumer reaches it under this name directly; a cross-namespace consumer
+  # qualifies it with the target namespace caller-side. protocol is "http" — the
+  # port published as provides.port serves the REST and GraphQL APIs over HTTP,
+  # and a consumer composing a URL needs the scheme rather than the product name.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    grpc_port: "{{ .infra.grpc_port }}"
+    protocol: "http"
+  # An attached API key authenticates as a named identity, and an identity cannot
+  # be bound without a name. values.api_key_user carries that name and the
+  # Component declares a default for it, so an ordinary deployment never has to
+  # think about it — but a deployment that sets it to an empty string has asked for
+  # a key bound to nobody. The build halts here, where the fix is one line in the
+  # deployment's own document, rather than emitting a server configuration that
+  # enables authentication against an empty identity list and rejects every
+  # request once the server starts. It halts only on that combination: with no
+  # credential attached no identity is needed at all, and a named identity renders
+  # exactly what the deployment asked for.
+  assertions:
+    api_key_user_required: >-
+      {{- if and (hasKey (default dict .features) "api_key") (not (optional .values "api_key_user" "")) -}}
+      {{- fail "this deployment attaches a credential to the api_key slot, so the server is asked to enable API-key authentication, but values.api_key_user carries no identity for that key to authenticate as: set values.api_key_user to the name the key signs in as, or remove the api_key attachment if anonymous access is wanted" -}}
+      {{- end -}}
+    # A Release may set a single key inside an infra group — `compute.cpu` alone, or
+    # `storage.size` alone — and a group supplied that way carries only the keys it
+    # names, so the sibling this Recipe also reads arrives empty. Rendered, that
+    # would emit a workload with a CPU limit and no memory limit, or a volume with a
+    # size and no storage class: a deployment materially different from the one the
+    # Component's declared defaults describe, with nothing in the output saying so.
+    # The build halts here instead, naming the key that is missing and the group it
+    # belongs to, so the fix is one line in the deployment's own document. A
+    # deployment that supplies no operational sizing at all is unaffected — every key
+    # then carries the Component's default — and so is one that supplies a whole
+    # group.
+    compute_group_complete: >-
+      {{- if not (optional (default dict .infra.compute) "cpu" "") -}}
+      {{- fail "this deployment sets part of infra.compute on the vector store but leaves compute.cpu empty, so the rendered workload would carry no CPU request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+      {{- if not (optional (default dict .infra.compute) "memory" "") -}}
+      {{- fail "this deployment sets part of infra.compute on the vector store but leaves compute.memory empty, so the rendered workload would carry no memory request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+    storage_group_complete: >-
+      {{- if not (optional (default dict .infra.storage) "size" "") -}}
+      {{- fail "this deployment sets part of infra.storage on the vector store but leaves storage.size empty, so the rendered volume would request no size: set both storage.size and storage.type together, or remove the storage block entirely to take the component's defaults" -}}
+      {{- end -}}
+      {{- if not (optional (default dict .infra.storage) "type" "") -}}
+      {{- fail "this deployment sets part of infra.storage on the vector store but leaves storage.type empty, so the rendered volume would name no storage class: set both storage.size and storage.type together, or remove the storage block entirely to take the component's defaults" -}}
+      {{- end -}}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # form: stateful selects a StatefulSet on the helm provider; the
+    # persistentTemplate volume and the headless Service below are companions of
+    # this form.
+    form: stateful
+    replicas: 1
+    containers:
+      main:
+        image: cr.weaviate.io/semitechnologies/weaviate:{{ .infra.engine_version }}
+        # The image's entrypoint is the server binary and its default arguments
+        # carry the listen address, so overriding the arguments is how the
+        # operator's HTTP port reaches the server. The address is fixed at all
+        # interfaces because the container is the isolation boundary; the port and
+        # the scheme are the parts a deployment configures.
+        args:
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "{{ .infra.port }}"
+          - "--scheme"
+          - "http"
+        # The gRPC port, the data path and the query default are configured
+        # through the environment, which is the surface the server reads them
+        # from. The data path matches the volume mount below, so the server writes
+        # where the persistent volume is attached. Module settings are emitted only
+        # when the deployment named them, so a deployment supplying its own vectors
+        # renders a server with no modules loaded.
+        variables:
+          GRPC_PORT: "{{ .infra.grpc_port }}"
+          PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+    {{- with .values.query_defaults_limit }}
+          QUERY_DEFAULTS_LIMIT: "{{ . }}"
+    {{- end }}
+    {{- with .values.enable_modules }}
+          ENABLE_MODULES: "{{ . }}"
+    {{- end }}
+    {{- with .values.vectorizer_module }}
+          DEFAULT_VECTORIZER_MODULE: "{{ . }}"
+    {{- end }}
+        # The access posture is always stated, so a reader of the rendered
+        # manifest sees it without knowing any server default. With a credential
+        # attached, anonymous access is off, API-key authentication is on, the key
+        # authenticates as the named identity, and the key itself arrives as an env
+        # secretKeyRef so the plaintext never lands in the manifest.
+    {{- if hasKey (default dict .features) "api_key" }}
+          AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "false"
+          AUTHENTICATION_APIKEY_ENABLED: "true"
+          AUTHENTICATION_APIKEY_USERS: "{{ .values.api_key_user }}"
+        attachments:
+          AUTHENTICATION_APIKEY_ALLOWED_KEYS:
+            from: api_key
+            as: env
+    {{- else }}
+          AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+          grpc: {{ .infra.grpc_port }}
+        # The resource quantities are quoted so the rendered value stays a string
+        # whatever the deployment supplies. Rendered bare, a whole-core quantity
+        # such as 1 or 2 re-parses as a YAML integer and fails workload validation,
+        # which wants a string here; a milli quantity such as 500m happens not to.
+        # Quoting removes the difference, so every legal quantity a deployment may
+        # write renders and validates alike.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        volumeMounts:
+          - name: data
+            path: /var/lib/weaviate
+    volumes:
+      data:
+        persistentTemplate:
+          size: {{ .infra.storage.size }}
+          class: {{ .infra.storage.type }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
+          grpc: {{ .infra.grpc_port }}
+      headless:
+        type: Headless
+        ports:
+          http: {{ .infra.port }}
+          grpc: {{ .infra.grpc_port }}

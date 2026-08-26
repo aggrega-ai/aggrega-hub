@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: weaviate
+  version: 1.0.0
+  description: >
+    Weaviate for local development via Docker Compose. Synthesized-mode
+    Workload — the compose provider translates the Workload kind into a service
+    entry (image, ports, environment). The rendered service always states its
+    access posture: anonymous access is enabled where no credential is attached,
+    and where an api_key credential is attached anonymous access is turned off,
+    API-key authentication is turned on and the key arrives on the env pipe.
+    Storage sizing and the persistent volume are a synthesized-Helm concern, so
+    this local-development flavor writes its data inside the container and
+    declares no data volume, mirroring how the Compose postgres flavor leaves
+    storage to the helm target. provides.host is the bare service name, resolved
+    on the compose network.
+  license: BSD-3-Clause
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/datastore/weaviate:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # protocol is "http" — the port published as provides.port serves the REST and
+  # GraphQL APIs over HTTP, and a consumer composing a URL needs the scheme rather
+  # than the product name.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    grpc_port: "{{ .infra.grpc_port }}"
+    protocol: "http"
+  # An attached API key authenticates as a named identity, and an identity cannot
+  # be bound without a name. The halt condition and its reasoning are the same as
+  # on the helm flavor: a deployment that empties values.api_key_user has asked for
+  # a key bound to nobody, and the build stops where the fix is one line in the
+  # deployment's own document rather than at server start.
+  assertions:
+    api_key_user_required: >-
+      {{- if and (hasKey (default dict .features) "api_key") (not (optional .values "api_key_user" "")) -}}
+      {{- fail "this deployment attaches a credential to the api_key slot, so the server is asked to enable API-key authentication, but values.api_key_user carries no identity for that key to authenticate as: set values.api_key_user to the name the key signs in as, or remove the api_key attachment if anonymous access is wanted" -}}
+      {{- end -}}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    containers:
+      main:
+        image: cr.weaviate.io/semitechnologies/weaviate:{{ .infra.engine_version }}
+        # The image's entrypoint is the server binary and its default arguments
+        # carry the listen address, so overriding the arguments is how the
+        # operator's HTTP port reaches the server.
+        args:
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "{{ .infra.port }}"
+          - "--scheme"
+          - "http"
+        # The gRPC port, the data path and the query default are configured through
+        # the environment. compute and storage sizing are a helm-synth concern;
+        # this flavor reads only the developer, port and version surface, as the
+        # Compose postgres flavor does, so the data path here names a location
+        # inside the container and the data does not outlive it.
+        variables:
+          GRPC_PORT: "{{ .infra.grpc_port }}"
+          PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+    {{- with .values.query_defaults_limit }}
+          QUERY_DEFAULTS_LIMIT: "{{ . }}"
+    {{- end }}
+    {{- with .values.enable_modules }}
+          ENABLE_MODULES: "{{ . }}"
+    {{- end }}
+    {{- with .values.vectorizer_module }}
+          DEFAULT_VECTORIZER_MODULE: "{{ . }}"
+    {{- end }}
+        # The access posture is always stated. When a credential is attached to the
+        # api_key slot its value arrives on the inject pipe as
+        # .context.inject.env.AUTHENTICATION_APIKEY_ALLOWED_KEYS, anonymous access
+        # is turned off and the key authenticates as the named identity. With none
+        # attached, anonymous access is enabled.
+    {{- if and .context.inject.env .context.inject.env.AUTHENTICATION_APIKEY_ALLOWED_KEYS }}
+          AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "false"
+          AUTHENTICATION_APIKEY_ENABLED: "true"
+          AUTHENTICATION_APIKEY_USERS: "{{ .values.api_key_user }}"
+          AUTHENTICATION_APIKEY_ALLOWED_KEYS: "{{ .context.inject.env.AUTHENTICATION_APIKEY_ALLOWED_KEYS }}"
+    {{- else }}
+          AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+          grpc: {{ .infra.grpc_port }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
+          grpc: {{ .infra.grpc_port }}

@@ -112,8 +112,13 @@ cognitive browse axis of the catalog's three-axis label scheme:
   the behavioral subsets selectors and policies discriminate on.
 
 Multi-membership is expressed through capability labels, never a
-multi-valued category: a Postgres-with-pgvector is `category: datastore`
-plus `datastore.aggrega.ai/engine: vector`, discoverable from both axes.
+multi-valued category: a Postgres specialization for pgvector deployments is
+`category: datastore` plus `datastore.aggrega.ai/engine: vector`, discoverable
+from both axes. The label sits on that specialization rather than on the
+general-purpose Postgres, whose vector capability arrives with an extension a
+deployment enables; a component carries an engine label on its own base only
+where the product's identity is that engine, as `core/datastore/qdrant` and
+`core/datastore/redis` do.
 There is no stored "is-AI" boolean — tooling derives AI-relevance from any
 `ai-`-prefixed category or AI-relevant capability value.
 
