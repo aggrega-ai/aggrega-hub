@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: agenta-runner
+  version: 1.0.0
+  license: MIT
+  # The identifier names the terms of the software this Recipe realizes: the
+  # image below is the platform's open core, published under the MIT Expat terms
+  # its repository states for everything outside one named subtree. That subtree
+  # is published under separate terms and is built into a different image, which
+  # this Recipe does not pin and offers no knob to select. No single identifier
+  # states both situations, so the coarse class covering the product as a whole
+  # is carried on the component's component.aggrega.ai/upstream-licensing label
+  # rather than asserted here.
+  description: >
+    The agent runner on Kubernetes via the helm provider's Workload synthesis: a
+    stateless Deployment plus a ClusterIP Service on the HTTP port the
+    model-facing service calls. The local sandbox provider is the only one
+    enabled — an agent's harness runs as a child process in this container — so
+    the deployment needs nothing else present for a run to start.
+
+    What this Recipe deliberately does not render is the point of it. A locally
+    sandboxed harness shares this container, so every variable here is readable
+    by an agent's own code; the Recipe therefore emits the runner's own
+    configuration, the platform's in-cluster address, and the runner's shared
+    token, and nothing else. There is no database URL, no cache or queue
+    address, no object-store key and no encryption key in the rendered
+    container, because the component declares no socket that would carry one.
+
+    The single replica is deliberate rather than a default left in place: a
+    local sandbox belongs to the container that created it, so a second replica
+    would answer for sessions it cannot reach.
+
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service — it carries no namespace, so the recipe is independent
+    of where it is deployed. A consumer in another namespace qualifies the host
+    with the target namespace on its own side (caller-side routing), and
+    assembles its own URL rather than reusing provides.endpoint.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/agenta-runner:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Target-expected names: the runner reads its own configuration from
+  # AGENTA_RUNNER_PORT, AGENTA_RUNNER_LOG_LEVEL, AGENTA_RUNNER_TOKEN,
+  # AGENTA_RUNNER_ENABLED_SANDBOX_PROVIDERS, AGENTA_RUNNER_DEFAULT_SANDBOX_PROVIDER
+  # and the two session-lifetime variables, and it reads the platform's address
+  # from AGENTA_API_URL with AGENTA_API_INTERNAL_URL as the in-cluster override.
+  # Both are set to the same in-cluster base URL here, because the runner reaches
+  # the platform from inside the cluster and an external address would make it
+  # depend on the ingress tier to talk to a Service beside it.
+  #
+  # AGENTA_RUNNER_REPLICA_ID is set to a stable literal rather than left to vary
+  # per pod. A local sandbox session is owned by the container that created it,
+  # so a fresh identifier after a restart would orphan the sessions that
+  # container still owns until their retention window expires.
+  #
+  # The name the api edge delivers on is read here as API_ENDPOINT. That is the
+  # `in:` key that uses-edge must be set to, and the component's socket comment
+  # states the same contract on the authoring side.
+  #
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the runner's own listen port, the
+  # container port and the Service; the literal is never repeated.
+  #
+  # host and endpoint spell the Service name out twice on purpose. A provides
+  # entry cannot read another provides entry, and the name has to match the
+  # Service the helm provider derives from the service key below, so the
+  # repetition is forced, not a choice, and the two must be edited together.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}"
+    protocol: "http"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The runner holds no durable state of its own — an agent's files live in the
+    # platform's object store, which this tier never reaches — so the default
+    # stateless form (a Deployment on the helm provider) is correct.
+    form: stateless
+    # One replica, deliberately: a local sandbox session belongs to the container
+    # that created it.
+    replicas: 1
+    containers:
+      main:
+        image: "ghcr.io/agenta-ai/agenta-runner:{{ .infra.engine_version }}"
+        variables:
+          AGENTA_RUNNER_PORT: "{{ .infra.port }}"
+          AGENTA_RUNNER_LOG_LEVEL: "{{ .infra.log_level }}"
+          # The local sandbox runs a harness in this container. No remote
+          # provider is enabled, so a deployment that wants one configures it
+          # itself rather than finding it half-wired.
+          AGENTA_RUNNER_ENABLED_SANDBOX_PROVIDERS: local
+          AGENTA_RUNNER_DEFAULT_SANDBOX_PROVIDER: local
+          AGENTA_RUNNER_REPLICA_ID: runner-0
+          AGENTA_RUNNER_SESSION_IDLE_MINUTES: "{{ .values.session_idle_minutes }}"
+          AGENTA_RUNNER_SESSION_RETENTION_MINUTES: "{{ .values.session_retention_minutes }}"
+          # The platform's in-cluster base URL, taken straight from the api
+          # edge. Both names carry it: the runner reads the first and treats the
+          # second as the in-cluster override, and in this realization they are
+          # the same address.
+          AGENTA_API_URL: "{{ .context.inject.env.API_ENDPOINT }}"
+          AGENTA_API_INTERNAL_URL: "{{ .context.inject.env.API_ENDPOINT }}"
+    {{- if not (hasKey (default dict .features) "runner_token") }}
+          AGENTA_RUNNER_TOKEN: dev-agenta-runner-change-me
+    {{- end }}
+    {{- if hasKey (default dict .features) "runner_token" }}
+        attachments:
+          AGENTA_RUNNER_TOKEN:
+            from: runner_token
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the deployment supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

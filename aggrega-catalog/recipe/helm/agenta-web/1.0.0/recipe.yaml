@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: agenta-web
+  version: 1.0.0
+  license: MIT
+  # The identifier names the terms of the software this Recipe realizes: the
+  # image below is the platform's open core, published under the MIT Expat terms
+  # its repository states for everything outside one named subtree. That subtree
+  # is published under separate terms and is built into a different image, which
+  # this Recipe does not pin and offers no knob to select. No single identifier
+  # states both situations, so the coarse class covering the product as a whole
+  # is carried on the component's component.aggrega.ai/upstream-licensing label
+  # rather than asserted here.
+  description: >
+    The agent workspace's browser console on Kubernetes via the helm provider's
+    Workload synthesis: a stateless Deployment plus a ClusterIP Service on the
+    HTTP port the ingress tier routes the browser path to. The console holds no
+    state and owns no datastore, so it renders stateless.
+
+    Two kinds of address are emitted, and keeping them apart is what makes the
+    console work. The in-cluster base URLs of the control-plane API and the
+    model-facing service, resolved from the `api` and `services` edges, are what
+    the server-side rendering path calls: a page assembled inside the cluster
+    reaches those services by their Service names. The externally reachable base
+    URL the operator supplied is what the browser calls, since a Service name
+    does not resolve outside the cluster, and the two path suffixes on it match
+    the routes the ingress tier assembles. The authentication core's own base
+    URL, resolved from the `auth_core` edge, is emitted for the sign-in flow.
+
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service — it carries no namespace, so the recipe is independent
+    of where it is deployed. A consumer in another namespace qualifies the host
+    with the target namespace on its own side (caller-side routing), and
+    assembles its own URL rather than reusing provides.endpoint.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/agenta-web:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Target-expected names: the console reads HOSTNAME for its bind address and
+  # PORT for its listen port, the three AGENTA_*_URL variables for the addresses
+  # a browser calls, AGENTA_API_INTERNAL_URL and AGENTA_SERVICES_INTERNAL_URL for
+  # the in-cluster addresses its server-side rendering path calls,
+  # SUPERTOKENS_URI_CORE for the authentication core, and AGENTA_AUTH_KEY and
+  # AGENTA_CRYPT_KEY for the token and encryption keys it shares with the
+  # control-plane API.
+  #
+  # The names the edges deliver on are read here as API_ENDPOINT,
+  # SERVICES_ENDPOINT and AUTH_CORE_ENDPOINT. Those are the `in:` keys each
+  # uses-edge must be set to, and the component's socket comments state the same
+  # contract on the authoring side.
+  #
+  # AGENTA_MOBILE_GATE is driven from the component's own value rather than from
+  # anything observable, because whether a small-screen visitor should be
+  # redirected depends on whether a mobile front end is deployed AND routed, and
+  # an ahead-of-time compiler can see neither.
+  #
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the console's own listen port, the
+  # container port and the Service; the literal is never repeated.
+  #
+  # host and endpoint spell the Service name out twice on purpose. A provides
+  # entry cannot read another provides entry, and the name has to match the
+  # Service the helm provider derives from the service key below, so the
+  # repetition is forced, not a choice, and the two must be edited together.
+  #
+  # The external base URL has no sensible default: it is the address a browser
+  # reaches this deployment on, which depends on the cluster's own ingress and
+  # which an ahead-of-time compiler cannot discover. A build that has not
+  # supplied it halts here rather than rendering a console that calls nothing.
+  assertions:
+    external_base_url_supplied: >-
+      {{- if not (and (hasKey .infra "external_base_url") (index .infra "external_base_url")) -}}
+      {{- fail "infra.external_base_url must name the externally reachable base URL of the platform, as a browser reaches it through the ingress tier (for example https://agenta.example.com); set it in the Release" -}}
+      {{- end -}}
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}"
+    protocol: "http"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The console holds no durable state, so the default stateless form (a
+    # Deployment on the helm provider) is correct.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "ghcr.io/agenta-ai/agenta-web:{{ .infra.engine_version }}"
+        # The image ships the console for each edition under its own path and
+        # runs whichever the arguments name. This is the open-core one, matching
+        # the image pinned above.
+        command: ["/app/entrypoint.sh"]
+        args: ["node", "./oss/server.js"]
+        variables:
+          # Bind on every interface so the Service can reach the container.
+          HOSTNAME: "0.0.0.0"
+          PORT: "{{ .infra.port }}"
+          AGENTA_LICENSE: oss
+          # The addresses the browser calls. All three derive from one authored
+          # value so they cannot disagree, and the two path suffixes match the
+          # routes the ingress tier assembles.
+          AGENTA_WEB_URL: "{{ .infra.external_base_url }}"
+          AGENTA_API_URL: "{{ .infra.external_base_url }}/api"
+          AGENTA_SERVICES_URL: "{{ .infra.external_base_url }}/services"
+          # The addresses the server-side rendering path calls, resolved from the
+          # edges. A page rendered in the cluster reaches these directly; the
+          # browser cannot, because a Service name does not resolve outside it.
+          AGENTA_API_INTERNAL_URL: "{{ .context.inject.env.API_ENDPOINT }}"
+          AGENTA_SERVICES_INTERNAL_URL: "{{ .context.inject.env.SERVICES_ENDPOINT }}"
+          # The authentication core's own base URL, resolved from its edge.
+          SUPERTOKENS_URI_CORE: "{{ .context.inject.env.AUTH_CORE_ENDPOINT }}"
+          AGENTA_MOBILE_GATE: "{{ .values.mobile_redirect_enabled }}"
+          ALLOW_EMBED: "{{ .values.allow_embedding }}"
+          # Stated rather than left to the image, because a standard-library
+          # entity chooses the quieter default.
+          NEXT_TELEMETRY_DISABLED: "1"
+    {{- if not (hasKey (default dict .features) "auth_key") }}
+          AGENTA_AUTH_KEY: dev-agenta-auth-change-me
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "crypt_key") }}
+          AGENTA_CRYPT_KEY: dev-agenta-crypt-change-me
+    {{- end }}
+    {{- $attached := false }}
+    {{- range $slot := list "auth_key" "crypt_key" "auth_core_api_key" }}
+    {{- if hasKey (default dict $.features) $slot }}{{ $attached = true }}{{ end }}
+    {{- end }}
+    {{- if $attached }}
+        attachments:
+    {{- end }}
+    {{- if hasKey (default dict .features) "auth_key" }}
+          AGENTA_AUTH_KEY:
+            from: auth_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "crypt_key" }}
+          AGENTA_CRYPT_KEY:
+            from: crypt_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "auth_core_api_key" }}
+          SUPERTOKENS_API_KEY:
+            from: auth_core_api_key
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the deployment supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

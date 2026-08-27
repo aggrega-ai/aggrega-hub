@@ -1,0 +1,401 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Aggregate
+metadata:
+  name: core/agenta
+  version: 1.0.0
+  description: >
+    A self-contained Agenta installation packaged as a reusable module — the
+    workspace in which a team builds agents that do work, by describing the job
+    in chat, connecting the applications the agent needs, setting what it may do
+    on its own, and correcting it through feedback. It composes fourteen
+    single-workload components: a control-plane API, a model-facing service, an
+    agent runner, a browser console, a small-screen front end, a stream-consuming
+    worker, a queue-consuming worker, a scheduler, a schema-migration step, a
+    PostgreSQL backend, two Redis-compatible instances, an S3-compatible object
+    store, and the authentication core the platform holds its accounts in.
+
+    Two of those are worth naming against the other things a team might reach
+    for. This module is not a trace store: `core/observability/langfuse`, in the
+    catalogue's observability category, is the self-hosted platform whose
+    identity is tracing and evaluating what a language-model application did,
+    and a deployment that wants that and only that wires there. Nor is it a
+    prompt registry: `core/devtool/promptlayer`, in the devtool category, is the
+    hosted registry whose identity is authoring and versioning prompts an
+    application fetches at run time, and a deployment that wants that wires
+    there. This module is where an agent itself is built, configured and run —
+    it records traces and runs evaluations of its own, as material for improving
+    an agent, rather than as the product it offers. All three are worth having
+    for different reasons, and a deployment may wire more than one.
+
+    The relational edges are what make the platform stateful. Six components
+    reach the backend — the API, the model-facing service, both workers, the
+    scheduler and the migration step — and each edge carries the backend's
+    in-cluster host and port along with its user, and names two databases on the
+    edge itself: one for the platform's own model, one for the traces it
+    records. Naming them on the edge rather than in the backend's own values is
+    what lets one server hold both without either name being fixed in a
+    component. The migration step is the one that creates their tables; the
+    other five expect them to exist, which is why a deployment sequences it
+    first. The backend's own initialization creates all three databases the
+    module needs, including the authentication core's.
+
+    The two cache-family edges are separate on purpose. Five components reach
+    the volatile instance for sessions, cached reads and rate-limit counters,
+    and five reach the durable instance, which is where work is put and taken:
+    the API, the model-facing service and the scheduler write to it, and the two
+    worker tiers read from it. They are two instances of one component rather
+    than two components, because it is one engine deployed twice with different
+    durability, and keeping them apart means a discardable cache can be sized,
+    evicted and lost without touching queued work.
+
+    The authentication edge is the one the platform cannot start without. Four
+    components — the API, the model-facing service and both front ends — reach
+    `core/security/supertokens` and each carries that core's own base URL, not a
+    protocol endpoint: the platform addresses the core by its URI rather than
+    speaking OpenID Connect to it, so an identity provider is not a substitute
+    here. The core keeps its own accounts in a database on the same backend the
+    rest of the module uses.
+
+    The object-store edges hold what agents produce. The API, the model-facing
+    service and the object store are wired so that files written during a run
+    are kept in a bucket named on each edge, which is what lets an agent's
+    working directory survive the sandbox it ran in being torn down.
+
+    The runner is the isolation boundary, and the module's shape reflects that.
+    The model-facing service hands a run to it, and it starts the agent's
+    harness as a process inside its own sandbox. It is wired to the API alone —
+    no backend, no cache, no queue, no object store — because a locally
+    sandboxed harness shares that container and can read its environment, so the
+    platform's database password, its encryption key and the object store's keys
+    are kept out of the one place an agent's own code could read them. That is a
+    property of this topology rather than of any single component, and widening
+    the runner's wiring removes it.
+
+    The whole module shares one set of pinned development credentials — the
+    backend password, the key the platform's internal tokens are signed with, the
+    key stored provider credentials are encrypted under, the key the two API
+    tiers present to each other, the token the runner requires, and the object
+    store's access pair — so it runs self-contained with no external secret.
+    These defaults are for evaluation and local development; a deployment
+    holding real model-provider credentials attaches its own to the credential
+    slots each component declares. While the runner's token is at its default,
+    anything that can reach the runner can start an agent run.
+
+    This module is the working platform core, and four parts of a full
+    deployment are deliberately out of scope. It ships no internal reverse
+    proxy: a single external endpoint is assembled at the ingress tier, which
+    routes `/api` to the control-plane API, `/services` to the model-facing
+    service, `/m` to the small-screen front end, and `/` to the console. It
+    wires no remote sandbox provider — the runner uses the sandbox inside its own
+    container, so a deployment that wants agent runs on separate compute
+    contracts for a provider and configures the runner itself. It composes no
+    model provider: which models an agent may use is configured in the platform
+    at run time, against provider credentials a deployment supplies there rather
+    than in its topology. And it carries no outbound-mail path, so the platform's
+    invitations and notifications need a mail service this module does not
+    compose.
+
+    The module exports the control-plane API as `api`, the endpoint an external
+    client and the ingress tier's API route talk to; the model-facing service as
+    `services`, the endpoint the playground and the ingress tier's services
+    route talk to; the console as `console`, the browser endpoint; and the
+    small-screen front end as `mobile`.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  components:
+    # The relational backend. Its initialization creates the three databases the
+    # module needs: the platform's own model, its traces, and the authentication
+    # core's accounts. The core's database is created here rather than by the
+    # core itself, because the core is given one database name and this module
+    # puts all three on one server.
+    db:
+      type: core/datastore/postgres
+      values:
+        user: agenta
+        # The database published on this component's provides, and so the one
+        # the authentication core is given — it is the only consumer in this
+        # module that reads the published name. Every other consumer names the
+        # database it wants on its own edge, which is why the platform's two are
+        # not this value.
+        database: agenta_supertokens
+        init_scripts:
+          10-agenta-databases.sql: |
+            CREATE DATABASE agenta_core OWNER agenta;
+            CREATE DATABASE agenta_tracing OWNER agenta;
+    # The discardable instance: sessions, cached reads, rate-limit counters.
+    cache:
+      type: core/datastore/redis
+    # The instance work is put on and taken from. Separate from the cache above
+    # so that losing a cache never loses queued work.
+    queue:
+      type: core/datastore/redis
+    # Where the files an agent writes are kept.
+    store:
+      type: core/storage/minio
+    # The authentication core. It holds its accounts in a database on the same
+    # backend the rest of the module uses.
+    auth:
+      type: core/security/supertokens
+      uses:
+        backend:
+          db:
+            target: db
+            inject:
+              env:
+                - { in: POSTGRESQL_HOST, from: host }
+                - { in: POSTGRESQL_PORT, from: port }
+                - { in: POSTGRESQL_USER, from: user }
+                - { in: POSTGRESQL_DATABASE_NAME, from: database }
+    # The schema-migration step. It creates the tables the five services below
+    # expect, so a deployment sequences it ahead of them.
+    migrations:
+      type: core/ai-agent/agenta-migrations
+      uses:
+        backend:
+          db:
+            target: db
+            inject:
+              env:
+                - { in: BACKEND_HOST, from: host }
+                - { in: BACKEND_PORT, from: port }
+                - { in: BACKEND_USER, from: user }
+    # The agent runner. Wired to the API alone, deliberately: see the isolation
+    # paragraph in the description above.
+    runner:
+      type: core/ai-agent/agenta-runner
+      uses:
+        api:
+          api:
+            target: api
+            inject:
+              env:
+                - { in: API_ENDPOINT, from: endpoint }
+    # The control-plane API: the platform's own data plane.
+    api:
+      type: core/ai-agent/agenta-api
+      uses:
+        backend:
+          db:
+            target: db
+            inject:
+              env:
+                - { in: BACKEND_HOST, from: host }
+                - { in: BACKEND_PORT, from: port }
+                - { in: BACKEND_USER, from: user }
+        cache:
+          volatile:
+            target: cache
+            inject:
+              env:
+                - { in: CACHE_HOST, from: host }
+                - { in: CACHE_PORT, from: port }
+        queue:
+          durable:
+            target: queue
+            inject:
+              env:
+                - { in: QUEUE_HOST, from: host }
+                - { in: QUEUE_PORT, from: port }
+        auth_core:
+          auth:
+            target: auth
+            inject:
+              env:
+                - { in: AUTH_CORE_ENDPOINT, from: endpoint }
+        store:
+          objects:
+            target: store
+            inject:
+              env:
+                - { in: STORE_HOST, from: host }
+                - { in: STORE_PORT, from: port }
+        runner:
+          runner:
+            target: runner
+            inject:
+              env:
+                - { in: RUNNER_ENDPOINT, from: endpoint }
+    # The model-facing service: completions, chat, and starting an agent run.
+    services:
+      type: core/ai-agent/agenta-services
+      uses:
+        backend:
+          db:
+            target: db
+            inject:
+              env:
+                - { in: BACKEND_HOST, from: host }
+                - { in: BACKEND_PORT, from: port }
+                - { in: BACKEND_USER, from: user }
+        cache:
+          volatile:
+            target: cache
+            inject:
+              env:
+                - { in: CACHE_HOST, from: host }
+                - { in: CACHE_PORT, from: port }
+        queue:
+          durable:
+            target: queue
+            inject:
+              env:
+                - { in: QUEUE_HOST, from: host }
+                - { in: QUEUE_PORT, from: port }
+        auth_core:
+          auth:
+            target: auth
+            inject:
+              env:
+                - { in: AUTH_CORE_ENDPOINT, from: endpoint }
+        store:
+          objects:
+            target: store
+            inject:
+              env:
+                - { in: STORE_HOST, from: host }
+                - { in: STORE_PORT, from: port }
+        runner:
+          runner:
+            target: runner
+            inject:
+              env:
+                - { in: RUNNER_ENDPOINT, from: endpoint }
+    # Drains the platform's continuous streams into the tracing database.
+    worker_streams:
+      type: core/ai-agent/agenta-worker-streams
+      uses:
+        backend:
+          db:
+            target: db
+            inject:
+              env:
+                - { in: BACKEND_HOST, from: host }
+                - { in: BACKEND_PORT, from: port }
+                - { in: BACKEND_USER, from: user }
+        cache:
+          volatile:
+            target: cache
+            inject:
+              env:
+                - { in: CACHE_HOST, from: host }
+                - { in: CACHE_PORT, from: port }
+        queue:
+          durable:
+            target: queue
+            inject:
+              env:
+                - { in: QUEUE_HOST, from: host }
+                - { in: QUEUE_PORT, from: port }
+    # Runs the platform's discrete background jobs: webhooks, triggers, agent
+    # turns and evaluations.
+    worker_queues:
+      type: core/ai-agent/agenta-worker-queues
+      uses:
+        backend:
+          db:
+            target: db
+            inject:
+              env:
+                - { in: BACKEND_HOST, from: host }
+                - { in: BACKEND_PORT, from: port }
+                - { in: BACKEND_USER, from: user }
+        cache:
+          volatile:
+            target: cache
+            inject:
+              env:
+                - { in: CACHE_HOST, from: host }
+                - { in: CACHE_PORT, from: port }
+        queue:
+          durable:
+            target: queue
+            inject:
+              env:
+                - { in: QUEUE_HOST, from: host }
+                - { in: QUEUE_PORT, from: port }
+        services:
+          services:
+            target: services
+            inject:
+              env:
+                - { in: SERVICES_ENDPOINT, from: endpoint }
+    # Decides when a time-triggered thing is due and enqueues it.
+    scheduler:
+      type: core/ai-agent/agenta-cron
+      uses:
+        backend:
+          db:
+            target: db
+            inject:
+              env:
+                - { in: BACKEND_HOST, from: host }
+                - { in: BACKEND_PORT, from: port }
+                - { in: BACKEND_USER, from: user }
+        cache:
+          volatile:
+            target: cache
+            inject:
+              env:
+                - { in: CACHE_HOST, from: host }
+                - { in: CACHE_PORT, from: port }
+        queue:
+          durable:
+            target: queue
+            inject:
+              env:
+                - { in: QUEUE_HOST, from: host }
+                - { in: QUEUE_PORT, from: port }
+    # The browser console.
+    console:
+      type: core/ai-agent/agenta-web
+      uses:
+        api:
+          api:
+            target: api
+            inject:
+              env:
+                - { in: API_ENDPOINT, from: endpoint }
+        services:
+          services:
+            target: services
+            inject:
+              env:
+                - { in: SERVICES_ENDPOINT, from: endpoint }
+        auth_core:
+          auth:
+            target: auth
+            inject:
+              env:
+                - { in: AUTH_CORE_ENDPOINT, from: endpoint }
+    # The small-screen front end.
+    mobile:
+      type: core/ai-agent/agenta-web-mobile
+      uses:
+        api:
+          api:
+            target: api
+            inject:
+              env:
+                - { in: API_ENDPOINT, from: endpoint }
+        services:
+          services:
+            target: services
+            inject:
+              env:
+                - { in: SERVICES_ENDPOINT, from: endpoint }
+        auth_core:
+          auth:
+            target: auth
+            inject:
+              env:
+                - { in: AUTH_CORE_ENDPOINT, from: endpoint }
+  exportedComponents:
+    api: api
+    services: services
+    console: console
+    mobile: mobile

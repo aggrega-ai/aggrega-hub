@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: agenta-worker-queues
+  version: 1.0.0
+  license: MIT
+  # The identifier names the terms of the software this Recipe realizes: the
+  # image below is the platform's open core, published under the MIT Expat terms
+  # its repository states for everything outside one named subtree. That subtree
+  # is published under separate terms and is built into a different image, which
+  # this Recipe does not pin and offers no knob to select. No single identifier
+  # states both situations, so the coarse class covering the product as a whole
+  # is carried on the component's component.aggrega.ai/upstream-licensing label
+  # rather than asserted here.
+  description: >
+    The agent workspace's queue-consuming worker on Kubernetes via the helm
+    provider's Workload synthesis: a stateless Deployment and no Service. There
+    is no Service because nothing connects to this tier — work reaches it by
+    being enqueued — and emitting one would advertise an endpoint that answers
+    nothing.
+
+    Each backing system's identity arrives on .context.inject.env and is
+    composed here into the single connection string its client reads, under the
+    same variable names the control-plane API's Recipe uses, because the two run
+    the same image and read the same configuration. The model-facing service's
+    in-cluster base URL, resolved from the `services` edge, is what a job that
+    runs an agent turn or scores an evaluation calls. The relational connections
+    are rendered password-free: the password arrives beside them as an env
+    secret reference and is named inside each URL in the platform's own
+    runtime-substitution form.
+
+    The queue selector is emitted from the component's own value, empty by
+    default, which is what makes one container run every family. This Recipe
+    publishes no provides contract, because the component declares none.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/agenta-worker-queues:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Target-expected names: the worker reads POSTGRES_URI_CORE and
+  # POSTGRES_URI_TRACING for the two relational databases, REDIS_URI and
+  # REDIS_URI_VOLATILE for the cache, REDIS_URI_DURABLE for the queues it
+  # consumes, AGENTA_SERVICES_URL for the model-facing service it calls, and
+  # AGENTA_WORKER_QUEUES for which families this container runs — an empty value
+  # meaning all of them, which is why the variable is emitted even when the
+  # component's value is unset.
+  #
+  # The names the edges deliver on are read here as BACKEND_HOST, BACKEND_PORT,
+  # BACKEND_USER, CACHE_HOST, CACHE_PORT, QUEUE_HOST, QUEUE_PORT and
+  # SERVICES_ENDPOINT. Those are the `in:` keys each uses-edge must be set to,
+  # and the component's socket comments state the same contract on the authoring
+  # side.
+  #
+  # POSTGRES_PASSWORD is named inside both relational URLs in the
+  # $(POSTGRES_PASSWORD) form, which the platform's own container runtime
+  # expands from the variable of that name delivered beside it.
+  provides: {}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The worker holds no durable state — the relational backend is the system
+    # of record — so the default stateless form (a Deployment on the helm
+    # provider) is correct. No services key: nothing connects to this tier.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "ghcr.io/agenta-ai/agenta-api:{{ .infra.engine_version }}"
+        # The platform image ships several entry points and runs whichever the
+        # command names. This one drains the queues; the control-plane API, the
+        # stream worker, the scheduler and the migration step run the same image
+        # under their own commands, which is why all five pin the same
+        # engine_version.
+        command: ["python", "-m", "entrypoints.worker_queues"]
+        variables:
+          AGENTA_LICENSE: oss
+          AGENTA_LOG_LEVEL: "{{ .infra.log_level }}"
+          # Which job families this container runs. Empty means all of them,
+          # which is what a single-container deployment wants.
+          AGENTA_WORKER_QUEUES: "{{ .values.queues }}"
+          AGENTA_WORKER_CONCURRENCY: "{{ .values.concurrency }}"
+          # The model-facing service this tier calls, resolved from its edge.
+          AGENTA_SERVICES_URL: "{{ .context.inject.env.SERVICES_ENDPOINT }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "backend" }}
+          POSTGRES_URI_CORE: "postgresql+asyncpg://{{ $.context.inject.env.BACKEND_USER }}:$(POSTGRES_PASSWORD)@{{ $.context.inject.env.BACKEND_HOST }}:{{ $.context.inject.env.BACKEND_PORT }}/{{ $edge.values.core_database }}"
+          POSTGRES_URI_TRACING: "postgresql+asyncpg://{{ $.context.inject.env.BACKEND_USER }}:$(POSTGRES_PASSWORD)@{{ $.context.inject.env.BACKEND_HOST }}:{{ $.context.inject.env.BACKEND_PORT }}/{{ $edge.values.tracing_database }}"
+    {{- end }}
+    {{- if eq $edge.socket "cache" }}
+          REDIS_URI: "redis://{{ $.context.inject.env.CACHE_HOST }}:{{ $.context.inject.env.CACHE_PORT }}/{{ $edge.values.db_index }}"
+          REDIS_URI_VOLATILE: "redis://{{ $.context.inject.env.CACHE_HOST }}:{{ $.context.inject.env.CACHE_PORT }}/{{ $edge.values.db_index }}"
+    {{- end }}
+    {{- if eq $edge.socket "queue" }}
+          REDIS_URI_DURABLE: "redis://{{ $.context.inject.env.QUEUE_HOST }}:{{ $.context.inject.env.QUEUE_PORT }}/{{ $edge.values.db_index }}"
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "backend_password") }}
+          POSTGRES_PASSWORD: apppass
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "auth_key") }}
+          AGENTA_AUTH_KEY: dev-agenta-auth-change-me
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "crypt_key") }}
+          AGENTA_CRYPT_KEY: dev-agenta-crypt-change-me
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "services_internal_key") }}
+          AGENTA_SERVICES_INTERNAL_KEY: dev-agenta-internal-change-me
+    {{- end }}
+    {{- $attached := false }}
+    {{- range $slot := list "backend_password" "auth_key" "crypt_key" "services_internal_key" }}
+    {{- if hasKey (default dict $.features) $slot }}{{ $attached = true }}{{ end }}
+    {{- end }}
+    {{- if $attached }}
+        attachments:
+    {{- end }}
+    {{- if hasKey (default dict .features) "backend_password" }}
+          POSTGRES_PASSWORD:
+            from: backend_password
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "auth_key" }}
+          AGENTA_AUTH_KEY:
+            from: auth_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "crypt_key" }}
+          AGENTA_CRYPT_KEY:
+            from: crypt_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "services_internal_key" }}
+          AGENTA_SERVICES_INTERNAL_KEY:
+            from: services_internal_key
+            as: env
+    {{- end }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the deployment supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"

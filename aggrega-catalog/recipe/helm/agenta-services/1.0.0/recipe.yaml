@@ -1,0 +1,236 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: agenta-services
+  version: 1.0.0
+  license: MIT
+  # The identifier names the terms of the software this Recipe realizes: the
+  # image below is the platform's open core, published under the MIT Expat terms
+  # its repository states for everything outside one named subtree. That subtree
+  # is published under separate terms and is built into a different image, which
+  # this Recipe does not pin and offers no knob to select. No single identifier
+  # states both situations, so the coarse class covering the product as a whole
+  # is carried on the component's component.aggrega.ai/upstream-licensing label
+  # rather than asserted here.
+  description: >
+    The agent workspace's model-facing service on Kubernetes via the helm
+    provider's Workload synthesis: a stateless Deployment plus a ClusterIP
+    Service on the HTTP port the console's playground and the queue-consuming
+    worker call. The service keeps no durable state of its own, so it renders
+    stateless, with no persistent volume and no headless Service.
+
+    Each backing system's identity arrives on .context.inject.env and is
+    composed here into the single connection string its client reads, exactly as
+    the control-plane API's Recipe does — the two services read one model, so
+    they are given the same connections under the same variable names. The
+    relational connections are rendered password-free: the password arrives
+    beside them as an env secret reference and is named inside each URL in the
+    platform's own runtime-substitution form, so the plaintext never appears in
+    the rendered manifest.
+
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service — it carries no namespace, so the recipe is independent
+    of where it is deployed. A consumer in another namespace qualifies the host
+    with the target namespace on its own side (caller-side routing), and
+    assembles its own URL rather than reusing provides.endpoint.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/agenta-services:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Target-expected names: the service reads each backing system as one
+  # connection string — POSTGRES_URI_CORE and POSTGRES_URI_TRACING, REDIS_URI
+  # and REDIS_URI_VOLATILE for the cache, REDIS_URI_DURABLE for the queue,
+  # AGENTA_STORE_ENDPOINT_URL for the object store, SUPERTOKENS_URI_CORE for the
+  # authentication core, and AGENTA_RUNNER_INTERNAL_URL for the runner.
+  # Composing the host, port and user that arrive on the edges into those
+  # strings is this Recipe's job. REDIS_URI and REDIS_URI_VOLATILE are both
+  # emitted with the same value because the service reads whichever it finds and
+  # its own published deployment sets both.
+  #
+  # The names the edges deliver on are read here as BACKEND_HOST, BACKEND_PORT,
+  # BACKEND_USER, CACHE_HOST, CACHE_PORT, QUEUE_HOST, QUEUE_PORT,
+  # AUTH_CORE_ENDPOINT, STORE_HOST, STORE_PORT and RUNNER_ENDPOINT. Those are
+  # the `in:` keys each uses-edge must be set to, and the component's socket
+  # comments state the same contract on the authoring side.
+  #
+  # POSTGRES_PASSWORD is named inside both relational URLs in the
+  # $(POSTGRES_PASSWORD) form, which the platform's own container runtime
+  # expands from the variable of that name delivered beside it. That is what
+  # lets one URL carry the credential while the credential itself stays a secret
+  # reference.
+  #
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the service's own bind address, the
+  # container port and the Service; the literal is never repeated.
+  #
+  # host and endpoint spell the Service name out twice on purpose. A provides
+  # entry cannot read another provides entry, and the name has to match the
+  # Service the helm provider derives from the service key below, so the
+  # repetition is forced, not a choice, and the two must be edited together.
+  assertions:
+    external_base_url_supplied: >-
+      {{- if not (and (hasKey .infra "external_base_url") (index .infra "external_base_url")) -}}
+      {{- fail "infra.external_base_url must name the externally reachable base URL of the platform, as a browser reaches it through the ingress tier (for example https://agenta.example.com); set it in the Release" -}}
+      {{- end -}}
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}"
+    protocol: "http"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The service holds no durable state, so the default stateless form (a
+    # Deployment on the helm provider) is correct: no form: stateful, no
+    # persistentTemplate volume, no PVC.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "ghcr.io/agenta-ai/agenta-services:{{ .infra.engine_version }}"
+        command:
+          - gunicorn
+          - entrypoints.main:app
+          - --bind
+          - "0.0.0.0:{{ .infra.port }}"
+          - --worker-class
+          - uvicorn.workers.UvicornWorker
+          - --workers
+          - "{{ .infra.web_workers }}"
+          - --log-level
+          - info
+          - --access-logfile
+          - "-"
+          - --error-logfile
+          - "-"
+        variables:
+          AGENTA_LICENSE: oss
+          AGENTA_LOG_LEVEL: "{{ .infra.log_level }}"
+          # The addresses reported outward. All three are derived from one
+          # authored value so they cannot disagree, and the two path suffixes
+          # match the routes the ingress tier assembles.
+          AGENTA_WEB_URL: "{{ .infra.external_base_url }}"
+          AGENTA_API_URL: "{{ .infra.external_base_url }}/api"
+          AGENTA_SERVICES_URL: "{{ .infra.external_base_url }}/services"
+          # The path prefix this service is mounted under at the ingress tier.
+          # It matches the AGENTA_SERVICES_URL suffix above.
+          SCRIPT_NAME: /services
+          AGENTA_SERVICES_TIMEOUT: "{{ .values.model_call_timeout_seconds }}"
+          AGENTA_SERVICES_MAX_CONCURRENCY: "{{ .values.max_concurrent_model_calls }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "backend" }}
+          POSTGRES_URI_CORE: "postgresql+asyncpg://{{ $.context.inject.env.BACKEND_USER }}:$(POSTGRES_PASSWORD)@{{ $.context.inject.env.BACKEND_HOST }}:{{ $.context.inject.env.BACKEND_PORT }}/{{ $edge.values.core_database }}"
+          POSTGRES_URI_TRACING: "postgresql+asyncpg://{{ $.context.inject.env.BACKEND_USER }}:$(POSTGRES_PASSWORD)@{{ $.context.inject.env.BACKEND_HOST }}:{{ $.context.inject.env.BACKEND_PORT }}/{{ $edge.values.tracing_database }}"
+    {{- end }}
+    {{- if eq $edge.socket "cache" }}
+          REDIS_URI: "redis://{{ $.context.inject.env.CACHE_HOST }}:{{ $.context.inject.env.CACHE_PORT }}/{{ $edge.values.db_index }}"
+          REDIS_URI_VOLATILE: "redis://{{ $.context.inject.env.CACHE_HOST }}:{{ $.context.inject.env.CACHE_PORT }}/{{ $edge.values.db_index }}"
+    {{- end }}
+    {{- if eq $edge.socket "queue" }}
+          REDIS_URI_DURABLE: "redis://{{ $.context.inject.env.QUEUE_HOST }}:{{ $.context.inject.env.QUEUE_PORT }}/{{ $edge.values.db_index }}"
+    {{- end }}
+    {{- if eq $edge.socket "store" }}
+          AGENTA_STORE_ENDPOINT_URL: "http://{{ $.context.inject.env.STORE_HOST }}:{{ $.context.inject.env.STORE_PORT }}"
+          AGENTA_STORE_BUCKET: "{{ $edge.values.bucket }}"
+          AGENTA_STORE_REGION: "{{ $edge.values.region }}"
+    {{- end }}
+    {{- end }}
+          # The authentication core's own base URL, resolved from the auth_core
+          # edge. The service names that core's URI rather than a protocol
+          # endpoint, which is why the edge carries an endpoint.
+          SUPERTOKENS_URI_CORE: "{{ .context.inject.env.AUTH_CORE_ENDPOINT }}"
+          # The runner's in-cluster base URL, taken straight from its edge. This
+          # is the address an agent run is handed to.
+          AGENTA_RUNNER_INTERNAL_URL: "{{ .context.inject.env.RUNNER_ENDPOINT }}"
+    {{- if not (hasKey (default dict .features) "backend_password") }}
+          POSTGRES_PASSWORD: apppass
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "auth_key") }}
+          AGENTA_AUTH_KEY: dev-agenta-auth-change-me
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "crypt_key") }}
+          AGENTA_CRYPT_KEY: dev-agenta-crypt-change-me
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "services_internal_key") }}
+          AGENTA_SERVICES_INTERNAL_KEY: dev-agenta-internal-change-me
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "runner_token") }}
+          AGENTA_RUNNER_TOKEN: dev-agenta-runner-change-me
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "store_access_key") }}
+          AGENTA_STORE_ACCESS_KEY: admin
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "store_secret_key") }}
+          AGENTA_STORE_SECRET_KEY: dev-minio-root-change-me
+    {{- end }}
+    {{- $attached := false }}
+    {{- range $slot := list "backend_password" "auth_key" "crypt_key" "services_internal_key" "runner_token" "store_access_key" "store_secret_key" "auth_core_api_key" }}
+    {{- if hasKey (default dict $.features) $slot }}{{ $attached = true }}{{ end }}
+    {{- end }}
+    {{- if $attached }}
+        attachments:
+    {{- end }}
+    {{- if hasKey (default dict .features) "backend_password" }}
+          POSTGRES_PASSWORD:
+            from: backend_password
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "auth_key" }}
+          AGENTA_AUTH_KEY:
+            from: auth_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "crypt_key" }}
+          AGENTA_CRYPT_KEY:
+            from: crypt_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "services_internal_key" }}
+          AGENTA_SERVICES_INTERNAL_KEY:
+            from: services_internal_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "runner_token" }}
+          AGENTA_RUNNER_TOKEN:
+            from: runner_token
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "store_access_key" }}
+          AGENTA_STORE_ACCESS_KEY:
+            from: store_access_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "store_secret_key" }}
+          AGENTA_STORE_SECRET_KEY:
+            from: store_secret_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "auth_core_api_key" }}
+          SUPERTOKENS_API_KEY:
+            from: auth_core_api_key
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the deployment supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

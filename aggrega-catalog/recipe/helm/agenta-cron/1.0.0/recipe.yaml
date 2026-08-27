@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: agenta-cron
+  version: 1.0.0
+  license: MIT
+  # The identifier names the terms of the software this Recipe realizes: the
+  # image below is the platform's open core, published under the MIT Expat terms
+  # its repository states for everything outside one named subtree. That subtree
+  # is published under separate terms and is built into a different image, which
+  # this Recipe does not pin and offers no knob to select. No single identifier
+  # states both situations, so the coarse class covering the product as a whole
+  # is carried on the component's component.aggrega.ai/upstream-licensing label
+  # rather than asserted here.
+  description: >
+    The agent workspace's scheduler on Kubernetes via the helm provider's
+    Workload synthesis: a single-replica stateless Deployment and no Service.
+
+    The controller shape is a deliberate choice rather than a default left in
+    place. The scheduler is a resident process carrying its own schedule table,
+    which is how the platform's own published deployment runs it, so this Recipe
+    renders it as a Deployment rather than as a scheduled workload. A scheduled
+    form would hand the timing decision to the platform underneath and fire the
+    container on a fixed expression, which is not what this tier does — it wakes
+    on its own clock and reads schedules a user authored in the platform.
+
+    One replica, and that too is deliberate: two schedulers reading one schedule
+    table would each enqueue the same due item. There is no Service because
+    nothing connects to this tier.
+
+    Each backing system's identity arrives on .context.inject.env and is
+    composed here into the single connection string its client reads, under the
+    same variable names the control-plane API's Recipe uses. The relational
+    connections are rendered password-free: the password arrives beside them as
+    an env secret reference and is named inside each URL in the platform's own
+    runtime-substitution form. This Recipe publishes no provides contract,
+    because the component declares none.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/agenta-cron:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Target-expected names: the scheduler reads POSTGRES_URI_CORE and
+  # POSTGRES_URI_TRACING for the two relational databases, REDIS_URI and
+  # REDIS_URI_VOLATILE for the cache, and REDIS_URI_DURABLE for the queue it
+  # enqueues onto. It reads no variable naming its own schedule: the schedule
+  # table it fires from is inside the image, and the per-agent schedules come
+  # from the relational backend.
+  #
+  # The names the edges deliver on are read here as BACKEND_HOST, BACKEND_PORT,
+  # BACKEND_USER, CACHE_HOST, CACHE_PORT, QUEUE_HOST and QUEUE_PORT. Those are
+  # the `in:` keys each uses-edge must be set to, and the component's socket
+  # comments state the same contract on the authoring side.
+  #
+  # POSTGRES_PASSWORD is named inside both relational URLs in the
+  # $(POSTGRES_PASSWORD) form, which the platform's own container runtime
+  # expands from the variable of that name delivered beside it.
+  provides: {}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # A resident scheduler, not a platform-scheduled run: see the description.
+    # It holds no durable state, so the stateless form is correct, and no
+    # services key because nothing connects to this tier.
+    form: stateless
+    # One replica, deliberately: two schedulers would each enqueue the same due
+    # item.
+    replicas: 1
+    containers:
+      main:
+        image: "ghcr.io/agenta-ai/agenta-api:{{ .infra.engine_version }}"
+        # The platform image ships a schedule runner and its table. The
+        # control-plane API, the two worker tiers and the migration step run the
+        # same image under their own commands, which is why all five pin the same
+        # engine_version.
+        command: ["/usr/local/bin/supercronic", "/app/crontab"]
+        variables:
+          AGENTA_LICENSE: oss
+          AGENTA_LOG_LEVEL: "{{ .infra.log_level }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "backend" }}
+          POSTGRES_URI_CORE: "postgresql+asyncpg://{{ $.context.inject.env.BACKEND_USER }}:$(POSTGRES_PASSWORD)@{{ $.context.inject.env.BACKEND_HOST }}:{{ $.context.inject.env.BACKEND_PORT }}/{{ $edge.values.core_database }}"
+          POSTGRES_URI_TRACING: "postgresql+asyncpg://{{ $.context.inject.env.BACKEND_USER }}:$(POSTGRES_PASSWORD)@{{ $.context.inject.env.BACKEND_HOST }}:{{ $.context.inject.env.BACKEND_PORT }}/{{ $edge.values.tracing_database }}"
+    {{- end }}
+    {{- if eq $edge.socket "cache" }}
+          REDIS_URI: "redis://{{ $.context.inject.env.CACHE_HOST }}:{{ $.context.inject.env.CACHE_PORT }}/{{ $edge.values.db_index }}"
+          REDIS_URI_VOLATILE: "redis://{{ $.context.inject.env.CACHE_HOST }}:{{ $.context.inject.env.CACHE_PORT }}/{{ $edge.values.db_index }}"
+    {{- end }}
+    {{- if eq $edge.socket "queue" }}
+          REDIS_URI_DURABLE: "redis://{{ $.context.inject.env.QUEUE_HOST }}:{{ $.context.inject.env.QUEUE_PORT }}/{{ $edge.values.db_index }}"
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "backend_password") }}
+          POSTGRES_PASSWORD: apppass
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "auth_key") }}
+          AGENTA_AUTH_KEY: dev-agenta-auth-change-me
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "crypt_key") }}
+          AGENTA_CRYPT_KEY: dev-agenta-crypt-change-me
+    {{- end }}
+    {{- $attached := false }}
+    {{- range $slot := list "backend_password" "auth_key" "crypt_key" }}
+    {{- if hasKey (default dict $.features) $slot }}{{ $attached = true }}{{ end }}
+    {{- end }}
+    {{- if $attached }}
+        attachments:
+    {{- end }}
+    {{- if hasKey (default dict .features) "backend_password" }}
+          POSTGRES_PASSWORD:
+            from: backend_password
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "auth_key" }}
+          AGENTA_AUTH_KEY:
+            from: auth_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "crypt_key" }}
+          AGENTA_CRYPT_KEY:
+            from: crypt_key
+            as: env
+    {{- end }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the deployment supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"

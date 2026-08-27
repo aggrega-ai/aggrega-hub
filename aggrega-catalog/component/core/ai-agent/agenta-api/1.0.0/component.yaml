@@ -1,0 +1,276 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/ai-agent/agenta-api
+  version: 1.0.0
+  # metadata.license is deliberately absent. The field carries the SPDX
+  # identifier of the software the entity describes, and no single identifier
+  # covers this one: the platform is published open-core, so which terms apply
+  # depends on which part a deployment uses, and the published container image
+  # declares no single licence of its own. The class that situation falls into
+  # is stated instead through component.aggrega.ai/upstream-licensing below, and
+  # the licence of the artifact the Recipe actually pins is named on that
+  # Recipe, which is the surface that knows which artifact it pinned.
+  description: >
+    The control-plane API of an agent workspace — the service that holds the
+    agents a team builds, each agent's instructions, tools, skills, permissions
+    and version history, and the record of every run. It serves the REST API the
+    console renders from and an external client calls, and it is the tier that
+    reads and writes the platform's relational model.
+
+    It holds no state of its own; four backing systems do. The relational
+    backend wired through `backend` holds the agents, the teams and the
+    accounts, and it holds them in two databases named on that edge — one for
+    the platform's own model, one for the traces it records — so a deployment
+    can place them apart without either name being fixed here. The cache wired
+    through `cache` holds sessions and rate-limit counters; the queue wired
+    through `queue` is where work destined for the worker tiers is put; and the
+    object store wired through `store` holds the files an agent writes, so an
+    agent's working directory survives its sandbox being torn down. It reaches
+    the authentication core wired through `auth_core` for every sign-in and
+    every session check, and it addresses that core by the core's own base URL
+    rather than through a protocol endpoint, which is why the socket names a
+    core and not an identity provider.
+
+    A deployment wires here for the platform's own data plane: an external
+    client that lists agents, starts a run or reads a trace talks to this
+    service, and the console and the mobile front end render from it. It is the
+    counterpart of `core/ai-agent/agenta-services`, which owns the model-facing
+    side — completions, chat and the dispatch of an agent run to the runner — so
+    a caller that wants to invoke a model reaches that service rather than this
+    one.
+
+    Exports its host, port, endpoint and protocol to consumers via the uses
+    topology, where the endpoint is the in-cluster base URL another workload of
+    the platform calls.
+
+    Realized on Kubernetes via its Helm Recipe, which synthesizes the service as
+    a stateless Deployment behind a ClusterIP Service on its HTTP port and
+    composes each backing system's connection from the values that arrive on the
+    injection context.
+  labels:
+    component.aggrega.ai/type: server
+    component.aggrega.ai/category: ai-agent
+    # Every Recipe of this component runs the service as containers in the
+    # deployment's own cluster, so a single posture is its identity.
+    # Selector-only: never stamped onto rendered output.
+    component.aggrega.ai/hosting: self-hosted
+    # The platform's core is published under permissive terms while a named
+    # subtree of the repository carries its own separate terms, so which terms
+    # apply depends on which part a deployment uses. The image this component's
+    # Recipe pins is the core.
+    component.aggrega.ai/upstream-licensing: open-core
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  # Self-inject allowlist: the component may inject resolved uses-edge values
+  # into the env delivery mechanism.
+  inject: [env]
+
+  usesSchema:
+    # The relational backend holding the platform's own model and its traces.
+    # The selected component's provides host, port and user arrive on the
+    # injection context and the Recipe composes them into two connection URLs,
+    # one per database named below. The password is not carried on this edge —
+    # it is attached to the backend_password slot, so it stays a secret
+    # reference and never appears inside a rendered URL.
+    backend:
+      selector: "component.aggrega.ai/category=datastore"
+      inject: [env]
+      required: true
+      valueSchema:
+        # Two databases on one server. They are named on the edge rather than in
+        # values because the backend component publishes a single `database`
+        # name and this consumer needs two; naming them here keeps the backend
+        # unchanged and lets a deployment place them where it wants.
+        core_database:
+          type: string
+          default: agenta_core
+          description: Database on the wired backend holding the platform's own model — agents, teams, accounts, and the record of what each run did.
+        tracing_database:
+          type: string
+          default: agenta_tracing
+          description: Database on the same backend holding the traces and spans the platform records.
+    # The cache holding sessions, cached reads and rate-limit counters.
+    cache:
+      selector: "component.aggrega.ai/category=datastore"
+      inject: [env]
+      required: true
+      valueSchema:
+        db_index:
+          type: integer
+          minimum: 0
+          maximum: 15
+          default: 0
+          description: Logical-database index this connection uses on the wired cache.
+    # The durable queue the worker tiers take their work from. It is a separate
+    # socket from `cache` because the two hold different things — one is
+    # discardable, one is not — and a deployment routinely wires them to
+    # separate instances with separate durability settings.
+    queue:
+      selector: "component.aggrega.ai/category=datastore"
+      inject: [env]
+      required: true
+      valueSchema:
+        db_index:
+          type: integer
+          minimum: 0
+          maximum: 15
+          default: 0
+          description: Logical-database index this connection uses on the wired queue.
+    # The authentication core holding accounts, credentials and sessions. The
+    # service calls the core's own base URL, so the edge carries that endpoint
+    # rather than a host and port to assemble. Required: the service refuses to
+    # serve a request it cannot authenticate.
+    auth_core:
+      selector: "component.aggrega.ai/category=security"
+      inject: [env]
+      required: true
+    # The S3-compatible object store holding the files an agent writes. Required
+    # because an agent's working directory is part of what the platform is: with
+    # no store, files written during a run are lost when the sandbox is torn
+    # down. The store's own credentials are not on this edge — they are attached
+    # to the store_access_key and store_secret_key slots below.
+    store:
+      selector: "component.aggrega.ai/category=storage"
+      inject: [env]
+      required: true
+      valueSchema:
+        bucket:
+          type: string
+          default: agenta
+          description: Bucket on the wired object store that agent working directories are kept in.
+        region:
+          type: string
+          default: us-east-1
+          description: Region name the S3 client sends. An S3-compatible store that does not use regions accepts any value; a cloud store needs its own.
+    # The runner that starts an agent's harness in a sandbox. This service
+    # reaches it to inspect and cancel runs; the model-facing service is what
+    # starts them.
+    runner:
+      selector: "component.aggrega.ai/category=ai-agent"
+      inject: [env]
+      required: true
+
+  featuresSchema:
+    # Every slot is optional and transparent (`required` omitted → optional;
+    # inject: [env] so the synthesized Workload may reference it as an env
+    # secret). Each selector is secret-kind-pinned but family-agnostic, so any
+    # credential Feature of the secret kind may fill it. Unattached, the Recipe
+    # emits a pinned development literal, which is what makes a bare deployment
+    # render and run.
+    backend_password:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Password the service authenticates to the relational backend with. Delivered as an env secret reference and substituted into the connection URL at run time, so the value never appears in the rendered manifest. Unattached, the Recipe emits the development default the standard-library relational Recipes leave in place."
+    auth_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Key the platform signs its own internal tokens with. Every workload of the platform that issues or verifies one carries the same value, so a deployment attaching a credential here attaches it to each of them. Unattached, the Recipe emits a pinned development literal suitable for evaluation only."
+    crypt_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Key the stored model-provider credentials and connected-application tokens are encrypted under. It must be the same value on every workload of the platform that reads them, and changing it makes what is already stored unreadable. Unattached, the Recipe emits a pinned development literal suitable for evaluation only."
+    services_internal_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Key this service and the model-facing service present to each other on internal calls. Both ends carry the same value. Unattached, the Recipe emits a pinned development literal suitable for evaluation only."
+    runner_token:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Token presented on every call to the runner, which rejects an untokened request. The same credential is attached to the runner's own slot so both ends agree. Unattached, the Recipe emits a pinned development literal suitable for evaluation only."
+    store_access_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Access-key identifier the S3 client authenticates to the wired object store with. It names an account on that store, so it matches whatever the store itself was given. Unattached, the Recipe emits the development default the standard-library object-store Recipes leave in place."
+    store_secret_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Secret key paired with the access-key identifier above. Unattached, the Recipe emits the development default the standard-library object-store Recipes leave in place."
+    auth_core_api_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "API key presented to the authentication core. The core issues none by default and accepts every caller that can reach its address, so a deployment that has attached a key to the core attaches the same one here. Unattached, no key is sent."
+
+  schema:
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate. These shape
+      # what a user of the platform experiences, so they sit here rather than in
+      # infra.
+      email_sign_in_enabled:
+        type: boolean
+        default: true
+        description: Allow an account to sign in with an email address and a password. Turned off, only the sign-in methods a deployment has configured elsewhere remain.
+      allowed_email_domains:
+        type: string
+        description: Comma-separated list of email domains an account may be created under. Left unset, any domain is accepted.
+      password_min_length:
+        type: integer
+        minimum: 1
+        default: 8
+        description: Fewest characters a password may have. The authentication core enforces it at sign-up and at password change.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 8000
+        description: Port the service serves its HTTP API on; consumers connect here. Most operators should omit this and let the Recipe assign the default (8000).
+      external_base_url:
+        type: string
+        description: >
+          Externally reachable base URL of the whole platform, as a browser
+          reaches it through the ingress tier — for example
+          https://agenta.example.com. The service composes the addresses it
+          hands out in links and mail from it. The compiler cannot know a
+          cluster's external hostname, so this carries no default and the
+          Kubernetes realization halts at build until it is set.
+      engine_version:
+        type: string
+        default: "v0.114.1"
+        description: Platform API container image tag. The API service, the model-facing service, the two worker tiers, the scheduler and the schema-migration task run the same image, so a deployment moves them together.
+      web_workers:
+        type: integer
+        minimum: 1
+        default: 2
+        description: Number of request-serving worker processes in one container. Raising it raises throughput and the container's memory ceiling together, so it is sized with compute.memory.
+      log_level:
+        type: string
+        enum: [DEBUG, INFO, WARNING, ERROR, CRITICAL]
+        default: INFO
+        description: Log verbosity the service emits.
+      compute:
+        cpu:
+          type: string
+          default: 500m
+        memory:
+          type: string
+          default: 1Gi
+      overrides:
+        type: object
+        additionalProperties: true
+        description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology
+      # edges. host, port and protocol are the shape every server component
+      # publishes; endpoint is the in-cluster base URL a caller uses, which is a
+      # URL rather than a bare host, so it is published as its own key rather
+      # than left for a consumer to assemble.
+      host: { type: string, required: true }
+      port: { type: integer, required: true }
+      endpoint: { type: string, required: true }
+      protocol: { type: string }
