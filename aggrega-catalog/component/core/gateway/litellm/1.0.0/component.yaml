@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/gateway/litellm
+  version: 1.0.0
+  # metadata.license is deliberately absent. The field carries the SPDX
+  # identifier of the software the entity describes, and no single identifier
+  # covers this one: the proxy is published open-core, so the terms depend on
+  # which part a deployment uses. The class that situation falls into is stated
+  # instead through component.aggrega.ai/upstream-licensing below, and the
+  # licence of the artifact each Recipe actually pins is named on that Recipe,
+  # which is the surface that knows which artifact it pinned.
+  description: >
+    An AI gateway that fronts several upstream provider models behind one
+    in-cluster endpoint and routes each request by the model name the caller
+    asks for. Its authoring surface is the model map: a list of published
+    aliases, each pointing at a provider-qualified upstream target. The map is
+    what reaches rendered output — the gateway's configuration names every alias
+    it serves, the target behind each one, and the strategy it applies when more
+    than one entry publishes the same alias — so a reader of the rendered
+    artifact can see the routing table the gateway will serve. Each target is a
+    deterministic pointer string the runtime resolves as it serves a request;
+    the compiler never contacts a provider. The gateway holds the upstream
+    credential and presents it to the provider on the caller's behalf, so the
+    credential never reaches the calling application. Callers speak one
+    OpenAI-compatible API to one address whichever provider answers behind it,
+    and the map can be repointed at a different upstream without a caller
+    changing. Realized on Kubernetes via its Helm Recipe, which carries the
+    model map in a ConfigMap the proxy reads at startup; helm-only, because the
+    routing table is a configuration body and a target with no
+    configuration-resource primitive can carry one upstream at a time rather
+    than a map. Exports its proxy host, port, endpoint, and protocol to
+    consumers via the uses topology.
+  labels:
+    component.aggrega.ai/type: server
+    component.aggrega.ai/category: gateway
+    component.aggrega.ai/hosting: self-hosted
+    component.aggrega.ai/upstream-licensing: open-core
+    # The gateway capability dimension: this router reads the model name out of
+    # the request body and routes on it, so a runtime control that has to parse
+    # an LLM payload can attach here. The value is asserted by what the Recipe
+    # renders — the model map below is in the rendered configuration, not merely
+    # in this component's schema.
+    gateway.aggrega.ai/intelligence: semantic
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  # Self-inject allowlist: the component may inject its own provides keys into
+  # the env delivery mechanism.
+  inject: [env]
+
+  featuresSchema:
+    # Both slots are optional and transparent (`required` omitted → optional;
+    # inject: [env] so a synthesized Workload may reference them as env
+    # secrets). The selector is secret-kind-pinned but family-agnostic, so any
+    # credential Feature of the secret kind may fill either slot. Neither
+    # credential's value reaches the configuration body — the Recipe delivers
+    # both as environment variables and the configuration names the variable,
+    # never the value.
+    master_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Optional administrative key guarding the gateway's own API. When attached, the Recipe delivers it as the environment variable the proxy reads at startup, so callers and the management API must present it. Unattached, the gateway starts with no administrative key and treats every caller as an unprivileged internal user, which suits a development deployment and not a shared one."
+    provider_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Optional credential the gateway presents to the upstream providers its model map targets. When attached, every map entry names the environment variable the Recipe delivers it under, so the gateway authenticates upstream and the calling application never holds the credential. Unattached, the gateway serves and routes but holds no upstream credential, so a routed request fails at the provider; attach one for any deployment that must actually reach a model. A map spanning several providers that each require their own distinct credential needs one credential per provider, which this single slot does not express — such a deployment carries the additional variables through its own secret machinery."
+
+  schema:
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate.
+      #
+      # The model map is this component's reason to exist. Each entry publishes
+      # one alias a caller may ask for and names the upstream target that alias
+      # resolves to, and the whole map is rendered into the gateway's
+      # configuration, so the routing table is visible in the artifact rather
+      # than implied by it. Aliases are deliberately independent of their
+      # targets: a target can be repointed without any caller changing what it
+      # asks for.
+      models:
+        type: array
+        min: 1
+        required: true
+        description: The model map the gateway serves. Each entry publishes one alias and names the upstream target it resolves to. At least one entry is required — a gateway with an empty map serves nothing.
+        items:
+          name:
+            type: string
+            required: true
+            description: The alias the gateway publishes and a caller asks for. Independent of the target below, so the target can change without a caller changing.
+          target:
+            type: string
+            required: true
+            description: The provider-qualified upstream model this alias resolves to, in the proxy's own provider/model notation (for example openai/gpt-4o or anthropic/claude-sonnet-4). A deterministic pointer string the runtime resolves per request; the compiler never contacts the provider.
+      routing_strategy:
+        type: string
+        enum: [simple-shuffle, least-busy, usage-based-routing, latency-based-routing]
+        default: simple-shuffle
+        description: How the gateway picks between map entries that publish the same alias. It only takes effect where an alias appears more than once — a map whose aliases are all distinct routes by name alone and this value changes nothing about it.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 4000
+        description: Proxy port callers connect to. Most operators should omit this and let the Recipe assign the default (4000).
+      engine_version:
+        type: string
+        default: "v1.85.1"
+        description: Gateway image tag. Selects the image tag on the synthesized proxy container.
+      compute:
+        cpu:
+          type: string
+          default: "1"
+        memory:
+          type: string
+          default: 2Gi
+      database_url:
+        type: string
+        description: Optional connection string for the gateway's own bookkeeping database, which backs key management, spend tracking and request logs. A deterministic pointer string the runtime resolves; the compiler never connects to it. Omit it and the gateway runs stateless — it serves and routes normally, and the features that need persistence are simply inactive.
+      overrides:
+        type: object
+        additionalProperties: true
+        description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      # host, port and protocol are the gateway family's contract, the same keys
+      # every other gateway component publishes; endpoint is the
+      # OpenAI-compatible base URL a caller wiring to the gateway reads.
+      host: { type: string, required: true }
+      port: { type: integer, required: true }
+      endpoint: { type: string, required: true }
+      protocol: { type: string }

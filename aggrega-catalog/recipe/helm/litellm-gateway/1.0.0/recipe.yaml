@@ -1,0 +1,174 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: litellm-gateway
+  version: 1.0.0
+  license: MIT
+  description: >
+    An AI gateway on Kubernetes via the helm provider's Workload synthesis,
+    running the official upstream proxy image directly (no external Helm chart).
+    Renders a Deployment plus a ConfigMap, and the ConfigMap is where this
+    realization earns the gateway's capability: it carries the routing table —
+    every published alias, the upstream target each one resolves to, and the
+    strategy applied where an alias appears more than once — so the rendered
+    artifact shows which models the gateway serves rather than leaving it to the
+    running process to reveal. The proxy container reads that file through the
+    --config flag. A ClusterIP Service fronts the API. When the optional
+    master_key credential slot is attached the administrative key reaches the
+    gateway as an env secretKeyRef, so its value never appears in the rendered
+    manifest; unattached, the gateway starts with no administrative key. When the
+    optional provider_key slot is attached the upstream credential reaches the
+    gateway the same way and every map entry names that variable rather than
+    carrying the credential, which is what keeps the credential inside the
+    gateway and out of the calling application. The bookkeeping database
+    connection string is emitted only when infra.database_url is set; with none
+    the gateway runs stateless. provides.host is the bare, self-contained
+    in-cluster service name of the synthesized ClusterIP Service — it carries no
+    namespace, so the recipe is independent of where it is deployed. A consumer
+    in another namespace qualifies the host with the target namespace on its own
+    side (caller-side routing). The configuration contract is authored against
+    LiteLLM v1.85.1.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/gateway/litellm:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Each entry below is the single authored home for a value the artifacts
+  # template and the workload template both have to agree on. They are separate
+  # templates, so a variable bound in one is not visible in the other, and these
+  # entries are what keeps the emitted ConfigMap and the container that reads it
+  # from drifting apart: config_file is the ConfigMap's data key and the filename
+  # the proxy is pointed at, config_map_name is the resource name the ConfigMap
+  # declares and the volume sources, and provider_key_variable is the variable
+  # the routing table names for its upstream credential and the variable the
+  # attached credential is delivered under. A second home for that last one is
+  # exactly how a routing table comes to name a variable nothing sets.
+  locals:
+    config_file: config.yaml
+    config_map_name: "{{ .context.instance_id }}-config"
+    provider_key_variable: LITELLM_PROVIDER_API_KEY
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the proxy's own listen-port argument, the
+  # container port and the Service; the literal is never repeated. endpoint is the
+  # OpenAI-compatible base URL a caller wiring to the gateway reads, assembled
+  # from the same host and port as the other keys.
+  #
+  # host and endpoint spell the Service name out twice on purpose. A provides
+  # entry cannot read another provides entry, and the name has to match the
+  # Service the helm provider derives from the service key below, so there is no
+  # home either could dereference instead — the repetition is forced, not a
+  # choice, and the two must be edited together.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}/v1"
+    protocol: "http"
+  artifacts:
+    # The gateway's routing table. Every entry of the developer's model map
+    # becomes one published alias and the upstream target it resolves to, and the
+    # strategy entry below states how the gateway picks between entries that
+    # publish the same alias. This body is the reason the component's capability
+    # label is true of what is rendered rather than only of what is authored: a
+    # reader of this artifact can see the models the gateway serves.
+    #
+    # No credential value appears here. The upstream credential is named through
+    # the proxy's own environment indirection — each entry carries the variable
+    # name and the runtime reads the value from the environment — and the
+    # administrative key is not named here at all, because the proxy reads its
+    # variable directly from the environment at startup.
+    litellm-gateway-config.configmap.yaml: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .locals.config_map_name }}
+      data:
+        {{ .locals.config_file }}: |
+          model_list:
+      {{- range .values.models }}
+            - model_name: {{ .name }}
+              litellm_params:
+                model: {{ .target }}
+      {{- if hasKey (default dict $.features) "provider_key" }}
+                api_key: os.environ/{{ $.locals.provider_key_variable }}
+      {{- end }}
+      {{- end }}
+          router_settings:
+            routing_strategy: {{ .values.routing_strategy }}
+  workload: |
+    {{- $configDir := "/etc/litellm" -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "ghcr.io/berriai/litellm:{{ .infra.engine_version }}"
+        # $configDir is the single authored home for the directory the routing
+        # table is mounted at: the path the proxy is pointed at and the volume
+        # mount that decides what is mounted there both read the binding, so a
+        # future move cannot relocate one and leave the other behind. The
+        # filename within it is the ConfigMap's own data key, so it is read from
+        # the entry the emitted ConfigMap shares.
+        # The image entrypoint execs the proxy with the container args as its
+        # command line, and supplying args replaces the image's own default
+        # arguments — so the listen port is passed here explicitly rather than
+        # inherited, dereferencing its single authored home.
+        args:
+          - "--config"
+          - "{{ $configDir }}/{{ .locals.config_file }}"
+          - "--port"
+          - "{{ .infra.port }}"
+    {{- if .infra.database_url }}
+        variables:
+          DATABASE_URL: "{{ .infra.database_url }}"
+    {{- end }}
+    {{- if or (hasKey (default dict .features) "master_key") (hasKey (default dict .features) "provider_key") }}
+        attachments:
+    {{- end }}
+    {{- if hasKey (default dict .features) "master_key" }}
+          # The variable the proxy itself reads at startup. Delivered as an env
+          # secretKeyRef, so the key's value never lands in the manifest.
+          LITELLM_MASTER_KEY:
+            from: master_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "provider_key" }}
+          # The same variable every routing-table entry names through the proxy's
+          # environment indirection, read from the one home above so the table
+          # and the delivery agree by construction.
+          {{ .locals.provider_key_variable }}:
+            from: provider_key
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # Quoted on purpose. A CPU quantity may legitimately be authored as a
+        # bare number ("1"), and an unquoted template expansion of it lands in
+        # the workload document as a YAML integer, which the resource-quantity
+        # contract refuses because a quantity is a string.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        volumeMounts:
+          - name: config
+            path: {{ $configDir }}
+    volumes:
+      config:
+        configmap:
+          source: {{ .locals.config_map_name }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
