@@ -1,0 +1,158 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: event-publisher-knative
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The event-publishing tool realized as a Knative Service the Knative
+    Serving control plane reconciles. The recipe emits a single Service custom
+    resource; the control plane turns it into a revision, admits an inbound
+    call while that revision runs no replicas, and sets the replica count from
+    the concurrency it observes, so the tool occupies no compute between the
+    calls that invoke it. The replica floor and ceiling carry through as the
+    revision's own scaling bounds. The broker the tool publishes to arrives on
+    the tool's messaging socket, and the recipe delivers that broker's host,
+    port and protocol into the container alongside the developer's topic, so
+    the running tool addresses the broker the topology resolved rather than one
+    named in its own configuration. provides is the addressable name the
+    control plane gives the Service. The Knative Serving control plane is a
+    runtime prerequisite: the build halts unless the operator affirms it is
+    installed (infra.control_plane_present), so no custom resource is emitted
+    into a cluster that cannot reconcile it.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-tool/event-publisher:1.0.0
+  # A Knative Service is addressable in its own namespace under the Service's
+  # own name, on port 80, and the control plane routes from there to the
+  # revision's container port. provides.host is therefore that bare in-cluster
+  # name with no namespace segment, so the recipe is independent of where it is
+  # deployed; a consumer in another namespace qualifies it on its own side
+  # (caller-side routing). provides.port is 80 rather than infra.port because
+  # 80 is what a caller connects to — infra.port is where the container listens
+  # behind the control plane's routing, and only the container spec below reads
+  # it.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "80"
+    endpoint: "http://{{ .context.instance_id }}"
+    protocol: "http"
+  assertions:
+    # The Knative Serving control plane must exist in the target cluster before
+    # a Serving custom resource can reconcile. The compiler cannot inspect
+    # cluster state, so the prerequisite is declared: an operator affirms it in
+    # the Release, and an unaffirmed build halts here rather than emitting an
+    # orphan custom resource.
+    knative_control_plane_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail "the Knative Serving control plane must be installed in the target cluster before this realization emits its Knative Service; once Knative Serving is present, affirm the prerequisite by setting infra.control_plane_present to true in the Release" -}}
+      {{- end -}}
+    # This component wraps no upstream product, so it holds no default image to
+    # fall back to: the deployment names the one it runs.
+    image_supplied: >-
+      {{- if not (optional .infra "image" "") -}}
+      {{- fail "this realization runs an image the deployment supplies, because the tool component packages no upstream product and therefore holds no default: set infra.image to the container image serving the tool in the Release" -}}
+      {{- end -}}
+    compute_group_complete: >-
+      {{- if not (optional (default dict .infra.compute) "cpu" "") -}}
+      {{- fail "this deployment sets part of infra.compute on the tool but leaves compute.cpu empty, so the rendered revision would carry no CPU request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+      {{- if not (optional (default dict .infra.compute) "memory" "") -}}
+      {{- fail "this deployment sets part of infra.compute on the tool but leaves compute.memory empty, so the rendered revision would carry no memory request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+  # This Recipe reads from infra.overrides:
+  #   annotations - map[string]string (added to the revision template's annotations)
+  #
+  # The key exists because the control plane reads its per-revision switches
+  # from the revision's annotations, and which switches an installation offers
+  # belongs to the installed control-plane version rather than to this catalog.
+  # The two scaling bounds are not among them: they come from infra.min_replicas
+  # and infra.max_replicas.
+  #
+  # The tool's own values and the broker's coordinates are both delivered to the
+  # container as environment variables. The image is the deployment's, so no
+  # upstream documentation names a spelling for them; the recipe delivers each
+  # under a stable name for the application's own code to read. The two optional
+  # values are emitted only when the developer set them, so an unset value
+  # renders no variable rather than an empty one.
+  #
+  # The broker's host, port and protocol are read off the messaging socket's
+  # own edge rather than from a value on the tool, which is what makes the
+  # destination the topology's to decide: the edge is found by matching the
+  # socket name the component declares, so the alias the developer chose for
+  # the connection does not reach this template. The tool declares one topic, so
+  # one broker is delivered: several edges on that socket would each deliver a
+  # broker under the same variable names, leaving undefined which one the tool
+  # addresses, so the template halts and names the socket rather than emitting
+  # an artifact whose behaviour the author did not choose.
+  artifacts:
+    service.yaml: |
+      {{- $wired := list -}}
+      {{- range $alias, $edge := .context.uses -}}
+      {{- if eq $edge.socket "target_messaging" -}}
+      {{- $wired = append $wired $alias -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if gt (len $wired) 1 -}}
+      {{- fail "this tool publishes to one broker, because it names one topic, and this deployment wires several onto its target_messaging socket: leave one edge on target_messaging, and declare a second event-publishing component for a second broker" -}}
+      {{- end -}}
+      apiVersion: serving.knative.dev/v1
+      kind: Service
+      metadata:
+        name: {{ .context.instance_id }}
+      spec:
+        template:
+          metadata:
+            annotations:
+              autoscaling.knative.dev/min-scale: "{{ .infra.min_replicas }}"
+              autoscaling.knative.dev/max-scale: "{{ .infra.max_replicas }}"
+              {{- if and .infra.overrides .infra.overrides.annotations }}
+              {{- range $k, $v := .infra.overrides.annotations }}
+              {{ $k }}: "{{ $v }}"
+              {{- end }}
+              {{- end }}
+          spec:
+            containers:
+              - image: "{{ .infra.image }}"
+                ports:
+                  - containerPort: {{ .infra.port }}
+                env:
+                  - name: EVENT_TOOL_TARGET_TOPIC
+                    value: "{{ .values.target_topic }}"
+                  - name: EVENT_TOOL_SIDE_EFFECTS
+                    value: "{{ .values.side_effects }}"
+                  - name: EVENT_TOOL_TIMEOUT_SECONDS
+                    value: "{{ .values.timeout_seconds }}"
+                  {{- with .values.payload_schema_ref }}
+                  - name: EVENT_TOOL_PAYLOAD_SCHEMA_REF
+                    value: "{{ . }}"
+                  {{- end }}
+                  {{- with .values.llm_description_override }}
+                  - name: EVENT_TOOL_DESCRIPTION
+                    value: "{{ . }}"
+                  {{- end }}
+                  {{- range $alias, $edge := .context.uses }}
+                  {{- if eq $edge.socket "target_messaging" }}
+                  - name: EVENT_TOOL_BROKER_HOST
+                    value: "{{ $edge.provides.host }}"
+                  - name: EVENT_TOOL_BROKER_PORT
+                    value: "{{ $edge.provides.port }}"
+                  {{- with (optional $edge.provides "protocol" "") }}
+                  - name: EVENT_TOOL_BROKER_PROTOCOL
+                    value: "{{ . }}"
+                  {{- end }}
+                  {{- end }}
+                  {{- end }}
+                resources:
+                  requests:
+                    cpu: "{{ .infra.compute.cpu }}"
+                    memory: "{{ .infra.compute.memory }}"
+                  limits:
+                    cpu: "{{ .infra.compute.cpu }}"
+                    memory: "{{ .infra.compute.memory }}"
