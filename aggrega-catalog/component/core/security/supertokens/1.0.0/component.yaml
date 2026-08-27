@@ -1,0 +1,171 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/security/supertokens
+  version: 1.0.0
+  # metadata.license is deliberately absent. The field carries the SPDX
+  # identifier of the software the entity describes, and no single identifier
+  # covers this one: the project is published open-core, so which terms apply
+  # depends on which part a deployment uses, and the published container image
+  # declares no single licence of its own. The class that situation falls into is
+  # stated instead through component.aggrega.ai/upstream-licensing below, and the
+  # licence of the artifact the Recipe actually pins is named on that Recipe,
+  # which is the surface that knows which artifact it pinned.
+  description: >
+    An authentication core: the backend service that holds an application's
+    users, their credentials and their sessions, and issues and verifies the
+    tokens that carry a session between requests. It is reached only by an
+    application's own backend, over HTTP, through one of the project's backend
+    client libraries — the library is configured with this component's published
+    endpoint and calls the core to sign a user up, sign them in, refresh a
+    session or revoke one.
+
+    It keeps no durable state of its own. Every user, session and token is
+    written to a relational backend wired through its `backend` uses-socket: the
+    selected component's provides host, port, user and database arrive on the
+    injection context and compose the core's database connection. The core
+    creates and migrates its own tables on that backend at startup, so no
+    separate migration step is needed, and it needs a PostgreSQL backend
+    specifically — that is the engine this release of the core supports. The
+    socket is required rather than optional because a core given no database
+    falls back to an in-memory store and loses every user it holds when the
+    process restarts; a deployment that has not wired one halts at build with a
+    diagnostic naming the socket, which is the outcome a reader wants.
+
+    A deployment wires here when sign-in belongs to the application: the
+    application's backend owns the sign-in routes and the screens a user sees,
+    and this component sits behind that backend on a private network as the
+    place the user records live. `core/security/keycloak`, in this same
+    category, is wired instead when sign-in belongs to the platform: it serves
+    its own account console and token endpoints, and applications and other
+    services reach it as an identity provider over OpenID Connect and SAML. Both
+    keep their user records in a relational backend, and the choice between them
+    is where the sign-in surface lives and what a consumer speaks to reach it.
+
+    Reachability is a deliberate part of the model. The core answers
+    administrative calls over the whole user store to anything that can reach
+    it, so it is published on an in-cluster address for an application backend
+    to consume and is not intended to be exposed to a browser or to the public
+    internet. It issues no API key by default; a deployment that widens who can
+    reach it attaches one to the `api_key` slot below.
+
+    Realized on Kubernetes via its Helm Recipe, which synthesizes the core as a
+    stateless Deployment behind a ClusterIP Service on its HTTP port. Exports
+    its host, port, endpoint and protocol to consumers via the uses topology,
+    where the endpoint is the base URL an application's backend library is
+    configured with.
+  labels:
+    component.aggrega.ai/type: server
+    component.aggrega.ai/category: security
+    component.aggrega.ai/hosting: self-hosted
+    component.aggrega.ai/upstream-licensing: open-core
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  # Self-inject allowlist: the component may inject resolved uses-edge values
+  # into the env delivery mechanism.
+  inject: [env]
+
+  usesSchema:
+    # The relational backend holding the users, sessions and tokens the core
+    # serves. The selected component's provides host, port, user and database
+    # arrive on the injection context under the names the core itself reads, so
+    # the Recipe passes them through rather than composing a connection string —
+    # which is also what keeps the backend password out of the rendered
+    # artifact, since a password embedded in a URL cannot be delivered as a
+    # secret reference. Required: a core with no backend keeps its users in
+    # memory and loses them on restart.
+    #
+    # Because the values arrive under the names the core reads, the edge's
+    # inject.env entries name them: POSTGRESQL_HOST from host, POSTGRESQL_PORT
+    # from port, POSTGRESQL_USER from user, POSTGRESQL_DATABASE_NAME from
+    # database. The password is not carried on this edge — it is attached to the
+    # backend_password slot below, so it stays a secret reference.
+    backend:
+      selector: "component.aggrega.ai/category=datastore"
+      inject: [env]
+      required: true
+
+  featuresSchema:
+    # Both slots are optional and transparent (`required` omitted → optional;
+    # inject: [env] so the synthesized Workload may reference them as env
+    # secrets). The selector is secret-kind-pinned but family-agnostic, so any
+    # credential Feature of the secret kind may fill either.
+    backend_password:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Password the core authenticates to the relational backend with, delivered as an env secret reference so the value never appears in the rendered manifest. Unattached, the Recipe emits the development default the standard-library relational Recipes leave in place, which is what makes an unattached deployment render and run."
+    api_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "API key a caller must present to reach the core. The core issues none by default and accepts every caller that can reach its address, so a deployment where anything beyond the application's own backend can reach it attaches one here. Unattached, no key is emitted and the core stays open to whatever the network lets through."
+
+  schema:
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate. Session
+      # lifetimes shape what a user experiences, so they sit here rather than in
+      # infra: they are the application's behaviour, not its sizing.
+      access_token_validity_seconds:
+        type: integer
+        min: 1
+        default: 3600
+        description: How long an access token stays valid, in seconds. A shorter window narrows how long a stolen token is useful and costs a refresh round trip more often.
+      refresh_token_validity_minutes:
+        type: integer
+        min: 1
+        default: 144000
+        description: How long a refresh token stays valid, in minutes. This is the outer bound on a session — once it expires the user signs in again, whatever the access token says.
+      password_hashing_algorithm:
+        type: string
+        enum: [BCRYPT, ARGON2]
+        default: BCRYPT
+        description: Algorithm the core hashes stored passwords with. Changing it on a deployment that already holds users rehashes each password the next time that user signs in, so both algorithms stay readable during the transition.
+      telemetry_enabled:
+        type: boolean
+        default: true
+        description: Send the project's own anonymous usage telemetry. Turned off, the core reports nothing outward and every other behaviour is unchanged.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 3567
+        description: Port the core serves its HTTP API on; consumers connect here. Most operators should omit this and let the Recipe assign the default (3567).
+      engine_version:
+        type: string
+        default: "12.1.1"
+        description: Core container image tag.
+      log_level:
+        type: string
+        enum: [DEBUG, INFO, WARN, ERROR, NONE]
+        default: INFO
+        description: Log verbosity of the core.
+      compute:
+        cpu:
+          type: string
+          default: 250m
+        memory:
+          type: string
+          default: 1Gi
+      overrides:
+        type: object
+        additionalProperties: true
+        description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      # host, port and protocol are the shape every server component publishes;
+      # endpoint is the base URL an application's backend library is configured
+      # with, which is a URL rather than a bare host, so it is published as its
+      # own key rather than left for a consumer to assemble.
+      host: { type: string, required: true }
+      port: { type: integer, required: true }
+      endpoint: { type: string, required: true }
+      protocol: { type: string }
