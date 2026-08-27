@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: dify-ssrf-proxy
+  version: 1.0.0
+  license: GPL-2.0-or-later
+  description: >
+    The Dify egress proxy on Kubernetes via the helm provider's Workload
+    synthesis (a stateless Deployment plus a ClusterIP Service on the proxy
+    port). The proxy caches in memory only and keeps nothing across a restart,
+    so it renders stateless.
+
+    The whole Squid configuration is emitted as a ConfigMap via artifacts: and
+    mounted whole-directory, and the container is started against that file
+    directly. Every value the configuration needs is resolved when the stack is
+    compiled, so the rendered file is the final configuration rather than a
+    template a container entrypoint has to expand at startup — which is what
+    lets a reviewer read the effective access rules out of the manifest.
+
+    The access rules are ordered so that the refusal comes before the
+    permissions: any destination in private, loopback, link-local, shared-CGN or
+    IPv4 multicast address space is refused, and only then are the named domains and
+    the calling workloads permitted. That ordering is the security property — a
+    supplied address reaches the public internet and cannot reach the cluster's
+    own services or the node's metadata endpoint — so a private range becomes
+    reachable only by being named in allowed_private_networks, which renders
+    ahead of the refusal.
+
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service — it carries no namespace, so the recipe is independent
+    of where it is deployed. A consumer in another namespace qualifies the host
+    with the target namespace on its own side (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/dify-ssrf-proxy:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-default"
+  # with no namespace segment. A same-namespace consumer reaches it under this
+  # name directly; a cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  # The resolved Squid configuration. The ACL definitions name the client
+  # ranges the proxy accepts calls from and the destination ranges it refuses;
+  # the access rules below them are evaluated in order, and the order is the
+  # security property rather than a style choice.
+  artifacts:
+    dify-ssrf-proxy-config.yaml: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-config
+      data:
+        squid.conf: |
+          # Client ranges the proxy accepts calls from — the cluster's own
+          # private address space, which is where the calling workloads sit.
+          acl client_localnet src 10.0.0.0/8
+          acl client_localnet src 100.64.0.0/10
+          acl client_localnet src 169.254.0.0/16
+          acl client_localnet src 172.16.0.0/12
+          acl client_localnet src 192.168.0.0/16
+          acl client_localnet src fc00::/7
+          acl client_localnet src fe80::/10
+
+          # Destination ranges the proxy refuses. A supplied address resolving
+          # into any of these is denied, which is what stops a workflow reaching
+          # the cluster's own services or the node's metadata endpoint.
+          acl to_private_networks dst 0.0.0.0/8
+          acl to_private_networks dst 10.0.0.0/8
+          acl to_private_networks dst 100.64.0.0/10
+          acl to_private_networks dst 127.0.0.0/8
+          acl to_private_networks dst 169.254.0.0/16
+          acl to_private_networks dst 172.16.0.0/12
+          acl to_private_networks dst 192.168.0.0/16
+          acl to_private_networks dst 224.0.0.0/4
+          acl to_private_networks dst 240.0.0.0/4
+          acl to_private_networks dst ::/128
+          acl to_private_networks dst ::1/128
+          acl to_private_networks dst ::ffff:0:0/96
+          acl to_private_networks dst fc00::/7
+          acl to_private_networks dst fe80::/10
+
+          acl SSL_ports port 443
+          acl Safe_ports port 80
+          acl Safe_ports port 21
+          acl Safe_ports port 443
+          acl Safe_ports port 1025-65535
+          acl CONNECT method CONNECT
+
+          # Domains permitted by name regardless of the address they resolve to.
+          # The plugin marketplace the platform installs from is always named;
+          # anything else is named by the deployment.
+          acl allowed_domains dstdomain .marketplace.dify.ai
+      {{- range .values.allowed_domains }}
+          acl allowed_domains dstdomain {{ . }}
+      {{- end }}
+      {{- if .values.allowed_private_networks }}
+
+          # Private destinations this deployment named. They are permitted ahead
+          # of the private-network refusal below, which is the only way a
+          # private address becomes reachable through the proxy.
+          acl allowed_private_networks dst
+      {{- range .values.allowed_private_networks }} {{ . }}
+      {{- end }}
+      {{- end }}
+
+          http_port {{ .infra.port }}
+          coredump_dir /var/spool/squid
+          client_request_buffer_max_size {{ .values.max_request_body_size }}
+          cache_mem 256 MB
+          memory_cache_mode disk
+          max_filedescriptors 65536
+          connect_timeout 30 seconds
+          request_timeout 2 minutes
+          read_timeout 2 minutes
+          # Logs go to the container's own streams rather than to files, so the
+          # runtime collects them. Rotation is off because there is no file to
+          # rotate. access_log names a module and a destination; cache_log names
+          # a destination only.
+          access_log stdio:/dev/stdout
+          cache_log /dev/stderr
+          logfile_rotate 0
+
+          # Access rules, evaluated in order. The refusals come first, then the
+          # named private destinations, then the named domains, then the calling
+          # workloads, then a final deny.
+          http_access deny !Safe_ports
+          http_access deny CONNECT !SSL_ports
+          http_access allow localhost manager
+          http_access deny manager
+      {{- if .values.allowed_private_networks }}
+          http_access allow client_localnet allowed_private_networks
+      {{- end }}
+          http_access deny to_private_networks
+          http_access allow allowed_domains
+          http_access allow client_localnet
+          http_access allow localhost
+          http_access deny all
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The proxy caches in memory only and keeps nothing across a restart, so the
+    # default stateless form (a Deployment on the helm provider) is correct.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "ubuntu/squid:{{ .infra.engine_version }}"
+        # The image's own entrypoint expands a configuration template at
+        # startup. The configuration this Recipe emits is already resolved, so
+        # the container runs the proxy against it directly: -N stays in the
+        # foreground, -Y defers optional work during startup, and -C leaves
+        # fatal-signal handling to the runtime.
+        command: ["/usr/sbin/squid", "-f", "/etc/squid/squid.conf", "-NYC", "1"]
+        ports:
+          proxy: {{ .infra.port }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the deployment supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        volumeMounts:
+          - name: config
+            path: /etc/squid
+    volumes:
+      config:
+        configmap:
+          source: "{{ .context.instance_id }}-config"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          proxy: {{ .infra.port }}

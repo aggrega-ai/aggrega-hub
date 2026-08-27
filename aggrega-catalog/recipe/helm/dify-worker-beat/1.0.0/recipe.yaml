@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: dify-worker-beat
+  version: 1.0.0
+  # metadata.license is deliberately absent. The Dify platform this Recipe
+  # realizes is published under a modified Apache License 2.0 carrying
+  # additional conditions, and no single SPDX identifier names those terms; the
+  # licensing class sits on the Component's upstream-licensing label. The
+  # SPDX header at the top of this file states the terms of the file itself.
+  description: >
+    The Dify task scheduler on Kubernetes via the helm provider's Workload
+    synthesis. The scheduler runs the same image as the API server under a
+    different MODE and does one thing: read the periodic-task schedule from the
+    backend and enqueue each task onto the Celery broker at its due time. It
+    opens no listening socket, so it renders as a stateless Deployment with no
+    ports and no Service, and it publishes nothing.
+
+    Exactly one replica is rendered and the count is not a knob. Two schedulers
+    reading one schedule and enqueuing onto one broker would put every periodic
+    task on the queue twice, so scaling this component out multiplies the work
+    rather than sharing it. Throughput is scaled on the task worker, which is
+    what consumes what the scheduler enqueues.
+
+    The backend and cache identities resolved from the component's uses-edges
+    arrive on .context.inject.env under the names the scheduler itself reads.
+    The backend password comes from a credential when one is attached and from
+    an inline development default otherwise, matching the standard-library
+    PostgreSQL Recipe's own default.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/dify-worker-beat:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # The scheduler publishes no provides contract: it opens no listening socket,
+  # so there is no address for a consumer to read.
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The scheduler holds no durable state — the schedule lives in the backend —
+    # so the stateless form (a Deployment on the helm provider) is correct. No
+    # ports and no services: it opens no listening socket. The replica count is
+    # fixed at one because a second scheduler would double-enqueue every
+    # periodic task.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "langgenius/dify-api:{{ .infra.engine_version }}"
+        # MODE selects the scheduler role of the shared API image.
+        variables:
+          MODE: beat
+          LOG_LEVEL: "{{ .infra.log_level }}"
+          # The migration flag is read ahead of the mode, so it would apply to
+          # the scheduler exactly as it does to the API server. It is false here
+          # because the API server is the single place that applies the schema
+          # upgrade.
+          MIGRATION_ENABLED: "false"
+          # The backend and cache identities arrive on the inject pipe under the
+          # names the scheduler itself reads, so these pass through
+          # untranslated.
+          DB_TYPE: postgresql
+          DB_HOST: "{{ .context.inject.env.DB_HOST }}"
+          DB_PORT: "{{ .context.inject.env.DB_PORT }}"
+          DB_USERNAME: "{{ .context.inject.env.DB_USERNAME }}"
+          DB_DATABASE: "{{ .context.inject.env.DB_DATABASE }}"
+          REDIS_HOST: "{{ .context.inject.env.REDIS_HOST }}"
+          REDIS_PORT: "{{ .context.inject.env.REDIS_PORT }}"
+          CELERY_BACKEND: redis
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "cache" }}
+          REDIS_DB: "{{ $edge.values.db_index }}"
+          CELERY_BROKER_URL: "redis://{{ $.context.inject.env.REDIS_HOST }}:{{ $.context.inject.env.REDIS_PORT }}/{{ $edge.values.broker_db_index }}"
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "password") }}
+          DB_PASSWORD: apppass
+    {{- end }}
+    {{- if hasKey (default dict .features) "password" }}
+        attachments:
+          DB_PASSWORD:
+            from: password
+            as: env
+    {{- end }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the deployment supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"

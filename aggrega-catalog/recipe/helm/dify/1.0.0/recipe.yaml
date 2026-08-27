@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: dify
+  version: 1.0.0
+  # metadata.license is deliberately absent. The Dify platform this Recipe
+  # realizes is published under a modified Apache License 2.0 carrying
+  # additional conditions, and no single SPDX identifier names those terms; the
+  # licensing class sits on the Component's upstream-licensing label. The
+  # SPDX header at the top of this file states the terms of the file itself.
+  description: >
+    The Dify API and console server on Kubernetes via the helm provider's
+    Workload synthesis (a stateless Deployment plus a ClusterIP Service on the
+    API port). The server holds no local state — the PostgreSQL backend, the
+    Redis-compatible cache and the vector datastore are the systems of record —
+    so it renders stateless. The backend identity resolved from the `backend`
+    uses-edge (host, port, username, database) and the cache, vector-store,
+    sandbox, plugin-runtime and proxy identities resolved from their edges
+    arrive on .context.inject.env and compose the server's connection settings
+    and the in-cluster URLs of its siblings.
+
+    Three of those edges are translated rather than passed through, because the
+    variable the server reads is not the one the target publishes. The
+    vector-store edge publishes a host, a port and a gRPC port, and the driver
+    named on that edge decides which variables carry them: a Weaviate
+    connection composes WEAVIATE_ENDPOINT and WEAVIATE_GRPC_ENDPOINT, and a
+    Qdrant connection composes QDRANT_URL and QDRANT_GRPC_PORT. The sandbox
+    edge composes CODE_EXECUTION_ENDPOINT, and the plugin-runtime edge composes
+    PLUGIN_DAEMON_URL. The proxy edge composes SSRF_PROXY_HTTP_URL and
+    SSRF_PROXY_HTTPS_URL, which is how a request to a user-supplied address
+    leaves through the proxy rather than directly.
+
+    The backend password is rendered password-free where possible: with no
+    credential attached the Recipe uses an inline development default matching
+    the standard-library PostgreSQL Recipe's own default, and with one attached
+    the password is supplied on DB_PASSWORD via the credential subsystem. The
+    same holds for the application secret and the sandbox execution key. The
+    remaining internal handshake secrets — the plugin runtime's server key and
+    the key the runtime presents on the internal API — are pinned shared
+    development literals, so the stack runs self-contained with no external
+    secret. These defaults are for evaluation and local development; a
+    deployment holding real model-provider credentials attaches its own.
+
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service — it carries no namespace, so the recipe is independent
+    of where it is deployed. A consumer in another namespace qualifies the host
+    with the target namespace on its own side (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/dify:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-default"
+  # with no namespace segment. A same-namespace consumer reaches it under this
+  # name directly; a cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The server holds no durable state — the backend, the cache and the vector
+    # datastore are the systems of record — so the default stateless form (a
+    # Deployment on the helm provider) is correct: no form: stateful, no
+    # persistentTemplate volume, no PVC.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "langgenius/dify-api:{{ .infra.engine_version }}"
+        # MODE selects which of the three roles this image runs. The API image
+        # also runs the task worker and the scheduler, each under its own MODE,
+        # which is why all three components pin the same engine_version.
+        variables:
+          MODE: api
+          LOG_LEVEL: "{{ .infra.log_level }}"
+          # The listen port the server binds. It is emitted as well as published
+          # on the container port and the Service, because the server reads its
+          # bind port from here: without it, moving infra.port would move the
+          # Service and the container port while the process kept binding its
+          # own default.
+          DIFY_PORT: "{{ .infra.port }}"
+          # The server applies outstanding schema migrations at startup, so a
+          # fresh backend becomes usable without a separate migration step. This
+          # is the one workload in the stack where the flag is true: the worker
+          # and the scheduler set it false so they cannot run the same upgrade
+          # concurrently with this one.
+          MIGRATION_ENABLED: "true"
+          # The backend identity arrives on the inject pipe under the names the
+          # server itself reads, so these pass through untranslated. DB_TYPE is
+          # fixed because the backend socket is wired to a PostgreSQL component.
+          DB_TYPE: postgresql
+          DB_HOST: "{{ .context.inject.env.DB_HOST }}"
+          DB_PORT: "{{ .context.inject.env.DB_PORT }}"
+          DB_USERNAME: "{{ .context.inject.env.DB_USERNAME }}"
+          DB_DATABASE: "{{ .context.inject.env.DB_DATABASE }}"
+          # The cache identity likewise passes through under the server's own
+          # names. The two logical-database indices come from the cache edge's
+          # own values block, read by socket name rather than by the alias the
+          # topology chose, so the Recipe does not depend on that alias. The
+          # broker URL carries no password because the standard-library Redis
+          # Recipe leaves authentication off unless a credential is attached to
+          # it; a deployment that attaches one supplies the broker URL through
+          # its own override.
+          REDIS_HOST: "{{ .context.inject.env.REDIS_HOST }}"
+          REDIS_PORT: "{{ .context.inject.env.REDIS_PORT }}"
+          CELERY_BACKEND: redis
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "cache" }}
+          REDIS_DB: "{{ $edge.values.db_index }}"
+          CELERY_BROKER_URL: "redis://{{ $.context.inject.env.REDIS_HOST }}:{{ $.context.inject.env.REDIS_PORT }}/{{ $edge.values.broker_db_index }}"
+    {{- end }}
+    {{- end }}
+          # The vector-store edge is translated: the driver named on the edge
+          # decides which variables carry the store's address, because the two
+          # drivers the socket admits read different ones. VECTOR_STORE is the
+          # variable the server dispatches on.
+          VECTOR_INDEX_NAME_PREFIX: "{{ .values.vector_index_prefix }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "vector_store" }}
+          VECTOR_STORE: "{{ $edge.values.engine }}"
+    {{- if eq $edge.values.engine "weaviate" }}
+          WEAVIATE_ENDPOINT: "http://{{ $.context.inject.env.VDB_HOST }}:{{ $.context.inject.env.VDB_PORT }}"
+          WEAVIATE_GRPC_ENDPOINT: "grpc://{{ $.context.inject.env.VDB_HOST }}:{{ $.context.inject.env.VDB_GRPC_PORT }}"
+    {{- end }}
+    {{- if eq $edge.values.engine "qdrant" }}
+          QDRANT_URL: "http://{{ $.context.inject.env.VDB_HOST }}:{{ $.context.inject.env.VDB_PORT }}"
+          QDRANT_GRPC_PORT: "{{ $.context.inject.env.VDB_GRPC_PORT }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+          # The sibling edges are translated into the single URL each subsystem
+          # is addressed by. The sandbox and the plugin runtime are reached
+          # directly in-cluster; the proxy is reached as a forward proxy, which
+          # is what the two SSRF_PROXY variables mean.
+          CODE_EXECUTION_ENDPOINT: "http://{{ .context.inject.env.SANDBOX_HOST }}:{{ .context.inject.env.SANDBOX_PORT }}"
+          PLUGIN_DAEMON_URL: "http://{{ .context.inject.env.PLUGIN_DAEMON_HOST }}:{{ .context.inject.env.PLUGIN_DAEMON_PORT }}"
+          PLUGIN_DIFY_INNER_API_URL: "http://{{ .context.instance_id }}-default:{{ .infra.port }}"
+          SSRF_PROXY_HTTP_URL: "http://{{ .context.inject.env.SSRF_PROXY_HOST }}:{{ .context.inject.env.SSRF_PROXY_PORT }}"
+          SSRF_PROXY_HTTPS_URL: "http://{{ .context.inject.env.SSRF_PROXY_HOST }}:{{ .context.inject.env.SSRF_PROXY_PORT }}"
+          # The internal handshake secrets the server shares with the plugin
+          # runtime are pinned shared development literals, matching the
+          # literals the plugin-runtime Recipe pins, so the two agree with no
+          # external secret. A production deployment overrides both.
+          PLUGIN_DAEMON_KEY: dify-plugin-daemon-server-key
+          INNER_API_KEY_FOR_PLUGIN: dify-plugin-inner-api-key
+          # Application limits the developer declared.
+          TOP_K_MAX_VALUE: "{{ .values.top_k_max }}"
+          MAX_PARALLEL_LIMIT: "{{ .values.max_parallel_limit }}"
+          MAX_ITERATIONS_NUM: "{{ .values.max_iterations }}"
+          MAX_TOOLS_NUM: "{{ .values.max_tools }}"
+          INDEXING_MAX_SEGMENTATION_TOKENS_LENGTH: "{{ .values.indexing_max_segmentation_tokens }}"
+    {{- with .infra.external_url }}
+          # The externally reachable base URL, when the operator supplied one.
+          # The server composes the console, application, service-API and file
+          # URLs from it, which is what makes a shared link resolve from
+          # outside the cluster. Left empty, none of these is emitted and the
+          # server derives each address from the incoming request.
+          CONSOLE_API_URL: "{{ . }}"
+          CONSOLE_WEB_URL: "{{ . }}"
+          SERVICE_API_URL: "{{ . }}"
+          APP_API_URL: "{{ . }}"
+          APP_WEB_URL: "{{ . }}"
+          FILES_URL: "{{ . }}"
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "password") }}
+          DB_PASSWORD: apppass
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "secret_key") }}
+          SECRET_KEY: dify-development-secret-key-evaluation-only
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "code_execution_key") }}
+          CODE_EXECUTION_API_KEY: dify-sandbox
+    {{- end }}
+    {{- if or (hasKey (default dict .features) "password") (hasKey (default dict .features) "secret_key") (hasKey (default dict .features) "code_execution_key") }}
+        attachments:
+    {{- if hasKey (default dict .features) "password" }}
+          DB_PASSWORD:
+            from: password
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "secret_key" }}
+          SECRET_KEY:
+            from: secret_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "code_execution_key" }}
+          CODE_EXECUTION_API_KEY:
+            from: code_execution_key
+            as: env
+    {{- end }}
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the deployment supplies: a whole-core quantity such as
+        # 1 re-parses as a YAML integer and fails workload validation, while a
+        # milli quantity happens not to.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

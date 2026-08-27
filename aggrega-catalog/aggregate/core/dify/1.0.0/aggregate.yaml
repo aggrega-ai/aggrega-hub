@@ -1,0 +1,276 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Aggregate
+metadata:
+  name: core/dify
+  version: 1.0.0
+  description: >
+    A self-contained Dify installation packaged as a reusable module — the
+    platform on which an application author builds retrieval-augmented
+    assistants and agent workflows from a browser. It composes ten
+    single-workload components: an API and console server, a task worker, a task
+    scheduler, a web front end, a code sandbox, a plugin runtime, an egress
+    proxy, a PostgreSQL backend, a Redis-compatible cache, and a Weaviate vector
+    datastore.
+
+    The three datastore edges are what make the platform stateful. The API
+    server, the worker, the scheduler and the plugin runtime each reach the
+    backend, which carries its in-cluster host and port along with its user and
+    database name, and each composes them into a PostgreSQL connection; the
+    plugin runtime keeps its plugin catalogue in a database of its own on the
+    same server. The same four reach the cache, which carries its host and port,
+    and each edge names two logical-database indices — one for the application
+    cache, one for the Celery broker — so the two keyspaces stay apart on one
+    cache. The API server and the worker reach the vector datastore, which
+    carries its host, its HTTP port and its gRPC port, and each edge names the
+    client driver to speak on it, so wiring a different store is a change of
+    target and driver name rather than a change of component. The compiler
+    routes all of these strings without interpreting them.
+
+    Four internal edges complete the platform. The API server and the worker
+    reach the code sandbox, which runs the Python and JavaScript of a workflow's
+    code nodes so that an application author's code never runs inside the
+    platform's own process. They also reach the plugin runtime, through which
+    every model call and tool invocation is dispatched — a platform with no
+    plugin runtime can edit a workflow but cannot run one — and the runtime
+    reaches back into the API server over the internal API to resolve workspace
+    and credential context. The front end reaches the API server for every piece
+    of data it renders.
+
+    The egress proxy is the fifth internal edge and it carries a security
+    property rather than a convenience. A Dify workflow fetches whatever address
+    its author or its end user supplied — a page to crawl, a file to load, an
+    HTTP request node's target — so the API server, the worker and the sandbox
+    all send those requests through the proxy, which refuses any destination in
+    private, loopback, link-local or IPv4 multicast address space. A supplied address
+    therefore reaches the public internet and cannot reach this module's own
+    services or the node's metadata endpoint. The proxy's allowlist of private
+    destinations is empty, and widening it is an explicit act.
+
+    The whole module shares one set of pinned development credentials — the
+    backend password, the application secret under which stored model-provider
+    credentials are encrypted, the sandbox execution key, and the two keys the
+    plugin runtime and the API server present to each other — so it runs
+    self-contained with no external secret. These defaults are for evaluation
+    and local development; a deployment holding real model-provider credentials
+    attaches its own to the credential slots each component declares. While the
+    sandbox execution key is at its default, any workload that can reach the
+    sandbox can execute code through it.
+
+    This module is the working platform core, and three parts of a full Dify
+    deployment are deliberately out of scope. It ships no internal reverse
+    proxy: a single external endpoint is assembled at the ingress tier, which
+    routes the console and API paths (`/console/api`, `/api`, `/v1`, `/openapi`,
+    `/files`, `/mcp`, `/triggers`) to the API server, the plugin endpoint path
+    (`/e/`) to the plugin runtime, and the browser paths (`/explore` and `/`) to
+    the front end. It ships no agent shell-workspace tier — the agent session
+    backend, its shell sandbox and that sandbox's own dedicated egress proxy —
+    because that tier's isolation is a property of the network topology between
+    those three workloads rather than of any one of them, and a module that
+    rendered the workloads without the topology would present an isolation it
+    does not deliver. And it wires no shared file storage: the API server and
+    the worker each keep uploaded files on their own ephemeral volume, so
+    features that hand a file from one to the other — document upload and
+    dataset indexing among them — need a shared storage backend this module does
+    not compose. Real-time workflow collaboration, which needs a second API
+    process serving websockets, is likewise not included.
+
+    The module exports the API server as `api`, the endpoint an API client and
+    the ingress tier's API routes talk to; the front end as `console`, the
+    browser endpoint; and the plugin runtime as `plugins`, the endpoint the
+    plugin path routes to.
+spec:
+  components:
+    db:
+      type: core/datastore/postgres
+      values:
+        user: dify
+        database: dify
+    cache:
+      type: core/datastore/redis
+    vector:
+      type: core/datastore/weaviate
+    proxy:
+      type: core/ai-agent/dify-ssrf-proxy
+    sandbox:
+      type: core/ai-agent/dify-sandbox
+      uses:
+        ssrf_proxy:
+          proxy:
+            target: proxy
+            inject:
+              env:
+                - { in: SSRF_PROXY_HOST, from: host }
+                - { in: SSRF_PROXY_PORT, from: port }
+    plugins:
+      type: core/ai-agent/dify-plugin-daemon
+      uses:
+        backend:
+          db:
+            target: db
+            inject:
+              env:
+                - { in: DB_HOST, from: host }
+                - { in: DB_PORT, from: port }
+                - { in: DB_USERNAME, from: user }
+                - { in: DB_DATABASE, from: database }
+        cache:
+          redis:
+            target: cache
+            values:
+              db_index: 0
+            inject:
+              env:
+                - { in: REDIS_HOST, from: host }
+                - { in: REDIS_PORT, from: port }
+        api:
+          api:
+            target: api
+            inject:
+              env:
+                - { in: API_HOST, from: host }
+                - { in: API_PORT, from: port }
+    api:
+      type: core/ai-agent/dify
+      uses:
+        backend:
+          db:
+            target: db
+            inject:
+              env:
+                - { in: DB_HOST, from: host }
+                - { in: DB_PORT, from: port }
+                - { in: DB_USERNAME, from: user }
+                - { in: DB_DATABASE, from: database }
+        cache:
+          redis:
+            target: cache
+            values:
+              db_index: 0
+              broker_db_index: 1
+            inject:
+              env:
+                - { in: REDIS_HOST, from: host }
+                - { in: REDIS_PORT, from: port }
+        vector_store:
+          vdb:
+            target: vector
+            values:
+              engine: weaviate
+            inject:
+              env:
+                - { in: VDB_HOST, from: host }
+                - { in: VDB_PORT, from: port }
+                - { in: VDB_GRPC_PORT, from: grpc_port }
+        sandbox:
+          sandbox:
+            target: sandbox
+            inject:
+              env:
+                - { in: SANDBOX_HOST, from: host }
+                - { in: SANDBOX_PORT, from: port }
+        plugin_daemon:
+          plugins:
+            target: plugins
+            inject:
+              env:
+                - { in: PLUGIN_DAEMON_HOST, from: host }
+                - { in: PLUGIN_DAEMON_PORT, from: port }
+        ssrf_proxy:
+          proxy:
+            target: proxy
+            inject:
+              env:
+                - { in: SSRF_PROXY_HOST, from: host }
+                - { in: SSRF_PROXY_PORT, from: port }
+    worker:
+      type: core/ai-agent/dify-worker
+      uses:
+        backend:
+          db:
+            target: db
+            inject:
+              env:
+                - { in: DB_HOST, from: host }
+                - { in: DB_PORT, from: port }
+                - { in: DB_USERNAME, from: user }
+                - { in: DB_DATABASE, from: database }
+        cache:
+          redis:
+            target: cache
+            values:
+              db_index: 0
+              broker_db_index: 1
+            inject:
+              env:
+                - { in: REDIS_HOST, from: host }
+                - { in: REDIS_PORT, from: port }
+        vector_store:
+          vdb:
+            target: vector
+            values:
+              engine: weaviate
+            inject:
+              env:
+                - { in: VDB_HOST, from: host }
+                - { in: VDB_PORT, from: port }
+                - { in: VDB_GRPC_PORT, from: grpc_port }
+        sandbox:
+          sandbox:
+            target: sandbox
+            inject:
+              env:
+                - { in: SANDBOX_HOST, from: host }
+                - { in: SANDBOX_PORT, from: port }
+        plugin_daemon:
+          plugins:
+            target: plugins
+            inject:
+              env:
+                - { in: PLUGIN_DAEMON_HOST, from: host }
+                - { in: PLUGIN_DAEMON_PORT, from: port }
+        ssrf_proxy:
+          proxy:
+            target: proxy
+            inject:
+              env:
+                - { in: SSRF_PROXY_HOST, from: host }
+                - { in: SSRF_PROXY_PORT, from: port }
+    scheduler:
+      type: core/ai-agent/dify-worker-beat
+      uses:
+        backend:
+          db:
+            target: db
+            inject:
+              env:
+                - { in: DB_HOST, from: host }
+                - { in: DB_PORT, from: port }
+                - { in: DB_USERNAME, from: user }
+                - { in: DB_DATABASE, from: database }
+        cache:
+          redis:
+            target: cache
+            values:
+              db_index: 0
+              broker_db_index: 1
+            inject:
+              env:
+                - { in: REDIS_HOST, from: host }
+                - { in: REDIS_PORT, from: port }
+    console:
+      type: core/ai-agent/dify-web
+      uses:
+        api:
+          api:
+            target: api
+            inject:
+              env:
+                - { in: API_HOST, from: host }
+                - { in: API_PORT, from: port }
+  exportedComponents:
+    api: api
+    console: console
+    plugins: plugins

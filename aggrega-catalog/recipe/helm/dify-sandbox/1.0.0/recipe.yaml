@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: dify-sandbox
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The Dify code sandbox on Kubernetes via the helm provider's Workload
+    synthesis (a stateless Deployment plus a ClusterIP Service on the execution
+    port). Each execution is independent and its working directory is discarded,
+    so the sandbox holds nothing between calls and renders stateless.
+
+    The proxy identity resolved from the `ssrf_proxy` uses-edge arrives on
+    .context.inject.env and is composed into HTTP_PROXY and HTTPS_PROXY, the
+    variables the sandbox's own outbound client reads. That is the whole point
+    of the edge: code the sandbox runs was supplied by an application author, so
+    its egress leaves through the proxy, which refuses private destinations,
+    rather than going out directly with the pod's own reachability.
+
+    The execution key comes from a credential when one is attached, delivered on
+    API_KEY via the credential subsystem, and from a pinned development literal
+    otherwise — matching the literal the API-server and worker Recipes present
+    on CODE_EXECUTION_API_KEY, so the three agree with no external secret. That
+    default is for evaluation and local development: while it is in force, any
+    workload that can reach this Service can execute code through it.
+
+    Extra Python requirements the developer declared are delivered as a
+    ConfigMap emitted via artifacts: and mounted at the dependencies directory
+    the sandbox reads on startup. A deployment declaring none emits no
+    ConfigMap and no mount, rendering byte-identically to a Recipe with no such
+    surface at all.
+
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service — it carries no namespace, so the recipe is independent
+    of where it is deployed. A consumer in another namespace qualifies the host
+    with the target namespace on its own side (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/dify-sandbox:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-default"
+  # with no namespace segment. A same-namespace consumer reaches it under this
+  # name directly; a cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  # The declared Python requirements become one requirements file in a
+  # ConfigMap, mounted whole-directory where the sandbox looks for its
+  # dependencies. The entry renders empty — and so emits no file — when the
+  # developer declared none.
+  artifacts:
+    dify-sandbox-dependencies.yaml: |
+      {{- if .values.python_packages -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-dependencies
+      data:
+        python-requirements.txt: |
+      {{- range .values.python_packages }}
+          {{ . }}
+      {{- end }}
+      {{- end }}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # Each execution is independent and leaves nothing behind, so the default
+    # stateless form (a Deployment on the helm provider) is correct.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "langgenius/dify-sandbox:{{ .infra.engine_version }}"
+        variables:
+          SANDBOX_PORT: "{{ .infra.port }}"
+          GIN_MODE: release
+          WORKER_TIMEOUT: "{{ .values.worker_timeout }}"
+          ENABLE_NETWORK: "{{ .values.enable_network }}"
+          # The proxy identity arrives on the inject pipe and is composed into
+          # the two variables the sandbox's outbound client reads, so executed
+          # code reaches the network only through the proxy.
+          HTTP_PROXY: "http://{{ .context.inject.env.SSRF_PROXY_HOST }}:{{ .context.inject.env.SSRF_PROXY_PORT }}"
+          HTTPS_PROXY: "http://{{ .context.inject.env.SSRF_PROXY_HOST }}:{{ .context.inject.env.SSRF_PROXY_PORT }}"
+    {{- if not (hasKey (default dict .features) "code_execution_key") }}
+          API_KEY: dify-sandbox
+    {{- end }}
+    {{- if hasKey (default dict .features) "code_execution_key" }}
+        attachments:
+          API_KEY:
+            from: code_execution_key
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the deployment supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    {{- if .values.python_packages }}
+        volumeMounts:
+          - name: dependencies
+            path: /dependencies
+    {{- end }}
+    {{- if .values.python_packages }}
+    volumes:
+      dependencies:
+        configmap:
+          source: "{{ .context.instance_id }}-dependencies"
+    {{- end }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

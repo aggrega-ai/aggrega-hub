@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: dify-plugin-daemon
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The Dify plugin runtime on Kubernetes via the helm provider's Workload
+    synthesis. Installed plugin packages and the Python environments prepared
+    for them live on the runtime's own volume, so the workload renders as a
+    StatefulSet with a persistent claim, alongside the governing headless
+    Service the stateful form requires and a ClusterIP Service publishing the
+    dispatch port. One replica is rendered: the installed-plugin set lives on
+    that claim, so a second replica would hold a different set and answer
+    differently depending on which one a call reached.
+
+    The backend, cache and API-server identities resolved from the component's
+    uses-edges arrive on .context.inject.env. The backend identity passes
+    through under the names the runtime itself reads, except for the database
+    name: the runtime keeps its plugin catalogue in a database of its own, so
+    DB_DATABASE carries the developer's plugin_database value rather than the
+    platform database the backend edge published. The API-server edge is
+    translated into DIFY_INNER_API_URL, the internal endpoint the runtime calls
+    to resolve workspace and credential context.
+
+    The backend password comes from a credential when one is attached and from
+    an inline development default otherwise. The runtime's own server key and
+    the key it presents on the internal API are pinned shared development
+    literals, matching the literals the API-server and worker Recipes pin, so
+    the three agree with no external secret. These defaults are for evaluation
+    and local development.
+
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized ClusterIP Service — it carries no namespace, so the recipe is
+    independent of where it is deployed. A consumer in another namespace
+    qualifies the host with the target namespace on its own side (caller-side
+    routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/dify-plugin-daemon:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-default"
+  # with no namespace segment. A same-namespace consumer reaches it under this
+  # name directly; a cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # form: stateful selects a StatefulSet on the helm provider; the
+    # persistentTemplate volume and the headless Service below are companions of
+    # this form. The claim holds the installed plugin packages and their
+    # prepared runtime environments.
+    form: stateful
+    replicas: 1
+    containers:
+      main:
+        image: "langgenius/dify-plugin-daemon:{{ .infra.engine_version }}"
+        variables:
+          SERVER_PORT: "{{ .infra.port }}"
+          # The backend identity arrives on the inject pipe under the names the
+          # runtime itself reads. DB_DATABASE is the exception: the runtime
+          # keeps its catalogue in its own database on the same server, so the
+          # developer's value wins over the name the edge published.
+          DB_TYPE: postgresql
+          DB_HOST: "{{ .context.inject.env.DB_HOST }}"
+          DB_PORT: "{{ .context.inject.env.DB_PORT }}"
+          DB_USERNAME: "{{ .context.inject.env.DB_USERNAME }}"
+          DB_DATABASE: "{{ .values.plugin_database }}"
+          DB_SSL_MODE: disable
+          REDIS_HOST: "{{ .context.inject.env.REDIS_HOST }}"
+          REDIS_PORT: "{{ .context.inject.env.REDIS_PORT }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "cache" }}
+          REDIS_DB: "{{ $edge.values.db_index }}"
+    {{- end }}
+    {{- end }}
+          # The API-server edge is translated into the internal endpoint the
+          # runtime calls back on.
+          DIFY_INNER_API_URL: "http://{{ .context.inject.env.API_HOST }}:{{ .context.inject.env.API_PORT }}"
+          # Pinned shared development literals, matching the literals the API
+          # server and the worker Recipes pin. SERVER_KEY is the key a caller
+          # must present to this runtime; DIFY_INNER_API_KEY is the key this
+          # runtime presents back to the API server. A production deployment
+          # overrides both.
+          SERVER_KEY: dify-plugin-daemon-server-key
+          DIFY_INNER_API_KEY: dify-plugin-inner-api-key
+          FORCE_VERIFYING_SIGNATURE: "{{ .values.verify_signature }}"
+          MAX_PLUGIN_PACKAGE_SIZE: "{{ .values.max_package_size }}"
+          PLUGIN_MAX_EXECUTION_TIMEOUT: "{{ .values.max_execution_timeout }}"
+          # Plugin packages and their prepared environments live on the claim
+          # mounted below, so every storage path is rooted there.
+          PLUGIN_STORAGE_TYPE: local
+          PLUGIN_STORAGE_LOCAL_ROOT: /app/storage
+          PLUGIN_WORKING_PATH: /app/storage/cwd
+          PLUGIN_INSTALLED_PATH: plugin
+          PLUGIN_PACKAGE_CACHE_PATH: plugin_packages
+          PLUGIN_MEDIA_CACHE_PATH: assets
+    {{- if not (hasKey (default dict .features) "password") }}
+          DB_PASSWORD: apppass
+    {{- end }}
+    {{- if hasKey (default dict .features) "password" }}
+        attachments:
+          DB_PASSWORD:
+            from: password
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the deployment supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        volumeMounts:
+          - name: storage
+            path: /app/storage
+    volumes:
+      storage:
+        persistentTemplate:
+          size: {{ .infra.storage.size }}
+          class: {{ .infra.storage.type }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
+      headless:
+        type: Headless
+        ports:
+          http: {{ .infra.port }}
