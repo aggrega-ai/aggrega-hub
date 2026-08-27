@@ -62,7 +62,7 @@ the label section below). The 15 categories:
 | `network` | Network primitives | server, resource | created when the first entity lands |
 | `messaging` | Event buses, queues, streams | messaging | populated |
 | `storage` | Object/file storage, managed cloud resources | resource | populated |
-| `compute` | Generic compute primitives (server, worker, task, function bases) | server, worker, task, function | populated |
+| `compute` | Generic compute primitives, plus the control planes an event-driven realization depends on | server, worker, task, function | populated |
 | `observability` | Telemetry, tracing, monitoring | varies | populated |
 | `security` | Security and compliance components | varies | populated |
 | `bigdata` | Large-scale data processing | varies | created when the first entity lands |
