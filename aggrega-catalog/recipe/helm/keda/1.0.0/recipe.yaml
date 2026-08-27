@@ -1,0 +1,319 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: keda
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Installs the KEDA control plane as an explicit deployment component: a
+    ServiceAccount, the namespaced and cluster permissions the operator needs to
+    reconcile the scaling custom resources and the adapter needs to answer for
+    them, the operator and metrics-adapter
+    Deployments with the Services through which they reach one another, and the
+    API-service registration that puts the adapter behind the cluster's
+    external-metrics API. Emitting the control plane as a first-class component
+    lets an event-driven realization ship its runtime prerequisite alongside the
+    custom resources it emits (the bundled-deploy prerequisite mode), so the
+    custom resource and the operator that reconciles it are deployed together.
+    This is a minimal control-plane bootstrap. It does not install the
+    custom-resource definitions or the admission webhooks; a production install
+    wraps the project's own release manifests, which carry both.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/compute/keda:1.0.0
+  artifacts:
+    # The control plane's own object names are part of its in-cluster wiring
+    # contract: the metrics adapter reaches the operator's metrics service at
+    # keda-operator.<namespace>, and the API-service registration names the
+    # adapter's Service. Those names are therefore fixed and the namespace is
+    # what separates one installation from another. Only the cluster-scoped
+    # permission objects, which would collide across namespaces, carry the
+    # instance name. The API-service name is fixed by the external-metrics API
+    # itself, which admits one provider per cluster.
+    serviceaccount.yaml: |
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: keda-operator
+        namespace: {{ .infra.namespace }}
+    role.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: keda-operator
+        namespace: {{ .infra.namespace }}
+      rules:
+        - apiGroups: [""]
+          resources: ["secrets"]
+          verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+        - apiGroups: ["coordination.k8s.io"]
+          resources: ["leases"]
+          verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+    rolebinding.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: keda-operator
+        namespace: {{ .infra.namespace }}
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: keda-operator
+      subjects:
+        - kind: ServiceAccount
+          name: keda-operator
+          namespace: {{ .infra.namespace }}
+    # The aggregated-API layer authenticates the adapter's callers against a
+    # configuration entry held in the cluster's own system namespace, so the
+    # read on it is granted there rather than in the installation namespace.
+    rolebinding-auth-reader.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: {{ .context.instance_id }}-auth-reader
+        namespace: kube-system
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: extension-apiserver-authentication-reader
+      subjects:
+        - kind: ServiceAccount
+          name: keda-operator
+          namespace: {{ .infra.namespace }}
+    clusterrole-operator.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: {{ .context.instance_id }}-operator
+      rules:
+        - apiGroups: ["keda.sh"]
+          resources: ["scaledobjects", "scaledobjects/status", "scaledobjects/finalizers", "scaledjobs", "scaledjobs/status", "scaledjobs/finalizers", "triggerauthentications", "triggerauthentications/status", "clustertriggerauthentications", "clustertriggerauthentications/status"]
+          verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+        - apiGroups: ["eventing.keda.sh"]
+          resources: ["cloudeventsources", "cloudeventsources/status", "clustercloudeventsources", "clustercloudeventsources/status"]
+          verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+        - apiGroups: ["autoscaling"]
+          resources: ["horizontalpodautoscalers"]
+          verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+        - apiGroups: ["apps"]
+          resources: ["deployments", "replicasets", "statefulsets"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: ["batch"]
+          resources: ["jobs"]
+          verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+        - apiGroups: [""]
+          resources: ["configmaps", "configmaps/status", "pods", "secrets", "services", "external"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: [""]
+          resources: ["limitranges", "serviceaccounts"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: ["", "events.k8s.io"]
+          resources: ["events"]
+          verbs: ["create", "patch"]
+        - apiGroups: ["discovery.k8s.io"]
+          resources: ["endpointslices"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: ["apiregistration.k8s.io"]
+          resources: ["apiservices"]
+          verbs: ["get", "list", "watch", "update", "patch"]
+        - apiGroups: ["admissionregistration.k8s.io"]
+          resources: ["validatingwebhookconfigurations"]
+          verbs: ["get", "list", "watch", "update", "patch"]
+        - apiGroups: ["*"]
+          resources: ["*/scale"]
+          verbs: ["get", "list", "watch", "update", "patch"]
+    clusterrolebinding-operator.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: {{ .context.instance_id }}-operator
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: {{ .context.instance_id }}-operator
+      subjects:
+        - kind: ServiceAccount
+          name: keda-operator
+          namespace: {{ .infra.namespace }}
+    clusterrolebinding-auth-delegator.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: {{ .context.instance_id }}-auth-delegator
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: system:auth-delegator
+      subjects:
+        - kind: ServiceAccount
+          name: keda-operator
+          namespace: {{ .infra.namespace }}
+    clusterrole-external-metrics-reader.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: {{ .context.instance_id }}-external-metrics-reader
+      rules:
+        - apiGroups: ["external.metrics.k8s.io"]
+          resources: ["*"]
+          verbs: ["get", "list", "watch"]
+    clusterrolebinding-external-metrics-reader.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: {{ .context.instance_id }}-external-metrics-reader
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: {{ .context.instance_id }}-external-metrics-reader
+      subjects:
+        - kind: ServiceAccount
+          name: horizontal-pod-autoscaler
+          namespace: kube-system
+    operator.yaml: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: keda-operator
+        namespace: {{ .infra.namespace }}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: keda-operator
+        template:
+          metadata:
+            labels:
+              app: keda-operator
+              app.kubernetes.io/name: keda-operator
+          spec:
+            serviceAccountName: keda-operator
+            containers:
+              - name: keda-operator
+                image: {{ .infra.operator_image }}
+                command:
+                  - /keda
+                args:
+                  - --leader-elect
+                  - --zap-log-level=info
+                  - --zap-encoder=console
+                  - --zap-time-encoding=rfc3339
+                  - --enable-cert-rotation=true
+                ports:
+                  - name: http
+                    containerPort: 8080
+                env:
+                  - name: POD_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.namespace
+                volumeMounts:
+                  - name: certificates
+                    mountPath: /certs
+            volumes:
+              - name: certificates
+                secret:
+                  secretName: kedaorg-certs
+                  optional: true
+    operator-service.yaml: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: keda-operator
+        namespace: {{ .infra.namespace }}
+      spec:
+        selector:
+          app: keda-operator
+        ports:
+          - name: metricsservice
+            port: 9666
+            targetPort: 9666
+          - name: metrics
+            port: 8080
+            targetPort: 8080
+    metrics-apiserver.yaml: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: keda-metrics-apiserver
+        namespace: {{ .infra.namespace }}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: keda-metrics-apiserver
+        template:
+          metadata:
+            labels:
+              app: keda-metrics-apiserver
+              app.kubernetes.io/name: keda-metrics-apiserver
+          spec:
+            serviceAccountName: keda-operator
+            containers:
+              - name: keda-metrics-apiserver
+                image: {{ .infra.metrics_adapter_image }}
+                command:
+                  - /keda-adapter
+                args:
+                  - --secure-port=6443
+                  - --zap-log-level=error
+                  - --client-ca-file=/certs/ca.crt
+                  - --tls-cert-file=/certs/tls.crt
+                  - --tls-private-key-file=/certs/tls.key
+                  - --cert-dir=/certs
+                ports:
+                  - name: https
+                    containerPort: 6443
+                  - name: http
+                    containerPort: 8080
+                env:
+                  - name: POD_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.namespace
+                volumeMounts:
+                  - name: temp-vol
+                    mountPath: /tmp
+                  - name: certificates
+                    mountPath: /certs
+            volumes:
+              - name: temp-vol
+                emptyDir: {}
+              - name: certificates
+                secret:
+                  secretName: kedaorg-certs
+    metrics-apiserver-service.yaml: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: keda-metrics-apiserver
+        namespace: {{ .infra.namespace }}
+      spec:
+        selector:
+          app: keda-metrics-apiserver
+        ports:
+          - name: https
+            port: 443
+            targetPort: 6443
+          - name: metrics
+            port: 8080
+            targetPort: 8080
+    apiservice.yaml: |
+      apiVersion: apiregistration.k8s.io/v1
+      kind: APIService
+      metadata:
+        name: v1beta1.external.metrics.k8s.io
+      spec:
+        group: external.metrics.k8s.io
+        groupPriorityMinimum: 100
+        service:
+          name: keda-metrics-apiserver
+          namespace: {{ .infra.namespace }}
+        version: v1beta1
+        versionPriority: 100

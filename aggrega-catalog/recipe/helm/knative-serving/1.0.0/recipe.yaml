@@ -1,0 +1,337 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: knative-serving
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Installs the Knative Serving control plane as an explicit deployment
+    component: two ServiceAccounts, the cluster permissions each of them needs,
+    the configuration entry carrying the request-queue sidecar image, and the
+    four control-plane Deployments with the in-cluster Services through which
+    they reach one another. Emitting the control plane as a first-class component
+    lets a realization that scales a workload to zero ship its runtime
+    prerequisite alongside the custom resources it emits (the bundled-deploy
+    prerequisite mode), so the custom resource and the controllers that reconcile
+    it are deployed together. This is a minimal control-plane bootstrap. It does
+    not install the custom-resource definitions, the ingress and networking
+    layer, the admission-webhook registrations, or the configuration bodies the
+    remaining defaults are edited in; a production install wraps the project's
+    own release manifests, which carry all of those.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/compute/knative-serving:1.0.0
+  artifacts:
+    # The control plane's own object names are part of its in-cluster wiring
+    # contract: the activator reaches the autoscaler at autoscaler.<namespace>,
+    # the controller points serverless services at activator-service, and the
+    # controller reads its sidecar image from a configuration entry it looks up
+    # by name. Those names are therefore fixed and the namespace is what
+    # separates one installation from another. Only the cluster-scoped
+    # permission objects, which would collide across namespaces, carry the
+    # instance name.
+    serviceaccount-controller.yaml: |
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: controller
+        namespace: {{ .infra.namespace }}
+    serviceaccount-activator.yaml: |
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: activator
+        namespace: {{ .infra.namespace }}
+    clusterrole-controller.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: {{ .context.instance_id }}-controller
+      rules:
+        - apiGroups: [""]
+          resources: ["pods", "namespaces", "secrets", "configmaps", "endpoints", "services", "events", "serviceaccounts"]
+          verbs: ["get", "list", "create", "update", "delete", "patch", "watch"]
+        - apiGroups: [""]
+          resources: ["namespaces/finalizers"]
+          verbs: ["update"]
+        - apiGroups: ["discovery.k8s.io"]
+          resources: ["endpointslices"]
+          verbs: ["get", "list", "create", "update", "delete", "patch", "watch"]
+        - apiGroups: ["apps"]
+          resources: ["deployments", "deployments/finalizers"]
+          verbs: ["get", "list", "create", "update", "delete", "patch", "watch"]
+        - apiGroups: ["admissionregistration.k8s.io"]
+          resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
+          verbs: ["get", "list", "create", "update", "delete", "patch", "watch"]
+        - apiGroups: ["apiextensions.k8s.io"]
+          resources: ["customresourcedefinitions", "customresourcedefinitions/status"]
+          verbs: ["get", "list", "create", "update", "delete", "patch", "watch"]
+        - apiGroups: ["autoscaling"]
+          resources: ["horizontalpodautoscalers"]
+          verbs: ["get", "list", "create", "update", "delete", "patch", "watch"]
+        - apiGroups: ["coordination.k8s.io"]
+          resources: ["leases"]
+          verbs: ["get", "list", "create", "update", "delete", "patch", "watch"]
+        - apiGroups: ["serving.knative.dev", "autoscaling.internal.knative.dev", "networking.internal.knative.dev"]
+          resources: ["*", "*/status", "*/finalizers"]
+          verbs: ["get", "list", "create", "update", "delete", "deletecollection", "patch", "watch"]
+        - apiGroups: ["caching.internal.knative.dev"]
+          resources: ["images"]
+          verbs: ["get", "list", "create", "update", "delete", "deletecollection", "patch", "watch"]
+        - apiGroups: ["rbac.authorization.k8s.io"]
+          resources: ["clusterroles"]
+          verbs: ["list", "watch"]
+        - apiGroups: ["*"]
+          resources: ["*/scale"]
+          verbs: ["get", "list", "watch", "update", "patch"]
+    clusterrole-activator.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: {{ .context.instance_id }}-activator
+      rules:
+        - apiGroups: [""]
+          resources: ["services", "endpoints"]
+          verbs: ["get", "list", "watch"]
+        - apiGroups: ["serving.knative.dev"]
+          resources: ["revisions"]
+          verbs: ["get", "list", "watch"]
+    clusterrolebinding-controller.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: {{ .context.instance_id }}-controller
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: {{ .context.instance_id }}-controller
+      subjects:
+        - kind: ServiceAccount
+          name: controller
+          namespace: {{ .infra.namespace }}
+    clusterrolebinding-activator.yaml: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: {{ .context.instance_id }}-activator
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: {{ .context.instance_id }}-activator
+      subjects:
+        - kind: ServiceAccount
+          name: activator
+          namespace: {{ .infra.namespace }}
+    config-deployment.yaml: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: config-deployment
+        namespace: {{ .infra.namespace }}
+      data:
+        queue-sidecar-image: {{ .infra.queue_proxy_image }}
+    controller.yaml: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: controller
+        namespace: {{ .infra.namespace }}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: controller
+        template:
+          metadata:
+            labels:
+              app: controller
+              app.kubernetes.io/name: knative-serving
+          spec:
+            serviceAccountName: controller
+            containers:
+              - name: controller
+                image: {{ .infra.controller_image }}
+                ports:
+                  - name: metrics
+                    containerPort: 9090
+                  - name: probes
+                    containerPort: 8080
+                env:
+                  - name: POD_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.name
+                  - name: SYSTEM_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.namespace
+    webhook.yaml: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: webhook
+        namespace: {{ .infra.namespace }}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: webhook
+            role: webhook
+        template:
+          metadata:
+            labels:
+              app: webhook
+              role: webhook
+              app.kubernetes.io/name: knative-serving
+          spec:
+            serviceAccountName: controller
+            containers:
+              - name: webhook
+                image: {{ .infra.webhook_image }}
+                ports:
+                  - name: metrics
+                    containerPort: 9090
+                  - name: https-webhook
+                    containerPort: 8443
+                env:
+                  - name: POD_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.name
+                  - name: SYSTEM_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.namespace
+                  - name: WEBHOOK_NAME
+                    value: webhook
+                  - name: WEBHOOK_PORT
+                    value: "8443"
+    webhook-service.yaml: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: webhook
+        namespace: {{ .infra.namespace }}
+      spec:
+        selector:
+          app: webhook
+          role: webhook
+        ports:
+          - name: https-webhook
+            port: 443
+            targetPort: 8443
+    autoscaler.yaml: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: autoscaler
+        namespace: {{ .infra.namespace }}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: autoscaler
+        template:
+          metadata:
+            labels:
+              app: autoscaler
+              app.kubernetes.io/name: knative-serving
+          spec:
+            serviceAccountName: controller
+            containers:
+              - name: autoscaler
+                image: {{ .infra.autoscaler_image }}
+                ports:
+                  - name: metrics
+                    containerPort: 9090
+                  - name: websocket
+                    containerPort: 8080
+                env:
+                  - name: POD_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.name
+                  - name: POD_IP
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.podIP
+                  - name: SYSTEM_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.namespace
+    autoscaler-service.yaml: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: autoscaler
+        namespace: {{ .infra.namespace }}
+      spec:
+        selector:
+          app: autoscaler
+        ports:
+          - name: http
+            port: 8080
+            targetPort: 8080
+    activator.yaml: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: activator
+        namespace: {{ .infra.namespace }}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: activator
+        template:
+          metadata:
+            labels:
+              app: activator
+              app.kubernetes.io/name: knative-serving
+          spec:
+            serviceAccountName: activator
+            containers:
+              - name: activator
+                image: {{ .infra.activator_image }}
+                ports:
+                  - name: metrics
+                    containerPort: 9090
+                  - name: http1
+                    containerPort: 8012
+                  - name: h2c
+                    containerPort: 8013
+                env:
+                  - name: POD_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.name
+                  - name: POD_IP
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.podIP
+                  - name: SYSTEM_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.namespace
+    activator-service.yaml: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: activator-service
+        namespace: {{ .infra.namespace }}
+      spec:
+        selector:
+          app: activator
+        ports:
+          - name: http
+            port: 80
+            targetPort: 8012
+          - name: http2
+            port: 81
+            targetPort: 8013
