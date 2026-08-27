@@ -1,0 +1,198 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: librechat
+  version: 1.0.0
+  license: MIT
+  description: >
+    A self-hosted LibreChat installation on Kubernetes via the helm provider's
+    Workload synthesis: a single-replica Deployment, a ClusterIP Service on the
+    listen port, and one persistent volume for the files people upload. The
+    accounts, conversations, agents and stored per-user credentials live in the
+    document store wired on the `backend` edge rather than on that volume.
+
+    Two edges are translated rather than passed through, because the variables
+    the platform reads are not the names the targets publish. The model edge
+    carries both a published endpoint and a published model name: the endpoint
+    becomes the platform's OpenAI-compatible base URL, and the model name
+    becomes the single-entry model list the platform offers, so the name a
+    person picks in the interface is the name the wired component actually
+    serves under. The backend edge carries a host and a port, which compose the
+    document-store connection string together with the logical database name the
+    developer declared. Both are read by socket name rather than by the alias
+    the topology chose, so neither depends on that alias.
+
+    The bind address is set to accept traffic on every interface. The platform's
+    own default binds the loopback address only, which in a container means the
+    Service in front of it can reach nothing — so this is load-bearing rather
+    than decorative. The listen port is emitted for the same reason as the
+    Service and container port read it: the process reads its port from the
+    environment.
+
+    Three credential slots are wired conditionally. An attached model API key is
+    delivered as the platform's provider key; with none attached the Recipe
+    leaves the platform in its per-user mode, where each person enters their own
+    key in the interface and no key is rendered into the deployment at all. An
+    attached session secret signs the access tokens the platform issues, and an
+    attached credential-encryption key is what stored per-user provider
+    credentials are encrypted under. Where a slot is unattached the Recipe emits
+    a pinned development literal in its place, sized as the platform requires.
+    Those literals are published in this catalog, so a deployment rendered from
+    them offers no confidentiality for anything it stores: the token secret and
+    the refresh secret are guessable, and so is the key the stored credentials
+    are encrypted under. They suit evaluation and local development. The
+    refresh-token secret and the encryption initialization vector are pinned in
+    every rendering and have no slot of their own, so a deployment that needs
+    them deployment-specific supplies them through the target's own mechanism
+    rather than through this Recipe.
+
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service — it carries no namespace, so the recipe is independent
+    of where it is deployed. A consumer in another namespace qualifies the host
+    with the target namespace on its own side (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/librechat:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-default"
+  # with no namespace segment. A same-namespace consumer reaches it under this
+  # name directly; a cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  workload: |
+    {{- $uploadsPath := "/app/uploads" -}}
+    {{- $selfUrl := printf "http://%s-default:%v" .context.instance_id .infra.port -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The platform runs as one replica against one volume. Its system of record
+    # is the wired document store rather than local disk, and the volume carries
+    # uploads only, so the stateless form with a persistent volume is the shape
+    # here: a Deployment plus a PersistentVolumeClaim, and no headless Service to
+    # govern ordinals.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "ghcr.io/danny-avila/librechat:{{ .infra.engine_version }}"
+        # $uploadsPath is the single authored home for the upload directory: the
+        # volume mount reads the binding rather than repeating the literal.
+        # $selfUrl is the single authored home for the installation's own
+        # in-cluster address, used as the browser-facing base when the operator
+        # supplied no external URL; the address is composed once here so the two
+        # variables that carry it cannot disagree.
+        # The bind address and the listen port are both load-bearing; see the
+        # notes in the description.
+        variables:
+          HOST: 0.0.0.0
+          PORT: "{{ .infra.port }}"
+          # Quoted because a title is free text. Unquoted, a title spelled like a
+          # number or a boolean is read as one, and the variables map, which
+          # takes strings, then refuses the build over a title that was perfectly
+          # legal to choose.
+          APP_TITLE: "{{ .values.app_title }}"
+          ALLOW_REGISTRATION: "{{ .values.allow_registration }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "model" }}
+          # The model endpoint and the model name both arrive on the `model`
+          # uses-edge. The platform reads its OpenAI-compatible base URL from
+          # OPENAI_REVERSE_PROXY, and offers the models named in OPENAI_MODELS —
+          # one entry here, the name the wired component serves under.
+          OPENAI_REVERSE_PROXY: "{{ $edge.provides.endpoint }}"
+          OPENAI_MODELS: "{{ $edge.provides.model }}"
+    {{- end }}
+    {{- if eq $edge.socket "backend" }}
+          # The document-store connection, composed from the host and port the
+          # wired store published and the logical database name the developer
+          # declared.
+          MONGO_URI: "mongodb://{{ $edge.provides.host }}:{{ $edge.provides.port }}/{{ $.values.database_name }}"
+    {{- end }}
+    {{- end }}
+          # The browser-facing base URL. The operator's external URL when one was
+          # supplied, and the installation's own in-cluster address otherwise.
+    {{- with .infra.external_url }}
+          DOMAIN_CLIENT: "{{ . }}"
+          DOMAIN_SERVER: "{{ . }}"
+    {{- else }}
+          DOMAIN_CLIENT: "{{ $selfUrl }}"
+          DOMAIN_SERVER: "{{ $selfUrl }}"
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "model_api_key") }}
+          # The platform's per-user mode: each person enters their own provider
+          # key in the interface, and none is rendered into this deployment.
+          OPENAI_API_KEY: user_provided
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "session_secret") }}
+          # Development literal. Every deployment rendered from this default
+          # signs its access tokens with the same publicly known value; attach a
+          # secret credential to the session_secret slot for anything else.
+          JWT_SECRET: librechat-development-token-secret-evaluation-only
+    {{- end }}
+          # Pinned in every rendering and carrying no slot of its own. It is
+          # published in this catalog, so it is guessable wherever it is left in
+          # place.
+          JWT_REFRESH_SECRET: librechat-development-refresh-secret-evaluation-only
+    {{- if not (hasKey (default dict .features) "credential_encryption_key") }}
+          # Development literal, sized as the platform requires (a 32-byte key as
+          # 64 hexadecimal characters). Published in this catalog, so the stored
+          # per-user credentials of any deployment rendered from this default are
+          # readable to anyone holding a copy of the store; attach a secret
+          # credential to the credential_encryption_key slot for anything else.
+          CREDS_KEY: a67a6f78741ffa51b7e0b8ad66c030c2ce4462e499a5941027851b1d092494e5
+    {{- end }}
+          # The initialization vector paired with the key above, sized as the
+          # platform requires (a 16-byte value as 32 hexadecimal characters).
+          # Pinned in every rendering and carrying no slot of its own.
+          CREDS_IV: 8881b05adef1cab28b10901e03dff8ba
+    {{- if or (hasKey (default dict .features) "model_api_key") (or (hasKey (default dict .features) "session_secret") (hasKey (default dict .features) "credential_encryption_key")) }}
+        attachments:
+    {{- if hasKey (default dict .features) "model_api_key" }}
+          OPENAI_API_KEY:
+            from: model_api_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "session_secret" }}
+          JWT_SECRET:
+            from: session_secret
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "credential_encryption_key" }}
+          CREDS_KEY:
+            from: credential_encryption_key
+            as: env
+    {{- end }}
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        volumeMounts:
+          - name: uploads
+            path: {{ $uploadsPath }}
+        # The resource quantities are quoted so the rendered value stays a string
+        # whatever the deployment supplies: a whole-core quantity such as 1
+        # re-parses as a YAML integer and fails workload validation, while a
+        # milli quantity happens not to.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    volumes:
+      uploads:
+        persistent:
+          size: {{ .infra.storage_size }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
