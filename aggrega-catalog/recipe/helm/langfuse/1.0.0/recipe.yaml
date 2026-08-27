@@ -1,0 +1,352 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: langfuse
+  version: 1.0.0
+  description: >
+    Langfuse as a self-hosted tracing and prompt-registry platform on Kubernetes
+    via the helm provider's Workload synthesis, running the official upstream
+    images directly (no external Helm chart). Renders one Deployment carrying two
+    containers: the console and ingestion API, and the asynchronous worker that
+    drains the ingestion queue into the columnar analytics store. The two are
+    versioned together and read one identical set of backing-system addresses, so
+    they are co-located rather than split — which trades independent scaling for a
+    deployment that has one place to configure. A ClusterIP Service fronts the
+    console; the worker's port carries only its own health endpoint and is not
+    published on the Service.
+
+    The relational backend, the cache and the object store arrive as topology
+    edges. Their addresses reach the platform under the variable names the
+    platform itself reads, and the backend is delivered as separate host, port,
+    user and database variables rather than as a connection string, because a
+    password embedded in a URL cannot be delivered as a Kubernetes secret
+    reference — the separate form is what keeps the credential out of the
+    rendered manifest. The object store's endpoint is composed from its edge's
+    host and port, and the bucket, region, prefixes and access-key identifier are
+    read from that edge's own values, so wiring a different store is a change of
+    target and edge values rather than a change of component.
+
+    The columnar analytics store is not an edge: its HTTP address and its
+    native-protocol migration address are operator-supplied deterministic pointer
+    strings the runtime resolves, since a deployment typically reaches a columnar
+    store it does not run itself.
+
+    Every credential slot is optional. When one is attached its value reaches the
+    container as an env secretKeyRef and never appears in the rendered manifest;
+    when it is not, the recipe emits the deterministic development literal named
+    in the component's own slot description, so a bare deployment renders and
+    runs. The cache and analytics-store passwords are the two exceptions: with
+    nothing attached they emit no variable at all, because presenting a password
+    to a service that wants none fails the connection rather than defaulting.
+
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized ClusterIP Service — it carries no namespace, so the recipe is
+    independent of where it is deployed. A consumer in another namespace qualifies
+    the host with the target namespace on its own side (caller-side routing). The
+    configuration contract is authored against Langfuse 4.22.0.
+  license: MIT
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/observability/langfuse:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # The two entries below are the single authored home for the two container
+  # images. Each is dereferenced once in the workload template; they are named
+  # here so the image repositories and the shared tag sit together and cannot be
+  # moved apart, since the console and the worker must not run different
+  # versions of the same platform.
+  #
+  # Both artifacts are published under terms that let any reader pull and run
+  # them: the platform's core is MIT and the images are fetchable anonymously.
+  # A named subtree of the upstream is licensed separately and is inert without
+  # an enterprise key, which is why this Recipe names MIT for what it pins while
+  # the Component records the open-core class for the product as a whole.
+  locals:
+    console_image: "langfuse/langfuse:{{ .infra.engine_version }}"
+    worker_image: "langfuse/langfuse-worker:{{ .infra.engine_version }}"
+  # The columnar analytics store is where every trace, observation and score
+  # this platform serves actually lives, and its two addresses have no sensible
+  # default: a deployment reaches whichever store it runs or contracts for. A
+  # build that has not supplied them halts here rather than rendering a console
+  # with an address-less variable, which starts and then stays empty.
+  assertions:
+    analytics_store_addresses_supplied: >-
+      {{- if not (and (hasKey .infra "analytics_store_url") (index .infra "analytics_store_url")) -}}
+      {{- fail "infra.analytics_store_url must name the HTTP address of the columnar analytics store holding traces, observations and scores; set it in the Release" -}}
+      {{- end -}}
+      {{- if not (and (hasKey .infra "analytics_store_migration_url") (index .infra "analytics_store_migration_url")) -}}
+      {{- fail "infra.analytics_store_migration_url must name the native-protocol address of the same analytics store, which the platform applies its schema migrations over; set it in the Release" -}}
+      {{- end -}}
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the console's own listen port, the
+  # container port and the Service; the literal is never repeated.
+  #
+  # host and endpoint spell the Service name out twice on purpose. A provides
+  # entry cannot read another provides entry, and the name has to match the
+  # Service the helm provider derives from the service key below, so there is no
+  # home either could dereference instead — the repetition is forced, not a
+  # choice, and the two must be edited together.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}"
+    protocol: "http"
+  workload: |
+    {{- /*
+      The console's externally reachable base URL. The operator's value wins when
+      one was supplied; with none, the in-cluster Service address stands in, which
+      is correct for a deployment nobody reaches from a browser outside the
+      cluster. Bound once here because both containers read it and the fallback
+      must not be spelled twice.
+    */ -}}
+    {{- $externalURL := .infra.external_url | default (printf "http://%s-default:%v" .context.instance_id .infra.port) -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # Neither container holds durable state — the relational backend, the cache,
+    # the object store and the analytics store are the systems of record — so the
+    # default stateless form (a Deployment on the helm provider) is correct: no
+    # form: stateful, no persistentTemplate volume, no PVC.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "{{ .locals.console_image }}"
+        variables:
+          # The listen port the console binds. It is emitted as well as published
+          # on the container port and the Service, because the process reads its
+          # bind port from here: without it, moving infra.port would move the
+          # Service and the container port while the process kept binding its own
+          # default.
+          PORT: "{{ .infra.port }}"
+          NEXTAUTH_URL: "{{ $externalURL }}"
+          LANGFUSE_LOG_LEVEL: "{{ .infra.log_level }}"
+          LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "{{ .values.experimental_features }}"
+          LANGFUSE_OTEL_INGESTION_MAX_BODY_BYTES: "{{ .values.otel_max_body_bytes }}"
+          LANGFUSE_OTEL_MEDIA_UPLOAD_ENABLED: "{{ .values.media_upload_enabled }}"
+          # The backend identity arrives on the inject pipe under the names the
+          # platform itself reads, so these pass through untranslated.
+          DATABASE_HOST: "{{ .context.inject.env.DATABASE_HOST }}"
+          DATABASE_PORT: "{{ .context.inject.env.DATABASE_PORT }}"
+          DATABASE_USERNAME: "{{ .context.inject.env.DATABASE_USERNAME }}"
+          DATABASE_NAME: "{{ .context.inject.env.DATABASE_NAME }}"
+          # The cache identity likewise passes through under the platform's own
+          # names. The key prefix comes from the cache edge's own values block,
+          # read by socket name rather than by the alias the topology chose, so
+          # the Recipe does not depend on that alias.
+          REDIS_HOST: "{{ .context.inject.env.REDIS_HOST }}"
+          REDIS_PORT: "{{ .context.inject.env.REDIS_PORT }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "cache" }}
+          REDIS_KEY_PREFIX: "{{ $edge.values.key_prefix }}"
+    {{- end }}
+    {{- end }}
+          # The object store is addressed by a single endpoint the platform's S3
+          # client speaks to, composed from the store edge's host and port. The
+          # bucket, region, prefixes and access-key identifier come from that
+          # edge's own values, so one store serves two platforms by wiring two
+          # buckets. Event bodies and media share the connection and differ only
+          # in their key prefix.
+          LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "http://{{ .context.inject.env.STORE_HOST }}:{{ .context.inject.env.STORE_PORT }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "http://{{ .context.inject.env.STORE_HOST }}:{{ .context.inject.env.STORE_PORT }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "event_store" }}
+          LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "{{ $edge.values.bucket }}"
+          LANGFUSE_S3_EVENT_UPLOAD_REGION: "{{ $edge.values.region }}"
+          LANGFUSE_S3_EVENT_UPLOAD_PREFIX: "{{ $edge.values.event_prefix }}"
+          LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "{{ $edge.values.access_key_id }}"
+          LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "{{ $edge.values.force_path_style }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "{{ $edge.values.bucket }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_REGION: "{{ $edge.values.region }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: "{{ $edge.values.media_prefix }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: "{{ $edge.values.access_key_id }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "{{ $edge.values.force_path_style }}"
+    {{- end }}
+    {{- end }}
+          # The analytics store's two addresses are operator-supplied pointer
+          # strings, resolved by the runtime rather than by the compiler. The
+          # HTTP address serves the console's queries; the native-protocol
+          # address is the one the platform applies its schema migrations over.
+          CLICKHOUSE_URL: "{{ .infra.analytics_store_url }}"
+          CLICKHOUSE_MIGRATION_URL: "{{ .infra.analytics_store_migration_url }}"
+          CLICKHOUSE_USER: "{{ .infra.analytics_store_user }}"
+          CLICKHOUSE_DB: "{{ .infra.analytics_store_database }}"
+          CLICKHOUSE_CLUSTER_ENABLED: "{{ .infra.analytics_store_cluster }}"
+    {{- if not (hasKey (default dict .features) "backend_password") }}
+          DATABASE_PASSWORD: postgres
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "event_store_secret_key") }}
+          LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: minioadmin
+          LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: minioadmin
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "session_secret") }}
+          NEXTAUTH_SECRET: langfuse-development-session-secret-evaluation-only
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "encryption_key") }}
+          ENCRYPTION_KEY: 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "salt") }}
+          SALT: langfuse-development-salt-evaluation-only
+    {{- end }}
+    {{- if or (hasKey (default dict .features) "backend_password") (hasKey (default dict .features) "cache_password") (hasKey (default dict .features) "event_store_secret_key") (hasKey (default dict .features) "analytics_store_password") (hasKey (default dict .features) "session_secret") (hasKey (default dict .features) "encryption_key") (hasKey (default dict .features) "salt") }}
+        attachments:
+    {{- end }}
+    {{- if hasKey (default dict .features) "backend_password" }}
+          DATABASE_PASSWORD:
+            from: backend_password
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "cache_password" }}
+          REDIS_AUTH:
+            from: cache_password
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "event_store_secret_key" }}
+          LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:
+            from: event_store_secret_key
+            as: env
+          LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:
+            from: event_store_secret_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "analytics_store_password" }}
+          CLICKHOUSE_PASSWORD:
+            from: analytics_store_password
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "session_secret" }}
+          NEXTAUTH_SECRET:
+            from: session_secret
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "encryption_key" }}
+          ENCRYPTION_KEY:
+            from: encryption_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "salt" }}
+          SALT:
+            from: salt
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+      worker:
+        image: "{{ .locals.worker_image }}"
+        # The worker reads the same backing systems as the console — it drains the
+        # queue the console fills and writes what it drains to the analytics store
+        # — so its configuration is the console's, with its own listen port. The
+        # duplication is forced by the container boundary: two containers have two
+        # environments, and a template variable bound in one is not visible in the
+        # other.
+        variables:
+          PORT: "{{ .infra.worker_port }}"
+          LANGFUSE_LOG_LEVEL: "{{ .infra.log_level }}"
+          DATABASE_HOST: "{{ .context.inject.env.DATABASE_HOST }}"
+          DATABASE_PORT: "{{ .context.inject.env.DATABASE_PORT }}"
+          DATABASE_USERNAME: "{{ .context.inject.env.DATABASE_USERNAME }}"
+          DATABASE_NAME: "{{ .context.inject.env.DATABASE_NAME }}"
+          REDIS_HOST: "{{ .context.inject.env.REDIS_HOST }}"
+          REDIS_PORT: "{{ .context.inject.env.REDIS_PORT }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "cache" }}
+          REDIS_KEY_PREFIX: "{{ $edge.values.key_prefix }}"
+    {{- end }}
+    {{- end }}
+          LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "http://{{ .context.inject.env.STORE_HOST }}:{{ .context.inject.env.STORE_PORT }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "http://{{ .context.inject.env.STORE_HOST }}:{{ .context.inject.env.STORE_PORT }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "event_store" }}
+          LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "{{ $edge.values.bucket }}"
+          LANGFUSE_S3_EVENT_UPLOAD_REGION: "{{ $edge.values.region }}"
+          LANGFUSE_S3_EVENT_UPLOAD_PREFIX: "{{ $edge.values.event_prefix }}"
+          LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "{{ $edge.values.access_key_id }}"
+          LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "{{ $edge.values.force_path_style }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "{{ $edge.values.bucket }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_REGION: "{{ $edge.values.region }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: "{{ $edge.values.media_prefix }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: "{{ $edge.values.access_key_id }}"
+          LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "{{ $edge.values.force_path_style }}"
+    {{- end }}
+    {{- end }}
+          CLICKHOUSE_URL: "{{ .infra.analytics_store_url }}"
+          CLICKHOUSE_MIGRATION_URL: "{{ .infra.analytics_store_migration_url }}"
+          CLICKHOUSE_USER: "{{ .infra.analytics_store_user }}"
+          CLICKHOUSE_DB: "{{ .infra.analytics_store_database }}"
+          CLICKHOUSE_CLUSTER_ENABLED: "{{ .infra.analytics_store_cluster }}"
+    {{- if not (hasKey (default dict .features) "backend_password") }}
+          DATABASE_PASSWORD: postgres
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "event_store_secret_key") }}
+          LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: minioadmin
+          LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: minioadmin
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "encryption_key") }}
+          ENCRYPTION_KEY: 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "salt") }}
+          SALT: langfuse-development-salt-evaluation-only
+    {{- end }}
+    {{- if or (hasKey (default dict .features) "backend_password") (hasKey (default dict .features) "cache_password") (hasKey (default dict .features) "event_store_secret_key") (hasKey (default dict .features) "analytics_store_password") (hasKey (default dict .features) "encryption_key") (hasKey (default dict .features) "salt") }}
+        attachments:
+    {{- end }}
+    {{- if hasKey (default dict .features) "backend_password" }}
+          DATABASE_PASSWORD:
+            from: backend_password
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "cache_password" }}
+          REDIS_AUTH:
+            from: cache_password
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "event_store_secret_key" }}
+          LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:
+            from: event_store_secret_key
+            as: env
+          LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:
+            from: event_store_secret_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "analytics_store_password" }}
+          CLICKHOUSE_PASSWORD:
+            from: analytics_store_password
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "encryption_key" }}
+          ENCRYPTION_KEY:
+            from: encryption_key
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "salt" }}
+          SALT:
+            from: salt
+            as: env
+    {{- end }}
+        ports:
+          health: {{ .infra.worker_port }}
+        resources:
+          requests:
+            cpu: "{{ .infra.worker_compute.cpu }}"
+            memory: "{{ .infra.worker_compute.memory }}"
+          limits:
+            cpu: "{{ .infra.worker_compute.cpu }}"
+            memory: "{{ .infra.worker_compute.memory }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

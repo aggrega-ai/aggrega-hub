@@ -63,10 +63,10 @@ the label section below). The 15 categories:
 | `messaging` | Event buses, queues, streams | messaging | populated |
 | `storage` | Object/file storage, managed cloud resources | resource | populated |
 | `compute` | Generic compute primitives (server, worker, task, function bases) | server, worker, task, function | populated |
-| `observability` | Telemetry, tracing, monitoring | varies | created when the first entity lands |
-| `security` | Security and compliance components | varies | created when the first entity lands |
+| `observability` | Telemetry, tracing, monitoring | varies | populated |
+| `security` | Security and compliance components | varies | populated |
 | `bigdata` | Large-scale data processing | varies | created when the first entity lands |
-| `devtool` | Developer tooling | varies | created when the first entity lands |
+| `devtool` | Developer tooling | varies | populated |
 
 Directory-presence discipline:
 

@@ -1,0 +1,264 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/observability/langfuse
+  version: 1.0.0
+  # metadata.license is deliberately absent. The field carries the SPDX
+  # identifier of the software the entity describes, and no single identifier
+  # covers this one: the platform is published open-core, so which terms apply
+  # depends on which part a deployment uses, and the published container images
+  # declare no single licence of their own. The class that situation falls into
+  # is stated instead through component.aggrega.ai/upstream-licensing below, and
+  # the licence of the artifact each Recipe actually pins is named on that
+  # Recipe, which is the surface that knows which artifact it pinned.
+  description: >
+    A self-hosted tracing and evaluation platform for language-model
+    applications, and the home a team keeps its prompts in. An application sends
+    a trace per request — the prompt that went out, the completion that came
+    back, the latency, the token counts and the cost — and the platform stores,
+    indexes and charts them; the same trace carries the version of the prompt
+    that produced it, so a prompt in the registry and the behaviour it caused
+    are one record rather than two. Prompts are versioned and labelled in the
+    platform and fetched by an application at run time over the platform's own
+    API, which is what lets a prompt change without a redeploy. It ingests
+    OpenTelemetry spans as well as its own client libraries, so a deployment
+    already emitting spans points them here.
+
+    Its identity is a browser console plus an ingestion API, and it keeps none
+    of its own durable state: four backing systems do. The relational backend
+    holds organizations, projects, users and the prompt registry; the
+    Redis-compatible cache holds the ingestion queue the asynchronous worker
+    drains; the S3-compatible object store holds raw event bodies and uploaded
+    media; and a columnar analytics store holds the traces, observations and
+    scores the console reads. The first three are wired as topology edges to
+    components the deployment already declares. The analytics store is supplied
+    as deterministic pointer strings the runtime resolves — its address, its
+    migration address, its user and its database — because a deployment
+    typically reaches a columnar store the deployment itself does not run. Those
+    pointers carry no default and the Kubernetes realization refuses to render
+    until they are set: a build that has not supplied them halts with a
+    diagnostic naming the value, rather than emitting a console with nothing to
+    read.
+
+    Realized on Kubernetes via its Helm Recipe, which synthesizes the console
+    and the asynchronous worker as one deployment reading one set of backing
+    systems. Exports its console host, port, endpoint and protocol to consumers
+    via the uses topology, so an application that sends traces to it wires to
+    the same keys any other server publishes.
+  labels:
+    component.aggrega.ai/type: server
+    component.aggrega.ai/category: observability
+    component.aggrega.ai/hosting: self-hosted
+    component.aggrega.ai/upstream-licensing: open-core
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  # Self-inject allowlist: a consumer that sends traces here may inject this
+  # component's own provides keys into the env delivery mechanism.
+  inject: [env]
+
+  usesSchema:
+    # The relational backend holding organizations, projects, users and the
+    # prompt registry. The selected component's provides host, port, user and
+    # database arrive on the injection context under the names the platform
+    # itself reads, so the Recipe passes them through rather than composing a
+    # connection string — which is also what keeps the backend password out of
+    # the rendered artifact, since a password embedded in a URL cannot be
+    # delivered as a secret reference.
+    backend:
+      selector: "component.aggrega.ai/category=datastore"
+      inject: [env]
+      required: true
+    # The Redis-compatible cache carrying the ingestion queue. The console
+    # accepts an event and enqueues it here; the asynchronous worker drains the
+    # queue and writes to the analytics store, which is why the queue is a
+    # required part of the platform rather than an optimization.
+    cache:
+      selector: "component.aggrega.ai/category=datastore"
+      inject: [env]
+      required: true
+      valueSchema:
+        # A key prefix scoping this platform's keys on the connection, so one
+        # cache may carry more than one tenant. The prefix is a property of the
+        # connection rather than of either component.
+        key_prefix:
+          type: string
+          default: ""
+          description: Key prefix the platform applies to every key it writes on this connection. Leave it empty on a cache this platform has to itself; set it to keep two tenants apart on one shared cache.
+    # The S3-compatible object store holding raw event bodies and uploaded
+    # media. Every ingested event body is written here before the worker reads
+    # it back, so a deployment without an object store loses ingestion rather
+    # than losing a feature.
+    event_store:
+      selector: "component.aggrega.ai/category=storage"
+      inject: [env]
+      required: true
+      valueSchema:
+        # The bucket, the region and the two key prefixes are properties of this
+        # connection: the same store serves a different platform by wiring a
+        # different bucket, and neither component knows the other's naming.
+        bucket:
+          type: string
+          required: true
+          description: Bucket the platform writes event bodies and media into. It must already exist on the target store — the platform writes objects, it does not create buckets.
+        region:
+          type: string
+          default: us-east-1
+          description: Region name the platform's S3 client signs requests with. An S3-compatible store that has no regions still needs a value here, and any value it accepts will do.
+        event_prefix:
+          type: string
+          default: events/
+          description: Key prefix raw event bodies are written under.
+        media_prefix:
+          type: string
+          default: media/
+          description: Key prefix uploaded media is written under.
+        access_key_id:
+          type: string
+          required: true
+          description: Access-key identifier the platform authenticates to the store with. The identifier names a credential rather than being one, so it is stated here; its secret half is attached to the event_store_secret_key slot.
+        force_path_style:
+          type: boolean
+          default: true
+          description: Address buckets as a path segment rather than a hostname prefix. Self-hosted S3-compatible stores generally require the path form; a store reached by virtual-hosted style takes false.
+
+  featuresSchema:
+    # Every slot below is optional and transparent (`required` omitted →
+    # optional; inject: [env] so the synthesized Workload may reference it as an
+    # env secret). The selector is secret-kind-pinned but family-agnostic, so any
+    # credential Feature of the secret kind may fill any of them.
+    #
+    # Three of these — the session secret, the encryption key and the salt — have
+    # deterministic development defaults in the Recipe when nothing is attached,
+    # so a bare deployment renders and runs unchanged. Those defaults are for
+    # evaluation and local development: they are identical in every deployment
+    # that leaves the slot unattached, so anyone holding this catalog holds them.
+    # A deployment that stores real model-provider credentials or real user
+    # traffic attaches its own to all three.
+    backend_password:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Password the platform authenticates to the relational backend with, delivered as an env secret reference so the value never appears in the rendered manifest. Unattached, the Recipe emits the development default the standard-library relational Recipes leave in place, which is what makes an unattached deployment render and run."
+    cache_password:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Optional password the platform authenticates to the cache with. Unattached, no cache credential is emitted at all, which matches the standard-library Redis-compatible Recipes: those leave authentication off unless a credential is attached to them, and emitting a password against a cache that wants none would fail the connection."
+    event_store_secret_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Secret half of the access key the platform authenticates to the object store with; its identifier half is named on the event_store edge. Unattached, the Recipe emits the development default the standard-library object-store Recipes leave in place."
+    analytics_store_password:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Password the platform authenticates to the columnar analytics store with. Unattached, no analytics-store password is emitted, which suits a store reachable without one; a managed store almost always needs this slot filled."
+    session_secret:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Signing key for the browser session cookies the console issues. Anyone who knows it can mint a session for any user, so a deployment reachable by more than its author attaches one. Unattached, the Recipe emits a development literal."
+    encryption_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Key the platform encrypts stored provider credentials and integration secrets under, as 64 hexadecimal characters. Rotating it makes everything already encrypted unreadable, so it is set once at first deployment and kept. Unattached, the Recipe emits a development literal."
+    salt:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Salt the platform hashes API keys with before storing them. It is fixed for the life of a deployment — changing it invalidates every API key already issued. Unattached, the Recipe emits a development literal."
+
+  schema:
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate.
+      experimental_features:
+        type: boolean
+        default: false
+        description: Make the platform's experimental console features reachable. They are unfinished by the upstream's own account, so a deployment other people depend on leaves this off.
+      otel_max_body_bytes:
+        type: integer
+        min: 1048576
+        default: 5242880
+        description: Largest OpenTelemetry ingestion request body the platform accepts, in bytes. A tracing client that batches aggressively needs this raised; the value bounds one request, not a trace.
+      media_upload_enabled:
+        type: boolean
+        default: true
+        description: Accept media referenced by an ingested trace — an image or an audio clip a request carried — and store it in the object store beside the event bodies. Turned off, traces still ingest and their media references are dropped.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 3000
+        description: Port the console and the ingestion API listen on. Most operators should omit this and let the Recipe assign the default (3000).
+      worker_port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 3030
+        description: Port the asynchronous worker exposes its own health endpoint on. It serves no application traffic; it exists so the platform's readiness can be observed separately from the console's.
+      engine_version:
+        type: string
+        default: "4.22.0"
+        description: Platform image tag. Selects the tag on both the console container and the worker container, which are versioned together and must not be split across versions.
+      compute:
+        cpu:
+          type: string
+          default: "1"
+        memory:
+          type: string
+          default: 2Gi
+      worker_compute:
+        cpu:
+          type: string
+          default: "1"
+        memory:
+          type: string
+          default: 2Gi
+      external_url:
+        type: string
+        description: Externally reachable base URL of the console, as assembled at the ingress tier. The console composes the links it puts in an email and the address it redirects a browser to after sign-in from this, so a shared link resolves from outside the cluster. Omitted, the Recipe falls back to the in-cluster address, which is correct for a deployment nobody reaches from a browser outside the cluster.
+      analytics_store_url:
+        type: string
+        description: HTTP address of the columnar analytics store holding traces, observations and scores. A deterministic pointer string the runtime resolves; the compiler never connects to it. It carries no default because the console has nothing to read without one, and the Kubernetes realization refuses to render until it is set — a build that has not supplied it halts with a diagnostic naming this value, rather than emitting a console with an address-less variable that starts and stays empty.
+      analytics_store_migration_url:
+        type: string
+        description: Native-protocol address of the same analytics store, which the platform applies its schema migrations over. It is a separate value from the HTTP address because the two use different ports and different protocols on the same store. A deterministic pointer string the runtime resolves, and the Kubernetes realization refuses to render until it is set, on the same terms as the HTTP address above.
+      analytics_store_user:
+        type: string
+        default: default
+        description: User the platform authenticates to the analytics store as.
+      analytics_store_database:
+        type: string
+        default: default
+        description: Database within the analytics store the platform reads and writes.
+      analytics_store_cluster:
+        type: boolean
+        default: false
+        description: Treat the analytics store as a multi-node cluster, which changes the statements the platform's migrations issue. A single-node store takes false.
+      log_level:
+        type: string
+        enum: [trace, debug, info, warn, error, fatal]
+        default: info
+        description: Log verbosity of both containers.
+      overrides:
+        type: object
+        additionalProperties: true
+        description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      # host, port and protocol are the shape every server component publishes;
+      # endpoint is the base URL a tracing client points at.
+      host: { type: string, required: true }
+      port: { type: integer, required: true }
+      endpoint: { type: string, required: true }
+      protocol: { type: string }
