@@ -1,0 +1,162 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: http-request-keda
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The HTTP-request tool realized as a synthesized Deployment that KEDA scales
+    — one of two realizations of the same tool component, selected in the
+    Manifest. The recipe synthesizes the tool's own workload and Service, and
+    emits a ScaledObject alongside them; the KEDA operator reconciles that
+    custom resource into an autoscaler which moves the Deployment between the
+    declared replica floor and ceiling, a floor of zero included. The event
+    source the autoscaler reads is the deployment's to declare, through
+    infra.overrides.triggers, because it is a property of the environment the
+    tool runs in rather than of the tool: the build halts naming the key when no
+    trigger is declared. provides is the synthesized Service, matching the
+    Knative realization's contract key for key so consumers are
+    realization-agnostic. The KEDA control plane is a runtime prerequisite: the
+    build halts unless the operator affirms it is installed
+    (infra.control_plane_present), so no custom resource is emitted into a
+    cluster that cannot reconcile it.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-tool/http-request:1.0.0
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service
+  # "<instance_id>-<service-key>", and this workload's one service key is
+  # "default". It carries no namespace segment, so the recipe is independent of
+  # where it is deployed and a consumer in another namespace qualifies it on its
+  # own side (caller-side routing). The port is the one the tool listens on,
+  # because a caller reaches this realization's Service directly rather than
+  # through a routing layer — that is the one value that differs from the
+  # Knative realization, whose callers connect on 80.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}"
+    protocol: "http"
+  assertions:
+    # The KEDA control plane must exist in the target cluster before a scaling
+    # custom resource can reconcile. The compiler cannot inspect cluster state,
+    # so the prerequisite is declared: an operator affirms it in the Release,
+    # and an unaffirmed build halts here rather than emitting a custom resource
+    # nothing will act on — which would leave the Deployment at its authored
+    # replica count with no autoscaler, and at a floor of zero that means no
+    # replicas at all.
+    keda_control_plane_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail "the KEDA control plane must be installed in the target cluster before this realization emits its ScaledObject; once KEDA is present, affirm the prerequisite by setting infra.control_plane_present to true in the Release" -}}
+      {{- end -}}
+    # A ScaledObject scales on an event source, and which source belongs to the
+    # environment the tool runs in rather than to the tool. The catalog
+    # therefore declares none: it halts and names the key instead, so a
+    # deployment cannot end up with an autoscaler reading nothing.
+    scaling_trigger_declared: >-
+      {{- if not (optional (optional .infra "overrides" dict) "triggers" "") -}}
+      {{- fail "this realization scales the tool on an event source, and the source is the deployment's to name: set infra.overrides.triggers in the Release to one or more entries, each carrying a KEDA scaler type and its metadata, before this realization emits its ScaledObject" -}}
+      {{- end -}}
+    # This component wraps no upstream product, so it holds no default image to
+    # fall back to: the deployment names the one it runs.
+    image_supplied: >-
+      {{- if not (optional .infra "image" "") -}}
+      {{- fail "this realization runs an image the deployment supplies, because the tool component packages no upstream product and therefore holds no default: set infra.image to the container image serving the tool in the Release" -}}
+      {{- end -}}
+    compute_group_complete: >-
+      {{- if not (optional (default dict .infra.compute) "cpu" "") -}}
+      {{- fail "this deployment sets part of infra.compute on the tool but leaves compute.cpu empty, so the rendered workload would carry no CPU request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+      {{- if not (optional (default dict .infra.compute) "memory" "") -}}
+      {{- fail "this deployment sets part of infra.compute on the tool but leaves compute.memory empty, so the rendered workload would carry no memory request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+  # This Recipe reads from infra.overrides:
+  #   triggers - list (the ScaledObject's own trigger list; no default, and the
+  #              assertion above halts when it is absent)
+  #
+  # Each entry carries a scaler `type`, its `metadata` map of scalars, and an
+  # optional `name`. Those three are what this recipe renders, and a trigger
+  # needing more than them — a credential reference, for instance — is not
+  # expressible here.
+  #
+  # The key is an override rather than a field of the component's own schema
+  # because the scaler vocabulary is KEDA's, versioned with KEDA rather than
+  # with this catalog, and which sources a cluster can be scaled on belongs to
+  # the environment. That is the same reason the operator-driven realizations of
+  # other components read their controller-specific choices from this map.
+  artifacts:
+    scaledobject.yaml: |
+      apiVersion: keda.sh/v1alpha1
+      kind: ScaledObject
+      metadata:
+        name: {{ .context.instance_id }}
+      spec:
+        scaleTargetRef:
+          name: {{ .context.instance_id }}
+        minReplicaCount: {{ .infra.min_replicas }}
+        maxReplicaCount: {{ .infra.max_replicas }}
+        triggers:
+          {{- range .infra.overrides.triggers }}
+          - type: {{ .type }}
+            {{- with .name }}
+            name: {{ . }}
+            {{- end }}
+            {{- with .metadata }}
+            metadata:
+              {{- range $k, $v := . }}
+              {{ $k }}: "{{ $v }}"
+              {{- end }}
+            {{- end }}
+          {{- end }}
+  # The tool's own values are delivered to the container as environment
+  # variables. The image is the deployment's, so no upstream documentation names
+  # a spelling for them; the recipe delivers each under a stable name for the
+  # application's own code to read, and the developer's declared method, effect
+  # and timeout reach the running tool through exactly these names. The two
+  # optional values are emitted only when the developer set them, so an unset
+  # value renders no variable rather than an empty one. The names are the same
+  # ones the Knative realization delivers, so the container behaves identically
+  # under either.
+  #
+  # The authored replica count is the declared floor: the autoscaler KEDA
+  # creates from the ScaledObject above owns the count from then on, and
+  # starting at the floor means a floor of zero occupies no compute before the
+  # first event arrives.
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    replicas: {{ .infra.min_replicas }}
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        variables:
+          HTTP_TOOL_METHOD: "{{ .values.method }}"
+          HTTP_TOOL_SIDE_EFFECTS: "{{ .values.side_effects }}"
+          HTTP_TOOL_TIMEOUT_SECONDS: "{{ .values.timeout_seconds }}"
+          {{- with .values.payload_schema_ref }}
+          HTTP_TOOL_PAYLOAD_SCHEMA_REF: "{{ . }}"
+          {{- end }}
+          {{- with .values.llm_description_override }}
+          HTTP_TOOL_DESCRIPTION: "{{ . }}"
+          {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
