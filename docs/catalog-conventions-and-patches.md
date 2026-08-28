@@ -60,7 +60,7 @@ the label section below). The 15 categories:
 | `gateway` | API and AI gateways | server | populated |
 | `mesh` | Service meshes | server | created when the first entity lands |
 | `network` | Network primitives | server, resource | created when the first entity lands |
-| `messaging` | Event buses, queues, streams | messaging | populated |
+| `messaging` | Event buses, queues, streams | stateful-server, server | populated |
 | `storage` | Object/file storage, managed cloud resources | resource | populated |
 | `compute` | Generic compute primitives, plus the control planes an event-driven realization depends on | server, worker, task, function | populated |
 | `observability` | Telemetry, tracing, monitoring | varies | populated |
@@ -112,13 +112,14 @@ cognitive browse axis of the catalog's three-axis label scheme:
   the behavioral subsets selectors and policies discriminate on.
 
 Multi-membership is expressed through capability labels, never a
-multi-valued category: a Postgres specialization for pgvector deployments is
-`category: datastore` plus `datastore.aggrega.ai/engine: vector`, discoverable
-from both axes. The label sits on that specialization rather than on the
-general-purpose Postgres, whose vector capability arrives with an extension a
-deployment enables; a component carries an engine label on its own base only
-where the product's identity is that engine, as `core/datastore/qdrant` and
-`core/datastore/redis` do.
+multi-valued category: an entity is `category: datastore` plus whatever
+`datastore.aggrega.ai/engine` value its own product identity carries,
+discoverable from both axes. A component carries an engine label on its base
+where the product's identity is that engine, as `core/datastore/qdrant` carries
+`vector` and `core/datastore/redis` carries `kv`. A capability whose truth
+depends on what a deployment configures carries no label anywhere in the
+catalog — it is injected at compile time by the governance socket's
+`label-transform` role, which reads the developer's declared `values`.
 There is no stored "is-AI" boolean — tooling derives AI-relevance from any
 `ai-`-prefixed category or AI-relevant capability value.
 
@@ -304,6 +305,58 @@ product's licensing class is recorded through
 `component.aggrega.ai/upstream-licensing`: passing the test is not a claim that
 the wrapped product is open source, and a reader filtering on the label can still
 exclude what their own policy forbids.
+
+### Specialization, sibling or fleet — which shape a product takes
+
+A product that shares a protocol with an entity already in the catalog is
+exactly when an author reaches for `extends`, and often should not. Three
+shapes are available, and the choice is settled by asking about the **pillars**
+— `values`, `infra` and `provides` — rather than by how much protocol the two
+products share.
+
+**A specialization — use `extends`.** An extending Component composes
+structure: `metadata.labels`, `metadata.annotations`, `spec.featuresSchema`,
+`spec.inject`, `spec.usesSchema` and `spec.assertions`. The pillars do not
+compose. The child writes the literal marker `schema: inherited` and authors no
+pillar content, so its contract is its base's identically — which is what lets
+the base's Recipes serve it with no Recipe of its own.
+
+> **The question to answer: do the base's pillar semantics still hold word for
+> word** — every description, every default, every unit — for the artifact the
+> child would run?
+
+Only if they do is the product a specialization. A child inherits the base's
+pillar *text* unaltered, so a knob that would mean something different on the
+child's artifact makes the child's published contract a misdescription that no
+build can catch. What a specialization adds is scope a selector or a policy
+reads: an audit tier, a data zone, a governance contact, a socket narrower than
+the base's. `example/gateway/nginx-reviewed` is the shipped shape — it extends
+`core/gateway/nginx`, adds a reviewed-tier label and a data-zone label, adds
+governance annotations, and adds one socket whose selector admits only targets
+carrying the reviewed-tier label. Two authoring rules follow:
+
+- **The pillar ban is enforced when the document loads**, not by convention. An
+  extending Component that authors pillar content under `spec.schema` is
+  refused, and one that omits `spec.schema` altogether is refused by a
+  different message on the same constraint. There is no silent case.
+- **The Manifest mapping line is still required.** Recipe selection is by exact
+  mapping key, so a specialization needs its own `mappings.components.type`
+  entry even though it needs no Recipe. Its base's entry does not cover it.
+
+**A different product speaking the same protocol — author a sibling entity.**
+Its identity is not "the base plus something", so inheritance would misdescribe
+it, however drop-in the replacement is at the wire. `core/datastore/valkey`
+sits beside `core/datastore/redis` rather than extending it: each is its own
+product with its own pillars, and both are reachable by a consumer selecting on
+`datastore.aggrega.ai/engine: kv`.
+
+**A product needing several cooperating roles — author a fleet.** No amount of
+shared protocol makes several roles one component. Each role is its own entity
+with its own type, its own pillars and its own Recipe, wired together by the
+edges an Aggregate declares. The agent-workspace platform under
+`core/ai-agent/agenta-*` is the shipped shape — a control-plane API, a console,
+queue and stream workers, a schema-migration step and a scheduler, authored as
+separate components rather than one.
 
 ### Recipe/FeatureRecipe Provider Segment
 
