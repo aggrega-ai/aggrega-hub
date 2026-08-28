@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: timescaledb
+  version: 1.0.0
+  description: >
+    TimescaleDB for local development via Docker Compose. Synthesized-mode
+    Workload: the compose provider translates the Workload kind into a service
+    entry (image, port, exposed service). provides.host is the bare service
+    name, resolved on the compose network.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/datastore/timescaledb:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "postgres"
+  # The developer's custom server configuration renders as a compose config the
+  # server mounts as a file. Presence-guarded: a deployment that leaves
+  # custom_config unset emits no config, no configuration mount and no
+  # config_file argument, so it renders as though the key did not exist. The
+  # server's own data volume is unconditional and is a separate concern.
+  #
+  # The config's name is spelled here and again on the `pgconf` volume below. The
+  # artifact and the workload are separate template strings with no binding either
+  # could dereference, so the repetition is forced rather than chosen — the two
+  # must be edited together.
+  artifacts:
+    timescaledb-config.compose-fragment.yaml: |
+      {{- if .values.custom_config }}
+      configs:
+        {{ .context.instance_id }}-config:
+          content: |
+      {{ .values.custom_config | indent 6 }}
+      {{- end }}
+  workload: |
+    {{- $configFile := "/etc/postgresql/postgresql.conf" -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    containers:
+      main:
+        image: timescale/timescaledb:{{ .infra.engine_version }}
+        # The extension's library has to be loaded before the server accepts
+        # connections; without it the server stops with a fatal error naming the
+        # missing preload. Passing the list as a server option rather than writing
+        # it into the configuration file is what makes that survive a
+        # developer-supplied custom_config: a command-line setting takes
+        # precedence over the configuration file, so the block is still applied as
+        # authored and every setting in it still takes effect.
+        # extra_preload_libraries is appended to the list rather than replacing
+        # it, so a developer asking for further libraries gets them alongside the
+        # extension's own rather than instead of it.
+        #
+        # $configFile is the single authored home for the configuration path: the
+        # config_file argument and the mount that puts the file there both read
+        # the binding, so a future move cannot relocate one and leave the other
+        # pointing at the old path. It names a file rather than a directory
+        # because this target delivers a configmap volume as one file at the mount
+        # path.
+        command:
+          - postgres
+          - -c
+          - shared_preload_libraries=timescaledb{{ with .values.extra_preload_libraries }},{{ . }}{{ end }}
+    {{- if .values.custom_config }}
+          - -c
+          - config_file={{ $configFile }}
+    {{- end }}
+        # POSTGRES_USER / POSTGRES_DB are developer values. POSTGRES_PASSWORD is
+        # wired through the optional `password` credential slot: when attached its
+        # value arrives on the inject pipe (an inject-family FeatureRecipe such as
+        # dotenv-secret); with none attached the Recipe falls back to an inline
+        # development default. POSTGRES_INITDB_ARGS is emitted only when
+        # encoding/locale are set. Compute sizing is honored here as well as on
+        # the Kubernetes target, so the value an operator sets is not silently
+        # discarded on the local one.
+        variables:
+          POSTGRES_USER: {{ .values.user }}
+    {{- if hasKey (default dict .features) "password" }}
+          POSTGRES_PASSWORD: "{{ .context.inject.env.POSTGRES_PASSWORD }}"
+    {{- else }}
+          POSTGRES_PASSWORD: apppass
+    {{- end }}
+          POSTGRES_DB: {{ .values.database }}
+    {{- if or .values.encoding .values.locale }}
+          POSTGRES_INITDB_ARGS: "{{ with .values.encoding }}--encoding={{ . }}{{ end }}{{ with .values.locale }} --locale={{ . }}{{ end }}"
+    {{- end }}
+        ports:
+          p: {{ .infra.port }}
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+        volumeMounts:
+          - name: data
+            path: /var/lib/postgresql/data
+    {{- if .values.custom_config }}
+          - name: pgconf
+            path: {{ $configFile }}
+    {{- end }}
+    # The server owns a durable volume on this target too. A datastore whose data
+    # vanished with its container would be a different thing from the one the
+    # Kubernetes target deploys, and a developer testing against it would be
+    # testing something else. The declared size is carried through to the volume;
+    # this target has no volume-size concept of its own, so it honors the volume
+    # and not the number.
+    volumes:
+      data:
+        persistent:
+          size: {{ .infra.storage.size }}
+    {{- if .values.custom_config }}
+      pgconf:
+        configmap:
+          source: {{ .context.instance_id }}-config
+    {{- end }}
+    # NodePort rather than ClusterIP so infra.port reaches the emitted bytes on
+    # this target too: compose publishes a NodePort service's port to the host,
+    # which is also what a local-development datastore is for — a client on the
+    # developer's own machine connects to it. A ClusterIP service here would
+    # leave the port internal, and the value an operator set would change no
+    # emitted byte.
+    services:
+      db:
+        type: NodePort
+        ports:
+          p: {{ .infra.port }}
