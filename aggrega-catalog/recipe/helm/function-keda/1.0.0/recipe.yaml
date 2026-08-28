@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: function-keda
+  version: 1.0.0
+  description: >
+    The generic event-driven compute primitive realized as a Deployment paired
+    with a KEDA scaling resource the KEDA control plane reconciles. The recipe
+    synthesizes the workload and emits one ScaledObject beside it; the control
+    plane reads the depth of the event source the deployment names and sets the
+    replica count from it, zero included, so the function occupies no compute
+    while the source is empty. The emitted Deployment starts at the replica
+    floor, so a floor of zero is visible in the workload itself as well as in
+    the scaling resource.
+
+    This is the queue-paced of the primitive's two realizations: work arrives on
+    an event source the deployment names, rather than as an inbound call. The
+    event source is an operator value rather than a fixed property of the
+    component because the component is generic — it names no source of its own,
+    which is what leaves both pacings open to it. Where work arrives as an
+    inbound call, the deployment maps the component to the request-paced
+    realization in the Manifest. The two are chosen there and never both at once.
+
+    No Service definition and no provides contract are emitted, because the
+    component declares none and because the event source invokes the function
+    rather than a caller reaching it. Where the event source requires
+    credentials to read its depth, the deployment names an existing
+    trigger-authentication resource in infra.scaler.authentication_ref and the
+    recipe carries that name through without resolving it. The KEDA control
+    plane is a runtime prerequisite: the build halts unless the operator affirms
+    it is installed (infra.control_plane_present), so no custom resource is
+    emitted into a cluster that cannot reconcile it.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/compute/function:1.0.0
+  # This Recipe reads from infra.overrides:
+  #   annotations - map[string]string (added to the ScaledObject's annotations)
+  #
+  # The key exists because the control plane reads its per-object switches from
+  # the scaling resource's annotations, and which switches an installation
+  # offers belongs to the installed control-plane version rather than to this
+  # catalog. The two scaling bounds are not among them: they come from
+  # infra.min_replicas and infra.max_replicas.
+  #
+  # infra keys read here: image, port, compute, min_replicas, max_replicas,
+  # control_plane_present, scaler.type, scaler.metadata,
+  # scaler.authentication_ref, overrides.annotations.
+  #
+  # Target-expected names: the image is the deployment's, so no upstream
+  # documentation names a spelling for the developer's runtime value. The recipe
+  # delivers it under a stable name for the application's own code to read.
+  #
+  # The scaler's metadata keys carry through as authored, because which keys a
+  # scaler kind reads belongs to the installed control-plane version. Both key
+  # and value are rendered as strings, which is the shape that resource's
+  # metadata field takes.
+  provides: {}
+  assertions:
+    # The KEDA control plane must exist in the target cluster before a scaling
+    # custom resource can reconcile. The compiler cannot inspect cluster state,
+    # so the prerequisite is declared: an operator affirms it in the Release,
+    # and an unaffirmed build halts here rather than emitting an orphan custom
+    # resource.
+    keda_control_plane_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail "the KEDA control plane must be installed in the target cluster before this realization emits its ScaledObject; once KEDA is present, affirm the prerequisite by setting infra.control_plane_present to true in the Release" -}}
+      {{- end -}}
+    # This component packages no upstream product, so it holds no default image
+    # to fall back to: the deployment names the one it runs.
+    image_supplied: >-
+      {{- if not (optional .infra "image" "") -}}
+      {{- fail "this realization runs an image the deployment supplies, because the generic compute primitive packages no software and therefore holds no default: set infra.image to the container image serving the function in the Release" -}}
+      {{- end -}}
+    # A queue-paced realization with no event source named would emit a scaling
+    # resource that scales on nothing, which reconciles into a workload pinned
+    # at its floor. Both halves are required, and each is named separately so
+    # the reader is told which one is missing. The scaler block carries no
+    # default, so it is absent rather than empty when a deployment sets none; it
+    # is read through the optional accessor for that reason, which is what lets
+    # this assertion report the omission instead of the template failing on a
+    # missing key.
+    scaler_named: >-
+      {{- $scaler := optional .infra "scaler" dict -}}
+      {{- if not (optional $scaler "type" "") -}}
+      {{- fail "this realization scales on an event source the deployment names, and none is set, so the emitted scaling resource would scale on nothing: set infra.scaler.type to the event-source kind your KEDA installation spells it as, or map this component to the request-paced realization in the Manifest if its work arrives as an inbound call instead" -}}
+      {{- end -}}
+      {{- if not (optional $scaler "metadata" "") -}}
+      {{- fail "this deployment names an event-source kind in infra.scaler.type but supplies no coordinates for it, so the emitted scaling resource would name a source it cannot reach: set infra.scaler.metadata to the keys that kind expects, as strings" -}}
+      {{- end -}}
+    # The compute block's two sub-keys carry defaults, and a deployment that
+    # authors the block while setting only one of them takes neither default:
+    # the emitted container then carries one quantity and silently loses the
+    # other. Both are required together for that reason, and each is named
+    # separately so the reader is told which one is missing.
+    compute_group_complete: >-
+      {{- $compute := optional .infra "compute" dict -}}
+      {{- if not (optional $compute "cpu" "") -}}
+      {{- fail "this deployment sets part of infra.compute and leaves compute.cpu empty, so the rendered container would carry no CPU request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+      {{- if not (optional $compute "memory" "") -}}
+      {{- fail "this deployment sets part of infra.compute and leaves compute.memory empty, so the rendered container would carry no memory request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # A resident workload the scaling resource below drives. It starts at the
+    # replica floor rather than at one, so a floor of zero renders a workload
+    # holding no replicas until the event source has depth.
+    form: stateless
+    replicas: {{ .infra.min_replicas }}
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        ports:
+          http: {{ .infra.port }}
+        variables:
+          FUNCTION_RUNTIME: "{{ .values.runtime }}"
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+  # The output filename carries the realization's own name rather than the bare
+  # resource kind, because an artifact key is the output path used as written:
+  # two realizations sharing a key cannot sit in one boundary, and the build
+  # halts naming the path when they do.
+  artifacts:
+    function-scaledobject.yaml: |
+      apiVersion: keda.sh/v1alpha1
+      kind: ScaledObject
+      metadata:
+        name: {{ .context.instance_id }}
+        {{- if and .infra.overrides .infra.overrides.annotations }}
+        annotations:
+          {{- range $k, $v := .infra.overrides.annotations }}
+          {{ $k }}: "{{ $v }}"
+          {{- end }}
+        {{- end }}
+      spec:
+        scaleTargetRef:
+          name: {{ .context.instance_id }}
+        minReplicaCount: {{ .infra.min_replicas }}
+        maxReplicaCount: {{ .infra.max_replicas }}
+        triggers:
+          - type: "{{ .infra.scaler.type }}"
+            metadata:
+              {{- range $k, $v := .infra.scaler.metadata }}
+              {{ $k }}: "{{ $v }}"
+              {{- end }}
+            {{- with (optional .infra.scaler "authentication_ref" "") }}
+            authenticationRef:
+              name: "{{ . }}"
+            {{- end }}
