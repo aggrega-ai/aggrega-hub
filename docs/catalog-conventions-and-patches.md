@@ -60,7 +60,7 @@ the label section below). The 15 categories:
 | `gateway` | API and AI gateways | server | populated |
 | `mesh` | Service meshes | server | created when the first entity lands |
 | `network` | Network primitives | server, resource | created when the first entity lands |
-| `messaging` | Event buses, queues, streams | stateful-server, server | populated |
+| `messaging` | Event buses, queues, streams, and the external carriers a message leaves the deployment through | stateful-server, server, resource | populated |
 | `storage` | Object/file storage, managed cloud resources | resource | populated |
 | `compute` | Generic compute primitives, plus the control planes an event-driven realization depends on | server, worker, task, function | populated |
 | `observability` | Telemetry, tracing, monitoring | varies | populated |
