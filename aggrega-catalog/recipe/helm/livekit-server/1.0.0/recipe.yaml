@@ -1,0 +1,132 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: livekit-server
+  version: 1.0.0
+  description: >
+    A LiveKit media server on Kubernetes via the helm provider's Workload
+    synthesis, running the upstream livekit-server image (no external Helm
+    chart). It renders a stateless Deployment plus a ClusterIP Service and
+    declares no volume, because the server keeps room and participant state in
+    memory rather than on disk. The server is configured from a YAML body
+    delivered on the environment, which sets the signalling port, the WebRTC TCP
+    port and the single multiplexed WebRTC UDP port; the UDP port is declared
+    with its transport, so the emitted container and service ports carry UDP
+    rather than defaulting to TCP. The token-signing secret arrives from the
+    api_secret credential slot as an env secretKeyRef and is composed with the
+    public api_key identifier at container start, so the plaintext secret never
+    appears in the rendered manifest. External-IP discovery is off: this
+    realization publishes an in-cluster ClusterIP endpoint, and advertising a
+    node address that the Service does not route to would hand clients an
+    unreachable candidate — reaching clients outside the cluster is the ingress
+    tier's concern. When the state_store uses-edge is bound, the resolved host
+    and port compose the server's store address so several replicas coordinate
+    through it; unbound, no store address is emitted. provides.host is the bare,
+    self-contained in-cluster service name of the synthesized Service — it
+    carries no namespace, so the recipe is independent of where it is deployed.
+    A consumer in another namespace qualifies the host with the target namespace
+    on its own side (caller-side routing).
+  license: Apache-2.0
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/messaging/livekit-server:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare Service name "<instance_id>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
+  # (here "<instance_id>-default"), with no namespace segment. A same-namespace
+  # consumer reaches it under this name directly; a cross-namespace consumer
+  # qualifies it with the target namespace caller-side.
+  #
+  # provides publishes the api_key identifier but never the secret: provides is
+  # plaintext string routing, so the secret half travels only on the credential
+  # socket.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "ws"
+    api_key: "{{ .values.api_key }}"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The server holds no durable disk — room and participant state is in memory,
+    # and a multi-replica deployment coordinates through the state_store edge — so
+    # the default stateless form (a Deployment on the helm provider) is correct:
+    # no form: stateful, no persistentTemplate volume, no PVC.
+    replicas: 1
+    containers:
+      main:
+        image: livekit/livekit-server:{{ .infra.engine_version }}
+        # The api key pair the server signs and validates access tokens with.
+        # The public identifier is authored; the secret half is referenced
+        # through $(LIVEKIT_API_SECRET), which the runtime expands from the
+        # Secret when the container starts, so the plaintext never lands in the
+        # manifest. It is passed as an argument rather than as an environment
+        # variable because argument expansion reads the container's whole
+        # environment, while one environment variable expanding another sees
+        # only the variables declared ahead of it — and the credential is
+        # delivered after the variables block.
+        args:
+          - "--keys"
+          - "{{ .values.api_key }}: $(LIVEKIT_API_SECRET)"
+        variables:
+          # The server reads its whole configuration from this YAML body. Ports
+          # are declared here as well as on the container ports below: the
+          # container ports declare what the pod exposes, this body tells the
+          # process what to listen on, and both read the same infra keys so the
+          # two cannot disagree.
+          LIVEKIT_CONFIG: |
+            port: {{ .infra.port }}
+            log_level: {{ .infra.log_level }}
+            rtc:
+              tcp_port: {{ .infra.rtc_tcp_port }}
+              udp_port: {{ .infra.rtc_udp_port }}
+              use_external_ip: false
+    {{- if hasKey (default dict .context.inject.env) "LIVEKIT_STATE_STORE_HOST" }}
+            redis:
+              address: "{{ .context.inject.env.LIVEKIT_STATE_STORE_HOST }}:{{ .context.inject.env.LIVEKIT_STATE_STORE_PORT }}"
+    {{- end }}
+        attachments:
+          LIVEKIT_API_SECRET:
+            from: api_secret
+            as: env
+        ports:
+          # The UDP port carries WebRTC media and is declared with its transport;
+          # a media port opened as a stream port accepts no traffic from its
+          # clients. The other two carry ordinary TCP and take the target default.
+          api: {{ .infra.port }}
+          rtc-tcp: {{ .infra.rtc_tcp_port }}
+          rtc-udp:
+            port: {{ .infra.rtc_udp_port }}
+            protocol: UDP
+        # A tcp probe names the port number outright. The http probe form
+        # resolves its target from the container's first port name in
+        # alphabetical order, which here is a WebRTC port that speaks no HTTP.
+        health:
+          ready:
+            tcp: {{ .infra.port }}
+          live:
+            tcp: {{ .infra.port }}
+            initialDelaySeconds: 10
+        resources:
+          requests:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+          limits:
+            cpu: {{ .infra.compute.cpu }}
+            memory: {{ .infra.compute.memory }}
+    services:
+      default:
+        type: ClusterIP
+        # A service port takes the transport of the container port its name
+        # resolves to, so rtc-udp carries UDP without restating it here.
+        ports:
+          api: {{ .infra.port }}
+          rtc-tcp: {{ .infra.rtc_tcp_port }}
+          rtc-udp: {{ .infra.rtc_udp_port }}
