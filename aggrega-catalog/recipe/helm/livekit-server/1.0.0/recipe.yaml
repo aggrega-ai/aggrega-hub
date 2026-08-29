@@ -13,13 +13,21 @@ metadata:
     declares no volume, because the server keeps room and participant state in
     memory rather than on disk. The server is configured from a YAML body
     delivered on the environment, which sets the signalling port, the WebRTC TCP
-    port and the single multiplexed WebRTC UDP port; the UDP port is declared
-    with its transport, so the emitted container and service ports carry UDP
-    rather than defaulting to TCP. The token-signing secret arrives from the
-    api_secret credential slot as an env secretKeyRef and is composed with the
-    public api_key identifier at container start, so the plaintext secret never
-    appears in the rendered manifest. External-IP discovery is off: this
-    realization publishes an in-cluster ClusterIP endpoint, and advertising a
+    port and the WebRTC UDP media path. That media path takes one of two forms
+    and the body carries exactly one of them, because the server reads the range
+    in preference to the multiplexed port whenever both are configured. The
+    multiplexed single UDP port is the default, and it is emitted as a container
+    port declared with its transport, so the emitted container and service ports
+    carry UDP rather than defaulting to TCP. Setting both range bounds selects
+    the contiguous UDP port range instead: the range is expressible in the
+    server's configuration and not in a declared container port, so the
+    multiplexed port is dropped from the body and no UDP container port and no
+    UDP service port are emitted, and the range carries client traffic only
+    where the pod uses the node's own network. The token-signing secret arrives
+    from the api_secret credential slot as an env secretKeyRef and is composed
+    with the public api_key identifier at container start, so the plaintext
+    secret never appears in the rendered manifest. External-IP discovery is off:
+    this realization publishes an in-cluster ClusterIP endpoint, and advertising a
     node address that the Service does not route to would hand clients an
     unreachable candidate — reaching clients outside the cluster is the ingress
     tier's concern. When the state_store uses-edge is bound, the resolved host
@@ -55,6 +63,16 @@ spec:
   workload: |
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
+    {{- /* The media path: a contiguous UDP range when both bounds carry a
+           value, the multiplexed single port otherwise. Decided once here
+           because the configuration body and the two port sets must agree on
+           it — the server reads the range in preference to the multiplexed
+           port, so a body carrying both would leave the declared UDP port
+           unbound. Both bounds are tested for a value rather than for
+           presence: a declared infra key with no default reaches the template
+           as an empty value, so presence alone does not mean an operator set
+           it, and one bound alone does not select the range. */}}
+    {{- $mediaRange := and .infra.rtc_port_range_start .infra.rtc_port_range_end }}
     # The server holds no durable disk — room and participant state is in memory,
     # and a multi-replica deployment coordinates through the state_store edge — so
     # the default stateless form (a Deployment on the helm provider) is correct:
@@ -77,16 +95,23 @@ spec:
           - "{{ .values.api_key }}: $(LIVEKIT_API_SECRET)"
         variables:
           # The server reads its whole configuration from this YAML body. Ports
-          # are declared here as well as on the container ports below: the
-          # container ports declare what the pod exposes, this body tells the
-          # process what to listen on, and both read the same infra keys so the
-          # two cannot disagree.
+          # appear here as well as on the container ports below: the container
+          # ports declare what the pod exposes, this body tells the process what
+          # to listen on, and both are driven by the same infra keys and the same
+          # media-path decision, so the two cannot disagree about which ports the
+          # process opens. The range is the one media path with no container-port
+          # counterpart, and the ports block below says so at its own site.
           LIVEKIT_CONFIG: |
             port: {{ .infra.port }}
             log_level: {{ .infra.log_level }}
             rtc:
               tcp_port: {{ .infra.rtc_tcp_port }}
+    {{- if $mediaRange }}
+              port_range_start: {{ .infra.rtc_port_range_start }}
+              port_range_end: {{ .infra.rtc_port_range_end }}
+    {{- else }}
               udp_port: {{ .infra.rtc_udp_port }}
+    {{- end }}
               use_external_ip: false
     {{- if hasKey (default dict .context.inject.env) "LIVEKIT_STATE_STORE_HOST" }}
             redis:
@@ -97,14 +122,19 @@ spec:
             from: api_secret
             as: env
         ports:
-          # The UDP port carries WebRTC media and is declared with its transport;
-          # a media port opened as a stream port accepts no traffic from its
-          # clients. The other two carry ordinary TCP and take the target default.
+          # The multiplexed UDP port carries WebRTC media and is declared with
+          # its transport; a media port opened as a stream port accepts no
+          # traffic from its clients. The other two carry ordinary TCP and take
+          # the target default. A media range is a span of ports rather than one
+          # number, which a declared port does not express, so selecting it
+          # leaves no UDP port to declare here.
           api: {{ .infra.port }}
           rtc-tcp: {{ .infra.rtc_tcp_port }}
+    {{- if not $mediaRange }}
           rtc-udp:
             port: {{ .infra.rtc_udp_port }}
             protocol: UDP
+    {{- end }}
         # A tcp probe names the port number outright. The http probe form
         # resolves its target from the container's first port name in
         # alphabetical order, which here is a WebRTC port that speaks no HTTP.
@@ -125,8 +155,11 @@ spec:
       default:
         type: ClusterIP
         # A service port takes the transport of the container port its name
-        # resolves to, so rtc-udp carries UDP without restating it here.
+        # resolves to, so rtc-udp carries UDP without restating it here. It is
+        # published only alongside the container port it resolves to.
         ports:
           api: {{ .infra.port }}
           rtc-tcp: {{ .infra.rtc_tcp_port }}
+    {{- if not $mediaRange }}
           rtc-udp: {{ .infra.rtc_udp_port }}
+    {{- end }}
