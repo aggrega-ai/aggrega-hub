@@ -1,0 +1,160 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/messaging/livekit-sip
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    A LiveKit SIP bridge — the service that carries a telephone call into and
+    out of a realtime room. It answers SIP signalling on one port, which it
+    binds for datagram and stream transport alike, negotiates the call there,
+    and then carries the call audio over RTP on a contiguous range of UDP ports
+    it draws a per-call socket from. The room side of the call runs over the
+    bridge's own client session with the media server, and the state of a call
+    in progress lives in the Redis-compatible store the bridge and that server
+    share, which is also how the requests that set a call up pass between them.
+    A deployment wires here when it terminates a SIP trunk inside its
+    own cluster and joins those calls to rooms it already runs, rather than
+    routing the conversation through a carrier's own application platform.
+    Consumers receive the bridge's in-cluster host, its signalling port and the
+    protocol that port speaks; the token-signing secret arrives through the
+    credential socket and is never published on the topology, and the public
+    key identifier arrives over the edge to the media server, so the halves of
+    one key pair cannot drift apart. Realized by a Helm Recipe that synthesizes
+    a Deployment and a ClusterIP Service over the upstream image and declares no
+    volume: the bridge holds no durable disk. The RTP range is configuration the
+    bridge reads rather than ports the component declares — a span of ports is
+    not a container port — so those ports carry call audio where the pod uses
+    the node's own network and the range is open to the trunk on the node's
+    firewall.
+  labels:
+    component.aggrega.ai/type: server
+    component.aggrega.ai/category: messaging
+    component.aggrega.ai/hosting: self-hosted
+    component.aggrega.ai/upstream-licensing: osi-approved
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  # Self-inject allowlist: the component may inject its own provides keys and
+  # resolved uses-edge values into the env delivery mechanism.
+  inject: [env]
+
+  usesSchema:
+    # The media server whose rooms the bridge joins calls to. Required: the
+    # bridge holds a client session with that server for the whole life of a
+    # call, so there is no configuration under which it runs without one.
+    #
+    # The edge carries three of the target's published keys into this
+    # component's environment, and the Recipe reads them under these names:
+    #   LIVEKIT_MEDIA_SERVER_HOST     <- the target's host
+    #   LIVEKIT_MEDIA_SERVER_PORT     <- the target's port
+    #   LIVEKIT_MEDIA_SERVER_API_KEY  <- the target's api_key identifier
+    # The first two compose the signalling address the bridge opens its session
+    # on; the third is the public half of the key pair whose secret half fills
+    # the api_secret slot below.
+    #
+    # The selector admits any resident messaging server, which is as narrow as
+    # the label axes go — that the target publishes a host, a port and an
+    # api_key is a contract the selector cannot state and the wiring must
+    # honour.
+    media_server:
+      selector: "component.aggrega.ai/category=messaging, component.aggrega.ai/type=server"
+      required: true
+      inject: [env]
+
+    # The Redis-compatible store holding the state of calls in progress.
+    # Required: the bridge reads and writes call state there and refuses to
+    # start without a store address, and it is also how the bridge and the media
+    # server exchange the requests that set a call up. It must be the same store
+    # the media server is wired to.
+    #
+    # The edge carries the target's host and port under the names the Recipe
+    # reads, which are the same two names the media server's own store edge
+    # uses, so one deployment wires both components the same way:
+    #   LIVEKIT_STATE_STORE_HOST  <- the target's host
+    #   LIVEKIT_STATE_STORE_PORT  <- the target's port
+    state_store:
+      selector: "component.aggrega.ai/category=datastore, datastore.aggrega.ai/engine=kv"
+      required: true
+      inject: [env]
+
+  featuresSchema:
+    # The API secret the bridge authenticates to the media server with, and the
+    # same secret that server signs and validates access tokens with — one key
+    # pair, held by both. Required, and deliberately carrying no inline default:
+    # a signing secret that ships with the catalog would be a shared secret every
+    # reader holds, so a deployment attaches its own credential and nothing
+    # renders until it does. Transparent (inject: [env]) so the value reaches the
+    # container on the env pipe; the selector is secret-kind-pinned but
+    # family-agnostic, so either an inject-value or a referenceable credential
+    # may fill it.
+    api_secret:
+      selector: "feature.aggrega.ai/kind=secret"
+      required: true
+      sensitive: true
+      inject: [env]
+      description: "Signing secret paired with the api_key identifier the media_server edge carries. Attach the same credential the media server holds: the bridge authenticates to that server with this pair, so two different secrets leave the bridge unable to open a session."
+
+  schema:
+    # This component declares no values pillar. Every knob it exposes is an
+    # operational one — which ports the process opens, how loudly it logs, how
+    # much compute it is given — and the shape of a call is settled at runtime
+    # through the media server's own trunk and dispatch-rule APIs rather than at
+    # build time. A values pillar here would be a surface the Recipe reads
+    # nothing from.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      sip_port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 5060
+        description: SIP signalling port. The bridge binds it for UDP and for TCP together and announces it in the SIP headers it sends, so both transports of the trunk arrive on one number. Most operators should omit this and let the Recipe assign the default (5060).
+      health_port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 8080
+        description: Port carrying the bridge's own health endpoint, which answers with the load state of the process. The Recipe probes it, so leaving it at the default keeps the readiness and liveness checks working; it is a container port and the Service does not publish it.
+      rtp_port_start:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 10000
+        description: First port of the contiguous UDP range the bridge draws a per-call RTP socket from. The range sizes how many calls one replica carries at once, since each call holds a socket in it for its duration. The ports in it are configuration the bridge reads rather than ports the component declares — they are not container ports and no Service fronts them — so they carry call audio where the pod uses the node's own network and the range is open to the trunk on the node's firewall.
+      rtp_port_end:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 20000
+        description: Last port of the contiguous UDP RTP range, inclusive, and greater than rtp_port_start. Narrow the range to the number of concurrent calls a replica is sized for rather than leaving the full default span open on the node.
+      log_level:
+        type: string
+        enum: [debug, info, warn, error]
+        default: info
+        description: Bridge log verbosity.
+      engine_version:
+        type: string
+        default: "v1.12.0"
+        description: Bridge container image tag. Selects the image tag on container targets.
+      compute:
+        cpu:
+          type: string
+          default: 500m
+        memory:
+          type: string
+          default: 512Mi
+      overrides:
+        type: object
+        additionalProperties: true
+        description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      host: { type: string, required: true }
+      port: { type: integer, required: true }
+      protocol: { type: string }
