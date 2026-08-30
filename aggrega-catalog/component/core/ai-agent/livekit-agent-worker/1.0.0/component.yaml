@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/ai-agent/livekit-agent-worker
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    A LiveKit agent worker — the resident process that joins a realtime room as
+    a participant and runs the agent's own code there: the speech pipeline, or
+    the realtime model, that holds the conversation with whoever else is in the
+    room. It opens a WebSocket outward to the media server, registers itself as
+    available, and then waits to be handed work, running one agent session for
+    each job it accepts. It serves no application traffic — it listens on one
+    socket, the health endpoint its own probes read — so no other component
+    addresses it and no Service fronts it. A deployment wires here
+    when the conversation inside its own rooms is to be carried by software it
+    runs and by agent code it writes, rather than handed to a hosted agent
+    platform.
+
+    Upstream publishes the agent framework as a language package rather than as
+    a container image, and this component pins no image because there is none to
+    pin. The image is a required operational value carrying no default, so using
+    this component means building an image from the framework together with the
+    agent code, publishing it where the cluster can pull it, and naming that
+    reference in the deployment. Nothing renders until that reference is
+    supplied.
+
+    Consumers receive the dispatch name the worker registers under, which is
+    what a dispatch rule addresses it by; the worker publishes no host and no
+    port, because there is nothing to reach it on. The token-signing secret
+    arrives through the credential socket and is never published on the
+    topology, and the public key identifier arrives over the edge to the media
+    server, so the halves of one key pair cannot drift apart. Realized by a Helm
+    Recipe that synthesizes a Deployment over the supplied image and declares
+    neither a Service nor a volume: the worker holds no durable disk, and the
+    state of a session lives in memory for as long as that session lasts.
+  labels:
+    component.aggrega.ai/type: worker
+    component.aggrega.ai/category: ai-agent
+    component.aggrega.ai/hosting: self-hosted
+    component.aggrega.ai/upstream-licensing: osi-approved
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  # Self-inject allowlist: the component may inject its own provides keys and
+  # resolved uses-edge values into the env delivery mechanism.
+  inject: [env]
+
+  usesSchema:
+    # The media server whose rooms the worker joins. Required: the worker
+    # registers with that server on startup and refuses to run without an
+    # address, an API key and a secret, so there is no configuration under
+    # which it runs without one.
+    #
+    # The edge carries three of the target's published keys into this
+    # component's environment, and the Recipe reads them under these names:
+    #   LIVEKIT_MEDIA_SERVER_HOST     <- the target's host
+    #   LIVEKIT_MEDIA_SERVER_PORT     <- the target's port
+    #   LIVEKIT_MEDIA_SERVER_API_KEY  <- the target's api_key identifier
+    # They are the same three names the SIP bridge's own media_server edge
+    # uses, so one deployment wires both consumers the same way. The first two
+    # compose the signalling address the worker registers on; the third is the
+    # public half of the key pair whose secret half fills the api_secret slot
+    # below.
+    #
+    # The selector admits any resident messaging server, which is as narrow as
+    # the label axes go — that the target publishes a host, a port and an
+    # api_key is a contract the selector cannot state and the wiring must
+    # honour.
+    media_server:
+      selector: "component.aggrega.ai/category=messaging, component.aggrega.ai/type=server"
+      required: true
+      inject: [env]
+
+  featuresSchema:
+    # The API secret the worker authenticates to the media server with, and the
+    # same secret that server signs and validates access tokens with — one key
+    # pair, held by both. Required, and deliberately carrying no inline default:
+    # a signing secret that ships with the catalog would be a shared secret every
+    # reader holds, so a deployment attaches its own credential and nothing
+    # renders until it does. Transparent (inject: [env]) so the value reaches the
+    # container on the env pipe; the selector is secret-kind-pinned but
+    # family-agnostic, so either an inject-value or a referenceable credential
+    # may fill it.
+    api_secret:
+      selector: "feature.aggrega.ai/kind=secret"
+      required: true
+      sensitive: true
+      inject: [env]
+      description: "Signing secret paired with the api_key identifier the media_server edge carries. Attach the same credential the media server holds: the worker authenticates to that server with this pair, so two different secrets leave the worker unable to register."
+
+  schema:
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate.
+      agent_name:
+        type: string
+        description: Dispatch name the worker registers under. Naming it turns on explicit dispatch — the server then hands this worker only the rooms a dispatch rule or an access token names it in, so several agents can serve different rooms of one deployment. Leaving it unset keeps automatic dispatch, where the worker is offered every room the server opens, which is the shape a deployment running a single agent wants. The name reaches the worker as a default the framework reads on startup, so an agent whose own code names itself keeps the name its code sets and this field has no effect on it.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      #
+      # There is no engine_version knob here, and that is deliberate rather than
+      # an omission: the version travels inside the image reference the
+      # deployment supplies, so a separate version field would name a tag
+      # nothing reads.
+      image:
+        type: string
+        required: true
+        description: Container image reference the worker runs, including its tag or digest. It carries no default and the catalog pins nothing, because the agent framework is published as a language package rather than as a container image — an image for this component is built from that framework together with the agent code the deployment writes, published where the cluster can pull it, and named here. A build that omits it halts.
+      log_level:
+        type: string
+        enum: [debug, info, warn, error]
+        default: info
+        description: Worker log verbosity.
+      compute:
+        cpu:
+          type: string
+          default: 500m
+        memory:
+          type: string
+          default: 512Mi
+      overrides:
+        type: object
+        additionalProperties: true
+        description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      #
+      # The dispatch name and nothing else. A consumer that routes work to this
+      # worker addresses it by that name, so publishing it keeps the name
+      # authored once rather than repeated wherever a dispatch rule is written;
+      # a worker left on automatic dispatch publishes it empty, which is the
+      # accurate statement that it answers to no name. There is no host and no
+      # port to publish: the worker listens for no inbound connection, so it has
+      # no address a consumer could reach.
+      agent_name: { type: string }
