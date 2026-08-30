@@ -1,0 +1,162 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Aggregate
+metadata:
+  name: core/livekit
+  version: 1.0.0
+  description: >
+    A self-hosted realtime voice and video stack packaged as a reusable module.
+    It composes four single-workload components — a LiveKit media server, a SIP
+    bridge carrying telephone calls into and out of a room, an agent worker
+    joining a room as a participant, and a Valkey key-value store — wired by
+    internal edges: the media server and the bridge both reach the store, and
+    the bridge and the worker both reach the media server. The store edges
+    carry the store's in-cluster host and port into each consumer, which
+    composes them into the address of the shared state the server and the
+    bridge coordinate through and pass call setup requests over. The
+    media-server edges carry that server's host, its signalling port and its
+    public API key identifier into the bridge and the worker, which compose the
+    WebSocket address they open their own client session on. The compiler
+    routes the strings without interpreting them.
+
+    One API key pair holds the fleet together: the media server signs and
+    validates client access tokens with it, and the bridge and the worker
+    authenticate to that server with the same pair, so two different secrets
+    leave them unable to open a session. The public half travels the internal
+    edges as an ordinary string. The secret half is a module parameter
+    delivered to each of the three components through its own credential slot,
+    so each workload carries a reference to a secret resource rather than the
+    value itself. That parameter carries a pinned default so the module runs
+    self-contained with no external secret; the default is a development
+    credential every reader of this catalog holds, so it is for evaluation and
+    local development, and a deployment carrying real traffic fulfills the
+    parameter with a secret of its own.
+
+    The agent tier needs one input the module cannot supply. Upstream publishes
+    the agent framework as a language package rather than as a container image,
+    so the catalog pins no image for it and the worker's image is an
+    operational value the deployment sets to a reference it has built from that
+    framework together with its own agent code and published where the cluster
+    can pull it. Nothing renders until it does.
+
+    Several things are deliberately out of scope, and a deployment supplies
+    them around the module. It ships no ingress and no TLS termination: each
+    component that publishes an address does so as an in-cluster ClusterIP
+    Service, so reaching a client outside the cluster is the ingress tier's
+    concern, and external-address discovery is off on both the server and the
+    bridge. It ships no SIP trunk and no carrier account — the bridge
+    terminates a trunk the deployment brings. It defines no rooms, no dispatch
+    rules and no trunk configuration; those are settled at runtime through the
+    media server's own APIs rather than at build time. And a contiguous UDP
+    media range is configuration the process reads rather than ports the module
+    declares, so it carries traffic only where the pod uses the node's own
+    network: the bridge always draws its per-call RTP socket from such a range,
+    while the server multiplexes media onto one declared UDP port until a
+    deployment sets both bounds of a range for it. The module exports the media
+    server as `server`, the endpoint clients open their sessions on, and the
+    bridge as `telephony`, the endpoint a SIP trunk reaches.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  parameters:
+    # The secret half of the API key pair, held identically by all three
+    # LiveKit components: the media server signs and validates access tokens
+    # with it, and the bridge and the worker authenticate to that server with
+    # it. It is a module parameter rather than three separate attachment values
+    # so that the one secret is authored once and cannot drift between the
+    # components that must agree on it.
+    #
+    # The pinned default is what lets the module render self-contained. It is a
+    # development credential: every reader of this catalog holds it, so a
+    # deployment carrying real traffic fulfills this parameter with a secret of
+    # its own.
+    api_secret:
+      type: string
+      default: "devsecret_local_evaluation_only"
+      description: Secret half of the API key pair the media server signs client access tokens with and the bridge and the worker authenticate with. The default is a development credential shipped so the module runs self-contained; fulfill it with a secret of your own for any deployment carrying real traffic.
+  components:
+    # The Redis-compatible store the media server and the bridge share. It
+    # carries the state of a call in progress and the requests that set a call
+    # up, so both components must reach the same one — which is why it is a
+    # component of this module rather than something each tier brings.
+    store:
+      type: core/datastore/valkey
+
+    # The media server: the selective forwarding unit carrying audio and video
+    # between the participants of a room, and the component every other tier
+    # here holds a client session with.
+    media:
+      type: core/messaging/livekit-server
+      uses:
+        state_store:
+          store:
+            target: store
+            inject:
+              env:
+                - { in: LIVEKIT_STATE_STORE_HOST, from: host }
+                - { in: LIVEKIT_STATE_STORE_PORT, from: port }
+      features:
+        api_secret:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.api_secret }}"
+            key: LIVEKIT_API_SECRET
+
+    # The SIP bridge: telephony ingress and egress. It reaches the media server
+    # to join calls to rooms and the store to keep the state of a call in
+    # progress, which is also how it and the server exchange call setup.
+    bridge:
+      type: core/messaging/livekit-sip
+      uses:
+        media_server:
+          media:
+            target: media
+            inject:
+              env:
+                - { in: LIVEKIT_MEDIA_SERVER_HOST, from: host }
+                - { in: LIVEKIT_MEDIA_SERVER_PORT, from: port }
+                - { in: LIVEKIT_MEDIA_SERVER_API_KEY, from: api_key }
+        state_store:
+          store:
+            target: store
+            inject:
+              env:
+                - { in: LIVEKIT_STATE_STORE_HOST, from: host }
+                - { in: LIVEKIT_STATE_STORE_PORT, from: port }
+      features:
+        api_secret:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.api_secret }}"
+            key: LIVEKIT_API_SECRET
+
+    # The agent worker: a participant rather than a carrier of media. It
+    # registers with the media server and waits to be handed rooms, and it
+    # reaches nothing else — no store edge, because a session's state lives in
+    # the worker's memory for as long as that session lasts.
+    agent:
+      type: core/ai-agent/livekit-agent-worker
+      uses:
+        media_server:
+          media:
+            target: media
+            inject:
+              env:
+                - { in: LIVEKIT_MEDIA_SERVER_HOST, from: host }
+                - { in: LIVEKIT_MEDIA_SERVER_PORT, from: port }
+                - { in: LIVEKIT_MEDIA_SERVER_API_KEY, from: api_key }
+      features:
+        api_secret:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.api_secret }}"
+            key: LIVEKIT_API_SECRET
+  exportedComponents:
+    # The two components something outside the module addresses. The store is
+    # internal to the fleet, and the worker publishes no address at all — it
+    # opens its connection outward and nothing reaches it.
+    server: media
+    telephony: bridge
