@@ -563,14 +563,16 @@ variables:
 
 ### Other string-typed values inside `workload:`
 
-The same contract governs every string-typed key in the Workload schema, and the
-templated form is where it bites. `resources.{requests,limits}.{cpu,memory}`,
-`volumes.*.persistent.{size,class}`, `volumes.*.persistentTemplate.{size,class}`,
-`volumes.*.ephemeral.sizeLimit` and `scheduling.nodeSelector` values are all declared
-as strings.
+The same contract governs every string-typed key in the Workload schema, which makes
+the rule one line: **a templated value under a string-typed key is quoted.** The
+quotes go around the whole action, because YAML reads the rendered text rather than
+the template.
 
-The failure is invisible while the defaults are read and appears when an operator
-supplies a value spelled as a number. A Recipe writing
+Quote it even when today's default renders as a word. The failure is invisible while
+the defaults are read and appears the moment an operator supplies a value spelled as
+a number — and that operator did nothing wrong, because the value is legitimate and
+the key is a string. An unquoted template turns a correctly authored Release into a
+failed build. A Recipe writing
 
 ```yaml
 resources:
@@ -591,8 +593,38 @@ resources:
 An extended resource quantity is the same case, which is why the schema's own example
 spells it `'nvidia.com/gpu': '1'`.
 
+**A sequence element is the same case and is the one most easily missed, because it
+carries no key to read the type from.** `command` and `args` entries are string-typed,
+so a templated element is quoted like any other value:
+
+```yaml
+# CORRECT
+args:
+  - "--listen=0.0.0.0:{{ .infra.http_port }}"
+
+# WRONG — the rendered element is read by its spelling, not by its position
+args:
+  - --listen=0.0.0.0:{{ .infra.http_port }}
+```
+
+**Settle which keys are string-typed from the schema rather than from a list.** The
+ones a Recipe hits most often are `containers.*.image`, `containers.*.variables.*`,
+`resources.{requests,limits}.{cpu,memory}` and extended resource quantities,
+`volumes.*.persistent.{size,class}`, `volumes.*.persistentTemplate.{size,class}`,
+`volumes.*.ephemeral.sizeLimit`, `volumes.*.configmap.source`, `volumeMounts.*.path`,
+`scheduling.nodeSelector.*`, `runtimeClassName` and `imagePullSecrets` — but that is
+where the rule bites, not where it stops. `aggrega get-schema workload` prints the
+declared type of every key and settles any key in doubt.
+
 Container and service **ports** are the inverse: they are declared as integers, so
 they are written bare and a quoted port is refused.
+
+**Quoting costs nothing for a value that already worked.** A plain YAML scalar that
+resolves to a string and the same text in quotes parse to the same string, so a
+template already rendering a word is unaffected and the quotes are what keep a
+numeric-looking one working. Where a template can render *nothing*, guard the whole
+line with `{{- with … }}` instead of leaving it to emit an empty quoted value: an
+empty string is a value, and an absent key is not.
 
 ### Maintainer block
 
