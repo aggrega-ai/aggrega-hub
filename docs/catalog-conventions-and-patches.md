@@ -52,9 +52,9 @@ the label section below). The 15 categories:
 
 | Category | Contains | Typical ontology labels | On disk |
 | --- | --- | --- | --- |
-| `ai-agent` | AI agent frameworks, platforms, and patterns | worker, server, resource | populated |
+| `ai-agent` | AI agent frameworks, platforms, and patterns | worker, server, stateful-server, task, resource | populated |
 | `ai-model` | Model providers and inference runtimes | server, resource | populated |
-| `ai-tool` | Tools agents invoke | function, server, resource | populated |
+| `ai-tool` | Tools agents invoke | function, server, stateful-server, resource | populated |
 | `ai-pipeline` | AI data/processing pipelines | worker, task | created when the first entity lands |
 | `datastore` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server, resource | populated |
 | `gateway` | API and AI gateways | server | populated |
@@ -468,7 +468,33 @@ entity describes, not of the file describing it. It is stated per file rather
 than inferred from the repository so that a catalog published by anyone else can
 say what its own terms are.
 
+### Quoting follows the declared type
+
+The quoting rules below are one rule applied to several surfaces: **write each value
+in the spelling YAML reads as the type the schema declares.** YAML types a bare
+scalar by how it is spelled, so the question is never taste — it is whether the
+spelling and the declared type agree.
+
+Two directions, and both are real:
+
+- Where the schema declares a **string** and the value's spelling would make YAML
+  read it as a number, a boolean or a date, the value is **quoted**. Most catalog
+  values are words, which YAML already reads as strings, so most of them are written
+  bare — that is why the two rules below say "unquoted".
+- Where the schema declares a **number**, quoting is the error in the other
+  direction. A container port is an integer, so `p: 5432` is right and `p: "5432"`
+  is refused when the workload is parsed.
+
+A value assembled by a template is judged the same way, on what it renders to rather
+than on how it is written: the quotes go around the whole action, because YAML sees
+only the rendered text.
+
 ### Label values: unquoted
+
+Label values are declared as strings (`additionalProperties: { "type": "string" }`
+on `metadata.labels`), and the standard library's values are words, so they need no
+quotes. A label value spelled as a number or a boolean does need them — bare, it is
+refused when the entity loads.
 
 ```yaml
 # CORRECT
@@ -489,6 +515,84 @@ version: 1.0.0
 # WRONG
 version: "1.0.0"
 ```
+
+### Container variables: quoted
+
+A container's `variables` map is the surface where the previous two rules mislead if
+they are carried across unexamined. The Workload schema declares
+
+```json
+"variables": { "type": "object", "additionalProperties": { "type": "string" } }
+```
+
+on `$defs.container.properties.variables` — so **every value in the map is a
+string**, and environment values are exactly the ones authors spell as numbers and
+booleans. Quote them all:
+
+```yaml
+# CORRECT
+variables:
+  POSTGRES_USER: appuser
+  PGMAXCONN: "200"
+  DEBUG: "true"
+
+# WRONG — YAML reads these as an integer and a boolean
+variables:
+  PGMAXCONN: 200
+  DEBUG: true
+```
+
+The build halts at workload validation and names the contract:
+
+```text
+.containers.main.variables.PGMAXCONN: /$defs/container: type: 200 has type "integer", want "string"
+```
+
+The templated form is the one most easily missed, because what YAML reads is the
+rendered text rather than the template. Quote the whole action:
+
+```yaml
+# CORRECT
+variables:
+  PGPORT: "{{ .infra.port }}"
+
+# WRONG — renders to `PGPORT: 5432`, which YAML reads as an integer
+variables:
+  PGPORT: {{ .infra.port }}
+```
+
+### Other string-typed values inside `workload:`
+
+The same contract governs every string-typed key in the Workload schema, and the
+templated form is where it bites. `resources.{requests,limits}.{cpu,memory}`,
+`volumes.*.persistent.{size,class}`, `volumes.*.persistentTemplate.{size,class}`,
+`volumes.*.ephemeral.sizeLimit` and `scheduling.nodeSelector` values are all declared
+as strings.
+
+The failure is invisible while the defaults are read and appears when an operator
+supplies a value spelled as a number. A Recipe writing
+
+```yaml
+resources:
+  requests:
+    cpu: {{ .infra.compute.cpu }}
+```
+
+renders `cpu: 250m` — a string — for the usual default, and `cpu: 2` for an operator
+who asked for two whole cores, which halts. Quote the action so both spellings are
+strings:
+
+```yaml
+resources:
+  requests:
+    cpu: "{{ .infra.compute.cpu }}"
+```
+
+An extended resource quantity is the same case, which is why the schema's own example
+spells it `'nvidia.com/gpu': '1'`.
+
+Container and service **ports** are the inverse: they are declared as integers, so
+they are written bare and a quoted port is refused.
 
 ### Maintainer block
 
@@ -1139,6 +1243,40 @@ declared, validated and then silently dropped on one target is a defect, not a
 gap — either realize it for that target per the target's own pattern, or do not
 expose it for that target at all.
 
+Checking a component against that rule means knowing what each target can express.
+The `compose` target is the one that most often cannot, so its envelope is stated in
+the next section.
+
+### What the `compose` target expresses, and what it does not
+
+**This is the single home for the `compose` target's capability envelope.** A Recipe
+documents what *it* does with a value; it does not carry its own account of what the
+target can express. Several accounts of one target drift apart, and a reader
+comparing two Recipes in the same family then cannot tell which is right — a wrong
+account reads exactly as authoritative as a right one.
+
+| Workload construct | What `compose` does with it |
+| --- | --- |
+| `volumes.<n>.configmap`, mounted by a `volumeMounts` entry | **Realized.** The source becomes a compose `config` carrying the content, delivered as **one file at the mount path**. The mount path is emitted verbatim, so it names a *file*. |
+| Several named files mounted as a **directory** | **Not expressible.** One config is one file, and the target performs no key expansion: pointing the mount at a directory path writes a single file at that path. A value shaped as a map of filename to content — bootstrap scripts, a drop-in directory — has no `compose` realization. |
+| `volumes.<n>.persistent` | The volume is **created and named**; the declared `size` reaches no emitted byte, and nothing reports it. The target has no volume-size concept. |
+| `containers.<n>.resources` | **Realized** as `deploy.resources` — `cpu` as fractional cores, `memory` as an exact byte count. An operator's sizing is honored here, not dropped. |
+| `initContainers` | **Realized** as a companion service the main service waits on, through `depends_on` with `service_completed_successfully`. |
+| `services.<n>` | A `NodePort` or `LoadBalancer` entry publishes its ports on the host. A `ClusterIP` or `Headless` entry publishes nothing, so a port an operator sets reaches no emitted byte. |
+| `replicas` | **Dropped, with a warning** naming it. |
+| An attached credential | Arrives on the inject pipe and is delivered as a **literal environment value** in the emitted file. The target has no secret-reference primitive for a `secretKeyRef`-style pointer to resolve, so the material sits in the artifact rather than being pointed at from it. |
+| `containers.<n>.lifecycle`, `containers.<n>.envFrom` | **The build halts.** The target has neither primitive, and dropping either silently would change what the deployment means. |
+
+Two consequences for a Recipe author:
+
+- **A single configuration file is realizable on this target; a directory of them is
+  not.** Where a component exposes both — a raw configuration block and a map of
+  bootstrap scripts — the `compose` Recipe can realize the first and cannot realize
+  the second. Say so on the component's own value description, where a developer
+  reads it, rather than in a Recipe comment.
+- **The volume-size row is the knob rule's standing exception**, and it is named
+  rather than silent: see the datastore family template below.
+
 ### The datastore family template
 
 Every datastore component targets the same shape, distilled from the PostgreSQL
@@ -1155,7 +1293,13 @@ copying whichever sibling happens to be nearest.
 - **`infra`** — `port`, `engine_version`, `compute.{cpu,memory}`, and for stateful
   engines `storage.{size,type}`; `ha.{enabled,read_replicas}`;
   `backup.{enabled,retention_days}`; and `overrides` as the open bag for the
-  operational side.
+  operational side. **`storage.{size,type}` is scoped to the targets that have a
+  volume-size concept — the `compose` realization creates the volume and honors
+  neither number, which is this template's one named exception to the knob rule, not
+  a silent drop.** The key stays single-named and single-homed rather than split per
+  target: the size means the same thing everywhere, and a stateful member needs its
+  volume on the local target too or it would not be the same datastore the Kubernetes
+  target deploys.
 - **`provides`** — `host` and `port` are required; `user`, `database` and
   `protocol` are declared **only where the engine has the concept**. Redis, Valkey
   and Memcached have no user or database — do not invent them to make the family
