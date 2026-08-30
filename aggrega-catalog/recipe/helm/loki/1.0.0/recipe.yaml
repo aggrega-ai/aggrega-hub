@@ -15,6 +15,11 @@ metadata:
     services the chart bundles by default — the ingress gateway, the chunk and
     result caches, and the canary probe DaemonSet — are turned off so this wrap
     stays a single workload; those are separate services modelled on their own.
+    A memcached wired to the chunk_cache socket is exactly that case: the chart
+    keeps its own bundled cache off and the recipe points the chunk-cache client
+    at the wired memcached instead, with the batch size, parallelism, timeout and
+    entry lifetime taken from that edge's own values. Unwired, the client stays
+    off and every chunk is read from the data volume.
     The Loki server image and the config-reload sidecar image are pinned to
     resolvable tags for reproducible renders. The developer's retention_period
     flows into the in-process compactor, which deletes log streams once they age
@@ -141,16 +146,48 @@ spec:
     backend:
       replicas: 0
 
-    ## ── Auxiliary services and bundled subcharts (off) ─────────
-    ## The gateway, caches, canary probe, and test hook are separate workloads
-    ## modelled on their own; the bundled object-store, self-monitoring, and
-    ## rollout-operator subcharts are likewise separate services. Every toggle is
-    ## set explicitly — the chart gates each bundled subchart on a condition
-    ## value, and an unset condition falls back to on, so disabling them
-    ## explicitly is what keeps this wrap a single workload.
-    gateway:
+    ## ── Chunk cache ────────────────────────────────────────────
+    ## A memcached wired to the chunk_cache socket holds decompressed chunks
+    ## between queries, so a query touching a chunk an earlier query already read
+    ## does not fetch and decompress it again. The socket carries one connection:
+    ## the chart configures a single chunk-cache client. Wired, this block turns
+    ## that client on and points it at the memcached the edge resolved to — the
+    ## chart's documented path for a cache it does not deploy itself, which is
+    ## why the chart's own bundled memcached is turned off alongside it rather
+    ## than left at its default. The address is composed from the edge's resolved
+    ## host and port; the four client settings come from that edge's own values,
+    ## so one memcached serving two log servers is driven differently by each.
+    ## Unwired, the client stays off and every chunk is read from the server's own
+    ## store, which is the single-node shape this wrap ships by default.
+    {{- $chunk_cache := dict }}
+    {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "chunk_cache" }}
+        {{- $chunk_cache = $edge }}
+      {{- end }}
+    {{- end }}
+    {{- if $chunk_cache }}
+    memcached:
       enabled: false
     chunksCache:
+      enabled: true
+      addresses: "{{ $chunk_cache.provides.host }}:{{ $chunk_cache.provides.port }}"
+      batchSize: {{ $chunk_cache.values.batch_size }}
+      parallelism: {{ $chunk_cache.values.parallelism }}
+      timeout: "{{ $chunk_cache.values.timeout }}"
+      defaultValidity: "{{ $chunk_cache.values.entry_lifetime }}"
+    {{- else }}
+    chunksCache:
+      enabled: false
+    {{- end }}
+
+    ## ── Auxiliary services and bundled subcharts (off) ─────────
+    ## The gateway, the result cache, the canary probe, and the test hook are
+    ## separate workloads modelled on their own; the bundled object-store,
+    ## self-monitoring, and rollout-operator subcharts are likewise separate
+    ## services. Every toggle is set explicitly — the chart gates each bundled
+    ## subchart on a condition value, and an unset condition falls back to on, so
+    ## disabling them explicitly is what keeps this wrap a single workload.
+    gateway:
       enabled: false
     resultsCache:
       enabled: false
