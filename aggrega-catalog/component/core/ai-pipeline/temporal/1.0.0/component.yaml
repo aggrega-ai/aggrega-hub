@@ -1,0 +1,144 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/ai-pipeline/temporal
+  version: 1.0.0
+  description: >
+    Temporal, a durable-execution engine. A multi-step job is written as ordinary
+    program code against one of the project's client libraries; the engine records
+    every step's outcome as an event and hands the next piece of work to a worker
+    the application itself deploys. Because the run is a replayable event history
+    rather than a position in a process, a worker that crashes mid-job is replaced
+    and the job resumes where it stopped, and a step that fails is retried on the
+    policy the code declared. That division is what separates this from a
+    scheduler: the engine owns the run's history and its timers, while the
+    application owns the code each step executes.
+
+    It keeps none of its own durable state. A relational datastore holds the
+    event histories and a second database on that same connection holds the
+    visibility index the console and the list APIs read, so the store is wired as
+    a topology edge to a datastore component the deployment already declares
+    rather than bundled inside this one. The engine is reached over gRPC on the
+    frontend service, which is the address the provides contract publishes; a
+    browser console is deployed alongside it.
+
+    Realized on Kubernetes through a Helm Recipe that wraps the project's own
+    chart. It has no standalone local-container form, so no Compose Recipe is
+    provided.
+  license: MIT
+  labels:
+    component.aggrega.ai/type: server
+    component.aggrega.ai/category: ai-pipeline
+    pipeline.aggrega.ai/mode: durable
+    component.aggrega.ai/hosting: self-hosted
+    component.aggrega.ai/upstream-licensing: osi-approved
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  # Self-inject allowlist: a consumer whose workers connect to this engine may
+  # inject this component's own provides keys into the env delivery mechanism.
+  inject: [env]
+
+  usesSchema:
+    # The relational datastore holding the event histories and the visibility
+    # index. The edge's resolved host, port and user reach the Recipe, which
+    # passes them into the engine's own datastore configuration rather than
+    # composing a connection string — which is what keeps the store's password
+    # out of the rendered artifact, since a password embedded in a URL cannot be
+    # delivered as a secret reference. Required: the engine has nowhere to record
+    # a run without it, so a deployment that omits it would start and refuse
+    # every workflow.
+    metadata_store:
+      selector: "component.aggrega.ai/category=datastore"
+      inject: [env]
+      required: true
+      valueSchema:
+        # The dialect, the two database names and the transport belong to this
+        # connection rather than to either component: one datastore server can
+        # carry a second engine's histories under different database names.
+        driver:
+          type: string
+          enum: [postgres12, postgres12_pgx, mysql8]
+          default: postgres12
+          description: Which SQL dialect the engine speaks on this connection. The two PostgreSQL values select different client libraries against the same server; pick the MySQL value for a MySQL-compatible target.
+        history_database:
+          type: string
+          default: temporal
+          description: Database on this connection holding the event histories. It must already exist and carry the engine's schema — the engine's setup step creates the tables, it does not create the database.
+        visibility_database:
+          type: string
+          default: temporal_visibility
+          description: Database on the same connection holding the visibility index the console and the list APIs read. It is a second database rather than a second server, and it must already exist for the same reason.
+        connect_protocol:
+          type: string
+          default: tcp
+          description: Transport the engine dials the store over.
+
+  featuresSchema:
+    # Optional, black-box (`inject: []`): the Recipe binds the produced Secret by
+    # name and key, so the value reaches the engine's pods without passing
+    # through the rendered artifact and without the developer choosing how it is
+    # delivered.
+    metadata_password:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: []
+      description: "Password the engine authenticates to the relational datastore with. When attached, the Recipe points the engine at the produced Secret so the value never appears in the rendered manifest. Unattached, the engine is configured with no password, which suits a store reached without one and matches what the standard-library relational Recipes leave in place when nothing is attached to them."
+
+  schema:
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate.
+      console_enabled:
+        type: boolean
+        default: true
+        description: Deploy the browser console beside the engine. The console reads the visibility index to list and inspect runs; the engine serves its gRPC API with or without it, so turning it off removes a browser surface rather than a capability.
+      admin_tools_enabled:
+        type: boolean
+        default: true
+        description: Deploy the administrative command-line image as a long-running pod an operator can exec into to inspect namespaces, describe a run, or apply a schema change. Turning it off removes that entry point; it serves no application traffic either way.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      port:
+        type: integer
+        min: 1
+        max: 65535
+        default: 7233
+        description: Port the frontend service serves the gRPC API on. This is the address workers and clients dial, and the one the provides contract publishes. Most operators should omit this and let the Recipe assign the default (7233).
+      console_port:
+        type: integer
+        min: 1
+        max: 65535
+        default: 8080
+        description: Port the browser console listens on. It carries no application traffic; it exists so the console can be reached separately from the gRPC API.
+      history_shards:
+        type: integer
+        min: 1
+        default: 512
+        description: How many shards the event history is partitioned across, which bounds how far the engine can scale out. It is fixed for the life of a deployment — the engine cannot repartition an existing history, so raising it later requires a new deployment. Size it for the load the deployment is expected to reach rather than for its first day.
+      source_version:
+        type: string
+        description: Source artifact version (Helm chart). Overrides the Recipe's default source version. Changing from default does not guarantee value mapping compatibility.
+      compute:
+        cpu:
+          type: string
+          default: 100m
+        memory:
+          type: string
+          default: 512Mi
+      overrides:
+        type: object
+        additionalProperties: true
+        description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      # host and port address the frontend gRPC service, which is what a worker
+      # or a client connects to; protocol is grpc rather than http because the
+      # engine's own API is gRPC.
+      host: { type: string, required: true }
+      port: { type: integer, required: true }
+      protocol: { type: string }

@@ -1,0 +1,255 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: temporal
+  version: 1.0.0
+  description: >
+    Temporal via the project's own Helm chart, served from the temporalio HTTPS
+    chart repository. The chart deploys the engine's four services — the frontend
+    that clients and workers dial, the history service that owns the event
+    histories, the matching service that hands work to workers, and the engine's
+    own internal worker — together with their services, the schema-setup jobs
+    that create the tables before the services start, the browser console and the
+    administrative command-line pod. The relational datastore is not deployed
+    here: it arrives as a topology edge, and this Recipe passes that edge's
+    resolved host, port and user into the engine's datastore configuration. When
+    a credential is attached to the metadata_password slot, the Recipe points the
+    engine at the produced Secret by name rather than rendering the value. This
+    Recipe pins the engine, console and administrative container images to
+    explicit release tags for reproducible renders, and pins the chart's resource
+    names to the component instance id so the frontend Service is named
+    predictably. Default chart version in source.version; override via
+    infra.source_version.
+  license: MIT
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-pipeline/temporal:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://go.temporal.io/helm-charts
+    chart: temporal
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"1.6.0\" }}"
+
+  # provides.host is the frontend Service name. The valuesMapping below pins the
+  # chart's fullnameOverride to the instance id, and the chart suffixes the
+  # frontend's own Service with "-frontend", so that Service is named exactly
+  # "<instance_id>-frontend" with no namespace segment. A same-namespace worker
+  # dials it under this name directly; a worker in another namespace qualifies it
+  # with the target namespace caller-side. protocol is "grpc" — the engine's API
+  # is gRPC, and a client that assumed HTTP would not reach it.
+  provides:
+    host: "{{ .context.instance_id }}-frontend"
+    port: "{{ .infra.port }}"
+    protocol: "grpc"
+
+  # This Recipe reads from infra.overrides:
+  #   server_image      - map[string]string (server.image.* fields; overrides the tag pin)
+  #   console_image     - map[string]string (web.image.* fields; overrides the tag pin)
+  #   admin_tools_image - map[string]string (admintools.image.* fields; overrides the tag pin)
+  #   requests          - { cpu: string, memory: string } (resource requests, applied to the engine services and the console)
+  #   log_level         - string (server.config.logLevel; the engine's log verbosity)
+  #   service_type      - string (web.service.type; how the console is exposed, default ClusterIP)
+  #   replica_count     - integer (server.replicaCount; pods per engine service)
+  #   schema_helm_hooks - bool (schema.useHelmHooks; run schema setup as Helm hooks. Turn off for a delivery tool that applies manifests without hook ordering)
+  #   nodeSelector      - map[string]string (applied to the engine services and the console)
+  #   tolerations       - []object (applied to the engine services and the console)
+  valuesMapping: |
+    ## ── The relational datastore edge ──────────────────────────
+    ## The engine records every run here. The edge is required, so it is always
+    ## resolved by the time this template runs; its host and port compose the
+    ## dial address, its user names the login, and the two database names and the
+    ## dialect come from the edge's own values — so one datastore server can
+    ## carry a second engine's histories under different database names.
+    {{- $store := dict }}
+    {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "metadata_store" }}
+        {{- $store = $edge }}
+      {{- end }}
+    {{- end }}
+
+    ## ── Resource naming ────────────────────────────────────────
+    ## Pin the chart's generated names to the component instance id so the
+    ## frontend Service name is the one provides.host publishes.
+    fullnameOverride: "{{ .context.instance_id }}"
+
+    ## ── Image-compatibility shims ──────────────────────────────
+    ## The chart ships two shims for engine images at 1.29 and below. The image
+    ## pinned here is well past that, so both are off; leaving them on would wrap
+    ## the engine's entrypoint for a compatibility problem this render does not
+    ## have.
+    shims:
+      dockerize: false
+      elasticsearchTool: false
+
+    server:
+      ## ── Engine image ─────────────────────────────────────────
+      ## Pinned explicitly for a reproducible render. Override the whole image
+      ## block via infra.overrides.server_image.
+      {{- if and .infra.overrides .infra.overrides.server_image }}
+      image:
+        {{- range $k, $v := .infra.overrides.server_image }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+      {{- else }}
+      image:
+        repository: temporalio/server
+        tag: "1.31.2"
+      {{- end }}
+
+      {{- if and .infra.overrides .infra.overrides.replica_count }}
+      replicaCount: {{ .infra.overrides.replica_count }}
+      {{- end }}
+
+      ## ── Engine resources ─────────────────────────────────────
+      ## Applied to each of the four engine services.
+      resources:
+        limits:
+          cpu: "{{ .infra.compute.cpu }}"
+          memory: "{{ .infra.compute.memory }}"
+        {{- if and .infra.overrides .infra.overrides.requests }}
+        requests:
+          cpu: "{{ .infra.overrides.requests.cpu }}"
+          memory: "{{ .infra.overrides.requests.memory }}"
+        {{- end }}
+
+      ## ── Engine scheduling ────────────────────────────────────
+      {{- if .infra.overrides }}
+      {{- if .infra.overrides.nodeSelector }}
+      nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+      {{- end }}
+      {{- if .infra.overrides.tolerations }}
+      tolerations: {{ toJson .infra.overrides.tolerations }}
+      {{- end }}
+      {{- end }}
+
+      ## ── Frontend service ─────────────────────────────────────
+      ## The gRPC endpoint workers and clients dial, and the one provides.host
+      ## and provides.port address.
+      frontend:
+        service:
+          port: {{ .infra.port }}
+
+      config:
+        {{- if and .infra.overrides .infra.overrides.log_level }}
+        logLevel: "{{ .infra.overrides.log_level }}"
+        {{- end }}
+
+        ## ── Persistence ────────────────────────────────────────
+        ## Two logical stores on one connection: the event histories, and the
+        ## visibility index the console and the list APIs read.
+        persistence:
+          defaultStore: default
+          visibilityStore: visibility
+
+          ## How many shards the histories are partitioned across. Fixed for the
+          ## life of a deployment — the engine cannot repartition an existing
+          ## history.
+          numHistoryShards: {{ .infra.history_shards }}
+
+          datastores:
+            default:
+              sql:
+                pluginName: "{{ $store.values.driver }}"
+                driverName: "{{ $store.values.driver }}"
+                databaseName: "{{ $store.values.history_database }}"
+                connectAddr: "{{ $store.provides.host }}:{{ $store.provides.port }}"
+                connectProtocol: "{{ $store.values.connect_protocol }}"
+                user: "{{ $store.provides.user }}"
+                {{- if hasKey (default dict .features) "metadata_password" }}
+                ## Bound by name rather than by value, so the password reaches
+                ## the engine's pods without appearing in the rendered artifact.
+                existingSecret: "{{ .features.metadata_password.provides.name }}"
+                secretKey: "{{ .features.metadata_password.provides.key }}"
+                {{- end }}
+            visibility:
+              sql:
+                pluginName: "{{ $store.values.driver }}"
+                driverName: "{{ $store.values.driver }}"
+                databaseName: "{{ $store.values.visibility_database }}"
+                connectAddr: "{{ $store.provides.host }}:{{ $store.provides.port }}"
+                connectProtocol: "{{ $store.values.connect_protocol }}"
+                user: "{{ $store.provides.user }}"
+                {{- if hasKey (default dict .features) "metadata_password" }}
+                existingSecret: "{{ .features.metadata_password.provides.name }}"
+                secretKey: "{{ .features.metadata_password.provides.key }}"
+                {{- end }}
+
+    ## ── Schema setup ───────────────────────────────────────────
+    ## Jobs that create the engine's tables in the two databases before the
+    ## services start. They run as Helm hooks by default so that ordering holds.
+    {{- if and .infra.overrides (hasKey .infra.overrides "schema_helm_hooks") }}
+    schema:
+      useHelmHooks: {{ .infra.overrides.schema_helm_hooks }}
+    {{- end }}
+
+    ## ── Browser console (Developer intent) ─────────────────────
+    ## Reads the visibility index to list and inspect runs. The engine serves its
+    ## gRPC API whether or not this is deployed.
+    web:
+      enabled: {{ .values.console_enabled }}
+      {{- if and .infra.overrides .infra.overrides.console_image }}
+      image:
+        {{- range $k, $v := .infra.overrides.console_image }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+      {{- else }}
+      image:
+        repository: temporalio/ui
+        tag: "2.52.0"
+      {{- end }}
+
+      service:
+        port: {{ .infra.console_port }}
+        {{- if and .infra.overrides .infra.overrides.service_type }}
+        type: "{{ .infra.overrides.service_type }}"
+        {{- end }}
+
+      resources:
+        limits:
+          cpu: "{{ .infra.compute.cpu }}"
+          memory: "{{ .infra.compute.memory }}"
+        {{- if and .infra.overrides .infra.overrides.requests }}
+        requests:
+          cpu: "{{ .infra.overrides.requests.cpu }}"
+          memory: "{{ .infra.overrides.requests.memory }}"
+        {{- end }}
+
+      {{- if .infra.overrides }}
+      {{- if .infra.overrides.nodeSelector }}
+      nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+      {{- end }}
+      {{- if .infra.overrides.tolerations }}
+      tolerations: {{ toJson .infra.overrides.tolerations }}
+      {{- end }}
+      {{- end }}
+
+    ## ── Administrative command-line pod (Developer intent) ─────
+    ## A long-running pod an operator execs into to inspect namespaces, describe
+    ## a run, or apply a schema change. It serves no application traffic.
+    admintools:
+      enabled: {{ .values.admin_tools_enabled }}
+      {{- if and .infra.overrides .infra.overrides.admin_tools_image }}
+      image:
+        {{- range $k, $v := .infra.overrides.admin_tools_image }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+      {{- else }}
+      image:
+        repository: temporalio/admin-tools
+        tag: "1.31.2"
+      {{- end }}
+
+  sourceDigests:
+    - kind: helm-https-chart
+      url: https://go.temporal.io/helm-charts
+      chart: temporal
+      version: 1.6.0
+      digest: sha256:4ea557365bca72e635ae82fc4a93d586df238946e5d5a19eb32a8a24748449f9
