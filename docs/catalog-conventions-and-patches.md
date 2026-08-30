@@ -55,7 +55,7 @@ the label section below). The 15 categories:
 | `ai-agent` | AI agent frameworks, platforms, and patterns | worker, server, stateful-server, task, resource | populated |
 | `ai-model` | Model providers and inference runtimes | server, resource | populated |
 | `ai-tool` | Tools agents invoke | function, server, stateful-server, resource | populated |
-| `ai-pipeline` | AI data/processing pipelines | worker, task | created when the first entity lands |
+| `ai-pipeline` | Orchestrators that run a multi-step job | server, worker, task | populated |
 | `datastore` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server, resource | populated |
 | `gateway` | API and AI gateways | server | populated |
 | `mesh` | Service meshes | server | created when the first entity lands |
@@ -768,6 +768,47 @@ spec:
     ...
 ```
 
+### Sourced mode is the default wherever a good chart exists
+
+A helm Recipe takes one of two shapes. A **sourced** Recipe names an upstream
+chart in `source:` and maps the Component's values into that chart's own value
+surface. A **synthesised** Recipe carries an authored `workload:` block the
+provider assembles into resources directly.
+
+**Point the Recipe at the chart wherever an official — or good, complete and
+maintained — chart exists, and map values into it.** The upstream chart is where
+the product's own maintainers encode what the product needs: the resources it
+expects, the RBAC it runs under, the ordering its migrations require, the fields
+its custom resources carry. Re-deriving that by hand produces a realization that
+starts out equivalent and drifts every time the product moves, and the drift is
+invisible because the render still succeeds.
+
+**Synthesise when no such chart exists** — and say which of the three it failed:
+
+- **Not official** — no chart published by the product's own maintainers, and no
+  community chart with a maintainer who answers for it.
+- **Not complete** — the chart covers part of the product, or omits a surface the
+  Component needs to expose.
+- **Not maintained** — the chart lags the product it packages, or its latest
+  version predates the release the Component targets.
+
+An unofficial chart that is complete and maintained qualifies; an official chart
+that is unmaintained does not. Establish this per product against the chart
+itself rather than assuming it, and record the finding in the Recipe's
+`description` where a reader meets the choice.
+
+Two obligations follow a sourced Recipe:
+
+- **Pin the images the chart runs.** A chart that leaves an image tag to its own
+  default makes the render irreproducible across pulls, which is the whole point
+  of pinning the chart. Set each tag explicitly in the value mapping and offer an
+  `infra.overrides.<name>_image` escape that replaces the block.
+- **Pin the generated resource names.** Bind the chart's `fullnameOverride` to
+  `.context.instance_id` so a Service the Component publishes through `provides`
+  is named something the render actually emits. A `provides.host` that names no
+  emitted Service is a broken contract that no gate catches, because both sides
+  render successfully.
+
 ### Target-expected names are the Recipe's translation
 
 A Component publishes a value once, under the name that reads best on Aggrega's
@@ -1352,6 +1393,76 @@ copying whichever sibling happens to be nearest.
   `mixed` where the member is realized both self-hosted (helm, compose) and
   managed (the Terraform/CloudFormation equivalents). These are selector-only
   identity; the family's Recipes do not stamp them onto rendered output.
+
+### The pipeline family template
+
+The `ai-pipeline` category holds **the thing that orchestrates a multi-step
+job** — it schedules the job, retries a step that fails, fans a step out over a
+list of inputs, and tracks what produced what. That is narrower than the words
+"AI pipeline" suggest, and the boundary is the part that erodes, so a candidate
+is admitted by stating what it is *not*:
+
+- **Not an agent.** An application that serves an end user, or a framework an
+  application is assembled from, belongs under `ai-agent` — including the
+  workflow-automation platforms whose contract is an authored flow plus a model
+  socket. The tell is a required `ai-model` edge: an orchestrator is indifferent
+  to models, and usually has nothing to do with one.
+- **Not a model.** An orchestrator infers nothing. Every step it starts runs code
+  or an image the author supplied.
+- **Not a tool.** A tool is invoked as a capability inside another component's
+  turn. An orchestrator is submitted to, or connected to and polled; nothing
+  calls it mid-turn.
+- **Not a datastore.** An orchestrator persists run state as a means of resuming
+  a run, not as its contract. Several *require* a datastore, which is the
+  clearest signal of which side of the line they sit on.
+
+**Record that test on the entity.** A one-line statement in the Component's
+`description` of what it orchestrates is what lets the next author place the next
+candidate without re-deriving the boundary.
+
+- **`pipeline.aggrega.ai/mode`** is the family's capability label, and it names
+  **who holds the run and who executes its steps** — which is what predicts what
+  else a deployment must contain:
+
+  - **`reconciled`** — the run is a custom resource, and the engine's controller
+    reconciles it into workload on the platform. The platform's own API is the
+    run's record, so the engine keeps no separate run database; in exchange the
+    deployment carries the custom resource definitions and the runtime-prerequisite
+    discipline described under the operator-driven Recipes above.
+  - **`durable`** — the engine persists the run's event history and hands work to
+    workers the *application* deploys, which execute it and resume from that
+    history. The engine needs a datastore of its own and the application needs a
+    worker deployment of its own, and neither is optional.
+
+  A value is added when a realization needs one, never ahead of it: a value with
+  no entity carrying it describes nothing.
+
+- **Realizations** — a helm Recipe pointing at the product's own chart, per the
+  sourced-mode rule above. These products are exactly the complex case that rule
+  is written for: several cooperating services, custom resources, cluster RBAC and
+  schema-setup ordering. None of them has a meaningful single-container local
+  form, so a Compose Recipe is generally not authored.
+
+- **The datastore is a topology edge, never a bundled subchart.** Several upstream
+  charts bundle their own database so the chart installs standalone; turn that off
+  and declare a `uses` socket instead, so the deployment's datastore is one
+  component the deployment can see, size and back up. Pass the edge's resolved
+  `host`, `port`, `user` and database names into the product's own configuration
+  rather than composing a connection string — a password embedded in a URL cannot
+  be delivered as a secret reference, so composing one forces the credential into
+  the rendered artifact.
+
+- **The datastore password is a black-box credential slot.** Declare it with
+  `inject: []` and bind the produced Secret by name and key to whatever the chart
+  calls its existing-secret knob. The value then reaches the pods without passing
+  through the rendered artifact, and unattached the Recipe emits no password at
+  all, which suits a store reached without one.
+
+- **Identity labels** — the component's `metadata.labels` carries
+  `component.aggrega.ai/type` (`server` for the engine itself; `worker` or `task`
+  for a component modelling a step), `component.aggrega.ai/category: ai-pipeline`,
+  and `pipeline.aggrega.ai/mode`. Plus `component.aggrega.ai/hosting` and
+  `component.aggrega.ai/upstream-licensing` per the rules above.
 
 ## 7. Feature Pattern
 
