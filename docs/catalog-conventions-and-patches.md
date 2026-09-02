@@ -1541,6 +1541,73 @@ and runtime for the second. This is why the runtime AI-control tier above, and
 operator-driven custom resources generally, are Features and artifacts rather than
 workload dials or edges.
 
+### Name an emitted resource for the scope that carries it
+
+A Feature is authored once and attached many times. So a resource name a
+FeatureRecipe derives has to be distinct per attachment, or two attachments in one
+namespace derive the same name and the second resource overwrites the first.
+
+**The convention: a resource name an attachment emits carries the identity of the
+scope that carries the attachment.** At component scope that is the host component
+and the name the attachment is carried under; at boundary scope it is the
+boundary's own name. The catalog's component-scope FeatureRecipes compose both:
+
+```yaml
+# The attachment name may be authored with underscores, which a Kubernetes
+# resource name cannot carry, so it is folded to hyphens.
+name: '{{ .context.instance_id }}-{{ .attachment_name | replace "_" "-" }}'
+```
+
+Composing the host alone is enough where the chart already suffixes the resource
+per kind. Composing the *attachment* name as well is what keeps one Feature
+attached twice to a single component, under two names, from colliding with itself.
+
+**This is a convention authors uphold, not a rule the compiler applies.** Nothing
+in the compiler inspects a name template, infers that a value is a resource name,
+or composes a scope identity into one — it evaluates the template and pipes the
+string through. The compiler is deliberately unopinionated here, exactly as chart
+authoring is: a chart that hardcodes a resource name installs once and collides
+twice, and nothing in the templating engine prevents it either.
+
+What the compiler *does* do is refuse the result. Two contributors deriving one
+name in one key space halt the build (`E0038`), naming both contributors and the
+key space. That is a Loud Guardrail on the outcome, and it is not the same thing as
+enforcing the convention: it fires only once a collision is already reachable, and
+it cannot fire at all for a name that is unique today and collides on the next
+attachment someone writes. The convention is what keeps the halt from being
+reachable from ordinary authoring.
+
+#### Where an operator must be able to pin the name
+
+Some emitted resources are named by something outside the build: an IAM role's
+trust policy names the ServiceAccount it will mint credentials for, and a Workload
+Identity binding names the ServiceAccount it trusts. Composing a scope identity
+into such a name unconditionally would break that binding, which is worse than the
+collision it avoids — the build stays green and the deployment silently loses its
+identity.
+
+For that case, expose the name as an **optional** `infra` key, honour it exactly as
+written when supplied, and derive the scope-composed name only when it is absent:
+
+```yaml
+locals:
+  sa_name: '{{ default (printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-")) .infra.service_account_name }}'
+```
+
+Two things make this shape work. An omitted optional key arrives empty, so
+`default` supplies the derived name without the template needing to test for the
+key's presence. And deriving the name in `locals:` gives it one home: a
+FeatureRecipe's `provides:` and its `valuesMapping:` both read `.locals`, so the
+name published to the consumer and the name the chart emits are the same string by
+construction rather than by two templates agreeing. Where a consumer binds to a
+published name — a pod running under an emitted ServiceAccount — that agreement is
+the binding, so a second copy of the expression is a place for the two to drift
+apart silently.
+
+State the behaviour on both the Feature's `infra` key and the FeatureRecipe's
+`metadata.description`: an operator reading either needs to know that supplying the
+key pins the name and omitting it derives one.
+
 ## 8. OCI Registry
 
 The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
