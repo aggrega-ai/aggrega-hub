@@ -772,7 +772,7 @@ spec:
 
 A helm Recipe takes one of two shapes. A **sourced** Recipe names an upstream
 chart in `source:` and maps the Component's values into that chart's own value
-surface. A **synthesised** Recipe carries an authored `workload:` block the
+surface. A **synthesized** Recipe carries an authored `workload:` block the
 provider assembles into resources directly.
 
 **Point the Recipe at the chart wherever an official — or good, complete and
@@ -783,7 +783,7 @@ its custom resources carry. Re-deriving that by hand produces a realization that
 starts out equivalent and drifts every time the product moves, and the drift is
 invisible because the render still succeeds.
 
-**Synthesise when no such chart exists** — and say which of the three it failed:
+**Synthesize when no such chart exists** — and say which of the three it failed:
 
 - **Not official** — no chart published by the product's own maintainers, and no
   community chart with a maintainer who answers for it.
@@ -1044,7 +1044,7 @@ and its Recipe
 
 ### The `workload:` authoring contract
 
-Three rules govern every synthesised Recipe. Each is enforced at load or render
+Three rules govern every synthesized Recipe. Each is enforced at load or render
 time, so getting one wrong is a build failure rather than a silent difference.
 
 **1. `workload:` is a template string, never an inline map.** Author it as a block
@@ -1286,7 +1286,7 @@ active-passive or backup.** A datastore with persistence enabled is still that
 datastore. These capabilities are configurable values on the single component's
 surface, realized per target by whatever mechanism that target has: a chart's HA
 options, an operator custom resource's HA spec, a cloud provider's multi-AZ flag,
-or a synthesised StatefulSet with a PersistentVolumeClaim. Splitting a component
+or a synthesized StatefulSet with a PersistentVolumeClaim. Splitting a component
 or recipe family by stateful-ness is an antipattern — it doubles the catalog and
 forces a deployment to re-author its topology to change an operational setting.
 
