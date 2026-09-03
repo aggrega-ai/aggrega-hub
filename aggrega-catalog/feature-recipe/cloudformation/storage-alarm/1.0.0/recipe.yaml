@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: storage-alarm
+  version: 1.0.0
+  description: >
+    CloudFormation realization of example/storage-alarm. Component-scope: it
+    emits one CloudWatch alarm per attached component, watching the free storage
+    of the RDS instance that component's own Recipe describes. The alarm is a
+    fragment like any other, so it assembles into the same stack as its host
+    component rather than into a template of its own.
+
+    The alarm's own logical ID carries the identity of the scope that carries the
+    attachment: the host component and the name the attachment is carried under,
+    together. Composing the host alone would be enough to keep the alarm clear of
+    the resource it watches, and not enough to keep this Feature attached twice to
+    one component from colliding with itself — so both halves are composed.
+
+    The dimension identifying which instance to watch reads the host's resource by
+    the logical ID the standard-library CloudFormation Recipes derive — both
+    halves derive it from the same component instance name, which is what makes
+    them agree. Ref on an RDS instance resolves to that instance's identifier at
+    deploy time; the compiler pipes the reference through without resolving it.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: cloudformation
+  implements: example/storage-alarm:1.0.0
+  # executionScope omitted -> component: renders once per attached component.
+
+  # Two derived names. A logical ID is unique within a CloudFormation template and
+  # admits only letters and digits, so every separator is read as a word boundary
+  # and each word is capitalised.
+  #
+  # host_id is the resource the host component's own Recipe describes, so it reads
+  # the host name alone: payments-db gives PaymentsDb.
+  #
+  # alarm_id names this attachment's own resource, so it composes the host name
+  # and the attachment name: host payments-db carrying the attachment under
+  # storage-headroom gives PaymentsDbStorageHeadroom. It carries no suffix naming
+  # the kind, because the resource type below already says what it is — the same
+  # reasoning the database Recipe's own logical id follows.
+  locals:
+    host_id: '{{ regexReplaceAll "[^A-Za-z0-9]+" .context.instance_id " " | title | nospace }}'
+    alarm_id: '{{ regexReplaceAll "[^A-Za-z0-9]+" (printf "%s %s" .context.instance_id .attachment_name) " " | title | nospace }}'
+
+  # The alarm's identity, published for a consumer that wants to address it. The
+  # entry name reads as the attachment's own rather than as something the host
+  # publishes, which is what keeps it clear of the host component's entries: an
+  # attached Feature's outputs publish under the host component's name, so an
+  # entry name the host also publishes would meet the host's at one output name.
+  provides:
+    alarm-id: "!Ref {{ .locals.alarm_id }}"
+
+  artifacts:
+    template.yaml: |
+      Resources:
+        {{ .locals.alarm_id }}:
+          Type: AWS::CloudWatch::Alarm
+          Properties:
+            AlarmDescription: "Free storage below {{ .values.free_storage_bytes }} bytes on {{ .context.instance_id }}"
+            Namespace: AWS/RDS
+            MetricName: FreeStorageSpace
+            Dimensions:
+              - Name: DBInstanceIdentifier
+                Value: !Ref {{ .locals.host_id }}
+            Statistic: Minimum
+            Period: 300
+            EvaluationPeriods: {{ .infra.evaluation_periods | default 2 }}
+            Threshold: {{ .values.free_storage_bytes }}
+            ComparisonOperator: LessThanThreshold
+            TreatMissingData: breaching
+            {{- if .infra.notify_target }}
+            AlarmActions:
+              - "{{ .infra.notify_target }}"
+            {{- end }}
+
+      # Fragment provides: the provider projects this entry into the assembled
+      # stack Outputs, named for the host component and the entry together.
+      provides:
+        alarm-id: !Ref {{ .locals.alarm_id }}
