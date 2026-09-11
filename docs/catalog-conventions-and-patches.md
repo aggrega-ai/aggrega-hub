@@ -6,21 +6,25 @@
 
 ## 1. Directory Structure
 
-URI segments map 1:1 to filesystem path segments. The compiler resolves
-`type: core/datastore/mariadb:1.0.0` to `component/core/datastore/mariadb.yaml`.
+URI segments map 1:1 to filesystem path segments, and the version is a segment
+like any other. The compiler resolves `type: core/datastore/mariadb:1.0.0` to
+`component/core/datastore/mariadb/1.0.0/component.yaml`.
 
 ```text
 aggrega-catalog/
-├── component/{publisher}/{category}/{name}.yaml
-├── feature/{publisher}/{name}.yaml
-├── recipe/{provider}/{name}/recipe.yaml
-├── feature-recipe/{provider}/{name}/recipe.yaml
-├── aggregate/{publisher}/{name}/aggregate.yaml
-├── schemalibrary/{name}.yaml
-├── mappinglibrary/{name}.yaml
-├── workloadlibrary/{name}.yaml
-└── artifactslibrary/{name}.yaml
+├── component/{publisher}/{category}/{name}/{version}/component.yaml
+├── feature/{publisher}/{name}/{version}/feature.yaml
+├── recipe/{provider}/{name}/{version}/recipe.yaml
+├── feature-recipe/{provider}/{name}/{version}/recipe.yaml
+├── aggregate/{publisher}/{name}/{version}/aggregate.yaml
+├── schemalibrary/{name}/{version}/library.yaml
+├── mappinglibrary/{name}/{version}/library.yaml
+├── workloadlibrary/{name}/{version}/library.yaml
+└── artifactslibrary/{name}/{version}/library.yaml
 ```
+
+The `{version}` segment is mandatory on every kind; see "Per-version directory
+layout" below for the rule it follows and the per-kind filename it ends in.
 
 The four library kinds carry reusable fragments other entities reference by
 identity:
@@ -405,7 +409,7 @@ the `<version>/` segment:
 | Component | `component/core/datastore/mariadb/1.0.0/component.yaml` | `core/datastore/mariadb` |
 | Feature | `feature/core/data-masking/1.0.0/feature.yaml` | `core/data-masking` |
 | Recipe | `recipe/helm/postgres/1.0.0/recipe.yaml` | `postgres` |
-| FeatureRecipe | `feature-recipe/helm/k8s-dns-patcher/1.0.0/recipe.yaml` | `k8s-dns-patcher` |
+| FeatureRecipe | `feature-recipe/helm/k8s-dns-resolver/1.0.0/recipe.yaml` | `k8s-dns-resolver` |
 
 Recipes and FeatureRecipes do NOT include a publisher or capability in their name —
 the capability is the `spec.capability` field, which the parent directory mirrors
@@ -448,10 +452,12 @@ rather than `Base`).
 
 ### Name shortening
 
-When a component's filename would repeat the category, strip the suffix:
+When a component's name segment would repeat the category, strip the suffix. The
+filename is always `component.yaml`, so what shortens is the segment the name
+mirrors, not the file:
 
-- `anthropic-agent.yaml` in `ai-agent/` → `anthropic.yaml` (name: `core/ai-agent/anthropic`)
-- `openai-model.yaml` in `ai-model/` → `openai.yaml` (name: `core/ai-model/openai`)
+- `anthropic-agent/` in `ai-agent/` → `anthropic/` (name: `core/ai-agent/anthropic`)
+- `openai-model/` in `ai-model/` → `openai/` (name: `core/ai-model/openai`)
 
 ## 3. YAML Formatting
 
@@ -672,7 +678,7 @@ spec:
       port: { type: integer }
 ```
 
-The compact form (about 15 keywords) covers the common case in a fraction of the line count of full JSON Schema; the `$jsonschema:` escape hatch admits full JSON Schema 2020-12 at any node boundary when the compact form does not carry the needed keyword. See [`aggrega-docs/language-reference/vocabulary/compact-form-authoring.md`](https://github.com/aggrega/aggrega-docs/blob/main/language-reference/vocabulary/compact-form-authoring.md) for the keyword vocabulary and [`aggrega-docs/language-reference/entities/component.md`](https://github.com/aggrega/aggrega-docs/blob/main/language-reference/entities/component.md) for the per-pillar authoring framing.
+The compact form (about 15 keywords) covers the common case in a fraction of the line count of full JSON Schema; the `$jsonschema:` escape hatch admits full JSON Schema 2020-12 at any node boundary when the compact form does not carry the needed keyword. See [`aggrega-docs/language-reference/vocabulary/compact-form-authoring.md`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/vocabulary/compact-form-authoring.md) for the keyword vocabulary and [`aggrega-docs/language-reference/entities/component.md`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/entities/component.md) for the per-pillar authoring framing.
 
 ### The `overrides` escape hatch
 
@@ -717,7 +723,7 @@ Schema fragments shared across multiple Components or Features live in **SchemaL
 A SchemaLibrary entry carries one or more named schema definitions under `spec.schemas:`. A consumer Component references the entry by library name and definition name:
 
 ```yaml
-# schemalibrary/base-components.yaml — the library
+# schemalibrary/base-components/1.0.0/library.yaml — the library
 apiVersion: aggrega.ai/v1alpha1
 kind: SchemaLibrary
 metadata:
@@ -732,7 +738,7 @@ spec:
 ```
 
 ```yaml
-# component/core/datastore/mariadb.yaml — the consumer
+# component/core/datastore/mariadb/1.0.0/component.yaml — the consumer
 spec:
   schema:
     values:
@@ -744,7 +750,7 @@ spec:
 A MappingLibrary entry carries one or more named Go-template fragments under `spec.mappings:`. A consumer Recipe imports the entry inside `valuesMapping:`:
 
 ```yaml
-# recipe/helm/mariadb/recipe.yaml — the consumer
+# recipe/helm/mariadb/1.0.0/recipe.yaml — the consumer
 spec:
   valuesMapping:
     $import: DatastoreHelpers#/mappings/MariaDBCore
@@ -870,9 +876,9 @@ carrying this one, a bare reference matches both, resolves to neither, and the
 attachment is reported unmapped when the build checks resolution completeness.
 
 The canonical examples are
-[`recipe/terraform/mariadb-rds/recipe.yaml`](../aggrega-catalog/recipe/terraform/mariadb-rds/1.0.0/recipe.yaml)
+[`recipe/terraform/mariadb-rds/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/terraform/mariadb-rds/1.0.0/recipe.yaml)
 and
-[`recipe/cloudformation/mariadb-rds/recipe.yaml`](../aggrega-catalog/recipe/cloudformation/mariadb-rds/1.0.0/recipe.yaml).
+[`recipe/cloudformation/mariadb-rds/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/cloudformation/mariadb-rds/1.0.0/recipe.yaml).
 This guidance applies to managed services only — Recipes targeting
 self-managed datastores (Helm Bitnami chart, Compose container) still use the
 credential FeatureRecipe path because no upstream managed-secret flag exists
@@ -924,9 +930,9 @@ attachments:
 ```
 
 The canonical examples are
-[`recipe/helm/postgres/recipe.yaml`](../aggrega-catalog/recipe/helm/postgres/1.0.0/recipe.yaml)
+[`recipe/helm/postgres/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/helm/postgres/1.0.0/recipe.yaml)
 and
-[`recipe/compose/postgres/recipe.yaml`](../aggrega-catalog/recipe/compose/postgres/1.0.0/recipe.yaml).
+[`recipe/compose/postgres/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/compose/postgres/1.0.0/recipe.yaml).
 
 ### Credential-slot models — match the chart's auth surface
 
@@ -968,7 +974,7 @@ spec:
 ```
 
 For a runnable end-to-end walkthrough of this model, see
-[`language-reference/examples/mariadb-bitnami-credential-set/`](https://github.com/aggrega/aggrega-docs/blob/main/language-reference/examples/mariadb-bitnami-credential-set/).
+[`language-reference/examples/mariadb-bitnami-credential-set/`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/examples/mariadb-bitnami-credential-set/).
 
 **Model B — granular transparent inject-value.** For charts that accept a single
 password **value** (`postgres`, `valkey`, `redis`, `memcached`), the Component
@@ -987,7 +993,7 @@ spec:
 ```
 
 The canonical example is
-[`recipe/helm/postgres/recipe.yaml`](../aggrega-catalog/recipe/helm/postgres/1.0.0/recipe.yaml).
+[`recipe/helm/postgres/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/helm/postgres/1.0.0/recipe.yaml).
 
 The two models are principled, not arbitrary: Model A is required whenever the
 chart reads credentials **only** from a named multi-key Secret; Model B fits
@@ -1037,7 +1043,11 @@ spec:
 ```
 
 The whole Secret mounts as a directory, so each data key becomes a file named by
-the key. For a runnable end-to-end walkthrough, see the worked example
+the key. Where a mount must instead place a **single** file from the volume
+without masking the rest of the target directory, the `volumeMounts` entry
+carries `subPath`, whose contract is stated on the generated
+[Workload schema reference](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/schema/entities/workload.md).
+For a runnable end-to-end walkthrough, see the worked example
 [`component/example/compute/gcp-credentialed-service/`](../aggrega-catalog/component/example/compute/gcp-credentialed-service/1.0.0/component.yaml)
 and its Recipe
 [`recipe/helm/gcp-credentialed-service/`](../aggrega-catalog/recipe/helm/gcp-credentialed-service/1.0.0/recipe.yaml).
