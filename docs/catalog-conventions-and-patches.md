@@ -161,9 +161,10 @@ value set is a standard-library convention (the compiler is blind to it):
   deployment; the Recipe emits only the wiring to reach it.
 
 **Where the value lives — hosting is a static identity label.** `hosting` is a
-selector-only component identity label (`metadata.labels`); it is never stamped
-onto rendered output. Which value a component carries depends on whether the
-trait is invariant across the component's Recipes:
+component identity label (`metadata.labels`): its value is a property of the
+component, fixed by the entity rather than by any one deployment. Which value a
+component carries depends on whether the trait is invariant across the
+component's Recipes:
 
 - A component realized by Recipes that **all share one hosting posture** carries
   that single value — the component *is* one posture by identity, fixed the way
@@ -180,16 +181,33 @@ trait is invariant across the component's Recipes:
 `mixed` generalizes to any `<scope>.aggrega.ai/` identity label on a unified
 component whose Recipes span multiple values of that axis: rather than dropping
 the label or splitting the component, carry `mixed` to state honestly that the
-axis is realization-dependent. Because hosting is a selection concern — read
-from *which* Recipe renders — it belongs on component identity, not on rendered
-output: `component.aggrega.ai/hosting` is a `metadata.labels` key and never a
-`spec.outputLabels` key. Like the value set, that is convention rather than
-enforcement — the reserved-namespace rule on output labels covers the bare
-`aggrega.ai/` keyspace, not the `component.aggrega.ai/` identity keys, so
-nothing stops a Recipe from stamping the identity label except the author not
-doing it. A Recipe that wants the posture of *its own* realization visible on
-the emitted objects declares its own output-label key for that realization
-trait, which is a separate, Recipe-owned surface.
+axis is realization-dependent.
+
+**The convention on output labels binds the literal block only.** A Recipe has
+two ways to put a label on the output it renders, and this convention reaches
+one of them. It says: do not type `component.aggrega.ai/hosting` as a literal
+entry in `spec.outputLabels:`, the block whose keys *and values* a Recipe author
+writes in place. It does not reach `spec.outputComponentLabels:`, the block that
+names a component label key and stamps the value the component itself declares.
+Promoting `component.aggrega.ai/hosting` through that block is supported, and it
+is how a Recipe puts a component's posture onto the objects it renders.
+
+**The asymmetry has a reason worth stating, because the rule otherwise reads as
+an inconsistency.** A literal entry lets a Recipe author type a value the
+component's own identity contradicts — stamping one posture on a node whose
+Component declares another, and telling a downstream reader something the graph
+does not say. A promoted entry copies *by reference*: the value is read from the
+component every time output is rendered, so there is no second copy that can
+drift from the first. A Recipe that wants the posture of its *own* realization
+on the emitted objects declares an output-label key it owns for that realization
+trait, which is a separate surface from the component's identity key.
+
+Like the value set, this is convention rather than enforcement. The
+reserved-namespace rule on output labels refuses the bare `aggrega.ai/` and
+`app.kubernetes.io/` roots — in the literal block and the promoted block
+alike — and `component.aggrega.ai/` identity keys sit outside those roots. So
+nothing stops a Recipe from typing the identity label literally except the
+author not doing it.
 
 ### The `component.aggrega.ai/upstream-licensing` label
 
