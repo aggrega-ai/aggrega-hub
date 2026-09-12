@@ -10,7 +10,11 @@ metadata:
     PostgreSQL for local development via Docker Compose. Synthesized-mode
     Workload: the compose provider translates the Workload kind into a service
     entry (image, port, exposed service). provides.host is the bare service
-    name, resolved on the compose network.
+    name, resolved on the compose network. Bootstrap scripts (init_scripts) and
+    a custom server configuration block (custom_config) are both realized: each
+    script mounts under /docker-entrypoint-initdb.d and runs once when the
+    database first initializes, and the configuration block mounts as the
+    postgresql.conf the server's config_file argument points at.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -23,12 +27,68 @@ spec:
     user: "{{ .values.user }}"
     database: "{{ .values.database }}"
     protocol: "postgres"
+  # The developer's bootstrap scripts and custom server configuration render as
+  # compose configs the server mounts as files. Each half is presence-guarded
+  # independently: a deployment that leaves a value unset emits no config, no
+  # mount and no server argument for it, so it renders as though the key did not
+  # exist.
+  #
+  # init_scripts becomes one config per key, each mounted at its own filename
+  # under /docker-entrypoint-initdb.d. The image runs the files it finds there
+  # once, in filename order, and only when the data directory is empty — a
+  # database that already holds data is left untouched. custom_config becomes
+  # the postgresql.conf the server's config_file argument points at; settings
+  # the file omits keep their built-in defaults, and listen_addresses is the one
+  # worth naming, because its built-in default accepts local connections only —
+  # a block that omits it leaves the server unreachable from the other services
+  # on the compose network.
+  #
+  # Each config's name is spelled here and again on the volume that mounts it
+  # below. The artifact and the workload are separate template strings with no
+  # binding either could dereference, so the repetition is forced rather than
+  # chosen — the two must be edited together.
+  artifacts:
+    postgres-initdb.compose-fragment.yaml: |
+      {{- if .values.init_scripts }}
+      configs:
+      {{- range $name, $content := .values.init_scripts }}
+        {{ $.context.instance_id }}-initdb-{{ $name }}:
+          content: |
+      {{ $content | indent 6 }}
+      {{- end }}
+      {{- end }}
+    postgres-config.compose-fragment.yaml: |
+      {{- if .values.custom_config }}
+      configs:
+        {{ .context.instance_id }}-config:
+          content: |
+      {{ .values.custom_config | indent 6 }}
+      {{- end }}
   workload: |
+    {{- $configFile := "/etc/postgresql/postgresql.conf" -}}
+    {{- $initDir := "/docker-entrypoint-initdb.d" -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     containers:
       main:
         image: "postgres:{{ .infra.engine_version }}"
+    {{- if .values.custom_config }}
+        # The server arguments are supplied as args rather than as a command, so
+        # the image's own startup script still runs: it is what creates the
+        # database on an empty data directory, reads the POSTGRES_* variables
+        # below, and runs the bootstrap files. It passes these arguments through
+        # to the server, which is where config_file selects the mounted
+        # configuration file.
+        #
+        # $configFile is the single authored home for that path: the config_file
+        # argument and the mount that puts the file there both read the binding,
+        # so a future move cannot relocate one and leave the other pointing at
+        # the old path. It names a file rather than a directory.
+        args:
+          - postgres
+          - -c
+          - "config_file={{ $configFile }}"
+    {{- end }}
         # POSTGRES_USER / POSTGRES_DB are developer values (configurable, defaults
         # matching the historical inline values). POSTGRES_PASSWORD is wired through
         # the optional `password` credential slot: when attached its value arrives on
@@ -36,13 +96,10 @@ spec:
         # none attached the Recipe falls back to an inline development default.
         # storage/compute sizing is a helm-synth concern; the compose flavor reads
         # only the developer/port/version surface.
-        # This Recipe realizes neither init_scripts nor custom_config: a
-        # deployment that sets either value renders without it. Reach for the
-        # helm target when bootstrap scripts or a custom postgresql.conf are
-        # required. The optional application-user role (the app_user_password
-        # slot) is a helm-target realization for the same reason — it rides the
-        # first-init role-creation script the helm Recipe emits, so a compose
-        # deployment does not create a separate application role.
+        # The optional application-user role (the app_user_password slot) stays a
+        # helm-target realization: it rides the role-creation script the helm
+        # Recipe emits on first initialization, so a compose deployment does not
+        # create a separate application role.
         variables:
           POSTGRES_USER: "{{ .values.user }}"
     {{- if hasKey (default dict .features) "password" }}
@@ -56,6 +113,30 @@ spec:
     {{- end }}
         ports:
           p: {{ .infra.port }}
+    {{- if or .values.init_scripts .values.custom_config }}
+        volumeMounts:
+    {{- range $name, $content := .values.init_scripts }}
+          - name: "initdb-{{ $name }}"
+            path: "{{ $initDir }}/{{ $name }}"
+    {{- end }}
+    {{- if .values.custom_config }}
+          - name: pgconf
+            path: "{{ $configFile }}"
+    {{- end }}
+    {{- end }}
+    {{- if or .values.init_scripts .values.custom_config }}
+    volumes:
+    {{- range $name, $content := .values.init_scripts }}
+      "initdb-{{ $name }}":
+        configmap:
+          source: "{{ $.context.instance_id }}-initdb-{{ $name }}"
+    {{- end }}
+    {{- if .values.custom_config }}
+      pgconf:
+        configmap:
+          source: "{{ .context.instance_id }}-config"
+    {{- end }}
+    {{- end }}
     services:
       db:
         type: ClusterIP

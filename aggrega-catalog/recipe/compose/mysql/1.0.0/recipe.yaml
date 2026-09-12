@@ -17,7 +17,11 @@ metadata:
     command-line arguments rather than environment variables, so this
     local-development target leaves them at the image defaults. Secrets
     injected via the dotenv-secret FeatureRecipe surface as env vars in the
-    rendered service.
+    rendered service. Bootstrap scripts (init_scripts) and a custom server
+    configuration block (custom_config) are both realized: each script mounts
+    under /docker-entrypoint-initdb.d and runs once when the database first
+    initializes, and the configuration block mounts as a .cnf the server reads
+    through its defaults-extra-file argument.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -38,12 +42,68 @@ spec:
     database: "{{ .values.database }}"
     protocol: "mysql"
 
+  # The developer's bootstrap scripts and custom server configuration render as
+  # compose configs the server mounts as files. Each half is presence-guarded
+  # independently: a deployment that leaves a value unset emits no config, no
+  # mount and no server argument for it, so it renders as though the key did not
+  # exist.
+  #
+  # init_scripts becomes one config per key, each mounted at its own filename
+  # under /docker-entrypoint-initdb.d. The image runs the files it finds there
+  # once, in filename order, and only when the data directory is empty — a
+  # database that already holds data is left untouched. custom_config becomes a
+  # custom.cnf the server reads through --defaults-extra-file, in addition to
+  # the image's own configuration, so settings the block omits keep the values
+  # the image ships. It mounts in a directory of its own, which the image does
+  # not populate, so it never masks the image's configuration files.
+  #
+  # Each config's name is spelled here and again on the volume that mounts it
+  # below. The artifact and the workload are separate template strings with no
+  # binding either could dereference, so the repetition is forced rather than
+  # chosen — the two must be edited together.
+  artifacts:
+    mysql-initdb.compose-fragment.yaml: |
+      {{- if .values.init_scripts }}
+      configs:
+      {{- range $name, $content := .values.init_scripts }}
+        {{ $.context.instance_id }}-initdb-{{ $name }}:
+          content: |
+      {{ $content | indent 6 }}
+      {{- end }}
+      {{- end }}
+    mysql-config.compose-fragment.yaml: |
+      {{- if .values.custom_config }}
+      configs:
+        {{ .context.instance_id }}-config:
+          content: |
+      {{ .values.custom_config | indent 6 }}
+      {{- end }}
+
   workload: |
+    {{- $configFile := "/etc/aggrega/config/custom.cnf" -}}
+    {{- $initDir := "/docker-entrypoint-initdb.d" -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     containers:
       main:
         image: "{{ if .infra.overrides }}{{ if .infra.overrides.image }}{{ .infra.overrides.image }}{{ else }}mysql:{{ .infra.engine_version }}{{ end }}{{ else }}mysql:{{ .infra.engine_version }}{{ end }}"
+    {{- if .values.custom_config }}
+        # The server arguments are supplied as args rather than as a command, so
+        # the image's own startup script still runs: it is what creates the
+        # database on an empty data directory, reads the MYSQL_* variables below,
+        # and runs the bootstrap files. It prepends the server binary to an
+        # argument list beginning with a dash and passes the list on, which is
+        # where --defaults-extra-file is read. That option has to be the server's
+        # first argument, so it is the first entry here.
+        #
+        # $configFile is the single authored home for that path: the
+        # --defaults-extra-file argument and the mount that puts the file there
+        # both read the binding, so a future move cannot relocate one and leave
+        # the other pointing at the old path. It names a file rather than a
+        # directory.
+        args:
+          - "--defaults-extra-file={{ $configFile }}"
+    {{- end }}
         variables:
           MYSQL_DATABASE: "{{ .values.database }}"
           {{- if .values.user }}
@@ -62,6 +122,14 @@ spec:
         volumeMounts:
           - name: data
             path: /var/lib/mysql
+          {{- range $name, $content := .values.init_scripts }}
+          - name: "initdb-{{ $name }}"
+            path: "{{ $initDir }}/{{ $name }}"
+          {{- end }}
+          {{- if .values.custom_config }}
+          - name: dbconf
+            path: "{{ $configFile }}"
+          {{- end }}
         health:
           ready:
             tcp: 3306
@@ -77,6 +145,16 @@ spec:
       data:
         persistent:
           size: "{{ if .infra.storage }}{{ .infra.storage.size | default "10Gi" }}{{ else }}10Gi{{ end }}"
+      {{- range $name, $content := .values.init_scripts }}
+      "initdb-{{ $name }}":
+        configmap:
+          source: "{{ $.context.instance_id }}-initdb-{{ $name }}"
+      {{- end }}
+      {{- if .values.custom_config }}
+      dbconf:
+        configmap:
+          source: "{{ .context.instance_id }}-config"
+      {{- end }}
     services:
       default:
         type: ClusterIP
