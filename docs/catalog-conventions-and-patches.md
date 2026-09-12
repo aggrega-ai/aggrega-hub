@@ -362,6 +362,26 @@ edges an Aggregate declares. The agent-workspace platform under
 queue and stream workers, a schema-migration step and a scheduler, authored as
 separate components rather than one.
 
+A fleet member may be authored with a required `infra` value for the image it
+runs and no catalog-authored default, exactly as a standalone entity may: the
+admission test above treats an artifact the deployment supplies as one the
+catalog does not pin, and belonging to a fleet changes nothing about that. It is
+the honest shape for an upstream that publishes its software as a language
+package rather than as a container image, where there is no reference to pin.
+Declaring the value required is what keeps the omission loud — a build that
+reaches such a component with the value unset halts naming the key, and renders
+nothing.
+
+What the shape costs a reader is discovery, and disclosure is the convention
+that answers it. A member authored this way says in its own
+`metadata.description` which input the catalog does not supply, why there is
+none to pin, and that nothing renders until the deployment sets it; an Aggregate
+composing such a member says the same in its own description, so a reader
+choosing the module meets the constraint while reading rather than at the halt.
+Nothing checks this and an author may leave it out — the convention is here
+because the halt names the key that is missing and not the reason the catalog
+left it empty.
+
 ### Recipe/FeatureRecipe Provider Segment
 
 Domain 3 entities use the execution engine as the first path segment:
