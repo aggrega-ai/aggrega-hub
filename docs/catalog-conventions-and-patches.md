@@ -59,8 +59,8 @@ the label section below). The 15 categories:
 | `ai-agent` | AI agent frameworks, platforms, and patterns | worker, server, stateful-server, task, resource | populated |
 | `ai-model` | Model providers and inference runtimes | server, resource | populated |
 | `ai-tool` | Tools agents invoke | function, server, stateful-server, resource | populated |
-| `ai-pipeline` | Orchestrators that run a multi-step job | server, worker, task | populated |
-| `datastore` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server, server, resource | populated |
+| `ai-pipeline` | Orchestrators that run a multi-step job | server | populated |
+| `datastore` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server, server | populated |
 | `gateway` | API and AI gateways | server | populated |
 | `mesh` | Service meshes | server | created when the first entity lands |
 | `network` | Network primitives | server, resource | created when the first entity lands |
@@ -71,6 +71,13 @@ the label section below). The 15 categories:
 | `security` | Security and compliance components | varies | populated |
 | `bigdata` | Large-scale data processing | varies | created when the first entity lands |
 | `devtool` | Developer tooling | varies | populated |
+
+The ontology column tracks the shelf. For a populated category it lists exactly
+the `component.aggrega.ai/type` values its entities carry — every value listed
+has an entity carrying it, and every entity's value is listed — so a selector
+written from this column always has a target. For a category with no entity yet
+the column states what the shelf is expected to hold, because there are no
+members for it to match.
 
 Directory-presence discipline:
 
