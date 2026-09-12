@@ -644,6 +644,44 @@ maintainers:
 
 Use `#` for comments throughout — every catalog file is YAML, and YAML's comment character is `#`. Schema bodies live under `spec.schema:` as JSON Schema 2020-12 declarations (compact form by default; full JSON Schema YAML via `$jsonschema:` when needed), so the inner content is YAML too and follows the same `#` convention.
 
+### What a byte-level edit costs a consumer
+
+An entity's content digest is the SHA-256 of the file's **raw bytes**. Nothing is
+parsed, normalised or re-serialised first, which is what lets anything that can
+compute a SHA-256 verify a pin: `sha256sum component.yaml` prints the same hex the
+lockfile records, with no Aggrega-specific normalisation to agree on beforehand.
+
+The consequence is that the digest tracks the bytes exactly — including across an
+edit YAML defines as producing the identical parsed value. Re-wrapping a folded
+scalar, rewrapping a comment and adding trailing whitespace each move the digest
+while changing nothing the compiler reads.
+
+That digest is what a consumer's `release.lock` pins. When it moves, every lockfile
+holding the old one is out of date, and the next build halts instead of rendering:
+
+```text
+lockfile: out of date; it no longer matches the current catalog: entity
+"core/datastore/mariadb" changed: lockfile=(1.0.0,sha256:5c2ea291…)
+current=(1.0.0,sha256:2392e621…)
+```
+
+The halt names the refresh that clears it. Once the consumer's lockfile is
+refreshed the build proceeds and renders output byte-identical to what the old pin
+produced — the deployment does not change, because the parsed entity did not.
+`aggrega pull --verify` reports the same drift without writing, for a consumer that
+wants to know before it builds.
+
+So a tidy-up pass over catalog prose is a publishing event for everyone pinning the
+entities it touches, **from a diff in which nothing observable changed** — the
+author sees a whitespace change and the consumer sees a halted build. That
+invisibility is the part worth knowing, because the diff itself carries no signal
+of it.
+
+Nothing prevents a reflow, and prose that has drifted out of measure is worth
+fixing. What the cost argues for is timing: carry a reflow along with a change the
+entity is being published for anyway, rather than spending every consumer's re-pull
+on formatting alone.
+
 ## 4. Component Schema Pattern
 
 Every Component declares its data pillars under `spec.schema:` in JSON Schema 2020-12 compact form. Three pillars cover the per-domain ownership split: `values:` (developer intent), `infra:` (operational sizing), `provides:` (public API contract):
