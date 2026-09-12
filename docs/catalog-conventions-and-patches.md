@@ -60,12 +60,12 @@ the label section below). The 15 categories:
 | `ai-model` | Model providers and inference runtimes | server, resource | populated |
 | `ai-tool` | Tools agents invoke | function, server, stateful-server, resource | populated |
 | `ai-pipeline` | Orchestrators that run a multi-step job | server, worker, task | populated |
-| `datastore` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server, resource | populated |
+| `datastore` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server, server, resource | populated |
 | `gateway` | API and AI gateways | server | populated |
 | `mesh` | Service meshes | server | created when the first entity lands |
 | `network` | Network primitives | server, resource | created when the first entity lands |
 | `messaging` | Event buses, queues, streams, the realtime media services that carry voice and video between participants, and the external carriers a message leaves the deployment through | stateful-server, server, resource | populated |
-| `storage` | Object/file storage, managed cloud resources | resource | populated |
+| `storage` | Object/file storage, managed cloud resources | resource, server | populated |
 | `compute` | Generic compute primitives, plus the control planes an event-driven realization depends on | server, worker, task, function | populated |
 | `observability` | Telemetry, tracing, monitoring | varies | populated |
 | `security` | Security and compliance components | varies | populated |
