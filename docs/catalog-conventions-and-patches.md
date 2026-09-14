@@ -17,6 +17,7 @@ aggrega-catalog/
 ├── recipe/{provider}/{name}/{version}/recipe.yaml
 ├── feature-recipe/{provider}/{name}/{version}/recipe.yaml
 ├── aggregate/{publisher}/{name}/{version}/aggregate.yaml
+├── plugin/{pluginType}/{name}/{version}/plugin.yaml
 ├── schemalibrary/{name}/{version}/library.yaml
 ├── mappinglibrary/{name}/{version}/library.yaml
 ├── workloadlibrary/{name}/{version}/library.yaml
@@ -421,13 +422,16 @@ Domain 3 entities use the execution engine as the first path segment:
 <kind>/<publisher-or-provider>/.../<name>/<version>/<entity>.yaml
 ```
 
-The `<version>` directory segment MUST equal the entity's `metadata.version`. The
-publish-time bundler rejects a mismatch (`ErrEntityVersionPathMismatch`); Plugin
-sits outside that check, taking its version from `metadata.version` and its
-repository location from its socket coordinate. One published version is one
-directory, so the source tree holds every version of an entity side by side rather
-than relying on git history for older versions. The `<entity>.yaml` filename is
-kind-conventional:
+The `<version>` directory segment MUST equal the entity's `metadata.version` on
+every kind, Plugin included. The publish-time bundler rejects a mismatch
+(`ErrEntityVersionPathMismatch`) for the kinds it bundles. A Plugin publishes by a
+route of its own — its entity and its `.wasm` are packed into one manifest, tagged
+by `metadata.version`, at the repository location its socket coordinate derives —
+and that route reads the version from the entity rather than from the directory, so
+for Plugin the per-version layout is a catalog convention rather than a
+publish-time halt. One published version is one directory, so the source tree holds
+every version of an entity side by side rather than relying on git history for
+older versions. The `<entity>.yaml` filename is kind-conventional:
 
 | Kind | Filename |
 | --- | --- |
