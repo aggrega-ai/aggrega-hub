@@ -731,6 +731,9 @@ fixing. What the cost argues for is timing: carry a reflow along with a change t
 entity is being published for anyway, rather than spending every consumer's re-pull
 on formatting alone.
 
+What publishing such an edit then requires is a separate rule — see "A published
+version is final" below.
+
 ## 4. Component Schema Pattern
 
 Every Component declares its data pillars under `spec.schema:` in JSON Schema 2020-12 compact form. Three pillars cover the per-domain ownership split: `values:` (developer intent), `infra:` (operational sizing), `provides:` (public API contract):
@@ -1712,6 +1715,65 @@ The canonical registry is `hub.aggrega.ai`. OCI URIs mirror the filesystem:
 - `hub.aggrega.ai/component/core/datastore/mariadb:1.0.0`
 - `hub.aggrega.ai/recipe/helm/mariadb:1.0.0`
 - `hub.aggrega.ai/featurerecipe/helm/k8s-secret-from-parameter:1.0.0`
+
+### A published version is final
+
+A catalog entity's content at a declared version is immutable. Once a
+`name:version` is published, that version denotes those bytes; content that has
+changed is published under a new `metadata.version`, and the version directory
+segment moves with it — the two always move together (see "Per-version directory
+layout" above).
+
+This is enforced at publish time rather than left to convention. Before anything
+is uploaded, `aggrega push` compares what is already published at the target tag
+against what the content in front of it would publish, and halts when the two
+differ:
+
+```text
+aggrega push: hub.aggrega.ai/component/core/datastore/mariadb:1.0.0 is already
+published as sha256:afd69057…; refusing to overwrite with sha256:fe830920… —
+publish a new version (aggrega lint --pre-publish verifies the bump): oci: tag
+already published with different content
+```
+
+Pushing byte-identical content to a version that already holds it is not a
+conflict: nothing is uploaded, and the command reports the version as already
+published. No flag and no workspace-config setting relaxes the refusal.
+
+**Two questions, answered by two different commands.** `aggrega push` answers
+*whether a new version is owed* — it refuses changed content at a published
+version, and says nothing about how far the version should move.
+`aggrega lint --pre-publish` answers *how large the bump must be*, classifying
+the change against the previously published version and halting on an
+under-bump. The refusal above names the linter, which is why the two read as one
+path rather than as competing rules; the classification rubric is in
+[`aggrega-docs/language-reference/cli/aggrega-lint.md`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/cli/aggrega-lint.md).
+
+**What the comparison covers, and what it does not.** What `aggrega push`
+compares is the entity's own published content. For a single-document kind that
+is the entity file itself; for a Recipe or FeatureRecipe it is the whole version
+directory — every non-hidden file beside `recipe.yaml`, the co-located chart,
+mappings and artifacts included — because the content digest is computed over
+the entity's authoring tree. Rendered output that moves *without* any
+change to that content — because the compiler moved, or because a dependency's
+realization changed — is not what the comparison sees. The first half has a gate
+behind it and halts; the second has none: nothing detects it, and no version
+promise covers it.
+
+The shape worth recognising, because the entity edit can look smaller than the
+output change: a FeatureRecipe whose `valuesMapping` gains a conditional passing
+the scope's namespace into its chart, so an emitted resource gains a `namespace`
+field whenever the scope declares one. The recipe's bytes moved and the rendered
+output moved; the declared version did not. That is a content change, and it is
+published under a new version. An edit that never touches `recipe.yaml` at all
+lands in the same place: a chart template under the version directory is part of
+the entity's published content, so editing one is a content change like any
+other.
+
+A first publication is accepted — nothing is published at the tag yet, so there
+is nothing to compare against — and the bytes that land are what that version
+means from then on. An entity's declared version is therefore worth settling
+before its first publish rather than after.
 
 ### Registry repository segments
 
