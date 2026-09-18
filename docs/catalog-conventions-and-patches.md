@@ -129,7 +129,7 @@ multi-valued category: an entity is `category: datastore` plus whatever
 discoverable from both axes. A component carries an engine label on its base
 where the product's identity is that engine, as `core/datastore/qdrant` carries
 `vector` and `core/datastore/redis` carries `kv`. A capability whose truth
-depends on what a deployment configures carries no label anywhere in the
+depends on what the Aggregate declares carries no label anywhere in the
 catalog — it is injected at compile time by the governance socket's
 `label-transform` role, which reads the developer's declared `values`.
 There is no stored "is-AI" boolean — tooling derives AI-relevance from any
@@ -320,7 +320,7 @@ software it packages, and where the two differ the packaged software governs.
   test does not apply, and the entity is admitted whatever the service's own
   terms are. That relationship is between the user and the provider; the catalog
   neither distributes nor resells it.
-- **An artifact the deployment supplies is not pinned either.** A Recipe whose
+- **An artifact the Release supplies is not pinned either.** A Recipe whose
   image comes from a required `infra` value with no catalog-authored default
   names nothing, so the reader supplies an artifact they already hold the right
   to run.
@@ -390,7 +390,7 @@ separate components rather than one.
 
 A fleet member may be authored with a required `infra` value for the image it
 runs and no catalog-authored default, exactly as a standalone entity may: the
-admission test above treats an artifact the deployment supplies as one the
+admission test above treats an artifact the Release supplies as one the
 catalog does not pin, and belonging to a fleet changes nothing about that. It is
 the honest shape for an upstream that publishes its software as a language
 package rather than as a container image, where there is no reference to pin.
@@ -401,7 +401,7 @@ nothing.
 What the shape costs a reader is discovery, and disclosure is the convention
 that answers it. A member authored this way says in its own
 `metadata.description` which input the catalog does not supply, why there is
-none to pin, and that nothing renders until the deployment sets it; an Aggregate
+none to pin, and that nothing renders until the Release sets it; an Aggregate
 composing such a member says the same in its own description, so a reader
 choosing the module meets the constraint while reading rather than at the halt.
 Nothing checks this and an author may leave it out — the convention is here
@@ -716,7 +716,7 @@ current=(1.0.0,sha256:2392e621…)
 
 The halt names the refresh that clears it. Once the consumer's lockfile is
 refreshed the build proceeds and renders output byte-identical to what the old pin
-produced — the deployment does not change, because the parsed entity did not.
+produced — the rendered output does not change, because the parsed entity did not.
 `aggrega pull --verify` reports the same drift without writing, for a consumer that
 wants to know before it builds.
 
@@ -946,12 +946,12 @@ and adds synchronization risk.
 Preferring the native flag does not mean leaving the credential slot unbound.
 Where the Component declares that slot with `required: true`, nothing binding it
 halts the build — so "do not attach a credential here" is not an option the
-deployment has. The form that binds the slot without reintroducing a second
+Release has. The form that binds the slot without reintroducing a second
 lifecycle is `core/generated-secret`, the credential Feature that states the
 target engine owns the material. Its FeatureRecipes are pure wiring: each
 declares only the capability it binds to and the Feature it implements, and
-renders nothing. A deployment that binds the slot this way emits output
-byte-identical to the same deployment with no attachment at all — the slot is
+renders nothing. A Release that binds the slot this way emits output
+byte-identical to the same Release with no attachment at all — the slot is
 satisfied, and no second secret exists to drift out of step.
 
 The standard library ships that wiring for both managed-database capabilities:
@@ -980,7 +980,7 @@ A self-managed datastore Component declares its password as an **optional**
 credential slot in `spec.featuresSchema`, and its Recipes wire that slot
 **conditionally** — the credential subsystem when a credential is attached, an
 inline development default when none is. This keeps the slot non-breaking: a
-deployment that attaches no credential still renders and runs, byte-identically
+Release that attaches no credential still renders and runs, byte-identically
 to a Recipe with no slot at all.
 
 The shared Component declares an optional, transparent slot — no `required:`,
@@ -1192,10 +1192,10 @@ duplication is a single-sourcing hazard — put the address in one `infra` or
 ### Presence parametrization — expose an enable-parameter per component
 
 A published Aggregate exposes an enable/disable parameter per optional component
-so a deployment can toggle that component's presence per environment. The
+so a Release can toggle that component's presence per environment. The
 convention: declare a boolean parameter such as `enable_cache` in the Aggregate's
 `parameters`, and have the component's presence expression reference it. A
-deployment then flips the component on or off by fulfilling the parameter,
+Release then flips the component on or off by fulfilling the parameter,
 without editing the Aggregate's topology.
 
 Per-component presence toggling is documentation-only today; it becomes
@@ -1388,7 +1388,7 @@ surface, realized per target by whatever mechanism that target has: a chart's HA
 options, an operator custom resource's HA spec, a cloud provider's multi-AZ flag,
 or a synthesized StatefulSet with a PersistentVolumeClaim. Splitting a component
 or recipe family by stateful-ness is an antipattern — it doubles the catalog and
-forces a deployment to re-author its topology to change an operational setting.
+forces the Aggregate's topology to be re-authored to change an operational setting.
 
 Two consequences for authors:
 
@@ -1458,7 +1458,7 @@ copying whichever sibling happens to be nearest.
 
 - **`values`** — the engine-specific subset of logical bootstrap names plus engine
   configuration, each key carrying a `description` and a sensible default so a bare
-  deployment renders unchanged: the logical `database`, `user` (or `app_user` where
+  Aggregate renders unchanged: the logical `database`, `user` (or `app_user` where
   an application-role split applies), `encoding` / `locale`, `init_scripts` (an
   object whose values are strings), and `custom_config` for a raw configuration
   block. Plus the persistence, HA and backup toggles as configurable knobs, per the
@@ -1478,7 +1478,7 @@ copying whichever sibling happens to be nearest.
   and Memcached have no user or database — do not invent them to make the family
   look uniform.
 - **`featuresSchema`** — an optional transparent `password` slot carrying an inline
-  development default when nothing is attached, so an unattached deployment stays
+  development default when nothing is attached, so an unattached slot stays
   byte-identical to its pre-slot output; plus an optional `app_user_password` where
   the application-role split applies.
 - **Realizations** — helm synthesis (the workload `form`, a PersistentVolumeClaim
