@@ -251,14 +251,14 @@ Three rules bind the family, and each has already been got wrong once:
   nothing carries is worse than an absent one — a selector naming it parses,
   matches nothing, and reports nothing — so each is added in the same act as the
   first component to carry it. One fidelity the field does implement stays
-  absent for that reason: an upstream certificate pinned by key or fingerprint
-  rather than verified against an anchor. 🔴 **Its absence has a stronger ground
-  than "nothing carries it yet", and the difference decides what a later author
-  should do about it: no product in this set documents pinning by fingerprint,
-  public key or subject-key identifier at all.** A certificate-name assertion and
-  a named trust anchor are neither of them pins, so this is not a gap waiting on
-  a product — an attachment promising certificate pinning promises something
-  nothing here can honour.
+  absent, and no longer for want of a product: an upstream certificate pinned by
+  key rather than verified against an anchor. 🔴 **One gateway in the catalog can
+  pin, and the ground for keeping it off this family is what a second value here
+  would assert, not scarcity — a pin says which key a certificate must BE, where
+  every value on this family says what one must SAY.** A certificate-name
+  assertion and a named trust anchor are neither of them pins. While one product
+  carries the capability it stays a dial on that Component's own surface; a
+  shared value here is the thing to revisit if a second product gains it.
 
 Carriers today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 `upstream-tls: trust-anchor`), `core/gateway/contour` (`request-mirroring:
