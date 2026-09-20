@@ -508,6 +508,102 @@ mirrors, not the file:
 - `anthropic-agent/` in `ai-agent/` → `anthropic/` (name: `core/ai-agent/anthropic`)
 - `openai-model/` in `ai-model/` → `openai/` (name: `core/ai-model/openai`)
 
+### Key casing: two registers with two owners
+
+An entity's YAML carries two kinds of key, and they follow different rules
+because different people choose them.
+
+**The product owns one register, and it is camelCase.** `apiVersion`, `kind`,
+`metadata` and `spec`, the structural keys underneath them — `appliesTo`,
+`conflictsWith`, `executionScope`, `usesSchema`, `featuresSchema`,
+`valueSchema`, `infraSchema`, `valuesMapping` — and the schema vocabulary
+written inside a pillar — `type`, `description`, `default`, `required`, `enum`,
+`min`, `max`, `additionalProperties`, `$ref` — are all spelled by the product. An
+author writes each as the product spells it, and restyles none of them.
+
+**The catalog author owns the other register, and it is snake_case.** The data
+keys declared inside `values:`, `infra:`, `provides:` and `parameters:`, and the
+socket and slot names declared under `usesSchema:` and `featuresSchema:`, are the
+author's own vocabulary: `engine_version`, `max_attempts`, `retention_days`,
+`queue_depth_hint`, `app_user`.
+
+**Keeping the two apart is the point of the rule.** A reader meeting
+`engine_version` beside `executionScope` can tell which word this catalog
+invented and which one the product defines, and an author reading a halt that
+names a key knows immediately which surface to look at. Spelling the authored
+keys camelCase would file them under the product's register and lose that
+distinction — which is why the direction is snake_case for authored keys rather
+than camelCase everywhere.
+
+Two boundaries on the rule:
+
+- **It binds the key, never the value.** A value's spelling follows whatever the
+  thing it configures accepts, which is why one `log_level` key carries whatever
+  level names its own product understands.
+- **A library's `metadata.name` is outside it.** That name is an identity a
+  consumer references rather than a data key, and it follows its own rule — see
+  "Library-kind names are bare PascalCase" above.
+
+### Prefer the compact constraint keyword
+
+Write `min:` and `max:` rather than `minimum:` and `maximum:`.
+
+The compact keyword follows the node's declared `type:` — `min:` is a numeric
+bound on an `integer` or a `number`, a length bound on a `string`, and an
+item-count bound on an `array` — so one spelling covers every type and keeps
+meaning the right thing if the type changes. `minimum:` and `maximum:` are JSON
+Schema's own keywords, carried through as authored; they are accepted, and on a
+field declaring `type: integer` they express the same bound.
+
+What they do not do is mark the node. A compact keyword is part of what
+identifies a node as a compact-form leaf, so a node carrying only JSON Schema's
+spellings is classified by whatever else it holds. Keeping to the compact
+spelling keeps that question from arising, and keeps one field from carrying two
+registers at once: `min:` beside `maximum:` on a single field reads as two
+conventions in one place.
+
+Where the compact form has no equivalent — `exclusiveMinimum:`, `multipleOf:`,
+`uniqueItems:` — write the JSON Schema keyword, which is what it is there for.
+
+### Differences that are not divergences
+
+A pass that unifies key names across the catalog meets spellings that look
+inconsistent and are not. Each of the following is a real distinction, and
+flattening it changes what an entity means — usually with no build reporting it,
+because the compiler pipes whatever string it is handed and validates nothing
+about what the string means.
+
+- **A level or mode vocabulary follows the wrapped product.** The key is uniform
+  across the catalog; the accepted values are not, because each component's
+  product accepts its own set. Normalising the values makes the compiler pipe a
+  string the target rejects: the build succeeds and the container fails to start.
+- **A qualified port name is a different port.** Where a component listens on
+  several, the unqualified `port` is its primary and each qualified name is
+  another physical port. Collapsing them onto one key merges two listeners.
+- **A qualified image name is a different image.** A component that genuinely
+  deploys several images declares several image keys.
+- **A qualified account name is a different account.** `user` and `app_user` on
+  one component are two accounts, not two spellings of one.
+- **Label values are kebab-case while enum members are snake_case.** Two
+  registers with two rules, and they only look like a collision when a label
+  block and a pillar are read side by side. Label values are kebab-case across
+  the catalog.
+- **The same key in `values` and in `provides` is the string pipe working as
+  intended.** A component that accepts a value and also publishes one names both
+  for what they are; renaming either side to disambiguate makes the contract
+  harder to read, not easier.
+- **One word in two pillars can carry two directions.** `endpoint` under `infra`
+  is an address supplied to a component; under `provides` it is one the component
+  publishes. The pillar carries the direction, so the word does not have to.
+- **`required:` has two authored forms and both are correct.** `required: true`
+  on a field marks that one field; `required: [a, b]` beside a `properties:` map
+  names several at once. They are the same contract written at two scopes, not a
+  drift.
+
+Before renaming a key for consistency, establish what the two spellings denote.
+Where they denote the same thing, converge them; where they denote different
+things, the difference is the information.
+
 ## 3. YAML Formatting
 
 ### License header (required on every .yaml file)
@@ -867,7 +963,7 @@ spec:
     BaseComponentParameter:
       type: object
       properties:
-        displayName: { type: string }
+        display_name: { type: string }
         description: { type: string }
 ```
 
