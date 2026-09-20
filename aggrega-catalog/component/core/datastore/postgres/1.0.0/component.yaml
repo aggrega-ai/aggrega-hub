@@ -12,7 +12,15 @@ metadata:
     (Kubernetes), Terraform Recipes (AWS RDS, Azure Database), and
     CloudFormation Recipes, and by a reference Recipe that provisions nothing
     and only wires a consumer to a server that already exists. Exports its host
-    and port to consumers via the uses topology.
+    and port to consumers via the uses topology. Three Helm Recipes realize it
+    and the Manifest selects between them per deployment. Reach for the
+    synthesis Recipe on a cluster that runs no PostgreSQL control plane: it
+    needs no controller installed and no chart repository, so it builds with
+    nothing fetched. Reach for the controller-driven Recipe, which emits a
+    CloudNativePG Cluster custom resource, where that control plane is already
+    in place and the cluster should own failover, rolling upgrades and the
+    database's credentials. Reach for the reference Recipe where the server
+    already exists outside the deployment and nothing is to be provisioned.
   labels:
     component.aggrega.ai/type: stateful-server
     component.aggrega.ai/category: datastore
@@ -43,7 +51,7 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [env]
-      description: "Optional database password credential. When attached, supplies POSTGRES_PASSWORD via the credential subsystem; unattached, the Recipe uses its inline default."
+      description: "Optional database password credential. When attached, supplies POSTGRES_PASSWORD via the credential subsystem; unattached, the Recipe uses its inline default. The controller-driven realization owns the database's credentials through infra.credentials and halts the build when this slot is filled."
     # Optional application-user credential slot. When a credential is attached
     # here, the helm Recipe creates a distinct non-superuser login role
     # (named by values.app_user) with this credential as its password, via a
@@ -55,7 +63,7 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [env]
-      description: "Optional application-user password credential. When attached, the helm Recipe creates a non-superuser login role (named by values.app_user) with this password; unattached, no application role is created."
+      description: "Optional application-user password credential. When attached, the synthesized helm Recipe creates a non-superuser login role (named by values.app_user) with this password; unattached, no application role is created. The controller-driven realization owns the database's credentials through infra.credentials and halts the build when this slot is filled."
   schema:
     values:
       # Developer Intent — filled by the Developer in the Aggregate. Defaults
@@ -88,10 +96,21 @@ spec:
       init_scripts:
         type: object
         valuesType: string
-        description: SQL or shell scripts executed on first database initialization from /docker-entrypoint-initdb.d. Each key is a filename, each value is the file content. Scripts run once, when the data directory is empty, in alphabetical key order.
+        description: >
+          SQL or shell scripts executed on first database initialization from
+          /docker-entrypoint-initdb.d. Each key is a filename, each value is the
+          file content. Scripts run once, when the data directory is empty, in
+          alphabetical key order. The controller-driven realization runs each
+          entry as SQL in the application database instead, in the same key
+          order, so content that is not SQL belongs on a synthesized realization.
       custom_config:
         type: string
-        description: Raw server configuration block (postgresql.conf format). Applied verbatim as the server's configuration file; unspecified settings keep their built-in defaults.
+        description: >
+          Raw server configuration block (postgresql.conf format). Applied
+          verbatim as the server's configuration file; unspecified settings keep
+          their built-in defaults. The controller-driven realization takes server
+          configuration as named settings rather than as a file and halts the
+          build when this is set, naming the key it offers instead.
     infra:
       # Operational Sizing — filled by the Operator in the Release. Developer
       # never sees this.
@@ -100,7 +119,12 @@ spec:
         min: 1024
         max: 65535
         default: 5432
-        description: Server listen port. Most operators should omit this and let the Recipe assign the default (5432).
+        description: >
+          Server listen port. Most operators should omit this and let the Recipe
+          assign the default (5432). The controller-driven realization runs the
+          server on 5432 and cannot move it, so it halts the build on any other
+          value rather than handing a consumer a port the server does not answer
+          on.
       engine_version:
         type: string
         default: "16"
@@ -145,6 +169,40 @@ spec:
         type: object
         additionalProperties: true
         description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+      control_plane_present:
+        type: boolean
+        default: false
+        description: >
+          Operator affirmation that the CloudNativePG control plane is installed
+          in the target cluster. The controller-driven realization halts the build
+          unless this is set true, so a Cluster custom resource is never emitted as
+          an orphan into a cluster that cannot reconcile it. The synthesized and
+          reference realizations ignore this flag.
+      credentials:
+        type: string
+        enum: [generated, supplied]
+        default: generated
+        description: >
+          Who owns the database's credentials on the controller-driven realization.
+          `generated` — the controller creates the Secret holding the owning role's
+          password and owns it, which is what it does when nothing is supplied; the
+          developer's `database` and `user` values are still honored, and no
+          password reaches the rendered artifact. `supplied` — the controller reads
+          that role's credentials from an existing Secret named in
+          `credentials_secret` and generates none. The synthesized realizations
+          ignore this key: they take the database password from the `password`
+          credential slot and the application role's from `app_user_password`.
+      credentials_secret:
+        type: string
+        default: ""
+        description: >
+          Name of the existing Secret the controller-driven realization reads the
+          database owner's credentials from when `credentials` is `supplied`. The
+          Secret lives in the same namespace as the database, is of type
+          `kubernetes.io/basic-auth`, and carries a `username` entry that must
+          match `values.user` alongside a `password` entry holding that role's
+          password. Leave it empty when `credentials` is `generated`; a
+          controller-driven build halts if `supplied` is selected without it.
     provides:
       # Public API Contract — keys exported to consumers via uses topology edges.
       host: { type: string, required: true }
