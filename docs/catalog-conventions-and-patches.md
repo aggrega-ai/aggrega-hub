@@ -523,6 +523,50 @@ entity describes, not of the file describing it. It is stated per file rather
 than inferred from the repository so that a catalog published by anyone else can
 say what its own terms are.
 
+### Metadata key order
+
+Inside `metadata:`, the keys an entity carries are authored in this order:
+
+```yaml
+metadata:
+  name: core/datastore/redis
+  version: 1.0.0
+  license: AGPL-3.0
+  description: >
+    A Redis in-memory key-value cache, speaking the Redis wire protocol.
+  labels:
+    component.aggrega.ai/type: server
+    component.aggrega.ai/category: datastore
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+```
+
+Identity first, then the terms the described software is published under, then
+the prose, then the label set, then who answers for the entity. A key the entity
+does not carry is simply absent: the convention fixes the relative order of the
+keys that are present rather than which keys an entity must have, and keys
+outside this list — `annotations`, for instance — it does not order.
+
+Two things follow, and the second is the one worth knowing.
+
+- **`license` sits above `description`, directly under `version`.** That keeps it
+  within a couple of lines of the `# SPDX-License-Identifier:` header above, so
+  the two surfaces that each name a licence — the file's own terms and the
+  wrapped product's — are read together and told apart, instead of meeting a
+  paragraph of prose in between.
+- **Nothing enforces the order and nothing reads it.** YAML mapping order carries
+  no meaning to the compiler, so a `metadata:` block written in any order parses
+  to the same entity and renders byte-identical output. This is a reading
+  convention, and what it buys is that a scan across a shelf of entities finds the
+  same key in the same place every time.
+
+Being a reading convention, reordering an existing entity is never urgent — and
+it is not free either. It moves the file's bytes and therefore its content
+digest, with the consumer cost described under "What a byte-level edit costs a
+consumer" below. Carry a reorder along with a change the entity is being
+published for anyway.
+
 ### Quoting follows the declared type
 
 The quoting rules below are one rule applied to several surfaces: **write each value
