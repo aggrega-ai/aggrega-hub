@@ -1,0 +1,213 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: tyk
+  version: 1.0.0
+  license: MPL-2.0
+  description: >
+    Tyk Gateway on Kubernetes via the open-source stack chart the gateway's own
+    maintainers publish, served from the project's HTTPS chart repository. The
+    chart was chosen over a hand-authored workload because it meets all three
+    conditions the catalog asks of a chart: it is official, published by the
+    product's maintainers alongside the gateway itself; it is complete, carrying
+    the gateway Deployment, its Service, the storage wiring and the directory
+    setup the gateway needs at start; and it is maintained, its most recent
+    release post-dating the most recent gateway release by two days as read on
+    2026-09-20. The chart bundles three components — the gateway, an analytics
+    purger, and the vendor's Kubernetes controller — and only the gateway is
+    unconditional. This Recipe deploys the gateway alone: the purger and the
+    controller stay off, and the controller's configuration secret, which the
+    chart emits by default even with the controller itself off, is turned off
+    too, so the render carries nothing belonging to a component this Recipe does
+    not stand up. The chart's own default gateway image tag trails the current
+    gateway release, so this Recipe sets the tag explicitly from the Component's
+    engine_version rather than inheriting the chart's; override the whole image
+    block via infra.overrides.gateway_image. The chart names its generated
+    resources after the release, so fullnameOverride is bound to the component
+    instance and provides.host names the Service the chart actually emits.
+    Default chart version in source.version; override via infra.source_version.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/gateway/tyk:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://helm.tyk.io/public/helm/charts/
+    chart: tyk-oss
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"5.3.0\" }}"
+
+  # The chart prefixes the data-plane Service name with its own role segment and
+  # then appends the name fullnameOverride carries, so the emitted Service is
+  # `gateway-svc-<instance>`. provides.host spells that out rather than naming
+  # the instance alone, because a host that names no emitted Service is a broken
+  # contract that renders cleanly on both sides. The host is the bare service
+  # name with no namespace segment, so this Recipe is independent of where it is
+  # deployed and a cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "gateway-svc-{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+
+  # This Recipe reads from the `cache` uses-edge, which must deliver the store's
+  # address on the injection context under these keys:
+  #   TYK_STORE_HOST - the store's provides.host
+  #   TYK_STORE_PORT - the store's provides.port
+  #
+  # This Recipe reads from infra.overrides:
+  #   gateway_image    - map[string]string (the gateway image.* fields; replaces the tag pin)
+  #   setup_image      - map[string]string (the directory-setup init container's image fields; replaces the pin)
+  #   service_type     - string (the data-plane service type; default ClusterIP)
+  #   requests         - { cpu: string, memory: string } (gateway resource requests)
+  #   api_secret       - string (the gateway's own API secret; default is a development literal)
+  #   storage_database - integer (logical database index on the wired store; default 0)
+  #   nodeSelector     - map[string]string
+  #   tolerations      - []object
+  valuesMapping: |
+    ## ── The chart's shared block: what is deployed, and what it talks to ──
+    global:
+      ## The chart carries the analytics purger and the vendor's Kubernetes
+      ## controller as conditional subcharts, both off in the chart's own
+      ## defaults. They are restated as off here so the intent is legible in
+      ## this file and survives a change to those defaults: this Component is
+      ## the gateway and the store it is wired to, and nothing else.
+      components:
+        pump: false
+        operator: false
+
+      ## The port the emitted data-plane Service publishes.
+      servicePorts:
+        gateway: {{ .infra.port }}
+
+      secrets:
+        ## The gateway's own API secret. The chart's default is a placeholder
+        ## the reader is expected to replace, so a development literal is set
+        ## here instead and an operator supplies their own through
+        ## infra.overrides.api_secret. The control API this secret guards is
+        ## not exposed by this realization: the chart's control port is off and
+        ## the emitted Service carries the data-plane port alone.
+        {{- if and .infra.overrides .infra.overrides.api_secret }}
+        APISecret: "{{ .infra.overrides.api_secret }}"
+        {{- else }}
+        APISecret: "tyk-development-secret"
+        {{- end }}
+
+      redis:
+        ## The store identity resolved from the `cache` uses-edge. The chart
+        ## takes a list of addresses; one entry is the single-endpoint form.
+        addrs:
+          - "{{ .context.inject.env.TYK_STORE_HOST }}:{{ .context.inject.env.TYK_STORE_PORT }}"
+        storage:
+          database: {{ if and .infra.overrides (hasKey .infra.overrides "storage_database") }}{{ .infra.overrides.storage_database }}{{ else }}0{{ end }}
+        ## With a credential attached to the slot, the chart is pointed at the
+        ## Secret that credential produced and reads the password from it, so
+        ## the material never lands in the rendered manifest. With nothing
+        ## attached the password is empty, which is what the shipped
+        ## Redis-protocol components expect until a credential is attached to
+        ## them as well.
+        {{- if hasKey (default dict .features) "password" }}
+        passSecret:
+          name: "{{ .features.password.provides.name }}"
+          keyName: "{{ .features.password.provides.key }}"
+        {{- else }}
+        pass: ""
+        {{- end }}
+
+    ## The chart emits a configuration secret for the controller regardless of
+    ## whether the controller subchart is enabled. With the controller off
+    ## nothing reads it, so it is turned off and the render carries no resource
+    ## belonging to a component this Recipe does not stand up.
+    operatorSecret:
+      enabled: false
+
+    ## The chart ships a connectivity test pod and its script as test hooks.
+    ## They belong to installing the chart by hand rather than to what a Release
+    ## renders, so they are off.
+    tests:
+      enabled: false
+
+    ## ── The gateway subchart ───────────────────────────────────
+    tyk-gateway:
+      ## Bind the chart's name override to the component instance so the
+      ## Service named by provides.host is the one the render emits.
+      fullnameOverride: "{{ .context.instance_id }}"
+
+      gateway:
+        ## ── Gateway image pin ────────────────────────────────────
+        ## The chart's own default tag trails the gateway release this
+        ## Component targets, so the tag is set here from engine_version.
+        ## Override the whole block via infra.overrides.gateway_image.
+        {{- if and .infra.overrides .infra.overrides.gateway_image }}
+        image:
+          {{- range $k, $v := .infra.overrides.gateway_image }}
+          {{ $k }}: "{{ $v }}"
+          {{- end }}
+        {{- else }}
+        image:
+          repository: docker.tyk.io/tyk-gateway/tyk-gateway
+          tag: "{{ .infra.engine_version }}"
+        {{- end }}
+
+        ## ── Directory-setup init container image pin ─────────────
+        ## The chart runs a second image to create the gateway's working
+        ## directories before it starts. It is pinned here rather than left to
+        ## the chart, so both images the render names are this Recipe's own
+        ## choice. Override the whole block via infra.overrides.setup_image.
+        initContainers:
+          {{- if and .infra.overrides .infra.overrides.setup_image }}
+          setupDirectories:
+            {{- range $k, $v := .infra.overrides.setup_image }}
+            {{ $k }}: "{{ $v }}"
+            {{- end }}
+          {{- else }}
+          setupDirectories:
+            repository: busybox
+            tag: "1.32"
+          {{- end }}
+
+        ## ── Data-plane listen port ───────────────────────────────
+        containerPort: {{ .infra.port }}
+
+        ## ── Data-plane service (client entry point) ──────────────
+        ## The default service type keeps the gateway in-cluster, which is
+        ## where a consumer wired to it sits.
+        service:
+          {{- if and .infra.overrides .infra.overrides.service_type }}
+          type: "{{ .infra.overrides.service_type }}"
+          {{- else }}
+          type: ClusterIP
+          {{- end }}
+
+        ## ── Gateway resources ────────────────────────────────────
+        resources:
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          {{- if and .infra.overrides .infra.overrides.requests }}
+          requests:
+            cpu: "{{ .infra.overrides.requests.cpu }}"
+            memory: "{{ .infra.overrides.requests.memory }}"
+          {{- end }}
+
+        ## ── Scheduling overrides ─────────────────────────────────
+        {{- if .infra.overrides }}
+        {{- if .infra.overrides.nodeSelector }}
+        nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+        {{- end }}
+        {{- if .infra.overrides.tolerations }}
+        tolerations: {{ toJson .infra.overrides.tolerations }}
+        {{- end }}
+        {{- end }}
+
+  sourceDigests:
+    - kind: helm-https-chart
+      url: https://helm.tyk.io/public/helm/charts/
+      chart: tyk-oss
+      version: 5.3.0
+      digest: sha256:6555e2d6947dc611e955b8866aae03b978b3d65c0315f2180ec6a8491ea305f8

@@ -1,0 +1,126 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: tyk
+  version: 1.0.0
+  license: MPL-2.0
+  description: >
+    Tyk Gateway for local development via Docker Compose. Synthesized-mode
+    Workload: the image, the environment, the exposed port and the service entry
+    are translated from the Workload kind by the compose provider. The
+    Kubernetes realization points at the chart the gateway's maintainers
+    publish; there is no chart to point at here, so this Recipe assembles the
+    container directly over the same published image and sets the same gateway
+    settings the chart sets, expressed as the environment overrides the gateway
+    reads. Everything this Recipe does not set is left to the configuration file
+    the image ships, which is where the gateway's working directories and its
+    policy source already point. The gateway holds no local state — the wired
+    Redis-protocol store holds its keys, rate-limit counters and session state —
+    so it renders stateless and declares no volume. The store identity resolved
+    from the `cache` uses-edge arrives on the inject pipe and composes the
+    gateway's storage address. With no credential attached the gateway connects
+    with an empty password, which is what the store components for this target
+    expect until a credential is attached to them too; with one attached, its
+    value arrives on the inject pipe under TYK_STORE_PASSWORD, which is
+    therefore also the key the attached credential must publish under, because
+    compose has no env-from-secret primitive and a plain environment variable is
+    the delivery this target has. One ordering property is worth knowing before
+    this is deployed onto a cold host, and it is a property of the target rather
+    than of this Recipe: a dependency derived from a uses-edge waits on the
+    target having started rather than on it reporting healthy, so the gateway
+    may start before the store is accepting connections and will retry. No
+    readiness wait is hidden in a command line to compensate: that would move a
+    lifecycle concern into a string nothing can inspect or diagnose. Nothing is
+    published to the host, so the data plane is reachable from the compose
+    network only. The contract is key-for-key the one the Kubernetes realization
+    publishes; only host is spelled differently, because it is the name the
+    compose provider gives the synthesized service.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/gateway/tyk:1.0.0
+
+  # This Recipe reads from the `cache` uses-edge, which must deliver the store's
+  # address on the injection context under these keys:
+  #   TYK_STORE_HOST     - the store's provides.host
+  #   TYK_STORE_PORT     - the store's provides.port
+  #   TYK_STORE_PASSWORD - the attached credential's value, when the optional
+  #                        password slot is filled
+  #
+  # This Recipe reads from infra.overrides:
+  #   api_secret       - string (the gateway's own API secret; default is a development literal)
+  #   storage_database - integer (logical database index on the wired store; default 0)
+  #
+  # provides is evaluated before the workload and cannot read it, so the
+  # data-plane port has one authored home in .infra.port that every reader
+  # dereferences — provides.port here, and below the gateway's listen port, the
+  # container port and the service entry; the literal is never repeated.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  workload: |
+    {{- $apiSecret := "tyk-development-secret" -}}
+    {{- if and .infra.overrides .infra.overrides.api_secret -}}
+    {{- $apiSecret = .infra.overrides.api_secret -}}
+    {{- end -}}
+    {{- $storageDatabase := 0 -}}
+    {{- if and .infra.overrides (hasKey .infra.overrides "storage_database") -}}
+    {{- $storageDatabase = .infra.overrides.storage_database -}}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The gateway holds no durable state — the wired store is where its keys and
+    # counters live — so the stateless form is correct: there is nothing for a
+    # volume to outlive the container for, and none is declared. No replica
+    # count is authored: the Component exposes none for this target, and
+    # authoring one here would raise an unsupported-field warning naming a
+    # setting nobody asked for.
+    form: stateless
+    containers:
+      main:
+        image: "docker.tyk.io/tyk-gateway/tyk-gateway:{{ .infra.engine_version }}"
+        # No command or args override — the image's own default command starts
+        # the gateway against the configuration file the image ships. Each
+        # variable below overrides one setting in that file: the listen port,
+        # the storage connection composed from the `cache` uses-edge, the
+        # gateway's own API secret, and the policy source, which names the
+        # standalone posture explicitly rather than leaving it to be inferred.
+        variables:
+          TYK_GW_LISTENPORT: "{{ .infra.port }}"
+          TYK_GW_STORAGE_TYPE: "redis"
+          TYK_GW_STORAGE_ADDRS: "{{ .context.inject.env.TYK_STORE_HOST }}:{{ .context.inject.env.TYK_STORE_PORT }}"
+          TYK_GW_STORAGE_DATABASE: "{{ $storageDatabase }}"
+          TYK_GW_SECRET: "{{ $apiSecret }}"
+          TYK_GW_NODESECRET: "{{ $apiSecret }}"
+          TYK_GW_POLICIES_POLICYSOURCE: "file"
+    {{- if hasKey (default dict .features) "password" }}
+          TYK_GW_STORAGE_PASSWORD: "{{ .context.inject.env.TYK_STORE_PASSWORD }}"
+    {{- end }}
+        ports:
+          tcp: {{ .infra.port }}
+        # Each quantity is quoted because it is a string: a value with no unit
+        # suffix — a whole-core cpu count, say — would otherwise be read as a
+        # number and rejected before the target ever sees it.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    # A ClusterIP service entry keeps the gateway on the compose network, which
+    # is where its consumers sit: a consumer wired to it resolves the service
+    # name and the port straight from the edge. Nothing is published to the
+    # host, so the data plane is not reachable from outside the network on this
+    # target.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          tcp: {{ .infra.port }}
