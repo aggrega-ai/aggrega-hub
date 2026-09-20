@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: mariadb-cluster
+  version: 1.0.0
+  license: MIT
+  description: >
+    MariaDB realized as a MariaDB custom resource the mariadb-operator control
+    plane reconciles, rather than a directly synthesized StatefulSet — the
+    controller-driven realization of the same MariaDB component, selectable in the
+    Manifest alongside the synthesis recipe. The recipe emits one MariaDB
+    conformant to the k8s.mariadb.com/v1alpha1 API; the controller turns it into a
+    running server, its client Service and its credential Secrets, and creates the
+    initial database and application user from the developer's own values.
+    provides.host is the client Service the controller creates for the instance and
+    provides.port is the port the custom resource carries, so a consumer wires to it
+    exactly as it would to the synthesized realization. Credential custody is the
+    operator's choice: infra.credentials generated leaves both passwords with the
+    controller, and supplied points it at an existing Secret named in
+    infra.credentials_secret. The mariadb-operator control plane is a runtime
+    prerequisite: the build halts unless the operator affirms it is installed
+    (infra.control_plane_present), so no custom resource is emitted into a cluster
+    that cannot reconcile it. Reach for this realization where the control plane is
+    already in place; reach for the synthesis recipe where it is not.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/datastore/mariadb:1.0.0
+  # The controller creates the instance's client Service under the MariaDB custom
+  # resource's own name, with no suffix, listening on the port the custom resource
+  # declares; provides.host is that bare in-cluster name, matching the synthesis
+  # realization's contract so consumers are realization-agnostic. A consumer in
+  # another namespace qualifies the host on its own side (caller-side routing).
+  #
+  # Unlike some controllers, this one takes the listen port as a field on the custom
+  # resource, so infra.port is honored here exactly as the synthesis realization
+  # honors it and provides.port reads from the same place. The controller also
+  # creates a headless Service and, where replication is configured, primary and
+  # secondary Services; the consumer contract publishes the client Service alone,
+  # which is the one that routes to every instance.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "mariadb"
+  # Three declared conditions, each halting rather than emitting something that
+  # renders cleanly and does not work.
+  assertions:
+    # The mariadb-operator control plane must exist in the target cluster before a
+    # MariaDB custom resource can reconcile. The compiler cannot inspect cluster
+    # state, so the prerequisite is declared: an operator affirms it in the Release,
+    # and an unaffirmed build halts here rather than emitting an orphan custom
+    # resource.
+    mariadb_operator_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail "the mariadb-operator control plane must be installed in the target cluster before this realization emits its MariaDB custom resource; once the control plane is present, affirm the prerequisite by setting infra.control_plane_present to true in the Release" -}}
+      {{- end -}}
+    # The custom resource carries no surface for first-initialization SQL: the
+    # controller bootstraps an instance from its own fields or from a backup, and
+    # runs statements through a separate resource with its own lifecycle. Scripts
+    # set here would be accepted, validated and then reach no emitted byte. Halting
+    # says so instead of dropping them silently.
+    mariadb_controller_init_scripts: >-
+      {{- if and (hasKey (default dict .values) "init_scripts") .values.init_scripts -}}
+      {{- fail "the MariaDB custom resource carries no first-initialization script surface, so values.init_scripts would reach no emitted byte on this realization; select the synthesis recipe in the Manifest, which does honor it, or run the statements against the database once it is ready" -}}
+      {{- end -}}
+    # Supplied credentials need a Secret to read them from. An empty name would
+    # render a custom resource the controller waits on forever.
+    mariadb_supplied_credentials_secret: >-
+      {{- if and (eq .infra.credentials "supplied") (not .infra.credentials_secret) -}}
+      {{- fail "infra.credentials is supplied, so name the existing Secret the controller reads the database credentials from in infra.credentials_secret; leave infra.credentials at generated to have the controller create and own those Secrets instead" -}}
+      {{- end -}}
+  # This Recipe reads from infra.overrides:
+  #   replicas - integer (MariaDB spec.replicas; default 1)
+  #
+  # The instance count is the one cluster-shape knob the Component's own schema does
+  # not enumerate for this realization: the default renders the single-instance
+  # server, and a replicated set raises it. The custom resource validates an odd
+  # count unless its own even-number escape is set, so raise it to an odd number.
+  #
+  # infra.ha and infra.backup are read by neither realization of this component, so
+  # the move between them loses nothing; values.init_scripts is honored by the
+  # synthesis realization alone, which is why it halts above rather than passing
+  # quietly.
+  #
+  # The developer's charset and collation are server configuration, and the custom
+  # resource's server-configuration surface is myCnf — so they are written there
+  # rather than as container environment, which this realization does not author.
+  # custom_config is appended after them, verbatim, keeping the Component's own
+  # "injected verbatim" contract; it carries its own group header, so a rendered
+  # file may name the same configuration group twice. The group name follows the
+  # project's own example manifest.
+  artifacts:
+    mariadb.yaml: |
+      apiVersion: k8s.mariadb.com/v1alpha1
+      kind: MariaDB
+      metadata:
+        name: {{ .context.instance_id }}
+      spec:
+        {{- if and .infra.overrides .infra.overrides.replicas }}
+        replicas: {{ .infra.overrides.replicas }}
+        {{- else }}
+        replicas: 1
+        {{- end }}
+        image: "mariadb:{{ .infra.engine_version }}"
+        port: {{ .infra.port }}
+        database: "{{ .values.database }}"
+        {{- if .values.user }}
+        username: "{{ .values.user }}"
+        {{- end }}
+        {{- if eq .infra.credentials "supplied" }}
+        rootPasswordSecretKeyRef:
+          name: "{{ .infra.credentials_secret }}"
+          key: root-password
+        {{- if .values.user }}
+        passwordSecretKeyRef:
+          name: "{{ .infra.credentials_secret }}"
+          key: password
+        {{- end }}
+        {{- end }}
+        storage:
+          size: "{{ .infra.storage.size }}"
+          storageClassName: "{{ .infra.storage.type }}"
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        service:
+          type: ClusterIP
+        myCnf: |
+          [mariadb]
+          character-set-server={{ .values.charset }}
+          collation-server={{ .values.collation }}
+      {{- if .values.custom_config }}
+      {{ .values.custom_config | indent 4 }}
+      {{- end }}
