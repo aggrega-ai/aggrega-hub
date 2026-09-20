@@ -117,11 +117,15 @@ cognitive browse axis of the catalog's three-axis label scheme:
   categories carry the `ai-` prefix; dual-use categories (`datastore`,
   `gateway`, `mesh`, `network`, `messaging`, `storage`) appear bare, with
   AI flavor expressed by capability labels, not a category prefix.
-- **Axis 3 — per-category capability labels** (`<role>.aggrega.ai/<dimension>`):
+- **Axis 3 — capability labels** (`<role>.aggrega.ai/<dimension>`):
   e.g. `agent.aggrega.ai/autonomy`, `model.aggrega.ai/capability`,
   `tool.aggrega.ai/impact`, `gateway.aggrega.ai/intelligence`,
   `datastore.aggrega.ai/engine`, `pipeline.aggrega.ai/mode`. These carry
-  the behavioral subsets selectors and policies discriminate on.
+  the behavioral subsets selectors and policies discriminate on. Most are
+  per-category, but `<role>` names the **concern** rather than the category
+  where several categories share one: `dataplane.aggrega.ai/<dimension>` names
+  a position on the traffic path, so a proxy, an ingress gateway and a service
+  mesh describe themselves in one vocabulary.
 
 Multi-membership is expressed through capability labels, never a
 multi-valued category: an entity is `category: datastore` plus whatever
@@ -209,6 +213,57 @@ reserved-namespace rule on output labels refuses the bare `aggrega.ai/` and
 alike — and `component.aggrega.ai/` identity keys sit outside those roots. So
 nothing stops a Recipe from typing the identity label literally except the
 author not doing it.
+
+### The `dataplane.aggrega.ai/` capability family
+
+`dataplane.aggrega.ai/<dimension>` records what a component standing in the
+traffic path is able to do to the traffic passing through it. Like `hosting` it
+is a **cross-cutter**, but on a different axis: the same dimensions describe a
+reverse proxy, an ingress gateway, an AI gateway and a service mesh, so the
+prefix names a **position on the traffic path** rather than any one component
+kind. Naming it after the kind that carried it first would oblige every later
+kind to restate the vocabulary under its own prefix, leaving one capability with
+several names and no selector able to span them.
+
+The dimensions and their value sets:
+
+| Dimension | Values | What the value asserts |
+| --- | --- | --- |
+| `request-mirroring` | `full-rate`, `sampled` | The carrier can copy a matching request to a second destination and discard that destination's response. `full-rate` copies every matching request and offers no setting that narrows it; `sampled` offers a settable share, so a carrier that can sample carries `sampled` and not both. |
+| `caller-identity` | `client-certificate` | The carrier can convey the original caller's identity to the service behind it. `client-certificate` names the mechanism: the client's own TLS certificate details travel to the backend. |
+| `upstream-tls` | `trust-anchor` | The carrier can require the service it forwards to present a certificate chaining to a trust anchor the deployment supplies. |
+
+Three rules bind the family, and each has already been got wrong once:
+
+- **The fidelity rides in the value, not in a second key.** Two carriers that both
+  mirror requests can still differ in the way a Feature cares about, so a Feature
+  selects the fidelity it needs and is refused early and by name when the carrier
+  cannot deliver it.
+- **A value asserts a capability, never a configured state.** The two read alike
+  and only the first is a property of the product. `core/gateway/nginx` carries
+  `upstream-tls: trust-anchor` although the verification it names is off until an
+  operator turns it on, because the label is what a selector reads *before*
+  anything is configured. Each carrier's label comment says this in its own
+  terms, so a reader of the entity is not left to infer it.
+- **A value is declared only once a component carries it, and each value is
+  established against the product's own reference documentation.** Two fidelities
+  the field does implement are deliberately absent for that reason: an identity
+  conveyed as a header the carrier composes after authenticating the caller, and
+  an upstream certificate pinned by key or fingerprint rather than verified
+  against an anchor. Neither has a component in this catalog that can honour it,
+  and a value with no carrier is worse than an absent one — a selector naming it
+  parses, matches nothing, and reports nothing. Each is added in the same act as
+  its first carrier.
+
+Carriers today: `core/gateway/nginx` (`request-mirroring: full-rate`,
+`upstream-tls: trust-anchor`), `core/gateway/contour` (`request-mirroring:
+sampled`, `caller-identity: client-certificate`, `upstream-tls: trust-anchor`),
+`core/gateway/kong` (`upstream-tls: trust-anchor`). None of them carries a
+`gateway.aggrega.ai/intelligence` value, and that is the separation working: the
+intelligence label names a **product tier** — whether the router parses the
+request body — while this family names **capabilities**, and a Feature that needs
+one of these has no reason to ask about the other. The two compose on one
+component where both are true.
 
 ### The `component.aggrega.ai/upstream-licensing` label
 
