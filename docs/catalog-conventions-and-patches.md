@@ -685,6 +685,17 @@ about what the string means.
   on a field marks that one field; `required: [a, b]` beside a `properties:` map
   names several at once. They are the same contract written at two scopes, not a
   drift.
+- **`source:` has two authored forms and both are correct.** A scalar is a path,
+  relative to the Recipe file, to material the entity ships beside itself — a
+  chart directory, or a single fragment. A map is a reference to a chart the
+  entity does not ship, spelled `kind`, `url` and `version`, and carrying `chart`
+  as well where the URL names a repository rather than the chart inside it. The
+  two describe different origins, so there is no one form to converge them onto.
+- **Two node names inside one Aggregate that read as variants of one word are
+  two different nodes.** A stack that composes an object store together with the
+  gateway reading from it names each separately, and merging the pair merges two
+  workloads. The same word may also name the socket on the edge into a node —
+  that is the edge's local alias, not a second spelling of the node.
 
 Before renaming a key for consistency, establish what the two spellings denote.
 Where they denote the same thing, converge them; where they denote different
