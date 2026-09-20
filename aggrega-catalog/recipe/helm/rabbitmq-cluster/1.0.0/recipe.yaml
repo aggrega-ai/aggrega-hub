@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: rabbitmq-cluster
+  version: 1.0.0
+  license: MPL-2.0
+  description: >
+    RabbitMQ realized as a RabbitmqCluster custom resource the RabbitMQ Cluster
+    Operator reconciles, rather than a directly synthesized StatefulSet — the
+    controller-driven realization of the same RabbitMQ component, selectable in the
+    Manifest alongside the synthesis recipe. The recipe emits one RabbitmqCluster
+    conformant to the rabbitmq.com/v1beta1 API; the controller turns it into a
+    running broker, its client Service and its credential Secret. provides.host is
+    the client Service the controller creates for the cluster, so a consumer wires
+    to it exactly as it would to the synthesized realization. Credential custody is
+    the operator's choice: infra.credentials generated leaves the password with the
+    controller, and supplied points it at an existing Secret named in
+    infra.credentials_secret. The RabbitMQ Cluster Operator is a runtime
+    prerequisite: the build halts unless the operator affirms it is installed
+    (infra.control_plane_present), so no custom resource is emitted into a cluster
+    that cannot reconcile it. Reach for this realization where the control plane is
+    already in place; reach for the synthesis recipe where it is not.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/messaging/rabbitmq:1.0.0
+  # The RabbitMQ Cluster Operator creates the cluster's client Service under the
+  # RabbitmqCluster's own name, with no suffix, listening on the AMQP port;
+  # provides.host is that bare in-cluster name, matching the synthesis
+  # realization's contract so consumers are realization-agnostic. A consumer in
+  # another namespace qualifies the host on its own side (caller-side routing).
+  #
+  # The port is written as the literal the controller's Service publishes rather
+  # than as infra.port, because the controller fixes it — see the port-fidelity
+  # assertion below.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "5672"
+    protocol: "amqp"
+  # Three declared conditions, each halting rather than emitting something that
+  # renders cleanly and does not work.
+  assertions:
+    # The RabbitMQ Cluster Operator must exist in the target cluster before a
+    # RabbitmqCluster custom resource can reconcile. The compiler cannot inspect
+    # cluster state, so the prerequisite is declared: an operator affirms it in the
+    # Release, and an unaffirmed build halts here rather than emitting an orphan
+    # custom resource.
+    rabbitmq_operator_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail "the RabbitMQ Cluster Operator must be installed in the target cluster before this realization emits its RabbitmqCluster custom resource; once the operator is present, affirm the prerequisite by setting infra.control_plane_present to true in the Release" -}}
+      {{- end -}}
+    # The controller fixes the ports on the client Service it creates: AMQP on 5672
+    # and the management API on 15672. They are not fields on the custom resource,
+    # so a port set here would be accepted, validated and then reach no emitted
+    # byte. Halting says so instead of dropping it silently.
+    rabbitmq_controller_port_fidelity: >-
+      {{- if ne (int .infra.port) 5672 -}}
+      {{- fail "the RabbitMQ Cluster Operator publishes AMQP on 5672 and this realization cannot move it; leave infra.port at its default on this realization, or select the synthesis recipe in the Manifest, which does honor it" -}}
+      {{- end -}}
+      {{- if ne (int .infra.management_port) 15672 -}}
+      {{- fail "the RabbitMQ Cluster Operator publishes the management API on 15672 and this realization cannot move it; leave infra.management_port at its default on this realization, or select the synthesis recipe in the Manifest, which does honor it" -}}
+      {{- end -}}
+    # Supplied credentials need a Secret to read them from. An empty name would
+    # render a custom resource the controller waits on forever.
+    rabbitmq_supplied_credentials_secret: >-
+      {{- if and (eq .infra.credentials "supplied") (not .infra.credentials_secret) -}}
+      {{- fail "infra.credentials is supplied, so name the existing Secret the controller reads the broker credentials from in infra.credentials_secret; leave infra.credentials at generated to have the controller create and own that Secret instead" -}}
+      {{- end -}}
+  # This Recipe reads from infra.overrides:
+  #   replicas - integer (RabbitmqCluster spec.replicas; default 1)
+  #
+  # The node count is the one cluster-shape knob the Component's own schema does
+  # not enumerate: the default renders the single-node broker, and a quorum
+  # cluster raises it. The custom resource's own field documentation notes that
+  # only odd counts form a quorum under a network partition, so raise it to an odd
+  # number.
+  artifacts:
+    rabbitmqcluster.yaml: |
+      apiVersion: rabbitmq.com/v1beta1
+      kind: RabbitmqCluster
+      metadata:
+        name: {{ .context.instance_id }}
+      spec:
+        {{- if and .infra.overrides .infra.overrides.replicas }}
+        replicas: {{ .infra.overrides.replicas }}
+        {{- else }}
+        replicas: 1
+        {{- end }}
+        image: "rabbitmq:{{ .infra.engine_version }}"
+        persistence:
+          storage: "{{ .infra.storage.size }}"
+          storageClassName: "{{ .infra.storage.type }}"
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        service:
+          type: ClusterIP
+        {{- if eq .infra.credentials "supplied" }}
+        secretBackend:
+          externalSecret:
+            name: "{{ .infra.credentials_secret }}"
+        {{- else }}
+        rabbitmq:
+          additionalConfig: |
+            default_user = {{ .values.username }}
+        {{- end }}
