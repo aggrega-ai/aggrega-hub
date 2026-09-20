@@ -508,6 +508,92 @@ mirrors, not the file:
 - `anthropic-agent/` in `ai-agent/` → `anthropic/` (name: `core/ai-agent/anthropic`)
 - `openai-model/` in `ai-model/` → `openai/` (name: `core/ai-model/openai`)
 
+### Naming a second realization of one component
+
+A Component may be realized by several Recipes on the **same** provider, with the
+Manifest choosing between them per deployment. A chart or controller realization
+is added beside an existing one rather than replacing it, so each Recipe needs a
+`metadata.name` of its own and a reader has to be able to tell at a glance which
+realization each name denotes.
+
+(Recipes on *different* providers need none of this: `recipe/helm/mariadb` and
+`recipe/compose/mariadb` share a name and are told apart by the provider segment
+of their path. The rule below is for two names that would otherwise collide.)
+
+**The bare component name belongs to the realization that stands the component up
+with nothing already in place** — nothing installed in the cluster, no resource
+already existing outside the deployment, nothing that must be fetched. That is the
+realization a reader can deploy anywhere, so it carries the plain name:
+`recipe/helm/mariadb`, `recipe/helm/postgres`, `recipe/helm/kafka`.
+
+**Every other realization is named `<bare name>-<distinguisher>`, and the
+distinguisher names what realizes it.** It is read off the realization itself, not
+invented for the name:
+
+| What distinguishes the realization | Distinguisher | Example |
+| --- | --- | --- |
+| The controller whose custom resource it emits | the controller's own project name | `kafka-strimzi`, `vllm-kserve`, `vllm-kubeai`, `function-keda`, `function-knative` |
+| The operator-managed instance it reconciles, where the controller carries the product's own name and repeating that would say nothing | what that instance is | `rabbitmq-cluster`, `mariadb-cluster` |
+| The managed product it provisions | the product's name | `mariadb-rds`, `mysql-rds` |
+| What stands between the application and the component | that mechanism | `openai-gateway` |
+| The artifact the Recipe wraps | the artifact kind | `mariadb-rds-module` |
+| That the resource lives outside the deployment | `external` | `postgres-external` |
+
+**Where no realization stands the component up with nothing already in place, none
+of them takes the bare name and every one carries a distinguisher.**
+`core/compute/function` is realized only through a scaling control plane, so its
+Recipes are `function-keda` and `function-knative` and there is no plain
+`function` to be had.
+
+#### What a distinguisher must not be
+
+A distinguisher describes **one** realization. It never ranks a realization
+against its siblings, and three shapes that do will be proposed:
+
+- **A version marker** — `-v2`, `-2`, `-next`. It records when the name was chosen
+  rather than anything about the realization, and it has nowhere to go for a third
+  realization that is neither earlier nor later but simply different. The version
+  axis already has two homes of its own, `metadata.version` and the version
+  directory segment, and a name that duplicates them can disagree with them.
+- **A quality judgement** — `-better`, `-proper`, `-production`. Which realization
+  is right is a property of the target cluster rather than of the Recipe: the
+  synthesis realization is the correct choice where no control plane runs, and the
+  controller-driven one is correct where one does. A name that settles the question
+  in advance is wrong for every cluster the other answer suits, and it is wrong
+  persuasively, because a reader has no reason to doubt a name.
+- **A temporal marker** — `-new`, `-legacy`, `-old`. It is accurate only until the
+  next realization is authored, and by then it is a name Manifests have been
+  written against, so correcting it is a rename reaching every Manifest a reader
+  has written.
+
+A distinguisher taken from what realizes the component avoids all three, because
+it states a fact about that one realization which stays true however many
+siblings arrive beside it.
+
+#### Say which realization to reach for
+
+Two realizations offered with no guidance is a coin flip presented as a choice. So
+each one states, in its own `metadata.description`, which realization to reach for
+**and the condition that decides it** — a condition a reader can check against
+their own cluster, never a bare preference.
+
+The conditions that actually decide it are concrete: whether the control plane a
+realization needs is already installed, whether a chart repository is reachable
+from the build, whether the build has to complete with nothing fetched, whether
+the resource already exists outside the deployment, whether a credential must be
+kept out of the application. `recipe/helm/mariadb-cluster` states it in one
+sentence — *reach for this realization where the control plane is already in
+place; reach for the synthesis recipe where it is not* — and
+`recipe/helm/mariadb` states the same choice from its own side, naming the
+conditions that select it.
+
+**The sentence is stated on the Component as well as on each Recipe**, because a
+reader arrives from either direction: someone choosing a component reads the
+Component's description and needs to know the choice exists, and someone already
+holding a Recipe needs to know what the alternative is and when it wins. The
+Component's sentence names every realization; each Recipe's names itself and its
+alternative.
+
 ### Key casing: two registers with two owners
 
 An entity's YAML carries two kinds of key, and they follow different rules
