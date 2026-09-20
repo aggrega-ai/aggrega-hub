@@ -230,7 +230,8 @@ The dimensions and their value sets:
 | Dimension | Values | What the value asserts |
 | --- | --- | --- |
 | `request-mirroring` | `full-rate`, `sampled` | The carrier can copy a matching request to a second destination and discard that destination's response. `full-rate` copies every matching request and offers no setting that narrows it; `sampled` offers a settable share, so a carrier that can sample carries `sampled` and not both. |
-| `caller-identity` | `client-certificate` | The carrier can convey the original caller's identity to the service behind it. `client-certificate` names the mechanism: the client's own TLS certificate details travel to the backend. |
+| `caller-identity` | `client-certificate`, `injected-header` | The component can convey the original caller's identity to the service behind it, and the value names which mechanism does it. `client-certificate`: the client's own TLS certificate details travel to the backend. `injected-header`: the component authenticates the caller itself and composes headers naming them, which travel upstream on the forwarded request. |
+| `prompt-guard` | `pattern-list` | The component can inspect the chat and completion payload it is routing and refuse a request on its content. `pattern-list` names the fidelity: the match is against allow and deny patterns supplied in its configuration. The dimension is deliberately narrower than content inspection in general — a component here reads the model payload it already parses to route, and not one of them inspects an arbitrary HTTP body. |
 | `upstream-tls` | `trust-anchor` | The carrier can require the service it forwards to present a certificate chaining to a trust anchor the deployment supplies. |
 
 Three rules bind the family, and each has already been got wrong once:
@@ -246,24 +247,32 @@ Three rules bind the family, and each has already been got wrong once:
   anything is configured. Each carrier's label comment says this in its own
   terms, so a reader of the entity is not left to infer it.
 - **A value is declared only once a component carries it, and each value is
-  established against the product's own reference documentation.** Two fidelities
-  the field does implement are deliberately absent for that reason: an identity
-  conveyed as a header the carrier composes after authenticating the caller, and
-  an upstream certificate pinned by key or fingerprint rather than verified
-  against an anchor. Neither has a component in this catalog that can honour it,
-  and a value with no carrier is worse than an absent one — a selector naming it
-  parses, matches nothing, and reports nothing. Each is added in the same act as
-  its first carrier.
+  established against the product's own reference documentation.** A value
+  nothing carries is worse than an absent one — a selector naming it parses,
+  matches nothing, and reports nothing — so each is added in the same act as the
+  first component to carry it. One fidelity the field does implement stays
+  absent for that reason: an upstream certificate pinned by key or fingerprint
+  rather than verified against an anchor. 🔴 **Its absence has a stronger ground
+  than "nothing carries it yet", and the difference decides what a later author
+  should do about it: no product in this set documents pinning by fingerprint,
+  public key or subject-key identifier at all.** A certificate-name assertion and
+  a named trust anchor are neither of them pins, so this is not a gap waiting on
+  a product — an attachment promising certificate pinning promises something
+  nothing here can honour.
 
 Carriers today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 `upstream-tls: trust-anchor`), `core/gateway/contour` (`request-mirroring:
 sampled`, `caller-identity: client-certificate`, `upstream-tls: trust-anchor`),
-`core/gateway/kong` (`upstream-tls: trust-anchor`). None of them carries a
-`gateway.aggrega.ai/intelligence` value, and that is the separation working: the
+`core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/litellm`
+(`caller-identity: injected-header`, `prompt-guard: pattern-list`,
+`upstream-tls: trust-anchor`). Three of the four carry no
+`gateway.aggrega.ai/intelligence` value and the fourth carries `semantic` — and
+that mixture is the separation working rather than an exception to it. The
 intelligence label names a **product tier** — whether the router parses the
-request body — while this family names **capabilities**, and a Feature that needs
-one of these has no reason to ask about the other. The two compose on one
-component where both are true.
+request body — while this family names **capabilities**, so the two answer
+different questions and a component may honestly carry both. What a component's
+tier value never tells a reader is which of these capabilities it has: the AI
+gateway carries three of them, and no amount of reading its tier would say so.
 
 ### The `component.aggrega.ai/upstream-licensing` label
 
