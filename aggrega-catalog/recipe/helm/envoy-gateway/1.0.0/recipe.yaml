@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: envoy-gateway
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    An Envoy Gateway ingress gateway via the project's own Helm chart,
+    distributed as an artifact in a container registry and referenced as one
+    here. The chart is published by the project's own maintainers, covers the
+    whole control plane, and carries the same version as the release it
+    packages, so this Recipe maps the Component's surface into it rather than
+    re-deriving the control plane by hand. The chart carries the controller and
+    the access control it runs under, the certificate-generation job the
+    authentication paths need, and — unless the Release turns that off — the
+    custom-resource definitions the gateway and its routes are written against.
+    Those definitions are the experimental channel of the routing API, which
+    carries the standard channel's resources plus the TCP, TLS and UDP routes
+    and the listener-set resource; a cluster already holding the standard
+    channel installs them separately and sets infra.install_crds to false.
+    Beside the chart this Recipe emits the two resources the chart leaves to its
+    user: the gateway class, claimed under the same controller name the control
+    plane is configured to answer for, and the gateway itself with one HTTP
+    listener. It does not emit the data plane — the control plane creates that
+    when it reconciles the gateway — and it does not emit a namespace. The
+    control-plane image is pinned to an explicit release tag for a reproducible
+    render; override it through infra.image. Two further images are named by the
+    render and neither floats — the rate-limit image the chart itself pins, and
+    the data-plane image, left to the control plane's own built-in default,
+    which the control-plane pin fixes in turn. Each is replaceable through
+    infra.overrides. Default chart version in source.version; override via
+    infra.source_version.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/gateway/envoy-gateway:1.0.0
+
+  source:
+    kind: helm-oci-chart
+    url: oci://docker.io/envoyproxy/gateway-helm
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"v1.9.1\" }}"
+
+  # Each published value names a resource this Recipe emits, so a route
+  # attaching to the gateway names something the render actually carries.
+  provides:
+    gateway_class_name: "{{ .values.gateway_class_name }}"
+    gateway_name: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+
+  # The runtime prerequisite, declared rather than hoped for. By default this
+  # Release installs the custom-resource definitions alongside the controller
+  # that reconciles them, so the gateway class and the gateway it emits have
+  # both halves of their control plane in the same render. Where the Release
+  # does not install them, the definitions have to be in the cluster already —
+  # and the compiler runs ahead of time and cannot look, so it asks the operator
+  # to affirm it and halts when nobody has.
+  assertions:
+    custom_resource_definitions_prerequisite: |
+      {{- if and (not .infra.install_crds) (not .infra.control_plane_present) -}}
+      {{ fail "this Release does not install the custom-resource definitions the gateway class and the gateway are written against, because infra.install_crds is false; affirm that the target cluster already carries them by setting infra.control_plane_present to true on this component in the Release, or set infra.install_crds back to true and let this Release install them" }}
+      {{- end -}}
+
+  # This Recipe reads from infra.overrides:
+  #   ratelimit_image  - string (global.images.ratelimit.image; replaces the chart's pin)
+  #   data_plane_image - string (global.images.envoyProxy.image; replaces the control plane's built-in default)
+  #   requests         - { cpu: string, memory: string } (control-plane resource requests)
+  #   service_type     - string (service.type; default ClusterIP)
+  #   replicas         - integer (deployment.replicas)
+  #   nodeSelector     - map[string]string
+  #   tolerations      - []object
+  valuesMapping: |
+    ## ── Resource naming ────────────────────────────────────────
+    ## Bind the chart's own name prefix to the instance id so every object it
+    ## renders is named after the component the Aggregate declared.
+    fullnameOverride: "{{ .context.instance_id }}"
+
+    ## ── Image pins ─────────────────────────────────────────────
+    ## Pin the control-plane image explicitly for a reproducible render;
+    ## override it via infra.image. The rate-limit image the chart pins and the
+    ## data-plane image the control plane defaults to are each replaceable
+    ## through infra.overrides, and neither is restated here — restating a pin
+    ## the upstream already makes would be a second copy that drifts from it.
+    global:
+      images:
+        envoyGateway:
+          image: "{{ .infra.image }}"
+        {{- if and .infra.overrides .infra.overrides.ratelimit_image }}
+        ratelimit:
+          image: "{{ .infra.overrides.ratelimit_image }}"
+        {{- end }}
+        {{- if and .infra.overrides .infra.overrides.data_plane_image }}
+        envoyProxy:
+          image: "{{ .infra.overrides.data_plane_image }}"
+        {{- end }}
+
+    ## ── Custom-resource definitions ────────────────────────────
+    ## Install the definitions the gateway and its routes are written against,
+    ## together with the upgrade-safety policy that guards them. Set
+    ## infra.install_crds to false where the cluster manages them separately.
+    crds:
+      enabled: {{ .infra.install_crds }}
+
+    ## ── Gateway class controller name ──────────────────────────
+    ## The control plane answers for this name and the gateway class this Recipe
+    ## emits is claimed under it, so the two halves read one value.
+    config:
+      envoyGateway:
+        gateway:
+          controllerName: "{{ .infra.controller_name }}"
+
+    ## ── Control-plane workload ─────────────────────────────────
+    deployment:
+      {{- if and .infra.overrides .infra.overrides.replicas }}
+      replicas: {{ .infra.overrides.replicas }}
+      {{- end }}
+      envoyGateway:
+        resources:
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          {{- if and .infra.overrides .infra.overrides.requests }}
+          requests:
+            cpu: "{{ .infra.overrides.requests.cpu }}"
+            memory: "{{ .infra.overrides.requests.memory }}"
+          {{- end }}
+      {{- if .infra.overrides }}
+      {{- if or .infra.overrides.nodeSelector .infra.overrides.tolerations }}
+      pod:
+        {{- if .infra.overrides.nodeSelector }}
+        nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+        {{- end }}
+        {{- if .infra.overrides.tolerations }}
+        tolerations: {{ toJson .infra.overrides.tolerations }}
+        {{- end }}
+      {{- end }}
+      {{- end }}
+
+    ## ── Control-plane service ──────────────────────────────────
+    ## This Service carries the configuration stream the data plane reads. It is
+    ## not the client entry point: client traffic reaches the Service the control
+    ## plane creates for the gateway.
+    service:
+      {{- if and .infra.overrides .infra.overrides.service_type }}
+      type: "{{ .infra.overrides.service_type }}"
+      {{- else }}
+      type: ClusterIP
+      {{- end }}
+
+  # The two resources the chart leaves to its user: the gateway class is
+  # cluster-scoped, and one gateway serves every route attached to it, so both
+  # belong to the install rather than to any single application.
+  artifacts:
+    gatewayclass.yaml: |
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: GatewayClass
+      metadata:
+        name: {{ .values.gateway_class_name }}
+      spec:
+        controllerName: {{ .infra.controller_name }}
+    gateway.yaml: |
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: Gateway
+      metadata:
+        name: {{ .context.instance_id }}
+      spec:
+        gatewayClassName: {{ .values.gateway_class_name }}
+        listeners:
+          - name: http
+            port: {{ .infra.port }}
+            protocol: HTTP
+            allowedRoutes:
+              namespaces:
+                from: {{ .values.allowed_route_namespaces }}
+
+  sourceDigests:
+    - kind: helm-oci-chart
+      url: oci://docker.io/envoyproxy/gateway-helm
+      version: v1.9.1
+      digest: sha256:68ce74961eeb5fc5e395628d6bbed9305a85b34619bd7ee17b01187f101bb8c5
+      manifestDigest: sha256:91bae9aedb91ab34731e987afe01a3ccf454393015abeca705eea8ee15553e86
