@@ -1,0 +1,234 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: timescaledb-cloudnative-pg
+  version: 1.0.0
+  description: >
+    The time-series database realized as a Cluster custom resource the
+    CloudNativePG control plane reconciles, rather than a directly synthesized
+    StatefulSet — the controller-driven realization of the same component,
+    selectable in the Manifest alongside the synthesized recipes. The product has
+    no control plane of its own, so this realization runs it under the
+    general-purpose PostgreSQL controller this catalog already uses for
+    core/datastore/postgres: the server image stays a stock PostgreSQL one and
+    the time-series extension arrives as a second image the controller mounts
+    into it, which is the mechanism that controller offers for an extension the
+    server image does not carry. The recipe emits one Cluster conformant to the
+    postgresql.cnpg.io/v1 API, naming both images and the preload list the
+    extension needs to be loaded at server start; the controller turns it into a
+    running server, the Services that reach it and the Secret holding the
+    database owner's password, and creates the initial database and its owning
+    role from the developer's own values. The controller presents the instances
+    under several Services and provides.host is the read-write one, so a consumer
+    wires to it exactly as it would to a synthesized realization. Credential
+    custody is the operator's choice: infra.credentials generated leaves the
+    owner's password with the controller, and supplied points it at an existing
+    Secret named in infra.credentials_secret. Two runtime prerequisites are
+    declared rather than assumed, and the build halts on either: the control
+    plane must be installed (infra.control_plane_present), and the cluster must
+    be able to mount an image as a volume (infra.image_volumes_supported), which
+    is how the extension reaches the server. Both image references are pinned
+    and already matched to each other: infra.server_image defaults to the stock
+    PostgreSQL build that the default infra.extension_image was itself built on,
+    so the pair agrees out of the box on the three things it has to agree on —
+    PostgreSQL major version, operating-system distribution and processor
+    architecture — and a Release that moves one moves the other. Reach for this
+    realization where that control plane is already in place and the cluster can
+    mount an image as a volume; reach for the synthesized timescaledb recipe
+    where it is not — that one needs nothing installed, reaches no chart
+    repository, and builds with nothing fetched.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/datastore/timescaledb:1.0.0
+
+  # The controller fixes the server's listen port: it writes the port setting into
+  # every instance's own configuration, so the custom resource carries no field for
+  # it and no server setting can move it. The published contract and the assertion
+  # below both read this one value, so what a consumer is handed and what the
+  # assertion accepts cannot drift apart.
+  locals:
+    server_port: "5432"
+
+  # The controller creates three Services for an instance, named by appending a
+  # suffix to the custom resource's own name: `-rw` routes to the primary and
+  # accepts writes, `-ro` routes to the replicas alone, and `-r` routes to any
+  # instance. provides.host is the read-write one. It is the only one that answers
+  # on a single-instance cluster — `-ro` selects replicas, of which there are none
+  # — and it is the address the controller itself writes into the connection
+  # material it generates for the database. The name is composed from the same
+  # instance identifier the custom resource's own metadata.name carries, so the
+  # published host and the resource that produces the Service cannot name two
+  # different things. The host is the bare in-cluster name, carrying no namespace,
+  # matching the synthesized realization's contract so consumers are
+  # realization-agnostic; a consumer in another namespace qualifies it on its own
+  # side (caller-side routing).
+  #
+  # The read-only endpoint stays reachable under the same naming rule, but it is
+  # not published: the provides contract is the Component's and is shared by every
+  # realization of it, and a key only one realization can fill is one a consumer
+  # cannot depend on.
+  provides:
+    host: "{{ .context.instance_id }}-rw"
+    port: "{{ .locals.server_port }}"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "postgres"
+
+  # Seven declared conditions, each halting rather than emitting something that
+  # renders cleanly and does not work.
+  assertions:
+    # The CloudNativePG control plane must exist in the target cluster before a
+    # Cluster custom resource can reconcile. The compiler cannot inspect cluster
+    # state, so the prerequisite is declared: an operator affirms it in the Release,
+    # and an unaffirmed build halts here rather than emitting an orphan custom
+    # resource.
+    cloudnative_pg_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail "the CloudNativePG control plane must be installed in the target cluster before this realization emits its Cluster custom resource; once the control plane is present, affirm the prerequisite by setting infra.control_plane_present to true in the Release" -}}
+      {{- end -}}
+    # The extension reaches the server as a mounted image, which is a cluster
+    # capability rather than a controller one, so it is affirmed separately from
+    # the control plane. Affirming only the control plane is a false comfort: the
+    # custom resource reconciles and the server comes up without the extension.
+    # What the operator affirms covers two independent things — the cluster-level
+    # feature and the node-level container runtime, which no newer Kubernetes
+    # lifts — so both are named in the halt rather than left to be inferred from
+    # the cluster version.
+    cloudnative_pg_image_volumes: >-
+      {{- if not .infra.image_volumes_supported -}}
+      {{- fail "the target cluster must be able to mount an image as a volume before this realization emits its Cluster custom resource: that is how the time-series extension reaches the server, and a cluster that cannot mount it reconciles a server running without the extension. Two things have to hold, and neither implies the other: the ImageVolume feature, which is on by default from Kubernetes 1.35 and is enabled by hand on 1.33 and 1.34, and the container runtime on the nodes, which must be containerd v2.1.0 or later or CRI-O v1.31 or later. Affirm both by setting infra.image_volumes_supported to true in the Release, or select the synthesized timescaledb recipe in the Manifest, which runs a single image already carrying the extension" -}}
+      {{- end -}}
+    # The stock server image carries a matched default — the build the default
+    # extension image was itself built on — so the ordinary path never reaches
+    # this halt. It is reachable by a Release that sets the key to an empty
+    # string, and that is what it guards: with no halt, an emptied key would
+    # emit a Cluster naming no server image at all, which renders cleanly and
+    # gives the control plane nothing to pull.
+    #
+    # The two references are not checked against each other. Reading a major
+    # version or a distribution out of an image tag is guesswork on a string the
+    # publisher is free to spell as it likes, and a check built on a guess refuses
+    # references that are perfectly correct.
+    cloudnative_pg_server_image: >-
+      {{- if not .infra.server_image -}}
+      {{- fail "infra.server_image is empty, so this realization has no stock PostgreSQL server image to name in its Cluster custom resource. The key carries a default that already matches the default infra.extension_image, which the controller mounts into the server; either leave it at that default, or name a PostgreSQL image built for the same major version, operating-system distribution and processor architecture as the extension image this Release selects" -}}
+      {{- end -}}
+    # The listen port is the controller's, not the operator's. A port set here would
+    # be accepted, validated and then reach no emitted byte, and the consumer would
+    # be handed a port the server does not answer on.
+    cloudnative_pg_fixed_port: >-
+      {{- if ne (printf "%v" .infra.port) .locals.server_port -}}
+      {{- fail "this realization runs the server on port 5432 and cannot move it: the controller writes the port setting into every instance's own configuration, so the custom resource carries no field for it; leave infra.port at 5432 here, or select the synthesized timescaledb recipe in the Manifest, which does honor another port" -}}
+      {{- end -}}
+    # The custom resource takes server configuration as named settings rather than
+    # as a configuration file, so a raw block has nowhere to go.
+    cloudnative_pg_custom_config: >-
+      {{- if and (hasKey (default dict .values) "custom_config") .values.custom_config -}}
+      {{- fail "the Cluster custom resource takes server configuration as named settings rather than as a configuration file, so values.custom_config would reach no emitted byte on this realization; set the individual settings under infra.overrides.parameters, which this realization writes into the custom resource, or select the synthesized timescaledb recipe in the Manifest, which does honor the raw block" -}}
+      {{- end -}}
+    # Supplied credentials need a Secret to read them from. An empty name would
+    # render a custom resource the controller waits on forever.
+    cloudnative_pg_supplied_credentials_secret: >-
+      {{- if and (eq .infra.credentials "supplied") (not .infra.credentials_secret) -}}
+      {{- fail "infra.credentials is supplied, so name the existing Secret the controller reads the database owner's credentials from in infra.credentials_secret; leave infra.credentials at generated to have the controller create and own that Secret instead" -}}
+      {{- end -}}
+    # On this realization the controller owns the database's credentials, so an
+    # attached credential is a request the recipe cannot fulfil. Dropping it quietly
+    # would leave the application holding one password and the database another —
+    # a build that succeeds and a database nobody can sign in to.
+    cloudnative_pg_credential_slots: >-
+      {{- if hasKey (default dict .features) "password" -}}
+      {{- fail "a credential is attached to the password slot, but on this realization the controller owns the database's credentials: it either generates the owner's password or reads it from the Secret named in infra.credentials_secret, so an attached credential would reach no emitted byte and the application would authenticate with a password the database does not have; remove the attachment and set infra.credentials, or select the synthesized timescaledb recipe in the Manifest, which does wire the slot" -}}
+      {{- end -}}
+
+  # This Recipe reads from infra.overrides:
+  #   parameters - map[string]string (server settings written to the custom
+  #                resource's own configuration surface; the route this realization
+  #                offers in place of the raw values.custom_config block, which
+  #                halts above)
+  #
+  # values.custom_config and infra.port are honored by the synthesized
+  # realizations alone, which is why they halt above rather than passing quietly.
+  # infra.engine_version is honored by the synthesized realizations alone as well,
+  # and it is the one knob here that does not halt: it selects a tag on a
+  # repository this realization never reaches, and its two coordinates are
+  # infra.server_image and infra.extension_image instead. The Component's own
+  # description of the key says which realizations read it, which is where an
+  # operator meets the answer while authoring rather than at a halt.
+  #
+  # The controller does not enable superuser access by default, and this recipe
+  # does not ask it to: the role named by values.user owns the application database
+  # and is the role a consumer signs in as, which is the account the published
+  # contract names.
+  artifacts:
+    # The extension's library has to be loaded before the server accepts
+    # connections; without it the server stops with a fatal error naming the
+    # missing preload. The synthesized realizations pass the list as a server
+    # option; here it is a field on the custom resource, which is the surface the
+    # controller writes into every instance's configuration.
+    # extra_preload_libraries is appended to the extension's own library rather
+    # than replacing it, so a developer asking for further libraries gets them
+    # alongside it — the same contract the Component states and the synthesized
+    # realizations keep.
+    #
+    # The extension itself arrives as its own image, mounted as a volume, rather
+    # than as part of the server image. The extension entry's `name` and the
+    # library named in the preload list are deliberately different strings, and
+    # neither is a misspelling of the other: the first names the extension entry,
+    # the second names the shared object the server loads.
+    cluster.yaml: |
+      apiVersion: postgresql.cnpg.io/v1
+      kind: Cluster
+      metadata:
+        name: {{ .context.instance_id }}
+      spec:
+        instances: 1
+        imageName: "{{ .infra.server_image }}"
+        storage:
+          size: "{{ .infra.storage.size }}"
+          storageClass: "{{ .infra.storage.type }}"
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        postgresql:
+          shared_preload_libraries:
+            - "timescaledb"
+          {{- with .values.extra_preload_libraries }}
+          {{- range splitList "," . }}
+            - "{{ trim . }}"
+          {{- end }}
+          {{- end }}
+          extensions:
+            - name: timescaledb-oss
+              image:
+                reference: "{{ .infra.extension_image }}"
+          {{- if and .infra.overrides .infra.overrides.parameters }}
+          parameters:
+            {{- range $name, $setting := .infra.overrides.parameters }}
+            {{ $name }}: "{{ $setting }}"
+            {{- end }}
+          {{- end }}
+        bootstrap:
+          initdb:
+            database: "{{ .values.database }}"
+            owner: "{{ .values.user }}"
+            {{- with .values.encoding }}
+            encoding: "{{ . }}"
+            {{- end }}
+            {{- with .values.locale }}
+            locale: "{{ . }}"
+            {{- end }}
+            {{- if eq .infra.credentials "supplied" }}
+            secret:
+              name: "{{ .infra.credentials_secret }}"
+            {{- end }}

@@ -18,22 +18,35 @@ metadata:
     for data that is not shaped that way, and core/datastore/documentdb is the
     document store built on the same engine. Exports its host, port, user,
     database, and protocol to consumers via the uses topology, so any consumer
-    that speaks PostgreSQL reaches it unchanged. Realized self-hosted by a Helm
-    Recipe (a StatefulSet with a persistent volume and a ClusterIP Service) and
-    by a Compose Recipe for local development.
+    that speaks PostgreSQL reaches it unchanged. Realized three ways, all
+    self-hosted: a Helm Recipe that synthesizes a StatefulSet with a persistent
+    volume and a ClusterIP Service, a Compose Recipe for local development, and
+    a Helm Recipe that emits a Cluster custom resource for the CloudNativePG
+    control plane to reconcile. The product has no control plane of its own, so
+    the controller-driven realization runs it under the general-purpose
+    PostgreSQL controller this catalog already uses for core/datastore/postgres,
+    with the extension delivered as a second image the controller mounts into
+    the server. Reach for the synthesized Recipes where nothing is installed in
+    the target cluster — they need no control plane and no chart repository, and
+    they build with nothing fetched; reach for the controller-driven Recipe where
+    that control plane is already in place and the cluster can mount an image as
+    a volume.
   labels:
     component.aggrega.ai/type: stateful-server
     component.aggrega.ai/category: datastore
-    # Both Recipes run the server as a container in the deployment's own
-    # boundary, and neither maps onto a provider-managed service, so a single
-    # posture is this component's identity. Selector-only: never stamped onto
-    # rendered output.
+    # Every Recipe runs the server as a container in the Release's own
+    # boundary — the synthesized ones directly, the controller-driven one through
+    # a control plane installed in that same cluster — and none maps onto a
+    # provider-managed service, so a single posture is this component's identity.
+    # Selector-only: never stamped onto rendered output.
     component.aggrega.ai/hosting: self-hosted
     # The extension's source is split: the code outside its `tsl` directory is
     # published under the Apache License 2.0, and the code within it under the
-    # vendor's own terms. Which set covers a deployment therefore follows the
-    # image tag `engine_version` selects, and the default selects an `-oss` tag
-    # — the build that ships only the Apache-licensed shared objects.
+    # vendor's own terms. Which set covers a given Release therefore follows the
+    # image the realization runs — the tag `engine_version` selects on the
+    # synthesized realizations, and `extension_image` on the controller-driven
+    # one. Both defaults select an `-oss` build: the one that ships only the
+    # Apache-licensed shared objects.
     component.aggrega.ai/upstream-licensing: open-core
   maintainers:
     - name: Massimiliano Ferrero
@@ -54,11 +67,11 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [env]
-      description: "Optional database password credential. When attached, supplies POSTGRES_PASSWORD via the credential subsystem; unattached, the Recipe uses its inline default."
+      description: "Optional database password credential. When attached, supplies POSTGRES_PASSWORD via the credential subsystem; unattached, the Recipe uses its inline default. The controller-driven realization owns the database's credentials through infra.credentials and halts the build when this slot is filled."
   schema:
     values:
       # Developer Intent — filled by the Developer in the Aggregate. Every key
-      # carries a default where the engine has one, so a bare deployment renders
+      # carries a default where the engine has one, so a bare Release renders
       # without the developer choosing anything.
       database:
         type: string
@@ -81,16 +94,21 @@ spec:
           server's configuration file, so settings it omits keep their built-in
           defaults. One setting is not read from this block: the extension's
           library must be preloaded at server start or the server refuses to
-          start, so the Recipe passes the preload list as a server option, which
-          takes precedence over the configuration file. Name any further
-          libraries in extra_preload_libraries rather than here.
+          start, so the synthesized Recipes pass the preload list as a server
+          option, which takes precedence over the configuration file. Name any
+          further libraries in extra_preload_libraries rather than here. The
+          controller-driven realization takes server configuration as named
+          settings rather than as a file and halts the build when this is set,
+          naming the key it offers instead.
       extra_preload_libraries:
         type: string
         description: >
           Additional shared libraries to preload at server start, as a
           comma-separated list (e.g. pg_stat_statements). The extension's own
           library is always preloaded and does not need naming here; entries
-          given here are appended to it.
+          given here are appended to it. Every realization honors this — the
+          synthesized ones as a server option, the controller-driven one as the
+          preload list on the Cluster custom resource.
     infra:
       # Operational Sizing — filled by the Operator in the Release. Developer
       # never sees this.
@@ -99,17 +117,69 @@ spec:
         min: 1024
         max: 65535
         default: 5432
-        description: Server listen port. Most operators should omit this and let the Recipe assign the default (5432).
+        description: >
+          Server listen port. Most operators should omit this and let the Recipe
+          assign the default (5432). The controller-driven realization runs the
+          server on 5432 and cannot move it, so it halts the build on any other
+          value rather than handing a consumer a port the server does not answer
+          on.
       engine_version:
         type: string
-        default: "2.29.2-pg17-oss"
+        default: "2.29.2-pg18-oss"
         description: >
-          Server image tag. One compound coordinate carries three parts: the
-          extension version, the PostgreSQL major version it is built against,
-          and the edition suffix — so an operator supplies a value shaped like
-          2.29.2-pg17-oss rather than a bare major version. Dropping the -oss
-          suffix selects the build that also carries the vendor-licensed shared
-          objects.
+          Server image tag the synthesized Recipes run. One compound coordinate
+          carries three parts: the extension version, the PostgreSQL major
+          version it is built against, and the edition suffix — so an operator
+          supplies a value shaped like 2.29.2-pg18-oss rather than a bare major
+          version. Dropping the -oss suffix selects the build that also carries
+          the vendor-licensed shared objects. The controller-driven realization
+          does not read this key: it runs a stock PostgreSQL server image and
+          mounts the extension beside it as a second image, so its two
+          coordinates are server_image and extension_image.
+      server_image:
+        type: string
+        default: "ghcr.io/cloudnative-pg/postgresql:18.6-minimal-trixie"
+        description: >
+          Full reference of the stock PostgreSQL server image the
+          controller-driven realization runs. It carries no time-series
+          extension of its own — the extension arrives as the separate image
+          named in extension_image, which the controller mounts into this one.
+          The two have to be built for the same PostgreSQL major version,
+          operating-system distribution and processor architecture, or the
+          extension's shared objects do not load, so the pair is chosen
+          together. The default here is the build the default extension_image
+          was itself built on: the CloudNativePG project builds its extension
+          images on top of its own minimal PostgreSQL images, and the extension
+          image records that base in its own metadata — PostgreSQL 18 on the
+          Debian trixie base, the minimal build. So the reference has to name
+          the minimal build specifically, not merely the right major version and
+          base: a differently built image at the same major version and base
+          presents a different set of shared libraries for the extension to link
+          against. The default names a specific minor version rather than a tag
+          that rolls, so the
+          reference does not move under a Release. Set this key to move the pin —
+          to another minor version, another base, or a digest reference — and
+          move extension_image with it, since changing one side alone is what
+          breaks the pairing. A build that sets this key empty halts naming it
+          rather than emitting a Cluster with no server image. The synthesized
+          Recipes ignore it and take their image from engine_version.
+      extension_image:
+        type: string
+        default: "ghcr.io/cloudnative-pg/timescaledb-oss:2.29.2-18-trixie"
+        description: >
+          Full reference of the image carrying the time-series extension, which
+          the controller-driven realization mounts into server_image as a
+          volume. The default names the Apache-licensed build the CloudNativePG
+          project publishes at the extension version this component targets, for
+          PostgreSQL 18 on the Debian trixie base — which is the pairing the
+          default server_image already names, so the two defaults match without
+          an operator choosing either. It is pinned by tag: an image mounted as
+          a volume is resolved by the target cluster rather than by the build,
+          so whether a digest reference resolves on that path is the operator's
+          to check against their own cluster. Set this key to move the pin — to
+          another extension version, another base, or a digest reference that
+          cluster resolves — and move server_image with it. The synthesized
+          Recipes ignore it.
       compute:
         cpu:
           type: string
@@ -130,6 +200,56 @@ spec:
         type: object
         additionalProperties: true
         description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+      control_plane_present:
+        type: boolean
+        default: false
+        description: >
+          Operator affirmation that the CloudNativePG control plane is installed
+          in the target cluster. The controller-driven realization halts the
+          build unless this is set true, so a Cluster custom resource is never
+          emitted as an orphan into a cluster that cannot reconcile it. The
+          synthesized realizations ignore this flag.
+      image_volumes_supported:
+        type: boolean
+        default: false
+        description: >
+          Operator affirmation that the target cluster can mount an image as a
+          volume, which is how the controller-driven realization delivers the
+          extension. Two things have to hold for it and neither implies the
+          other: the cluster's ImageVolume feature, which is on by default from
+          Kubernetes 1.35 and is enabled by hand on 1.33 and 1.34; and the
+          container runtime the nodes run, which has to be containerd v2.1.0 or
+          later, or CRI-O v1.31 or later. The runtime floor is a node-level one
+          that no newer Kubernetes lifts, so check it against the nodes rather
+          than reading it off the cluster version. The controller-driven
+          realization halts the build unless this is set true, because an
+          extension the cluster cannot mount leaves a server that starts without
+          it. The synthesized realizations ignore this flag.
+      credentials:
+        type: string
+        enum: [generated, supplied]
+        default: generated
+        description: >
+          Who owns the database's credentials on the controller-driven
+          realization. `generated` — the controller creates the Secret holding
+          the owning role's password and owns it, which is what it does when
+          nothing is supplied; the developer's `database` and `user` values are
+          still honored, and no password reaches the rendered artifact.
+          `supplied` — the controller reads that role's credentials from an
+          existing Secret named in `credentials_secret` and generates none. The
+          synthesized realizations ignore this key: they take the database
+          password from the `password` credential slot.
+      credentials_secret:
+        type: string
+        default: ""
+        description: >
+          Name of the existing Secret the controller-driven realization reads the
+          database owner's credentials from when `credentials` is `supplied`. The
+          Secret lives in the same namespace as the database, is of type
+          `kubernetes.io/basic-auth`, and carries a `username` entry that must
+          match `values.user` alongside a `password` entry holding that role's
+          password. Leave it empty when `credentials` is `generated`; a
+          controller-driven build halts if `supplied` is selected without it.
     provides:
       # Public API Contract — keys exported to consumers via uses topology edges.
       host:
