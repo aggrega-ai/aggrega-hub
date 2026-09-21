@@ -1107,6 +1107,21 @@ spec:
       source_version: { type: string }
 ```
 
+### Pinning upstream keys is all-or-nothing per gateway
+
+Where a gateway Component exposes a knob for pinning the public keys it accepts
+from the upstreams it forwards to, a Release fills that knob for every upstream
+the gateway reaches or for none of them: each upstream carries an entry of its
+own, or one it inherits from a `*` entry. The first entry switches that gateway
+off chain verification for every upstream it reaches, so an upstream left out is
+reached with nothing verified at all rather than verified less strictly.
+
+Nothing checks this and a Release may leave an upstream out — the entries are
+text carried through to the gateway, so a half-filled surface renders as
+willingly as a complete one. What each entry means to the gateway belongs on the
+knob's own description; the convention is here because that description answers
+what one entry does and this is a property of the whole set.
+
 ## 5. Shared schema and mapping reuse
 
 Schema fragments shared across multiple Components or Features live in **SchemaLibrary** entries under `schemalibrary/`. Go template fragments shared across multiple Recipes or FeatureRecipes live in **MappingLibrary** entries under `mappinglibrary/`. Reuse via cross-document references — `$ref:` for schemas, `$import:` for mappings — replaces the inline-duplication pattern.
