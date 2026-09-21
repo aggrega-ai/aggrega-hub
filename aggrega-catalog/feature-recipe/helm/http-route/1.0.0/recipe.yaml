@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: http-route
+  version: 1.0.0
+  description: >
+    Component-scope FeatureRecipe for core/http-route: emits one Gateway API
+    HTTPRoute per attached component from a co-located chart, attaching the
+    route to the gateway the Operator names and forwarding the
+    developer-declared host and the request path to a port on the Service the
+    component's own Recipe emits. Resource Generation via source +
+    valuesMapping; the per-component .context.* root is available at component
+    scope. The route is emitted at gateway.networking.k8s.io/v1, which is the
+    version the routing API both serves and stores it at. The backend Service
+    name is the operator-set service_name where one is supplied, and otherwise
+    the primary Service a synthesized workload emits for the attached component
+    — the instance id followed by the primary service key, which is how
+    workload synthesis names it. The emitted resource is named for the
+    component that carries the attachment and for the attachment itself, so one
+    component carrying two of these attachments emits two routes rather than
+    one overwriting the other. A gateway control plane is a runtime
+    prerequisite: the build halts unless the Operator affirms one is running in
+    the target cluster (infra.control_plane_present), so a route is never
+    emitted into a cluster with nothing to reconcile it into routing. The
+    build also halts where the attachment names no gateway to attach to or no
+    Service port to forward to, because neither has a fallback that could be
+    right.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/http-route:1.0.0
+  # executionScope omitted -> component: renders once per attached component.
+  source: ./chart
+
+  # A gateway control plane implementing the Gateway API must already be
+  # running in the target cluster, and reconciling the gateway this route
+  # names, before an emitted route becomes routing; without one the route is an
+  # orphan that routes nothing. The compiler is ahead-of-time and cannot
+  # inspect cluster state, so the prerequisite is declared instead: the
+  # Operator affirms it on this attachment in the Release, and an unaffirmed
+  # build halts here rather than emitting a resource the cluster cannot act on.
+  #
+  # The two assertions below it guard the wiring the route cannot supply for
+  # itself. A route with no parent gateway attaches to nothing, and a route
+  # with no backend port forwards nowhere; both would render cleanly and serve
+  # no traffic, so both halt instead.
+  assertions:
+    gateway_control_plane_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail "a gateway control plane implementing the Gateway API must be running in the target cluster before this attachment emits its route; once one is present — installed cluster-wide, or declared as a gateway component in this same Aggregate — affirm the prerequisite by setting infra.control_plane_present to true on this attachment in the Release" -}}
+      {{- end -}}
+    gateway_parent_supplied: >-
+      {{- if not (optional .infra "gateway_name" "") -}}
+      {{- fail "this attachment names no gateway for its route to attach to, so the route would be admitted by nothing and serve no traffic: set infra.gateway_name on this attachment in the Release to the name of the gateway that fronts this component" -}}
+      {{- end -}}
+    service_port_supplied: >-
+      {{- if not (optional .infra "service_port" 0) -}}
+      {{- fail "this attachment names no Service port for its route to forward to, and a route names its backend port by number rather than by name: set infra.service_port on this attachment in the Release to the port the attached component's Service publishes" -}}
+      {{- end -}}
+
+  # This template is the single authored home for every routing fallback, and
+  # the chart reads what it resolves rather than re-deriving anything. An
+  # operator override wins wherever one is supplied; where none is, the
+  # fallback here is what renders. Putting a fallback in the chart as well would
+  # give one value two homes, and the two agreeing today is exactly what would
+  # hide them disagreeing later.
+  #
+  # The Service fallback is the primary Service workload synthesis emits for the
+  # attached component: the instance id followed by the primary service key. An
+  # upstream chart that names its own Service is reached by setting service_name.
+  #
+  # The emitted resource carries the identity of the scope holding the
+  # attachment and the attachment's own name, so a component carrying this
+  # attachment twice emits two distinctly named routes. An attachment name may
+  # be authored with underscores, which a Kubernetes resource name cannot
+  # carry, so it is folded to hyphens.
+  #
+  # The scope's namespace, when the scope declares one, so the emitted route
+  # lands beside the Service it forwards to rather than wherever the applying
+  # tool defaults to. Empty when no scope declares one, and the chart then omits
+  # the field — matching a synthesized workload, which also emits no namespace
+  # and is placed by the applying tool.
+  valuesMapping: |
+    {{- $service := default (printf "%s-default" .context.instance_id) .infra.service_name }}
+    {{- $path := default "/" .infra.path }}
+    targetName: "{{ .context.instance_id }}"
+    attachmentName: "{{ .attachment_name | replace "_" "-" }}"
+    host: "{{ .values.host }}"
+    gatewayName: "{{ .infra.gateway_name }}"
+    gatewayNamespace: "{{ .infra.gateway_namespace }}"
+    listenerName: "{{ .infra.listener_name }}"
+    serviceName: "{{ $service }}"
+    servicePort: {{ .infra.service_port }}
+    path: "{{ $path }}"
+    {{- $ns := "" }}
+    {{- if .context.annotations }}
+      {{- if .context.annotations.release }}
+        {{- $raw := index .context.annotations.release "aggrega.ai/namespace" }}
+        {{- if $raw }}{{- $ns = $raw }}{{- end }}
+      {{- end }}
+    {{- end }}
+    namespace: "{{ $ns }}"
