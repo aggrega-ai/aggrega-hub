@@ -106,8 +106,15 @@ Every Component under `core/` carries `component.aggrega.ai/category`, the
 cognitive browse axis of the catalog's three-axis label scheme:
 
 - **Axis 1 — operational `type`** (`component.aggrega.ai/type`): one of the
-  7 cloud-native primitives. Describes how infrastructure treats the
-  component (state, ingress, lifecycle). Never carries cognitive vocabulary.
+  cloud-native primitives — `server`, `worker`, `task`, `function`,
+  `stateful-server`, `resource`. Describes how infrastructure treats the
+  component (state, ingress, lifecycle). Never carries cognitive vocabulary,
+  and never a word the category axis uses: a value on both axes leaves a
+  reader unable to tell which one a label is speaking on, and a selector
+  written for one silently matching the other. The set is Aggrega's own and
+  the published Component schema enumerates it, so an entity carrying
+  anything else is refused when the document loads. A catalog needing a
+  classification of its own adds its own label key beside this one.
 - **Axis 2 — cognitive `category`** (`component.aggrega.ai/category`): a
   closed, single-valued set of 15:
   `ai-agent`, `ai-model`, `ai-tool`, `ai-pipeline`, `datastore`, `gateway`,
