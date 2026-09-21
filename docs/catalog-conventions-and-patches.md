@@ -65,7 +65,7 @@ the label section below). The 15 categories:
 | `gateway` | API and AI gateways | server | populated |
 | `mesh` | Service meshes | server | created when the first entity lands |
 | `network` | Network primitives | server, resource | created when the first entity lands |
-| `messaging` | Event buses, queues, streams, the realtime media services that carry voice and video between participants, and the external carriers a message leaves the deployment through | stateful-server, server, resource | populated |
+| `messaging` | Event buses, queues, streams, the realtime media services that carry voice and video between participants, and the external carriers a message leaves the Release through | stateful-server, server, resource | populated |
 | `storage` | Object/file storage, managed cloud resources | resource, server | populated |
 | `compute` | Generic compute primitives, plus the control planes an event-driven realization depends on | server, worker, task, function | populated |
 | `observability` | Telemetry, tracing, monitoring | varies | populated |
@@ -155,19 +155,19 @@ alike, so the label lives under the shared `component.aggrega.ai/` namespace
 rather than any one category's `<role>.aggrega.ai/` capability namespace. The
 value set is a standard-library convention (the compiler is blind to it):
 
-- **`self-hosted`** — the deployment runs the compute itself, as containers in
+- **`self-hosted`** — the Release runs the compute itself, as containers in
   its own cluster. The operator owns the process lifecycle.
-- **`managed`** — the deployment consumes a managed service it does not run:
+- **`managed`** — the Release consumes a managed service it does not run:
   a managed instance in the operator's own cloud account, or a third-party
-  managed / SaaS API. The provider owns the process lifecycle; the deployment
+  managed / SaaS API. The provider owns the process lifecycle; the Release
   holds a contract and credentials.
-- **`external`** — the deployment references a pre-existing resource it neither
+- **`external`** — the Release references a pre-existing resource it neither
   provisions nor operates. The resource's lifecycle sits entirely outside the
-  deployment; the Recipe emits only the wiring to reach it.
+  Release; the Recipe emits only the wiring to reach it.
 
 **Where the value lives — hosting is a static identity label.** `hosting` is a
 component identity label (`metadata.labels`): its value is a property of the
-component, fixed by the entity rather than by any one deployment. Which value a
+component, fixed by the entity rather than by any one Release. Which value a
 component carries depends on whether the trait is invariant across the
 component's Recipes:
 
@@ -179,7 +179,7 @@ component's Recipes:
   value **`mixed`** — for example a datastore realized self-hosted by its Helm
   and Compose Recipes and managed by its Terraform/CloudFormation RDS Recipes.
   `mixed` is the honest identity value for a multi-posture component: no single
-  posture *is* its identity, and the actual posture of a deployment follows the
+  posture *is* its identity, and the actual posture of a Release follows the
   Recipe the Manifest selects rather than any stamped trait. The component stays
   unified (one component, several Recipes); it is not split per posture.
 
@@ -232,7 +232,7 @@ The dimensions and their value sets:
 | `request-mirroring` | `full-rate`, `sampled` | The carrier can copy a matching request to a second destination and discard that destination's response. `full-rate` copies every matching request and offers no setting that narrows it; `sampled` offers a settable share, so a carrier that can sample carries `sampled` and not both. |
 | `caller-identity` | `client-certificate`, `injected-header` | The component can convey the original caller's identity to the service behind it, and the value names which mechanism does it. `client-certificate`: the client's own TLS certificate details travel to the backend. `injected-header`: the component authenticates the caller itself and composes headers naming them, which travel upstream on the forwarded request. |
 | `prompt-guard` | `pattern-list` | The component can inspect the chat and completion payload it is routing and refuse a request on its content. `pattern-list` names the fidelity: the match is against patterns supplied in its configuration. The dimension is deliberately narrower than content inspection in general — a component here reads the model payload it already parses to route, and not one of them inspects an arbitrary HTTP body. |
-| `upstream-tls` | `trust-anchor` | The carrier can require the service it forwards to present a certificate chaining to a trust anchor the deployment supplies. |
+| `upstream-tls` | `trust-anchor` | The carrier can require the service it forwards to present a certificate chaining to a trust anchor the Release supplies. |
 
 Three rules bind the family, and each has already been got wrong once:
 
@@ -278,7 +278,7 @@ gateway carries three of them, and no amount of reading its tier would say so.
 
 `component.aggrega.ai/upstream-licensing` records the licensing class of the
 **product or service the Component wraps** — the third-party software a
-deployment actually runs or calls. Like `hosting` it is a **cross-cutter**: the
+Release actually runs or calls. Like `hosting` it is a **cross-cutter**: the
 same values describe a datastore engine, a hosted model API and an agent
 framework alike, so it lives under the shared `component.aggrega.ai/` namespace
 rather than under any one category's `<role>.aggrega.ai/` capability namespace.
@@ -316,10 +316,10 @@ The value set is a closed, single-valued standard-library convention (the
 compiler is blind to it, as it is to every label):
 
 - **`osi-approved`** — the wrapped product is published under an OSI-approved
-  licence, and that licence covers the artifact a deployment runs.
+  licence, and that licence covers the artifact a Release runs.
 - **`open-core`** — the wrapped product's core is published under an
   OSI-approved licence while a named subtree or edition is not, so which terms
-  apply depends on which part a deployment uses.
+  apply depends on which part a Release uses.
 - **`source-available`** — the source is published under terms that are not
   OSI-approved, and those terms attach conditions to redistribution, to hosting,
   or to offering the software as a service. Whether they also let a given reader
@@ -339,7 +339,7 @@ schema enforcement.
 
 **It classifies the wrapped product, not this project's own dependencies.** The
 two are separate surfaces with separate rules. This label records the terms
-covering third-party software a deployment runs or calls, and every value in the
+covering third-party software a Release runs or calls, and every value in the
 set is available to it. The terms this project accepts for its own third-party
 dependencies — the libraries its compiler and tooling are built from — are
 governed separately, by a dependency-licence gate that is stricter. So a value
@@ -378,8 +378,8 @@ software it packages, and where the two differ the packaged software governs.
   and run the pinned artifact for themselves — a right terms can grant while
   still attaching conditions to redistribution, to hosting, or to offering the
   software as a service.
-- **A service a deployment merely calls is not a pinned artifact.** Where the
-  entity pins nothing and its Recipes only wire a deployment to a service the
+- **A service a Release merely calls is not a pinned artifact.** Where the
+  entity pins nothing and its Recipes only wire a Release to a service the
   reader contracts for directly — the reference realization of a hosted API — the
   test does not apply, and the entity is admitted whatever the service's own
   terms are. That relationship is between the user and the provider; the catalog
@@ -575,7 +575,7 @@ mirrors, not the file:
 ### Naming a second realization of one component
 
 A Component may be realized by several Recipes on the **same** provider, with the
-Manifest choosing between them per deployment. A chart or controller realization
+Manifest choosing between them per Release. A chart or controller realization
 is added beside an existing one rather than replacing it, so each Recipe needs a
 `metadata.name` of its own and a reader has to be able to tell at a glance which
 realization each name denotes.
@@ -586,7 +586,7 @@ of their path. The rule below is for two names that would otherwise collide.)
 
 **The bare component name belongs to the realization that stands the component up
 with nothing already in place** — nothing installed in the cluster, no resource
-already existing outside the deployment, nothing that must be fetched. That is the
+already existing outside the Release, nothing that must be fetched. That is the
 realization a reader can deploy anywhere, so it carries the plain name:
 `recipe/helm/mariadb`, `recipe/helm/postgres`, `recipe/helm/kafka`.
 
@@ -601,7 +601,7 @@ invented for the name:
 | The managed product it provisions | the product's name | `mariadb-rds`, `mysql-rds` |
 | What stands between the application and the component | that mechanism | `openai-gateway` |
 | The artifact the Recipe wraps | the artifact kind | `mariadb-rds-module` |
-| That the resource lives outside the deployment | `external` | `postgres-external` |
+| That the resource lives outside the Release | `external` | `postgres-external` |
 
 **Where no realization stands the component up with nothing already in place, none
 of them takes the bare name and every one carries a distinguisher.**
@@ -644,7 +644,7 @@ their own cluster, never a bare preference.
 The conditions that actually decide it are concrete: whether the control plane a
 realization needs is already installed, whether a chart repository is reachable
 from the build, whether the build has to complete with nothing fetched, whether
-the resource already exists outside the deployment, whether a credential must be
+the resource already exists outside the Release, whether a credential must be
 kept out of the application. `recipe/helm/mariadb-cluster` states it in one
 sentence — *reach for this realization where the control plane is already in
 place; reach for the synthesis recipe where it is not* — and
@@ -1540,7 +1540,7 @@ no containers, and so runs nothing. This is the shape a
 The reference realization fulfils the **same `provides` contract** as a
 provisioning Recipe for the same component, so a single component can offer
 several realizations — self-hosted, managed, referenced — selected per
-deployment through the Manifest's component-type mapping. The consumer's wiring
+Release through the Manifest's component-type mapping. The consumer's wiring
 is identical regardless of which realization answers it, because it reads the
 component's `provides` outputs, not the realization behind them.
 
@@ -1559,7 +1559,7 @@ Per engine, the wiring the reference Recipe emits:
 
 The credential slot is filled by a referenced credential — the
 `core/referenced-secret` Feature — rather than a provisioned one, so the secret
-material comes from outside the deployment. An optional governance Feature can
+material comes from outside the Release. An optional governance Feature can
 ride the same edge to carry policy context for the referenced resource without
 coupling it to provisioning.
 
@@ -1567,11 +1567,11 @@ coupling it to provisioning.
 the who-operates axis; the resource *lifecycle* — provision → adopt → reference
 — is a separate axis. A reference realization (provides-only, emits no compute)
 ships with the conventions above. *Adoption* — taking an existing resource under
-management so subsequent changes flow through the deployment, via the engine's
+management so subsequent changes flow through the Release, via the engine's
 own take-ownership syntax (Terraform `import` blocks, Crossplane observe-only
 management) — is a distinct capability delivered by a FeatureRecipe transform,
 not by the hosting label. A referenced resource stays externally owned; an
-adopted resource becomes deployment-managed.
+adopted resource becomes Release-managed.
 
 ### Gateway / operator-driven (custom-resource-emitting) Recipes
 
@@ -1580,7 +1580,7 @@ a controller that reconciles a **custom resource** into running infrastructure
 (a message broker becomes a Strimzi `Kafka`; a model-serving path becomes an
 Envoy AI Gateway `AIServiceBackend`). A Recipe realizes this by emitting the
 custom resource — one more realization of an existing component, selected per
-deployment through the Manifest's component-type mapping, coexisting with that
+Release through the Manifest's component-type mapping, coexisting with that
 component's synthesis, reference, and cloud-native realizations.
 
 The custom resource carries in `artifacts:`, one map entry per emitted file. The
@@ -1605,7 +1605,7 @@ never a silent emit. Two shapes, both explicit:
   with a build-time `assertions` entry that halts loudly when the flag is
   unaffirmed. The operator sets the flag in the Release once the control plane is
   in place, consciously acknowledging the requirement.
-- **Bundled-deploy** — the deployment ships the control plane too. The operator
+- **Bundled-deploy** — the Release ships the control plane too. The operator
   install is a first-class **companion component** (a `server` component whose
   Recipe emits the ServiceAccount, cluster RBAC, and controller Deployment, or
   wraps the project's upstream install chart), declared in the same Aggregate
@@ -1641,7 +1641,7 @@ A self-hosted inference runtime — a model server run on the cluster's own
 compute, marked `component.aggrega.ai/hosting: self-hosted` in the `ai-model`
 category (`ollama`, `vllm`, `tgi`, `tei`, `nvidia-nim`) — is deployed two
 genuinely different ways in the field, and each is a Recipe realizing the same
-component, selected per deployment through the Manifest:
+component, selected per Release through the Manifest:
 
 - **Direct synthesis.** The Recipe synthesizes the server itself as a `Workload`:
   a weights-pull initContainer resolves the model pointer into a per-replica
@@ -1739,7 +1739,7 @@ account reads exactly as authoritative as a right one.
 | `services.<n>` | A `NodePort` or `LoadBalancer` entry publishes its ports on the host. A `ClusterIP` or `Headless` entry publishes nothing, so a port an operator sets reaches no emitted byte. |
 | `replicas` | **Dropped, with a warning** naming it. |
 | An attached credential | Arrives on the inject pipe and is delivered as a **literal environment value** in the emitted file. The target has no secret-reference primitive for a `secretKeyRef`-style pointer to resolve, so the material sits in the artifact rather than being pointed at from it. |
-| `containers.<n>.lifecycle`, `containers.<n>.envFrom` | **The build halts.** The target has neither primitive, and dropping either silently would change what the deployment means. |
+| `containers.<n>.lifecycle`, `containers.<n>.envFrom` | **The build halts.** The target has neither primitive, and dropping either silently would change what the Release means. |
 
 Two consequences for a Recipe author:
 
@@ -1823,17 +1823,17 @@ candidate without re-deriving the boundary.
 
 - **`pipeline.aggrega.ai/mode`** is the family's capability label, and it names
   **who holds the run and who executes its steps** — which is what predicts what
-  else a deployment must contain:
+  else a Release must contain:
 
   - **`reconciled`** — the run is a custom resource, and the engine's controller
     reconciles it into workload on the platform. The platform's own API is the
     run's record, so the engine keeps no separate run database; in exchange the
-    deployment carries the custom resource definitions and the runtime-prerequisite
+    Release carries the custom resource definitions and the runtime-prerequisite
     discipline described under the operator-driven Recipes above.
   - **`durable`** — the engine persists the run's event history and hands work to
     workers the *application* deploys, which execute it and resume from that
     history. The engine needs a datastore of its own and the application needs a
-    worker deployment of its own, and neither is optional.
+    worker of its own, and neither is optional.
 
   A value is added when a realization needs one, never ahead of it: a value with
   no entity carrying it describes nothing.
@@ -1846,8 +1846,8 @@ candidate without re-deriving the boundary.
 
 - **The datastore is a topology edge, never a bundled subchart.** Several upstream
   charts bundle their own database so the chart installs standalone; turn that off
-  and declare a `uses` socket instead, so the deployment's datastore is one
-  component the deployment can see, size and back up. Pass the edge's resolved
+  and declare a `uses` socket instead, so the Release's datastore is one
+  component the Release can see, size and back up. Pass the edge's resolved
   `host`, `port`, `user` and database names into the product's own configuration
   rather than composing a connection string — a password embedded in a URL cannot
   be delivered as a secret reference, so composing one forces the credential into
@@ -1911,7 +1911,7 @@ which is exactly what a Feature is for.
 
 ### Authoring tiers
 
-The tiers order the taxonomy by what unblocks a production deployment soonest.
+The tiers order the taxonomy by what unblocks a production Release soonest.
 They are an authoring priority, not a dependency graph — a catalog may author any
 Feature at any time.
 
@@ -1984,7 +1984,7 @@ Some emitted resources are named by something outside the build: an IAM role's
 trust policy names the ServiceAccount it will mint credentials for, and a Workload
 Identity binding names the ServiceAccount it trusts. Composing a scope identity
 into such a name unconditionally would break that binding, which is worse than the
-collision it avoids — the build stays green and the deployment silently loses its
+collision it avoids — the build stays green and the Release silently loses its
 identity.
 
 For that case, expose the name as an **optional** `infra` key, honour it exactly as
