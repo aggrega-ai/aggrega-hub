@@ -1,0 +1,156 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: mysql-innodb-cluster
+  version: 1.0.0
+  license: GPL-2.0-only
+  description: >
+    A MySQL InnoDB Cluster realized as an InnoDBCluster custom resource the MySQL
+    Operator for Kubernetes reconciles. The recipe emits one InnoDBCluster
+    conformant to the mysql.oracle.com/v2 API, requesting a count of MySQL server
+    instances and a count of MySQL Router instances; the controller acts on that
+    request inside the target cluster. provides.host is the Service the controller
+    creates for the cluster, so a consumer wires to it by name. Credential custody
+    is the operator's choice: infra.credentials supplied points the custom
+    resource at an existing Secret named in infra.credentials_secret, and
+    generated renders that Secret beside the custom resource from the credential
+    attached to the root_password slot. The MySQL Operator control plane is a
+    runtime prerequisite: the build halts unless the operator affirms it is
+    installed (infra.control_plane_present), so no custom resource is emitted into
+    a cluster that cannot reconcile it. Reach for this realization where the
+    control plane is already in place; reach for core/datastore/mysql where it is
+    not, or where the application wants a logical database and a login role
+    created for it.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/datastore/mysql-innodb-cluster:1.0.0
+
+  # The custom resource carries no field for the server's listen port, so the port
+  # is not the operator's to move and is stated once here. The published contract
+  # reads this one value, so what a consumer is handed cannot drift from what the
+  # realization assumes.
+  locals:
+    server_port: "3306"
+
+  # The controller creates a Service under the custom resource's own name, and
+  # that Service is the cluster's entry point. The product's own documentation
+  # states the rule as "One service is the name of the InnoDB Cluster. It serves
+  # as primary entry point for an application", reachable inside the cluster
+  # under a stable name of the form
+  # "{innodbclustername}.{namespace}.svc.cluster.local" and accepting the bare
+  # cluster name. provides.host is that bare in-cluster name, carrying no
+  # namespace; a consumer in another namespace qualifies it on its own side
+  # (caller-side routing).
+  #
+  # The second Service the controller creates gives the individual servers stable
+  # names of their own; it is not published, because the entry point is the
+  # address a client should open a connection to.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .locals.server_port }}"
+    protocol: "mysql"
+
+  # Four declared conditions, each halting rather than emitting something that
+  # renders cleanly and does not work.
+  assertions:
+    # The MySQL Operator control plane must exist in the target cluster before an
+    # InnoDBCluster custom resource can reconcile. The compiler cannot inspect
+    # cluster state, so the prerequisite is declared: an operator affirms it in the
+    # Release, and an unaffirmed build halts here rather than emitting an orphan
+    # custom resource.
+    mysql_operator_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail "the MySQL Operator control plane must be installed in the target cluster before this realization emits its InnoDBCluster custom resource; once the control plane is present, affirm the prerequisite by setting infra.control_plane_present to true in the Release" -}}
+      {{- end -}}
+    # The custom resource constrains the server version to three dot-separated
+    # numeric parts, optionally followed by a suffix. A two-part version renders a
+    # custom resource that is rejected when it is applied, so it halts here where
+    # the key that carries it can be named.
+    mysql_innodb_cluster_version_shape: >-
+      {{- if not (regexMatch `^[0-9]+\.[0-9]+\.[0-9]+(-.+)?` .infra.engine_version) -}}
+      {{- fail "infra.engine_version must name a three-part MySQL Server version — major, minor and patch, optionally followed by a suffix — because the InnoDBCluster custom resource constrains it to that shape and the cluster rejects anything else when the resource is applied; write 8.4.0 rather than 8.4" -}}
+      {{- end -}}
+    # Supplied credentials need a Secret to read them from. An empty name would
+    # render a custom resource the controller waits on forever.
+    mysql_innodb_cluster_supplied_credentials_secret: >-
+      {{- if and (eq .infra.credentials "supplied") (not .infra.credentials_secret) -}}
+      {{- fail "infra.credentials is supplied, so name the existing Secret the controller reads the cluster's root account from in infra.credentials_secret; set infra.credentials to generated instead to have the Release render that Secret from the credential attached to the root_password slot" -}}
+      {{- end -}}
+    # The two custodies read the credential slot differently, and each mismatch is
+    # a build that succeeds and a cluster nobody can sign in to: generated with no
+    # credential attached renders a Secret with no password in it, and supplied
+    # with one attached leaves the application holding a password the cluster does
+    # not have.
+    mysql_innodb_cluster_credential_custody: >-
+      {{- if and (eq .infra.credentials "generated") (not (hasKey (default dict .features) "root_password")) -}}
+      {{- fail "infra.credentials is generated, so attach a credential to the root_password slot for the Release to render the Secret the custom resource names; set infra.credentials to supplied instead to point the controller at a Secret that already exists in the target cluster" -}}
+      {{- end -}}
+      {{- if and (eq .infra.credentials "supplied") (hasKey (default dict .features) "root_password") -}}
+      {{- fail "a credential is attached to the root_password slot while infra.credentials is supplied, so it would reach no emitted byte: the controller reads the root account from the Secret named in infra.credentials_secret and this realization renders none. Remove the attachment, or set infra.credentials to generated to have the Release render the Secret from it" -}}
+      {{- end -}}
+
+  # This Recipe reads no infra.overrides keys: every knob the emitted custom
+  # resource carries is enumerated on the Component itself.
+  #
+  # The developer's charset and collation are server configuration, and the custom
+  # resource's server-configuration surface is mycnf — so they are written there
+  # rather than as container environment, which this realization does not author.
+  # custom_config is appended after them, verbatim, keeping the Component's own
+  # "appended verbatim" contract; it carries its own group header, so a rendered
+  # file may name the same configuration group twice.
+  artifacts:
+    # Rendered only under the generated custody: the Secret the custom resource
+    # names, filled from the credential attached to the root_password slot. The
+    # entry renders empty — and is therefore skipped, emitting no file — under the
+    # supplied custody, where the Secret already exists in the target cluster. The
+    # slot is a black-box one, so its value arrives on the inject pipe and is read
+    # here rather than referenced.
+    #
+    # The halt below is at this site rather than beside the other declared
+    # conditions because it is the only surface that can see the pipe: the
+    # attachment can be present and still deliver its value under another name,
+    # which would otherwise render a Secret carrying an empty password — a build
+    # that succeeds and a cluster nobody can sign in to.
+    root-secret.yaml: |
+      {{- if eq .infra.credentials "generated" -}}
+      {{- if not .context.inject.env.MYSQL_ROOT_PASSWORD -}}
+      {{- fail "infra.credentials is generated, but no root password reached this realization under MYSQL_ROOT_PASSWORD: the credential attached to the root_password slot delivers its value under the name that credential declares, so declare MYSQL_ROOT_PASSWORD there, or set infra.credentials to supplied and name an existing Secret in infra.credentials_secret" -}}
+      {{- end -}}
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: {{ .context.instance_id }}-root
+      type: Opaque
+      stringData:
+        rootUser: "root"
+        rootHost: "%"
+        rootPassword: "{{ .context.inject.env.MYSQL_ROOT_PASSWORD }}"
+      {{- end }}
+    innodbcluster.yaml: |
+      apiVersion: mysql.oracle.com/v2
+      kind: InnoDBCluster
+      metadata:
+        name: {{ .context.instance_id }}
+      spec:
+        instances: {{ .infra.server_instances }}
+        router:
+          instances: {{ .infra.router_instances }}
+        version: "{{ .infra.engine_version }}"
+      {{- if eq .infra.credentials "supplied" }}
+        secretName: "{{ .infra.credentials_secret }}"
+      {{- else }}
+        secretName: "{{ .context.instance_id }}-root"
+      {{- end }}
+        mycnf: |
+          [mysqld]
+          character-set-server={{ .values.charset }}
+          collation-server={{ .values.collation }}
+      {{- if .values.custom_config }}
+      {{ .values.custom_config | indent 4 }}
+      {{- end }}
