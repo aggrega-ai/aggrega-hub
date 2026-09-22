@@ -236,22 +236,22 @@ The dimensions and their value sets:
 
 | Dimension | Values | What the value asserts |
 | --- | --- | --- |
-| `request-mirroring` | `full-rate`, `sampled` | The carrier can copy a matching request to a second destination and discard that destination's response. `full-rate` copies every matching request and offers no setting that narrows it; `sampled` offers a settable share, so a carrier that can sample carries `sampled` and not both. |
+| `request-mirroring` | `full-rate`, `sampled` | The component can copy a matching request to a second destination and discard that destination's response. `full-rate` copies every matching request and offers no setting that narrows it; `sampled` offers a settable share, so a component that can sample carries `sampled` and not both. |
 | `caller-identity` | `client-certificate`, `injected-header` | The component can convey the original caller's identity to the service behind it, and the value names which mechanism does it. `client-certificate`: the client's own TLS certificate details travel to the backend. `injected-header`: the component authenticates the caller itself and composes headers naming them, which travel upstream on the forwarded request. |
 | `prompt-guard` | `pattern-list` | The component can inspect the chat and completion payload it is routing and refuse a request on its content. `pattern-list` names the fidelity: the match is against patterns supplied in its configuration. The dimension is deliberately narrower than content inspection in general — a component here reads the model payload it already parses to route, and not one of them inspects an arbitrary HTTP body. |
-| `upstream-tls` | `trust-anchor` | The carrier can require the service it forwards to present a certificate chaining to a trust anchor the Release supplies. |
+| `upstream-tls` | `trust-anchor` | The component can require the service it forwards to present a certificate chaining to a trust anchor the Release supplies. |
 
 Three rules bind the family, and each has already been got wrong once:
 
-- **The fidelity rides in the value, not in a second key.** Two carriers that both
-  mirror requests can still differ in the way a Feature cares about, so a Feature
-  selects the fidelity it needs and is refused early and by name when the carrier
-  cannot deliver it.
+- **The fidelity rides in the value, not in a second key.** Two components that
+  both mirror requests can still differ in the way a Feature cares about, so a
+  Feature selects the fidelity it needs and is refused early and by name when the
+  component cannot deliver it.
 - **A value asserts a capability, never a configured state.** The two read alike
   and only the first is a property of the product. `core/gateway/nginx` carries
   `upstream-tls: trust-anchor` although the verification it names is off until an
   operator turns it on, because the label is what a selector reads *before*
-  anything is configured. Each carrier's label comment says this in its own
+  anything is configured. Each component's label comment says this in its own
   terms, so a reader of the entity is not left to infer it.
 - **A value is declared only once a component carries it, and each value is
   established against the product's own reference documentation.** A value
@@ -267,7 +267,7 @@ Three rules bind the family, and each has already been got wrong once:
   carries the capability it stays a dial on that Component's own surface; a
   shared value here is the thing to revisit if a second product gains it.
 
-Carriers today: `core/gateway/nginx` (`request-mirroring: full-rate`,
+Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 `upstream-tls: trust-anchor`), `core/gateway/contour` (`request-mirroring:
 sampled`, `caller-identity: client-certificate`, `upstream-tls: trust-anchor`),
 `core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/litellm`
