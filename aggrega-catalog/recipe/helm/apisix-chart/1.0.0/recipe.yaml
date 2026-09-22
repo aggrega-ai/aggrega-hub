@@ -1,0 +1,206 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: apisix-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Apache APISIX on Kubernetes via the project's own Helm chart, served from its
+    HTTPS chart repository. The chart is configured for the shape this Component
+    describes: the configuration store is the etcd component wired on the `etcd`
+    uses-socket, so the chart's own bundled etcd is switched off, and so is its
+    Kubernetes ingress controller, because the Component describes neither.
+    Under this configuration the chart renders a Deployment for the gateway, a
+    ClusterIP Service for the proxy data plane, a ClusterIP Service for the Admin
+    API, and the configuration map the gateway reads its whole runtime
+    configuration from.
+
+    What it carries that a hand-assembled workload does not is that configuration
+    map: the gateway's nginx tuning, its plugin set, its router, its DNS and
+    service-discovery settings and the role it runs in are all assembled by the
+    chart from named settings, where a workload has to carry a hand-written
+    configuration file that has to be re-derived by hand every time the gateway
+    moves. Reach for this realization where a chart repository is reachable at
+    build time and the gateway's own configuration is expected to follow the
+    product; reach for `apisix`, the workload-synthesis realization, where the
+    build must complete with nothing fetched. The gateway image is pinned to a
+    resolvable release tag for reproducible renders. Default chart version in
+    source.version; override via infra.source_version. provides.host is the proxy
+    data-plane Service name, which is what the Component publishes — it carries
+    no namespace, so the recipe is independent of where it is deployed; a
+    consumer in another namespace qualifies the host with the target namespace on
+    its own side (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/gateway/apisix:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://charts.apiseven.com
+    chart: apisix
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"2.17.0\" }}"
+
+  # provides.host is the proxy data-plane Service name — the entry point client
+  # traffic is sent to, which is what the Component's provides contract promises.
+  # The valuesMapping below pins the chart's fullnameOverride to the instance id,
+  # and the chart suffixes the proxy Service with "-gateway", so that Service is
+  # named exactly "<instance_id>-gateway". The Admin API Service takes
+  # "<instance_id>-admin" and is deliberately NOT what this pillar publishes: the
+  # Component's own port description says the published port carries proxied
+  # traffic and never the Admin API, which stays in-cluster. Both suffixes were
+  # read from a render of the chart, not assumed. A same-namespace consumer
+  # reaches the proxy under this name directly; a cross-namespace consumer
+  # qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}-gateway"
+    port: "{{ .infra.http_port }}"
+    protocol: "http"
+
+  # This Recipe reads from infra.overrides:
+  #   image        - map[string]string (image.* fields; overrides the tag pin)
+  #   service_type - string (proxy Service type; how the data plane is exposed, default ClusterIP)
+  #   requests     - { cpu: string, memory: string } (gateway resource requests)
+  #   nodeSelector - map[string]string (pod scheduling)
+  #   tolerations  - []object (pod scheduling)
+  valuesMapping: |
+    ## ── The configuration-store edge ───────────────────────────
+    ## The gateway keeps its routes here. The edge is required, so it is always
+    ## resolved by the time this template runs.
+    {{- $store := dict }}
+    {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "etcd" }}
+        {{- $store = $edge }}
+      {{- end }}
+    {{- end }}
+
+    ## ── Pin the chart's resource names to the instance id ──────
+    ## Names the proxy Service "<instance_id>-gateway", matching provides.host,
+    ## and the Admin API Service "<instance_id>-admin".
+    fullnameOverride: "{{ .context.instance_id }}"
+
+    ## ── Gateway image pin ──────────────────────────────────────
+    ## Pinned explicitly rather than left to whatever the chart's own default
+    ## becomes at the next chart version. The repository is the chart's own
+    ## default, so the image this realization runs is the one its chart is tested
+    ## against, and it is why the Component's engine_version says the
+    ## chart-backed realization pins its own tag. Override the whole block via
+    ## infra.overrides.image.
+    image:
+      {{- if and .infra.overrides .infra.overrides.image }}
+      {{- range $k, $v := .infra.overrides.image }}
+      {{ $k }}: "{{ $v }}"
+      {{- end }}
+      {{- else }}
+      repository: apache/apisix
+      tag: "3.18.0-ubuntu"
+      {{- end }}
+
+    ## ── Chart extras this Component does not describe ──────────
+    ## The chart can also deploy an etcd of its own and a Kubernetes ingress
+    ## controller. The configuration store is wired through the topology rather
+    ## than bundled, and the Component describes no ingress controller, so both
+    ## are switched off rather than rendered unreferenced.
+    etcd:
+      enabled: false
+    ingress-controller:
+      enabled: false
+
+    ## ── The gateway's own control endpoint ─────────────────────
+    ## 🔴 Switched off deliberately, and the reason is worth keeping. The chart
+    ## renders a Service in front of this endpoint while binding the endpoint
+    ## itself to the loopback address, so the Service resolves and answers
+    ## nothing — the same shape as a published address that names no Service,
+    ## which this catalog treats as a defect rather than a quirk. The Component
+    ## describes a proxy data plane and an Admin API and nothing else, so the
+    ## endpoint is not rendered at all instead of being rendered unreachable.
+    ## Established by reading the chart's own defaults for the endpoint's listen
+    ## address and its Service.
+    control:
+      enabled: false
+
+    ## ── The configuration store connection ─────────────────────
+    ## Composed from the resolved `etcd` edge. The user is emptied deliberately:
+    ## the chart sends credentials whenever one is set, and the standard-library
+    ## etcd Recipes leave authentication off, so presenting a user would fail the
+    ## connection rather than defaulting.
+    externalEtcd:
+      host:
+        - "http://{{ $store.provides.host }}:{{ $store.provides.port }}"
+      user: ""
+
+    ## ── Proxy data plane ───────────────────────────────────────
+    ## The client entry point, and the Service provides.host addresses. The chart
+    ## default exposes the gateway on every node; the Component describes an
+    ## in-cluster address, so it is a ClusterIP unless an operator says
+    ## otherwise. infra.http_port sets both the container port and the Service
+    ## port, so the published address and the listener move together.
+    service:
+      {{- if and .infra.overrides .infra.overrides.service_type }}
+      type: "{{ .infra.overrides.service_type }}"
+      {{- else }}
+      type: ClusterIP
+      {{- end }}
+      http:
+        enabled: true
+        servicePort: {{ .infra.http_port }}
+        containerPort: {{ .infra.http_port }}
+
+    apisix:
+      ## ── Admin API ────────────────────────────────────────────
+      ## In-cluster only, on the port the operator set, authenticated by the
+      ## static key the developer authored. The client allowlist is opened to the
+      ## cluster because the Admin API is reached from inside it and the chart's
+      ## own default admits the loopback address only, which would leave the
+      ## Service resolving and the API refusing every caller. Never published
+      ## through provides.
+      ##
+      ## ⚠️ The chart provisions a second, read-only Admin API role the Component
+      ## does not model, and its key stays the chart's own default. That is the
+      ## same stance the Component already takes on the admin key itself — a
+      ## deterministic default so the stack renders self-contained, replaced
+      ## wherever the Admin API is reachable by more than its author.
+      admin:
+        enabled: true
+        type: ClusterIP
+        port: {{ .infra.admin_port }}
+        servicePort: {{ .infra.admin_port }}
+        credentials:
+          admin: "{{ .values.admin_key }}"
+        allow:
+          ipList:
+            - 0.0.0.0/0
+
+    ## ── Gateway resources ──────────────────────────────────────
+    resources:
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      {{- if and .infra.overrides .infra.overrides.requests }}
+      requests:
+        cpu: "{{ .infra.overrides.requests.cpu }}"
+        memory: "{{ .infra.overrides.requests.memory }}"
+      {{- end }}
+
+    ## ── Scheduling overrides ───────────────────────────────────
+    {{- if .infra.overrides }}
+    {{- if .infra.overrides.nodeSelector }}
+    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+    {{- end }}
+    {{- if .infra.overrides.tolerations }}
+    tolerations: {{ toJson .infra.overrides.tolerations }}
+    {{- end }}
+    {{- end }}
+
+  sourceDigests:
+    - kind: helm-https-chart
+      url: https://charts.apiseven.com
+      chart: apisix
+      version: 2.17.0
+      digest: sha256:32614444bee4e185f52a66af624875b56f048ef7bcb9600fd3b99d0f7859bb78

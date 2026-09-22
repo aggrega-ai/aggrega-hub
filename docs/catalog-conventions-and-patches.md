@@ -1223,7 +1223,10 @@ that is unmaintained does not. Establish this per product against the chart
 itself rather than assuming it, and record the finding in the Recipe's
 `description` where a reader meets the choice.
 
-Two obligations follow a sourced Recipe:
+These obligations follow a sourced Recipe, and the list below is the statement of
+them — it is deliberately not counted in this sentence, because a count sitting
+beside the thing it counts is a second copy that goes stale the first time the list
+grows:
 
 - **Pin the images the chart runs.** A chart that leaves an image tag to its own
   default makes the render irreproducible across pulls, which is the whole point
@@ -1244,6 +1247,14 @@ Two obligations follow a sourced Recipe:
   top-level key never reaches it, so the pin is present, the check is satisfied,
   and the address still answers to nothing. **Render the chart both ways and read
   the emitted Service name before choosing which knob to bind.**
+- 🔴 **Supply whatever the chart would otherwise generate.** A chart that invents a
+  password, a key or a token when none is given produces **different bytes on every
+  render**, which breaks the byte-identical output the whole toolchain rests on —
+  and it breaks it silently, because the build succeeds and the artifacts look
+  right. Nothing in a single build can show it: it is visible only by rendering
+  twice and comparing. Supply the value on **both** paths, bound by name where a
+  credential is wired in and a fixed development value where nothing is, so the
+  realization renders the same bytes twice whatever is attached to it.
 
 **Per-entity validation does not render a sourced Recipe, so its success says
 less than it looks.** Validating a chart-backed Recipe reports that the render was

@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: keycloak-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Keycloak, a database-backed identity and access-management server, on
+    Kubernetes via the codecentric Keycloak.X Helm chart, served from that
+    project's HTTPS chart repository. The chart is configured for the shape this
+    Component describes: a server whose realms, clients and users live in the
+    PostgreSQL backend wired on the `backend` uses-socket, with the chart's
+    Ingress, OpenShift Route, HTTPRoute, autoscaler, network policy and
+    Prometheus-operator resources all left switched off, because the Component
+    describes none of them. Under this configuration the chart renders a
+    StatefulSet for the server, a ServiceAccount, a ClusterIP Service carrying
+    the account console and the token endpoints, and a headless Service the
+    server's own members find each other through. What it encodes that a
+    hand-assembled workload does not is the cluster-forming configuration: a
+    StatefulSet with ordered pod management behind that headless Service, the
+    database-backed cache stack the server replicates sessions over, the proxy
+    header mode it trusts when it sits behind one, and liveness, readiness and
+    startup probes aimed at the server's own management endpoint. Reach for this
+    realization where a chart repository is reachable at build time and the
+    server will be run as more than one replica; reach for `keycloak`, the
+    workload-synthesis realization, where the build must complete with nothing
+    fetched. The server image is pinned to a resolvable release tag for
+    reproducible renders. Default chart version in source.version; override via
+    infra.source_version. provides.host is the bare, self-contained in-cluster
+    Service name — it carries no namespace, so the recipe is independent of where
+    it is deployed; a consumer in another namespace qualifies the host with the
+    target namespace on its own side (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/security/keycloak:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://codecentric.github.io/helm-charts
+    chart: keycloakx
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"7.3.2\" }}"
+
+  # provides.host is the name of the Service carrying the account console, the
+  # token endpoints and the admin API, which is what the Component's provides
+  # contract promises.
+  #
+  # 🔴 It is NOT the bare instance id. The valuesMapping below pins the chart's
+  # fullnameOverride to the instance id, and the chart then suffixes that name
+  # per resource: the console Service is "<instance_id>-http" and the Service the
+  # server's own members find each other through is "<instance_id>-headless".
+  # Nothing is named by the bare pinned name except the StatefulSet and the
+  # ServiceAccount, so publishing the bare instance id would publish an address
+  # no Service answers to, and publishing the headless one would publish the
+  # members' rendezvous point rather than the endpoint a consumer redeems tokens
+  # against. Both suffixes were read from a render of the chart, not assumed.
+  #
+  # port follows the Service port the operator set; the server process itself
+  # always listens on the chart's fixed 8080 and the Service forwards to it. A
+  # same-namespace consumer reaches the console under this name directly; a
+  # cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}-http"
+    port: "{{ .infra.http_port }}"
+    protocol: "http"
+
+  # This Recipe reads from infra.overrides:
+  #   image        - map[string]string (image.* fields; overrides the tag pin)
+  #   service_type - string (service.type; how the console is exposed, default ClusterIP)
+  #   requests     - { cpu: string, memory: string } (server resource requests)
+  #   nodeSelector - map[string]string (pod scheduling)
+  #   tolerations  - []object (pod scheduling)
+  valuesMapping: |
+    ## ── The management port this chart cannot move ─────────────
+    ## Keycloak serves health and metrics on a management port the chart writes
+    ## as a literal into both the container and the console Service, so this
+    ## realization has no way to honor a value moved off it. Halt rather than
+    ## render a port the operator did not ask for and never find out.
+    {{- if ne (int .infra.management_port) 9000 -}}
+    {{- fail "the Keycloak chart serves health and metrics on the server's fixed management port 9000 and this realization cannot move it; leave infra.management_port at its default on this realization" -}}
+    {{- end -}}
+
+    ## ── The configuration backend edge ─────────────────────────
+    ## The server keeps its realms, clients and users here. The edge is required,
+    ## so it is always resolved by the time this template runs; its host and port
+    ## compose the connection, and its user and database name the login.
+    {{- $backend := dict }}
+    {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "backend" }}
+        {{- $backend = $edge }}
+      {{- end }}
+    {{- end }}
+
+    ## ── Pin the chart's resource names to the instance id ──────
+    ## Names the console Service "<instance_id>-http", matching provides.host,
+    ## and the members' headless Service "<instance_id>-headless". Read the
+    ## comment above provides for why the published name carries a suffix.
+    fullnameOverride: "{{ .context.instance_id }}"
+
+    ## ── Server image pin ───────────────────────────────────────
+    ## The chart's own default tag tracks whatever the chart's application
+    ## version becomes, which makes the render move whenever the chart moves;
+    ## pin it explicitly instead. The repository is the chart's own default, so
+    ## the image this realization runs is the one its chart is tested against,
+    ## and it is why the Component's engine_version says the chart-backed
+    ## realization pins its own tag. Override the whole block via
+    ## infra.overrides.image.
+    image:
+      {{- if and .infra.overrides .infra.overrides.image }}
+      {{- range $k, $v := .infra.overrides.image }}
+      {{ $k }}: "{{ $v }}"
+      {{- end }}
+      {{- else }}
+      repository: quay.io/keycloak/keycloak
+      tag: "26.7.4"
+      {{- end }}
+
+    ## ── Console and token-endpoint Service ─────────────────────
+    ## infra.http_port sets the Service port. The server process listens on the
+    ## chart's fixed 8080 and the Service forwards to it, so an operator moving
+    ## the port moves the published address and not the listener. The chart also
+    ## offers an HTTPS Service port; the Component publishes `http` and no TLS
+    ## material is configured here, so that port is switched off rather than left
+    ## advertising a listener the server does not serve.
+    ##
+    ## 🔴 Switching it off is spelled as a zero rather than as an empty value.
+    ## The chart types this key as an integer in its own value schema, so an
+    ## empty string is refused outright; and a null is dropped when this overlay
+    ## is merged over the chart's defaults, which leaves the chart's own 8443
+    ## standing. A zero passes the schema and reads as absent to the chart's own
+    ## test on the key. Established by rendering all three.
+    service:
+      {{- if and .infra.overrides .infra.overrides.service_type }}
+      type: "{{ .infra.overrides.service_type }}"
+      {{- else }}
+      type: ClusterIP
+      {{- end }}
+      httpPort: {{ .infra.http_port }}
+      httpsPort: 0
+
+    ## ── Backend connection ─────────────────────────────────────
+    ## Composed from the resolved `backend` edge. The password is the one place
+    ## the two credential shapes differ: attached, the chart is pointed at the
+    ## existing secret BY NAME, so the material never appears in the rendered
+    ## artifact; unattached, the Component declares the slot optional, so an
+    ## inline development default keeps the render working exactly as the
+    ## workload-synthesis realization does.
+    database:
+      vendor: postgres
+      hostname: "{{ $backend.provides.host }}"
+      port: {{ $backend.provides.port }}
+      database: "{{ $backend.provides.database }}"
+      username: "{{ $backend.provides.user }}"
+      {{- if hasKey (default dict .features) "password" }}
+      existingSecret: "{{ .features.password.provides.name }}"
+      existingSecretKey: "{{ .features.password.provides.key }}"
+      {{- else }}
+      password: "apppass"
+      {{- end }}
+
+    ## ── Bootstrap admin account and hostname resolution ────────
+    ## The chart carries no value of its own for either, so both are delivered
+    ## through the extension point it does declare for additional environment.
+    ## The admin account is seeded on first startup from the admin_user value and
+    ## the optional `admin_password` credential slot — bound by name when
+    ## attached, an inline development default when not, the same two shapes the
+    ## workload-synthesis realization offers. Hostname resolution is left to the
+    ## incoming request, so the server is self-contained with no real hostname
+    ## configured, which is what the workload-synthesis realization does too.
+    extraEnv: |
+      - name: KC_HOSTNAME_STRICT
+        value: "false"
+      - name: KC_BOOTSTRAP_ADMIN_USERNAME
+        value: "{{ .values.admin_user }}"
+      {{- if hasKey (default dict .features) "admin_password" }}
+      - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .features.admin_password.provides.name }}"
+            key: "{{ .features.admin_password.provides.key }}"
+      {{- else }}
+      - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+        value: "admin"
+      {{- end }}
+
+    ## ── Server resources ───────────────────────────────────────
+    resources:
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      {{- if and .infra.overrides .infra.overrides.requests }}
+      requests:
+        cpu: "{{ .infra.overrides.requests.cpu }}"
+        memory: "{{ .infra.overrides.requests.memory }}"
+      {{- end }}
+
+    ## ── Scheduling overrides ───────────────────────────────────
+    {{- if .infra.overrides }}
+    {{- if .infra.overrides.nodeSelector }}
+    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+    {{- end }}
+    {{- if .infra.overrides.tolerations }}
+    tolerations: {{ toJson .infra.overrides.tolerations }}
+    {{- end }}
+    {{- end }}
+
+  sourceDigests:
+    - kind: helm-https-chart
+      url: https://codecentric.github.io/helm-charts
+      chart: keycloakx
+      version: 7.3.2
+      digest: sha256:4ebb630c1f842245f7953be4f80ed080d1979ded25b31d48052f43f012e3c1d7
