@@ -1,0 +1,212 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: valkey-chart
+  version: 1.0.0
+  license: BSD-3-Clause
+  description: >
+    Valkey in-memory key-value cache on Kubernetes via the community-maintained
+    Valkey Helm chart, served from that project's HTTPS chart repository. The
+    chart is configured for the shape this Component describes: one cache process
+    behind a ClusterIP Service, with the chart's replication mode, network
+    policy, disruption budget, metrics exporter, Prometheus-operator resources
+    and transport security all left at their own off-by-default setting. Under
+    this configuration it renders a Deployment, that Service, a ConfigMap
+    carrying the cache directives, a second ConfigMap carrying the start-up
+    script that assembles the running configuration, and the ServiceAccount the
+    pod runs under. With a password attached it also renders the chart's own
+    connection check, a Pod carrying the helm test annotation that confirms an
+    unauthenticated connection is refused. The chart offers no setting to decline
+    it; it is named here rather than left to be discovered, and it is harmless as
+    it stands — it runs the same pinned image the cache runs, it reads and writes
+    nothing, and it carries no credential material.
+
+    What it carries that a hand-assembled workload does not is the cache's own
+    start-up and security machinery: a start-up step that assembles the running
+    configuration file on the pod, a hardened container that runs unprivileged
+    with a read-only root filesystem and every capability dropped, and start-up
+    and liveness probes that speak the cache's own protocol rather than merely
+    opening a socket. Authentication, when a credential is attached, is expressed
+    as an access-control entry whose password is hashed on the pod from a mounted
+    secret, so no credential material and no hash reaches the rendered artifact.
+    Reach for this realization where a chart repository is reachable at build
+    time; reach for `valkey`, the workload-synthesis realization, where the build
+    must complete with nothing fetched. The cache image is pinned to a resolvable
+    release tag for reproducible renders. Default chart version in
+    source.version; override via infra.source_version. provides.host is the bare,
+    self-contained in-cluster Service name — it carries no namespace, so the
+    recipe is independent of where it is deployed; a consumer in another
+    namespace qualifies the host with the target namespace on its own side
+    (caller-side routing). The packaged Valkey server is BSD-3-Clause.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/datastore/valkey:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://valkey.io/valkey-helm/
+    chart: valkey
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"0.12.0\" }}"
+
+  # provides.host is the cache's Service name, which is what the Component's
+  # provides contract promises. The valuesMapping below pins the chart's
+  # fullnameOverride to the instance id, and this chart names that Service by the
+  # pinned name with no suffix — read from a render of the chart, not assumed,
+  # because several charts in this catalog suffix it instead.
+  #
+  # port follows the port the operator set. It sets the Service port, the
+  # container port and — through the directive appended below — the port the
+  # server actually binds, so the published address and the listener move
+  # together. protocol is "valkey", naming the server on the other end; a
+  # consumer reaches it with a Redis-protocol client.
+  #
+  # A same-namespace consumer reaches the cache under this name directly; a
+  # cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    protocol: "valkey"
+
+  # This Recipe reads from infra.overrides:
+  #   image          - map[string]string (image.* fields; overrides the tag pin)
+  #   service_type   - string (service.type; how the endpoint is exposed, default ClusterIP)
+  #   requests       - { cpu: string, memory: string } (cache resource requests)
+  #   nodeSelector   - map[string]string (pod scheduling)
+  #   tolerations    - []object (pod scheduling)
+  valuesMapping: |
+    ## ── Pin the chart's resource names to the instance id ──────
+    ## Names the cache's Service exactly "<instance_id>", matching provides.host.
+    ## Every object this chart emits derives its name from this key, read from a
+    ## render rather than assumed.
+    fullnameOverride: "{{ .context.instance_id }}"
+
+    ## ── Cache image pin ────────────────────────────────────────
+    ## The chart's own default tag is its application version, so leaving it
+    ## unset makes the render move whenever the chart moves. Pin it explicitly.
+    ## The registry and repository are the chart's own defaults, so the image
+    ## this realization runs is the one its chart is tested against, and it is
+    ## why the Component's engine_version says the chart-backed realization pins
+    ## its own tag. This realization renders exactly one image: the cache's own,
+    ## which its start-up step and its probes also run. Override the whole block
+    ## via infra.overrides.image.
+    image:
+      {{- if and .infra.overrides .infra.overrides.image }}
+      {{- range $k, $v := .infra.overrides.image }}
+      {{ $k }}: "{{ $v }}"
+      {{- end }}
+      {{- else }}
+      registry: docker.io
+      repository: valkey/valkey
+      tag: "9.1.2"
+      {{- end }}
+
+    ## ── Cache Service ──────────────────────────────────────────
+    ## infra.port sets the Service port and the container port from one value.
+    service:
+      {{- if and .infra.overrides .infra.overrides.service_type }}
+      type: "{{ .infra.overrides.service_type }}"
+      {{- else }}
+      type: ClusterIP
+      {{- end }}
+      port: {{ .infra.port }}
+
+    ## ── The cache's own directives ─────────────────────────────
+    ## 🔴 THE LISTEN PORT IS WRITTEN HERE DELIBERATELY, EVEN THOUGH THE CHART
+    ## ALSO WRITES ONE, AND THAT IS NOT THE DUPLICATE-KEY MISTAKE IT RESEMBLES.
+    ## The chart's start-up step writes the server's base configuration with the
+    ## listen port as a LITERAL rather than from the Service port, so an operator
+    ## moving infra.port would move the Service and the container port while the
+    ## server went on binding the chart's own number — an address that resolves
+    ## to a process listening somewhere else, with the build green either way.
+    ## The same step then APPENDS this block to the file it just wrote, and the
+    ## server reads the last occurrence of a directive, so appending the port
+    ## here is the chart's own documented way of overriding it. Verified by
+    ## reading the assembled configuration rather than assumed.
+    ##
+    ## Every developer knob below is emitted only when the Aggregate set it, so a
+    ## bare declaration renders no redundant directive and the cache keeps its own
+    ## built-in default.
+    valkeyConfig: |
+      port {{ .infra.port }}
+      {{- with .values.maxmemory }}
+      maxmemory {{ . }}
+      {{- end }}
+      {{- with .values.maxmemory_policy }}
+      maxmemory-policy {{ . }}
+      {{- end }}
+      {{- with .values.databases }}
+      databases {{ . }}
+      {{- end }}
+      {{- if .values.appendonly }}
+      appendonly yes
+      {{- end }}
+
+    ## ── The durable volume, when the developer asked for one ───
+    ## The cache role holds no durable state, so persistence is off unless the
+    ## Aggregate switches it on; switched on, the volume is sized and classed
+    ## from infra exactly as the workload-synthesis realization sizes its own.
+    {{- if .values.persistence.enabled }}
+    dataStorage:
+      enabled: true
+      requestedSize: "{{ .infra.storage.size }}"
+      {{- with .infra.storage.type }}
+      className: "{{ . }}"
+      {{- end }}
+    {{- end }}
+
+    ## ── Authentication ─────────────────────────────────────────
+    ## Unattached, the chart's access control stays off and the cache accepts
+    ## unauthenticated connections, which is the Component's stated default and
+    ## the same posture the workload-synthesis realization takes.
+    ##
+    ## Attached, the chart is pointed at the credential's secret BY NAME with the
+    ## credential's own key, and its start-up step reads the password from the
+    ## mounted file and writes a hashed access-control entry on the pod — so
+    ## neither the password nor its hash appears in the rendered artifact. The
+    ## entry is written for the cache's default account, which the chart requires
+    ## whenever access control is on: without it the server would accept every
+    ## caller while appearing to be protected.
+    {{- if hasKey (default dict .features) "password" }}
+    auth:
+      enabled: true
+      usersExistingSecret: "{{ .features.password.provides.name }}"
+      aclUsers:
+        default:
+          permissions: "~* &* +@all"
+          passwordKey: "{{ .features.password.provides.key }}"
+    {{- end }}
+
+    ## ── Cache resources ────────────────────────────────────────
+    resources:
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      {{- if and .infra.overrides .infra.overrides.requests }}
+      requests:
+        cpu: "{{ .infra.overrides.requests.cpu }}"
+        memory: "{{ .infra.overrides.requests.memory }}"
+      {{- end }}
+
+    ## ── Scheduling overrides ───────────────────────────────────
+    {{- if .infra.overrides }}
+    {{- if .infra.overrides.nodeSelector }}
+    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+    {{- end }}
+    {{- if .infra.overrides.tolerations }}
+    tolerations: {{ toJson .infra.overrides.tolerations }}
+    {{- end }}
+    {{- end }}
+
+  sourceDigests:
+    - kind: helm-https-chart
+      url: https://valkey.io/valkey-helm/
+      chart: valkey
+      version: 0.12.0
+      digest: sha256:64d43433d6b80addb012dd7c21a1bf674bf034dc51210b6bf8eae9ddaf83740f

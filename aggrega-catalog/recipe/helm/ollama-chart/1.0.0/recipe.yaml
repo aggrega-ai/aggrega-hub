@@ -1,0 +1,243 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: ollama-chart
+  version: 1.0.0
+  license: MIT
+  description: >
+    Ollama as a self-hosted inference server on Kubernetes via the
+    community-maintained Ollama Helm chart, served from that project's HTTPS
+    chart repository. The chart is configured for the shape this Component
+    describes: one serving process with a model-cache volume, fronted by a
+    ClusterIP Service on the model port. Under this configuration it renders a
+    Deployment, that Service, a PersistentVolumeClaim for the model cache, and
+    the ServiceAccount the pod runs under — plus a horizontal autoscaler when the
+    Release declares replica bounds. The chart's Ingress, gateway and route
+    surfaces, and its option to render the server as a Knative service instead,
+    are left switched off, because the Component describes none of them, and so
+    is its connection-test Pod, which is not part of the deployed system and
+    would add a second image this Recipe would owe a pin for.
+
+    What it carries that a hand-assembled workload does not is threefold. It
+    honours the replica bounds the Component declares, rendering a horizontal
+    autoscaler the workload-synthesis realization has nowhere to emit. It runs
+    liveness and readiness probes against the serving endpoint, which that
+    realization carries none of. And it resolves the model pointer through the
+    runtime's own pull step after the server is up, rather than through a
+    hand-written start-stop sequence in an init container. Reach for this
+    realization where a chart repository is reachable at build time; reach for
+    `ollama`, the workload-synthesis realization, where the build must complete
+    with nothing fetched, or where more than one serving replica is wanted — that
+    realization gives each replica its own model cache, which this one cannot.
+    The runtime image is pinned to a resolvable release tag for reproducible
+    renders. Default chart version in source.version; override via
+    infra.source_version. provides.host is the bare, self-contained in-cluster
+    Service name — it carries no namespace, so the recipe is independent of where
+    it is deployed; a consumer in another namespace qualifies the host with the
+    target namespace on its own side (caller-side routing). The packaged Ollama
+    runtime is MIT.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-model/ollama:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://otwld.github.io/ollama-helm/
+    chart: ollama
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"1.83.0\" }}"
+
+  # provides.host is the model API's Service name, which is what the Component's
+  # provides contract promises. The valuesMapping below pins the chart's
+  # fullnameOverride to the instance id, and this chart names that Service by the
+  # pinned name with no suffix — read from a render of the chart, not assumed,
+  # because several charts in this catalog suffix it instead.
+  #
+  # endpoint is the OpenAI-compatible base URL an agent reads and hands to a
+  # client library; it is composed from the same host and port so the two cannot
+  # disagree, and a provides entry cannot read another, which is why the host
+  # appears twice and the two must be edited together.
+  #
+  # model is the deterministic pointer the runtime resolves at pod start; the
+  # compiler pipes the string and never fetches weights.
+  #
+  # A same-namespace consumer reaches the server under this name directly; a
+  # cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}/v1"
+    model: "{{ .values.model }}"
+    protocol: "http"
+
+  # The chart backs every replica with ONE claim rather than one claim each, and
+  # that claim's access mode admits a single node, so a second replica would sit
+  # unschedulable while the build reported success. The Component describes a
+  # per-replica cache, so this realization refuses the case it cannot serve
+  # rather than rendering it wrong, and names the realization that can.
+  assertions:
+    single_replica_only: >-
+      {{- if gt (int (optional .infra "replicas" 1)) 1 -}}
+      {{- fail "the Ollama chart backs every serving replica with one shared model-cache volume whose access mode admits a single node, so this realization serves one replica only: leave infra.replicas at 1 on this realization, or select the workload-synthesis realization, which gives each replica its own cache" -}}
+      {{- end -}}
+
+  # This Recipe reads from infra.overrides:
+  #   image          - map[string]string (image.* fields; overrides the tag pin)
+  #   service_type   - string (service.type; how the endpoint is exposed, default ClusterIP)
+  #   requests       - { cpu: string, memory: string } (serving resource requests)
+  #   target_cpu     - integer (autoscaling.targetCPUUtilizationPercentage)
+  #   nodeSelector   - map[string]string (pod scheduling)
+  #   tolerations    - []object (pod scheduling)
+  valuesMapping: |
+    ## ── Pin the chart's resource names to the instance id ──────
+    ## Names the model API's Service exactly "<instance_id>", matching
+    ## provides.host. Every object this chart emits derives its name from this
+    ## key, read from a render rather than assumed.
+    fullnameOverride: "{{ .context.instance_id }}"
+
+    ## ── Runtime image pin ──────────────────────────────────────
+    ## The chart's own default tag is its application version, so leaving it
+    ## unset makes the render move whenever the chart moves. Pin it explicitly.
+    ## The repository is the chart's own default, so the image this realization
+    ## runs is the one its chart is tested against, and it is why the Component's
+    ## engine_version says the chart-backed realization pins its own tag. This
+    ## realization renders exactly one image. Override the whole block via
+    ## infra.overrides.image.
+    image:
+      {{- if and .infra.overrides .infra.overrides.image }}
+      {{- range $k, $v := .infra.overrides.image }}
+      {{ $k }}: "{{ $v }}"
+      {{- end }}
+      {{- else }}
+      repository: ollama/ollama
+      tag: "0.34.2"
+      {{- end }}
+
+    ## ── The connection-test Pod ────────────────────────────────
+    ## ON in the chart's own defaults, and declined: a test Pod is not part of
+    ## the deployed system, and it runs a second image whose tag the chart leaves
+    ## floating, which this Recipe would then owe a pin for.
+    tests:
+      enabled: false
+
+    ## ── The model and the listen port ──────────────────────────
+    ## The developer's model pointer goes into the chart's own start-up pull
+    ## list, which the runtime resolves after the server is up; the compiler
+    ## pipes the string and fetches nothing. The port is the one value the chart
+    ## derives the container port, the server's bind address and the Service port
+    ## from, so the published address and the listener cannot drift apart.
+    ollama:
+      port: {{ .infra.port }}
+      models:
+        pull:
+          - "{{ .values.model }}"
+      {{- if (default dict .infra.gpu).count }}
+      ## GPU serving, when the operator asked for it. The chart requests the
+      ## extended resource and adds the runtime's own GPU handling; the runtime
+      ## class, when named, is set below on the pod itself.
+      gpu:
+        enabled: true
+        number: {{ .infra.gpu.count }}
+      {{- end }}
+
+    ## ── Model API Service ──────────────────────────────────────
+    service:
+      {{- if and .infra.overrides .infra.overrides.service_type }}
+      type: "{{ .infra.overrides.service_type }}"
+      {{- else }}
+      type: ClusterIP
+      {{- end }}
+      port: {{ .infra.port }}
+
+    ## ── The model-cache volume ─────────────────────────────────
+    ## The pulled weights live here. The chart leaves persistence off by default,
+    ## which would put the weights on the pod's own filesystem and re-pull them
+    ## at every restart; the Component describes a model cache and declares its
+    ## size, so it is switched on and sized from infra. Left unset, the claim
+    ## takes the cluster's default storage class.
+    persistentVolume:
+      enabled: true
+      size: "{{ .infra.model_cache.size }}"
+      {{- with .infra.model_cache.class }}
+      storageClass: "{{ . }}"
+      {{- end }}
+
+    ## ── Replica bounds ─────────────────────────────────────────
+    ## The Component declares a lower and an upper bound for the replica count.
+    ## The workload-synthesis realization has nowhere to put them and serves a
+    ## fixed count; this one renders the chart's horizontal autoscaler from them,
+    ## which is one of the reasons to reach for it. Both bounds are required
+    ## together — one alone describes no range — so the autoscaler is rendered
+    ## only when the Release supplies both.
+    {{- if and .infra.min_replicas .infra.max_replicas }}
+    autoscaling:
+      enabled: true
+      minReplicas: {{ .infra.min_replicas }}
+      maxReplicas: {{ .infra.max_replicas }}
+      {{- if and .infra.overrides .infra.overrides.target_cpu }}
+      targetCPUUtilizationPercentage: {{ .infra.overrides.target_cpu }}
+      {{- end }}
+    {{- else }}
+    replicaCount: {{ optional .infra "replicas" 1 }}
+    {{- end }}
+
+    ## ── The runtime class, when a GPU one is named ─────────────
+    {{- with (default dict .infra.gpu).runtime_class }}
+    runtimeClassName: "{{ . }}"
+    {{- end }}
+
+    ## ── Serving resources ──────────────────────────────────────
+    resources:
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      {{- if and .infra.overrides .infra.overrides.requests }}
+      requests:
+        cpu: "{{ .infra.overrides.requests.cpu }}"
+        memory: "{{ .infra.overrides.requests.memory }}"
+      {{- end }}
+
+    ## ── The gated-model pull credential ────────────────────────
+    ## Delivered as an environment binding BY NAME from the credential's secret,
+    ## so the material never appears in the rendered artifact. The variable is the
+    ## same one the workload-synthesis realization uses, so a model registry
+    ## configured for one realization is configured for both. Unattached, nothing
+    ## is emitted and the weights are pulled anonymously.
+    {{- if hasKey (default dict .features) "model_pull_token" }}
+    extraEnv:
+      - name: OLLAMA_PULL_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .features.model_pull_token.provides.name }}"
+            key: "{{ .features.model_pull_token.provides.key }}"
+    {{- end }}
+
+    ## ── Scheduling overrides ───────────────────────────────────
+    {{- if .infra.overrides }}
+    {{- if .infra.overrides.nodeSelector }}
+    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+    {{- end }}
+    {{- if .infra.overrides.tolerations }}
+    tolerations: {{ toJson .infra.overrides.tolerations }}
+    {{- end }}
+    {{- end }}
+
+    ## ── What this realization does not consume ─────────────────
+    ## infra.model_artifact names an OCI reference to the weights as an
+    ## alternative to the model pointer above. The chart's own start-up pull
+    ## reads a model name and has no surface for an artifact reference, so this
+    ## realization does not consume it either, exactly as the workload-synthesis
+    ## realization does not.
+
+  sourceDigests:
+    - kind: helm-https-chart
+      url: https://otwld.github.io/ollama-helm/
+      chart: ollama
+      version: 1.83.0
+      digest: sha256:3187b9c2e71ef9dd269a37b68200057c3a21725d1884375ca45aec491e5fa0b4

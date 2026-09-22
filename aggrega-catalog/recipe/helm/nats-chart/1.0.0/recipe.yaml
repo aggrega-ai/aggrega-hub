@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: nats-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    NATS messaging server on Kubernetes via the product's own Helm chart, served
+    from its project's HTTPS chart repository. The chart is configured for the
+    lean shape this Component describes: one server routing subjects in memory,
+    with the chart's stream persistence, clustering, gateway, leaf-node, MQTT and
+    websocket surfaces all left at their own off-by-default setting, and its
+    separate administrative client Deployment declined. Under this configuration
+    it renders a StatefulSet, a ClusterIP Service on the client port, a Headless
+    Service supplying stable server identity, a ConfigMap holding the server
+    configuration, and a disruption budget.
+
+    What it carries that a hand-assembled workload does not is the server's own
+    operational machinery: a sidecar that reloads the configuration in place when
+    the ConfigMap changes, so a configuration edit does not restart the server;
+    start-up, readiness and liveness probes against the monitoring endpoint;
+    and a graceful shutdown that puts the server into its drain mode and lets
+    connected clients move off before the pod goes away. It also honours the
+    monitoring port the Component declares, which the workload-synthesis
+    realization has nowhere to apply. Reach for this realization where a chart
+    repository is reachable at build time; reach for `nats`, the
+    workload-synthesis realization, where the build must complete with nothing
+    fetched. Both images this realization runs are pinned to resolvable release
+    tags for reproducible renders. Default chart version in source.version;
+    override via infra.source_version. provides.host is the bare, self-contained
+    in-cluster Service name — it carries no namespace, so the recipe is
+    independent of where it is deployed; a consumer in another namespace
+    qualifies the host with the target namespace on its own side (caller-side
+    routing). The packaged NATS server is Apache-2.0.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/messaging/nats:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://nats-io.github.io/k8s/helm/charts/
+    chart: nats
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"2.15.0\" }}"
+
+  # provides.host is the client Service name, which is what the Component's
+  # provides contract promises. The valuesMapping below pins the chart's
+  # fullnameOverride to the instance id, and this chart names that Service by the
+  # pinned name with no suffix — read from a render of the chart, not assumed,
+  # because several charts in this catalog suffix it instead. The Headless Service
+  # supplying stable server identity and the configuration ConfigMap are the two
+  # names that do carry a suffix, and neither is the address published here.
+  #
+  # port is the client port. It sets the server's own listen port below, which is
+  # the single value the chart derives the container port and the Service port
+  # from, so the published address and the listener cannot drift apart. protocol
+  # is "nats", which is what a consumer selects a client library for.
+  #
+  # A same-namespace consumer reaches the server under this name directly; a
+  # cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    protocol: "nats"
+
+  # This Recipe reads from infra.overrides:
+  #   image           - map[string]string (container.image.* fields; overrides the tag pin)
+  #   reloader_image  - map[string]string (reloader.image.* fields; overrides the tag pin)
+  #   requests        - { cpu: string, memory: string } (server resource requests)
+  #   nodeSelector    - map[string]string (pod scheduling)
+  #   tolerations     - []object (pod scheduling)
+  valuesMapping: |
+    ## ── Pin the chart's resource names to the instance id ──────
+    ## Names the client Service exactly "<instance_id>", matching provides.host.
+    ## Every object this chart emits derives its name from this key, read from a
+    ## render rather than assumed.
+    fullnameOverride: "{{ .context.instance_id }}"
+
+    ## ── The chart's separate administrative client ─────────────
+    ## The chart also deploys a small utility pod carrying the command-line
+    ## client, so an operator can publish and subscribe from inside the cluster.
+    ## It is ON in the chart's own defaults, and it is declined here because the
+    ## Component describes one messaging server and nothing else — leaving it on
+    ## would render a second Deployment, a second image to pin, and a
+    ## ServiceAccount none of which this Component's contract mentions.
+    natsBox:
+      enabled: false
+
+    ## ── The server's own configuration ─────────────────────────
+    ## The chart assembles the server configuration file from this block and
+    ## mounts it; the surfaces it already carries are left alone and only the
+    ## settings this Component exposes are set, so nothing is written twice.
+    ##
+    ## The client port is the one value the chart derives the container port, the
+    ## Service port and the server's listen directive from, which is what keeps
+    ## the published address and the process in lockstep. The monitoring endpoint
+    ## is left on — the chart's own probes are aimed at it — and moved to the
+    ## port the Component declares, which is a knob the workload-synthesis
+    ## realization has nowhere to apply.
+    config:
+      nats:
+        port: {{ .infra.port }}
+      monitor:
+        enabled: true
+        port: {{ .infra.monitoring_port }}
+      {{- if hasKey (default dict .features) "password" }}
+      ## ── Authentication, when a credential is attached ────────
+      ## The chart's own extension point for additional server configuration.
+      ## The password is written as a reference to the environment variable bound
+      ## below rather than as a literal, using the chart's own convention for an
+      ## unquoted value, so the material never appears in the rendered artifact
+      ## and the server reads it at start-up. Unattached, this whole block is
+      ## absent and the server runs without authentication, which is the
+      ## Component's stated default and the same posture the workload-synthesis
+      ## realization takes.
+      merge:
+        authorization:
+          user: "{{ .values.user }}"
+          password: << $NATS_PASSWORD >>
+      {{- end }}
+
+    ## ── The server container ───────────────────────────────────
+    ## The chart's own default tag is its application version, so leaving it
+    ## unset makes the render move whenever the chart moves. Pin it explicitly.
+    ## The repository is the chart's own default, so the image this realization
+    ## runs is the one its chart is tested against, and it is why the Component's
+    ## engine_version says the chart-backed realization pins its own tag.
+    ## Override the whole block via infra.overrides.image.
+    container:
+      image:
+        {{- if and .infra.overrides .infra.overrides.image }}
+        {{- range $k, $v := .infra.overrides.image }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+        {{- else }}
+        repository: nats
+        tag: "2.15.0-alpine"
+        {{- end }}
+      resources:
+        limits:
+          cpu: "{{ .infra.compute.cpu }}"
+          memory: "{{ .infra.compute.memory }}"
+        {{- if and .infra.overrides .infra.overrides.requests }}
+        requests:
+          cpu: "{{ .infra.overrides.requests.cpu }}"
+          memory: "{{ .infra.overrides.requests.memory }}"
+        {{- end }}
+      {{- if hasKey (default dict .features) "password" }}
+      ## The attached credential, bound BY NAME from its own secret, so the
+      ## material never appears in the rendered artifact. The configuration block
+      ## above references this variable.
+      env:
+        NATS_PASSWORD:
+          valueFrom:
+            secretKeyRef:
+              name: "{{ .features.password.provides.name }}"
+              key: "{{ .features.password.provides.key }}"
+      {{- end }}
+
+    ## ── The configuration-reload sidecar ───────────────────────
+    ## This is one of the two images this realization runs, so it is pinned here
+    ## rather than left to whatever the chart's own default becomes at the next
+    ## chart version. It watches the mounted configuration and signals the server
+    ## to re-read it, which is what lets a configuration change take effect
+    ## without restarting the server — machinery a synthesized workload has
+    ## nowhere to declare. Override the whole block via
+    ## infra.overrides.reloader_image.
+    reloader:
+      enabled: true
+      image:
+        {{- if and .infra.overrides .infra.overrides.reloader_image }}
+        {{- range $k, $v := .infra.overrides.reloader_image }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+        {{- else }}
+        repository: natsio/nats-server-config-reloader
+        tag: "0.23.0"
+        {{- end }}
+
+    ## ── Chart extras this Component does not describe ──────────
+    ## The chart can also enable stream persistence with its own volume,
+    ## clustering across several servers, gateway and leaf-node links, MQTT and
+    ## websocket listeners, an Ingress, a metrics exporter with its
+    ## Prometheus-operator monitor, and a ServiceAccount. The Component describes
+    ## one lean in-memory server and none of those, so each is left at the
+    ## chart's own off-by-default setting. The disruption budget the chart does
+    ## create by default is left alone: it carries no image and no address, and
+    ## declining it would be a change for its own sake.
+
+    ## ── Scheduling overrides ───────────────────────────────────
+    ## This chart carries no scheduling keys of its own; it exposes a merge point
+    ## onto the pod template instead, and that is the surface these land on.
+    {{- if .infra.overrides }}
+    {{- if or .infra.overrides.nodeSelector .infra.overrides.tolerations }}
+    podTemplate:
+      merge:
+        spec:
+          {{- if .infra.overrides.nodeSelector }}
+          nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+          {{- end }}
+          {{- if .infra.overrides.tolerations }}
+          tolerations: {{ toJson .infra.overrides.tolerations }}
+          {{- end }}
+    {{- end }}
+    {{- end }}
+
+  sourceDigests:
+    - kind: helm-https-chart
+      url: https://nats-io.github.io/k8s/helm/charts/
+      chart: nats
+      version: 2.15.0
+      digest: sha256:cf21ffddb6718a57e34dd9856c09e77bd6a51e309fb597e05cafa1e3c2557b99
