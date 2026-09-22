@@ -607,7 +607,7 @@ invented for the name:
 | The operator-managed instance it reconciles, where the controller carries the product's own name and repeating that would say nothing | what that instance is | `rabbitmq-cluster`, `mariadb-cluster` |
 | The managed product it provisions | the product's name | `mariadb-rds`, `mysql-rds` |
 | What stands between the application and the component | that mechanism | `openai-gateway` |
-| The artifact the Recipe wraps | the artifact kind | `mariadb-rds-module` |
+| The artifact the Recipe sources | the artifact kind | `mariadb-rds-module` |
 | That the resource lives outside the Release | `external` | `postgres-external` |
 
 **Where no realization stands the component up with nothing already in place, none
@@ -1100,7 +1100,7 @@ spec:
 Two `infra` fields carry version selection, and they are distinct. Both are provider-neutral conventions — the compiler reads neither; each Recipe decides which it honors and how.
 
 - **`engine_version`** — the running server or binary version. Every component carries it. On synthesized and Compose targets it selects the container image tag; on managed-service targets (Terraform, CloudFormation) it selects the provider's engine version — an RDS `engine_version`, for example. It is the live version knob for the software the component runs.
-- **`source_version`** — the version of the *source artifact* a Recipe pulls: a Helm chart version, a Terraform module version. Only artifact-backed Recipes (a chart wrap, a module wrap) pull such an artifact, so `source_version` belongs only on components whose Recipes are artifact-backed. A pure-synth Recipe assembles its workload directly and pulls no chart or module, so it has no source artifact to version — it exposes `engine_version` alone.
+- **`source_version`** — the version of the *source artifact* a Recipe pulls: a Helm chart version, a Terraform module version. Only artifact-backed Recipes (a sourced Recipe, over a chart or over a module) pull such an artifact, so `source_version` belongs only on components whose Recipes are artifact-backed. A pure-synth Recipe assembles its workload directly and pulls no chart or module, so it has no source artifact to version — it exposes `engine_version` alone.
 
 Declare `source_version` only where an artifact-backed Recipe reads it:
 
@@ -1630,7 +1630,7 @@ never a silent emit. Two shapes, both explicit:
 - **Bundled-deploy** — the Release ships the control plane too. The operator
   install is a first-class **companion component** (a `server` component whose
   Recipe emits the ServiceAccount, cluster RBAC, and controller Deployment, or
-  wraps the project's upstream install chart), declared in the same Aggregate
+  sources the project's upstream install chart), declared in the same Aggregate
   alongside the custom-resource-emitting component, so the custom resource and the
   controller that reconciles it are deployed together.
 
