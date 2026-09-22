@@ -1,0 +1,280 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: qdrant-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Qdrant vector database on Kubernetes via the product's own Helm chart, served
+    from its project's HTTPS chart repository. The chart is configured for the
+    shape this Component describes: one server with a persistent volume for its
+    vector data, publishing the REST and gRPC listeners. Under this configuration
+    it renders a StatefulSet with a per-replica data volume, a ClusterIP Service
+    carrying both listeners, a Headless Service supplying the StatefulSet's
+    stable network identity, a ConfigMap holding the server configuration and its
+    start-up script, and the ServiceAccount the pod runs under. The chart's
+    Ingress, disruption budget and Prometheus-operator monitor are left switched
+    off, because the Component describes none of them.
+
+    It also renders the chart's own interaction check, and what that check does
+    is stated here rather than left to be found: a Pod carrying the
+    `helm.sh/hook: test` annotation, together with the ConfigMap holding the
+    script that Pod runs. The script deletes the collection named
+    `test_collection` on the running server, then recreates it, inserts points
+    into it and queries them back. Anything held under that collection name at
+    the time is destroyed. A hook so annotated is applied only when a test is
+    explicitly asked for — deploying the Release does not run it — but an output
+    applied wholesale, with the hook annotation disregarded, does. The chart
+    offers no setting to decline the check. Where a Release must not carry it,
+    apply the rendered files selectively, or reach for `qdrant`, the
+    workload-synthesis realization, which renders no such Pod. The Pod runs a
+    pinned base image, reads no credential and carries no credential material.
+
+    What it carries that a hand-assembled workload does not is the start-up
+    machinery the product's own maintainers keep in step with it: a script that
+    raises the file-descriptor limit and joins each pod to the peer group by its
+    ordinal, a step that takes ownership of a pre-existing data volume before the
+    unprivileged server starts, a readiness check on the endpoint the server
+    reports readiness from, and a pre-stop pause that lets in-flight requests
+    finish before the pod leaves load-balancing. Reach for this realization where
+    a chart repository is reachable at build time; reach for `qdrant`, the
+    workload-synthesis realization, where the build must complete with nothing
+    fetched. Both images this realization emits — the server's and the
+    interaction check's — are pinned to resolvable release tags for reproducible
+    renders, each overridable from infra.overrides. Default chart version in
+    source.version; override via infra.source_version.
+    provides.host is the bare, self-contained in-cluster
+    Service name — it carries no namespace, so the recipe is independent of where
+    it is deployed; a consumer in another namespace qualifies the host with the
+    target namespace on its own side (caller-side routing). The packaged Qdrant
+    server is Apache-2.0.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/datastore/qdrant:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://qdrant.github.io/qdrant-helm
+    chart: qdrant
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"1.19.1\" }}"
+
+  # provides.host is the vector database's Service name, which is what the
+  # Component's provides contract promises. The valuesMapping below pins the
+  # chart's fullnameOverride to the instance id, and this chart names that
+  # Service by the pinned name with no suffix — read from a render of the chart,
+  # not assumed, because several charts in this catalog suffix it instead. The
+  # Headless Service the StatefulSet needs for its stable network identity is the
+  # one name that does carry a suffix, and it is not the address published here.
+  #
+  # port and grpc_port follow the ports the operator set. Each one sets the
+  # Service port, the container port and the server's own listen port from the
+  # same value below, so the published address and the listener cannot drift
+  # apart. protocol is "http" — the port published as provides.port serves
+  # Qdrant's REST API, and a consumer composing a URL needs the scheme.
+  #
+  # A same-namespace consumer reaches the server under this name directly; a
+  # cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    grpc_port: "{{ .infra.grpc_port }}"
+    protocol: "http"
+
+  # A Release may set a single key inside an infra group — `compute.cpu` alone, or
+  # `storage.size` alone — and a group supplied that way carries only the keys it
+  # names, so the sibling this Recipe also reads arrives empty. Rendered, that
+  # would emit a workload with a CPU limit and no memory limit, or a volume with a
+  # size and no storage class: a Release materially different from the one the
+  # Component's declared defaults describe, with nothing in the output saying so.
+  # The build halts here instead, naming the key that is missing and the group it
+  # belongs to, so the fix is one line in the Release. This is the same guard the
+  # workload-synthesis realization carries, because the hazard is the Component's
+  # shape rather than either realization's.
+  assertions:
+    compute_group_complete: >-
+      {{- if not (optional (default dict .infra.compute) "cpu" "") -}}
+      {{- fail "this Release sets part of infra.compute on the vector store but leaves compute.cpu empty, so the rendered workload would carry no CPU request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+      {{- if not (optional (default dict .infra.compute) "memory" "") -}}
+      {{- fail "this Release sets part of infra.compute on the vector store but leaves compute.memory empty, so the rendered workload would carry no memory request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+    storage_group_complete: >-
+      {{- if not (optional (default dict .infra.storage) "size" "") -}}
+      {{- fail "this Release sets part of infra.storage on the vector store but leaves storage.size empty, so the rendered volume would request no size: set both storage.size and storage.type together, or remove the storage block entirely to take the component's defaults" -}}
+      {{- end -}}
+      {{- if not (optional (default dict .infra.storage) "type" "") -}}
+      {{- fail "this Release sets part of infra.storage on the vector store but leaves storage.type empty, so the rendered volume would name no storage class: set both storage.size and storage.type together, or remove the storage block entirely to take the component's defaults" -}}
+      {{- end -}}
+
+  # This Recipe reads from infra.overrides:
+  #   image          - map[string]string (image.* fields; overrides the tag pin)
+  #   test_image     - string (the interaction check's image; overrides the tag pin)
+  #   service_type   - string (service.type; how the endpoint is exposed, default ClusterIP)
+  #   requests       - { cpu: string, memory: string } (server resource requests)
+  #   nodeSelector   - map[string]string (pod scheduling)
+  #   tolerations    - []object (pod scheduling)
+  valuesMapping: |
+    ## ── Pin the chart's resource names to the instance id ──────
+    ## Names the vector database's Service exactly "<instance_id>", matching
+    ## provides.host. Every object this chart emits derives its name from this
+    ## key, read from a render rather than assumed.
+    fullnameOverride: "{{ .context.instance_id }}"
+
+    ## ── Server image pin ───────────────────────────────────────
+    ## The chart's own default tag is its application version, so leaving it
+    ## unset makes the render move whenever the chart moves. Pin it explicitly.
+    ## The repository is the chart's own default, so the image this realization
+    ## runs is the one its chart is tested against, and it is why the Component's
+    ## engine_version says the chart-backed realization pins its own tag. The
+    ## chart's volume-ownership step runs this same image, so one pin covers the
+    ## server and that step both. Override the whole block via
+    ## infra.overrides.image.
+    image:
+      {{- if and .infra.overrides .infra.overrides.image }}
+      {{- range $k, $v := .infra.overrides.image }}
+      {{ $k }}: "{{ $v }}"
+      {{- end }}
+      {{- else }}
+      repository: docker.io/qdrant/qdrant
+      tag: "v1.19.1"
+      {{- end }}
+
+    ## ── The interaction check's image pin ──────────────────────
+    ## The chart renders a Pod carrying the helm.sh/hook: test annotation, and
+    ## the image that Pod runs is the second and last image this realization
+    ## emits. The chart's own default for it is a floating tag: the rendered
+    ## bytes stay the same while what a cluster would actually pull changes
+    ## under them on every upstream rebuild, which is the one drift a render can
+    ## never show. It is pinned here to a concrete published tag of that same
+    ## repository. Override it via infra.overrides.test_image. What the Pod's
+    ## script does is stated in this Recipe's description, because a reader
+    ## deciding whether to run it needs that before a cluster does.
+    chartTests:
+      dbInteraction:
+        {{- if and .infra.overrides .infra.overrides.test_image }}
+        image: "{{ .infra.overrides.test_image }}"
+        {{- else }}
+        image: "registry.suse.com/bci/bci-base:15.7-5.23.39"
+        {{- end }}
+
+    ## ── The two published listeners, and the peer port ─────────
+    ## This list drives the Service ports AND the container ports, so authoring
+    ## it from infra is what keeps the published address and the process in
+    ## lockstep. The server's own listen ports are set from the same values in
+    ## the configuration block below — the chart writes that file and the
+    ## container reads it, and moving one without the other would publish an
+    ## address nothing answers on.
+    ##
+    ## The peer port is left at the chart's own value: it carries traffic between
+    ## the server's own pods, the Component neither exposes nor publishes it, and
+    ## it is reached inside the pod group rather than through this Service.
+    service:
+      {{- if and .infra.overrides .infra.overrides.service_type }}
+      type: "{{ .infra.overrides.service_type }}"
+      {{- else }}
+      type: ClusterIP
+      {{- end }}
+      ports:
+        - name: http
+          port: {{ .infra.port }}
+          targetPort: {{ .infra.port }}
+          protocol: TCP
+          checksEnabled: true
+        - name: grpc
+          port: {{ .infra.grpc_port }}
+          targetPort: {{ .infra.grpc_port }}
+          protocol: TCP
+          checksEnabled: false
+        - name: p2p
+          port: 6335
+          targetPort: 6335
+          protocol: TCP
+          checksEnabled: false
+
+    ## ── The server's own configuration file ────────────────────
+    ## The chart assembles this file from the block below and mounts it; the keys
+    ## it already carries — the peer group and transport security — are left
+    ## alone, and only the settings this Component exposes are added, so nothing
+    ## is written twice. Each developer knob is emitted only when the Aggregate
+    ## set it, so a bare declaration renders no redundant setting and the server
+    ## keeps its own built-in default.
+    config:
+      service:
+        http_port: {{ .infra.port }}
+        grpc_port: {{ .infra.grpc_port }}
+        {{- with .values.max_request_size_mb }}
+        max_request_size_mb: {{ . }}
+        {{- end }}
+      {{- with .values.log_level }}
+      log_level: "{{ . }}"
+      {{- end }}
+      {{- if .values.telemetry_disabled }}
+      telemetry_disabled: true
+      {{- end }}
+
+    ## ── The vector data volume ─────────────────────────────────
+    ## Vector data is the point of this store rather than a cache of something
+    ## else, so the volume is sized and classed from infra rather than left to a
+    ## default.
+    persistence:
+      size: "{{ .infra.storage.size }}"
+      storageClassName: "{{ .infra.storage.type }}"
+
+    ## ── Authentication ─────────────────────────────────────────
+    ## 🔴 THE CHART'S OWN KEY SETTING IS DELIBERATELY NEVER SET, AND THAT IS A
+    ## CORRECTNESS REQUIREMENT RATHER THAN A PREFERENCE. Set to true it GENERATES
+    ## a random key, so two renders of identical input would differ; and both its
+    ## generated and its referenced form read the cluster for an existing secret,
+    ## which an ahead-of-time compiler has no access to and which would render
+    ## empty. Left unset, neither branch is reached: no key secret is emitted and
+    ## no random value is minted.
+    ##
+    ## The attached credential is delivered instead as an environment binding on
+    ## the setting's own name, BY NAME from the credential's secret, so the
+    ## material never appears in the rendered artifact and the server enforces
+    ## the key on every request. Unattached, nothing is emitted and the server
+    ## accepts unauthenticated requests, which is the Component's stated default
+    ## and the same posture the workload-synthesis realization takes.
+    {{- if hasKey (default dict .features) "api_key" }}
+    env:
+      - name: QDRANT__SERVICE__API_KEY
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .features.api_key.provides.name }}"
+            key: "{{ .features.api_key.provides.key }}"
+    {{- end }}
+
+    ## ── Server resources ───────────────────────────────────────
+    resources:
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      {{- if and .infra.overrides .infra.overrides.requests }}
+      requests:
+        cpu: "{{ .infra.overrides.requests.cpu }}"
+        memory: "{{ .infra.overrides.requests.memory }}"
+      {{- end }}
+
+    ## ── Scheduling overrides ───────────────────────────────────
+    {{- if .infra.overrides }}
+    {{- if .infra.overrides.nodeSelector }}
+    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+    {{- end }}
+    {{- if .infra.overrides.tolerations }}
+    tolerations: {{ toJson .infra.overrides.tolerations }}
+    {{- end }}
+    {{- end }}
+
+  sourceDigests:
+    - kind: helm-https-chart
+      url: https://qdrant.github.io/qdrant-helm
+      chart: qdrant
+      version: 1.19.1
+      digest: sha256:4562eb295c2d98ad9dbb625a729fcb593d315f2538d0200035aac37521f12b17
