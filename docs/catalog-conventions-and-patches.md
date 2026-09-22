@@ -607,8 +607,15 @@ invented for the name:
 | The operator-managed instance it reconciles, where the controller carries the product's own name and repeating that would say nothing | what that instance is | `rabbitmq-cluster`, `mariadb-cluster` |
 | The managed product it provisions | the product's name | `mariadb-rds`, `mysql-rds` |
 | What stands between the application and the component | that mechanism | `openai-gateway` |
-| The artifact the Recipe sources | the artifact kind | `mariadb-rds-module` |
+| The artifact the Recipe sources | the artifact kind | `mariadb-rds-module`, `prometheus-chart` |
 | That the resource lives outside the Release | `external` | `postgres-external` |
+
+A chart realization added beside an authored one is the common case of the
+sourced-artifact row: the authored Recipe fetches nothing, so it keeps the bare name,
+and the chart realization takes `-chart` — `prometheus-chart` beside `prometheus`.
+Where a component comes to carry two chart realizations from different publishers, the
+later one is distinguished by what actually tells them apart rather than by a second
+generic suffix.
 
 **Where no realization stands the component up with nothing already in place, none
 of them takes the bare name and every one carries a distinguisher.**
@@ -1231,6 +1238,19 @@ Two obligations follow a sourced Recipe:
   the structural omission which causes the defect rather than the defect itself:
   the check reads authored YAML and renders nothing, so confirming the published
   address against a Service the chart really emits stays the author's to do.
+  🔴 **And the name the chart honours is not always the top-level one.** Some
+  charts derive a component's resource names from a knob of their own —
+  `server.fullnameOverride` rather than `fullnameOverride`, say — and the
+  top-level key never reaches it, so the pin is present, the check is satisfied,
+  and the address still answers to nothing. **Render the chart both ways and read
+  the emitted Service name before choosing which knob to bind.**
+
+**Per-entity validation does not render a sourced Recipe, so its success says
+less than it looks.** Validating a chart-backed Recipe reports that the render was
+not attempted, precisely because resolving the chart is a separate step — so a
+clean result there means *not examined*, never *examined and fine*. A sourced
+Recipe is proven by a real build with the rendered output read, and by nothing
+short of one.
 
 ### Target-expected names are the Recipe's translation
 

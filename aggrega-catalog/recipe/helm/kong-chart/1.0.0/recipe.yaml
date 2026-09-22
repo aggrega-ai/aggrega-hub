@@ -1,0 +1,205 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: kong-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Kong, a database-backed API gateway, on Kubernetes via the official Kong Helm
+    chart, served from that project's HTTPS chart repository. The chart is
+    configured for the shape this Component describes: a gateway whose
+    configuration lives in the PostgreSQL backend wired on the `backend`
+    uses-socket, with the chart's own bundled database, its Kubernetes ingress
+    controller and its manager console all switched off, because the Component
+    describes none of them. Under this configuration the chart renders a
+    Deployment for the gateway, a ServiceAccount, a ClusterIP Service for the
+    proxy data plane, a ClusterIP Service for the in-cluster Admin API, and the
+    three schema-migration Jobs the product's own maintainers sequence around a
+    release: a bootstrap before the gateway first serves, an up-migration before
+    an upgrade, and a finishing migration after one. That sequencing is the reason
+    to reach for this realization — a workload assembled by hand can run a
+    bootstrap step before its own container and nothing more, so it has no way to
+    express what must happen on either side of a version change. Reach for this
+    realization where a chart repository is reachable at build time and the
+    gateway will be upgraded in place; reach for `kong`, the workload-synthesis
+    realization, where the build must complete with nothing fetched. The gateway
+    image is pinned to a resolvable release tag for reproducible renders. Default
+    chart version in source.version; override via infra.source_version.
+    provides.host is the proxy data-plane Service name, which is what the
+    Component publishes — it carries no namespace, so the recipe is independent of
+    where it is deployed; a consumer in another namespace qualifies the host with
+    the target namespace on its own side (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/gateway/kong:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://charts.konghq.com
+    chart: kong
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"3.4.1\" }}"
+
+  # provides.host is the proxy data-plane Service name — the entry point client
+  # traffic is sent to, which is what the Component's provides contract promises.
+  # The valuesMapping below pins the chart's fullnameOverride to the instance id,
+  # and the chart suffixes the proxy Service with "-proxy", so that Service is
+  # named exactly "<instance_id>-proxy". The Admin API Service takes
+  # "<instance_id>-admin" and is deliberately NOT what this pillar publishes: the
+  # Component's own description says the published port carries proxied traffic
+  # and never the Admin API. Both suffixes were read from a render of the chart,
+  # not assumed. A same-namespace consumer reaches the proxy under this name
+  # directly; a cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.instance_id }}-proxy"
+    port: "{{ .infra.proxy_port }}"
+    protocol: "http"
+
+  # This Recipe reads from infra.overrides:
+  #   image        - map[string]string (image.* fields; overrides the tag pin)
+  #   service_type - string (proxy.type; how the data plane is exposed, default ClusterIP)
+  #   requests     - { cpu: string, memory: string } (gateway resource requests)
+  #   nodeSelector - map[string]string (pod scheduling)
+  #   tolerations  - []object (pod scheduling)
+  valuesMapping: |
+    ## ── The configuration backend edge ─────────────────────────
+    ## The gateway keeps its routing configuration here. The edge is required, so
+    ## it is always resolved by the time this template runs; its host and port
+    ## compose the connection, and its user and database name the login.
+    {{- $backend := dict }}
+    {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "backend" }}
+        {{- $backend = $edge }}
+      {{- end }}
+    {{- end }}
+
+    ## ── Pin the chart's resource names to the instance id ──────
+    ## Names the proxy Service "<instance_id>-proxy", matching provides.host, and
+    ## the Admin API Service "<instance_id>-admin".
+    fullnameOverride: "{{ .context.instance_id }}"
+
+    ## ── Gateway image pin ──────────────────────────────────────
+    ## The chart's own default names a release series rather than a point
+    ## release, which makes the render move as that series moves; pin it
+    ## explicitly instead. Override the whole block via infra.overrides.image.
+    image:
+      {{- if and .infra.overrides .infra.overrides.image }}
+      {{- range $k, $v := .infra.overrides.image }}
+      {{ $k }}: "{{ $v }}"
+      {{- end }}
+      {{- else }}
+      repository: kong
+      tag: "3.9.3"
+      {{- end }}
+
+    ## ── Chart extras this Component does not describe ──────────
+    ## The chart can also deploy a PostgreSQL of its own, a Kubernetes ingress
+    ## controller, and the manager console. The backend is wired through the
+    ## topology rather than bundled, and the Component describes neither an
+    ## ingress controller nor a console, so all three are switched off rather
+    ## than rendered unreferenced.
+    postgresql:
+      enabled: false
+    ingressController:
+      enabled: false
+    manager:
+      enabled: false
+
+    ## ── Backend connection ─────────────────────────────────────
+    ## Composed from the resolved `backend` edge. The password is the one place
+    ## the two credential shapes differ: attached, it is bound by NAME so the
+    ## material never appears in the rendered artifact; unattached, the Component
+    ## declares the slot optional, so an inline development default keeps the
+    ## render working exactly as the workload-synthesis realization does.
+    env:
+      database: postgres
+      pg_host: "{{ $backend.provides.host }}"
+      pg_port: {{ $backend.provides.port }}
+      pg_user: "{{ $backend.provides.user }}"
+      pg_database: "{{ $backend.provides.database }}"
+      {{- if hasKey (default dict .features) "password" }}
+      pg_password:
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .features.password.provides.name }}"
+            key: "{{ .features.password.provides.key }}"
+      {{- else }}
+      pg_password: "apppass"
+      {{- end }}
+
+    ## ── Schema migrations ──────────────────────────────────────
+    ## The three steps the product's own maintainers sequence around a release.
+    ## They are what this realization carries that the workload-synthesis one
+    ## cannot: the bootstrap has an equivalent there (an init container), the
+    ## other two have none, because a workload has nowhere to say "before the
+    ## upgrade" or "after it".
+    migrations:
+      init: true
+      preUpgrade: true
+      postUpgrade: true
+
+    ## ── Proxy data plane ───────────────────────────────────────
+    ## The client entry point, and the Service provides.host addresses.
+    ## infra.proxy_port sets both the container port and the Service port, so the
+    ## published address and the listener move together. TLS is terminated
+    ## outside the cluster, matching the "http" this Recipe publishes.
+    proxy:
+      enabled: true
+      {{- if and .infra.overrides .infra.overrides.service_type }}
+      type: "{{ .infra.overrides.service_type }}"
+      {{- else }}
+      type: ClusterIP
+      {{- end }}
+      http:
+        enabled: true
+        containerPort: {{ .infra.proxy_port }}
+        servicePort: {{ .infra.proxy_port }}
+      tls:
+        enabled: false
+
+    ## ── Admin API ──────────────────────────────────────────────
+    ## In-cluster only, on the port the operator set. Never published through
+    ## provides.
+    admin:
+      enabled: true
+      type: ClusterIP
+      http:
+        enabled: true
+        containerPort: {{ .infra.admin_port }}
+        servicePort: {{ .infra.admin_port }}
+      tls:
+        enabled: false
+
+    ## ── Gateway resources ──────────────────────────────────────
+    resources:
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      {{- if and .infra.overrides .infra.overrides.requests }}
+      requests:
+        cpu: "{{ .infra.overrides.requests.cpu }}"
+        memory: "{{ .infra.overrides.requests.memory }}"
+      {{- end }}
+
+    ## ── Scheduling overrides ───────────────────────────────────
+    {{- if .infra.overrides }}
+    {{- if .infra.overrides.nodeSelector }}
+    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+    {{- end }}
+    {{- if .infra.overrides.tolerations }}
+    tolerations: {{ toJson .infra.overrides.tolerations }}
+    {{- end }}
+    {{- end }}
+
+  sourceDigests:
+    - kind: helm-https-chart
+      url: https://charts.konghq.com
+      chart: kong
+      version: 3.4.1
+      digest: sha256:2c7dbf6bc59846d0c779e2509f45d041cc0dba5af85d6728294b9f37cd02e1d7

@@ -1,0 +1,167 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: fluent-bit-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Fluent Bit log processor and forwarder on Kubernetes via the official Fluent
+    Helm chart, served from that project's HTTPS chart repository. The chart
+    deploys Fluent Bit in its node-collector shape: one pod per node reading the
+    container log files that node writes, a filter that enriches every record
+    with the pod, namespace and label metadata it reads back from the cluster,
+    and the ServiceAccount, ClusterRole and ClusterRoleBinding that filter needs
+    to do so. That cluster-scoped read grant is the reason to reach for this
+    realization — a forwarder assembled as a plain workload carries no such
+    grant, so it can neither read the node's log files nor enrich a record with
+    the workload it came from. The sink wired on the `forward_target` uses-socket
+    becomes the `forward` output, exactly as in the workload-synthesis
+    realization, so the developer-facing contract is unchanged between the two.
+    Reach for this realization where a chart repository is reachable at build
+    time and log records are to be collected from the cluster itself; reach for
+    `fluent-bit`, the workload-synthesis realization, where the build must
+    complete with nothing fetched, or where a single forwarding pod with its own
+    inputs is what is wanted rather than a per-node collector. The forwarder image
+    is pinned to a resolvable release tag for reproducible renders. Default chart
+    version in source.version; override via infra.source_version. provides.host is
+    the bare, self-contained in-cluster Service name — it carries no namespace, so
+    the recipe is independent of where it is deployed; a consumer in another
+    namespace qualifies the host with the target namespace on its own side
+    (caller-side routing). The Fluent Bit server is Apache-2.0.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/observability/fluent-bit:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://fluent.github.io/helm-charts
+    chart: fluent-bit
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"0.58.2\" }}"
+
+  # provides.host is the Service fronting the monitoring endpoint, which is what
+  # the Component's provides contract promises. The valuesMapping below pins the
+  # chart's fullnameOverride to the instance id, and this chart names its Service
+  # from that value with no suffix, so the Service is named exactly
+  # "<instance_id>" with no namespace segment. A same-namespace consumer reaches
+  # it under this name directly; a cross-namespace consumer qualifies it
+  # caller-side. protocol is "http" — the monitoring endpoint speaks HTTP.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+
+  # This Recipe reads from infra.overrides:
+  #   image        - map[string]string (image.* fields; overrides the tag pin)
+  #   service_type - string (service.type; default ClusterIP)
+  #   requests     - { cpu: string, memory: string } (container resource requests)
+  #   nodeSelector - map[string]string (pod scheduling)
+  #   tolerations  - []object (pod scheduling)
+  valuesMapping: |
+    ## ── Pin the chart's resource names to the instance id ──────
+    ## Names the monitoring Service exactly "<instance_id>", matching
+    ## provides.host. This chart's fullname helper reads the top-level override
+    ## and every resource it names derives from it, so one pin covers them all.
+    fullnameOverride: "{{ .context.instance_id }}"
+
+    ## ── Forwarder image pin ────────────────────────────────────
+    ## The chart leaves the tag empty and falls back to its own appVersion, which
+    ## makes the render move whenever the chart moves; pin it explicitly instead.
+    ## The repository is the chart's own default, so the image this realization
+    ## runs is the one its chart is tested against. This is why the Component's
+    ## engine_version says the chart-backed realization pins its own tag.
+    ## Override the whole block via infra.overrides.image.
+    image:
+      {{- if and .infra.overrides .infra.overrides.image }}
+      {{- range $k, $v := .infra.overrides.image }}
+      {{ $k }}: "{{ $v }}"
+      {{- end }}
+      {{- else }}
+      repository: cr.fluentbit.io/fluent/fluent-bit
+      tag: "5.1.2"
+      {{- end }}
+
+    ## ── Chart extras this Component does not describe ──────────
+    ## The chart can also render a connectivity test Pod under a Helm test hook.
+    ## A test hook is not part of the deployed system and the Component describes
+    ## nothing like it, so it is switched off rather than written into the output.
+    testFramework:
+      enabled: false
+
+    ## ── Cluster read grants ────────────────────────────────────
+    ## The record-enrichment filter below reads pod and namespace metadata back
+    ## from the cluster, so the chart's ServiceAccount and cluster-scoped read
+    ## grants are created. This is the capability the workload-synthesis
+    ## realization cannot express, and switching it off would leave the filter
+    ## failing every lookup at run time while the render stayed green.
+    rbac:
+      create: true
+    serviceAccount:
+      create: true
+
+    ## ── Monitoring endpoint ────────────────────────────────────
+    ## infra.port sets both the port the HTTP monitoring server binds and the
+    ## port its Service carries, so the published address and the listener move
+    ## together.
+    metricsPort: {{ .infra.port }}
+    service:
+      {{- if and .infra.overrides .infra.overrides.service_type }}
+      type: "{{ .infra.overrides.service_type }}"
+      {{- else }}
+      type: ClusterIP
+      {{- end }}
+      port: {{ .infra.port }}
+
+    ## ── Resources ──────────────────────────────────────────────
+    resources:
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      {{- if and .infra.overrides .infra.overrides.requests }}
+      requests:
+        cpu: "{{ .infra.overrides.requests.cpu }}"
+        memory: "{{ .infra.overrides.requests.memory }}"
+      {{- end }}
+
+    ## ── Scheduling overrides ───────────────────────────────────
+    {{- if .infra.overrides }}
+    {{- if .infra.overrides.nodeSelector }}
+    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+    {{- end }}
+    {{- if .infra.overrides.tolerations }}
+    tolerations: {{ toJson .infra.overrides.tolerations }}
+    {{- end }}
+    {{- end }}
+
+    ## ── Output pipeline ────────────────────────────────────────
+    ## The component wired on the `forward_target` socket becomes the forward
+    ## output: its resolved host and port from the enriched topology pipe are the
+    ## output's Host and Port, and the developer's forward_match value selects
+    ## which records are shipped. Only `outputs` is authored here — the chart's
+    ## own service, input and filter sections are what encode the node-collector
+    ## shape and the metadata enrichment, and re-deriving them by hand is exactly
+    ## what this realization exists not to do.
+    config:
+      outputs: |
+      {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "forward_target" }}
+        [OUTPUT]
+            Name   forward
+            Match  {{ $.values.forward_match }}
+            Host   {{ $edge.provides.host }}
+            Port   {{ $edge.provides.port }}
+      {{- end }}
+      {{- end }}
+
+  sourceDigests:
+    - kind: helm-https-chart
+      url: https://fluent.github.io/helm-charts
+      chart: fluent-bit
+      version: 0.58.2
+      digest: sha256:2404614ace4c7dc049b76fd39d13b695f7b66332c38095327ebaa8fc91f0b046

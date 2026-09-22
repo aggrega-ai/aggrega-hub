@@ -1,0 +1,220 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: prometheus-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Prometheus metrics server on Kubernetes via the prometheus-community Helm
+    chart, served from that project's HTTPS chart repository. The chart is
+    configured for the single-server shape this Component describes: the
+    alerting, exporter and push-gateway subcharts it can also deploy are
+    switched off, so the render is one Prometheus server and nothing else.
+    Under this configuration the chart renders a Deployment for the server, a
+    ConfigMap carrying the scrape configuration, a PersistentVolumeClaim for the
+    time-series database, a ClusterIP Service, and the ServiceAccount,
+    ClusterRole and ClusterRoleBinding the server needs to read the cluster's own
+    endpoints. That cluster-scoped read grant is the reason to reach for this
+    realization: a server assembled as a plain workload carries no such grant and
+    cannot discover targets from the cluster at all. Each connection on the
+    `scrape_target` uses-socket becomes one job in the scrape configuration the
+    chart writes, exactly as the workload-synthesis realization does, so the
+    developer-facing contract is unchanged between the two. Reach for this
+    realization where a chart repository is reachable at build time and the
+    server is expected to discover targets from the cluster; reach for
+    `prometheus`, the workload-synthesis realization, where the build must
+    complete with nothing fetched. The server image is pinned to a resolvable
+    release tag for reproducible renders. Default chart version in
+    source.version; override via infra.source_version. provides.host is the bare,
+    self-contained in-cluster Service name — it carries no namespace, so the
+    recipe is independent of where it is deployed; a consumer in another
+    namespace qualifies the host with the target namespace on its own side
+    (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/observability/prometheus:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://prometheus-community.github.io/helm-charts
+    chart: prometheus
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"29.31.1\" }}"
+
+  # provides.host is the query-endpoint Service name, which is what the
+  # Component's provides contract promises. The valuesMapping below pins
+  # server.fullnameOverride to the instance id, so that Service is named exactly
+  # "<instance_id>" with no namespace segment.
+  #
+  # 🔴 The knob is server.fullnameOverride and NOT the chart's top-level
+  # fullnameOverride. This chart derives the server's resource names from its own
+  # server.fullnameOverride, falling back to the release name plus the chart name
+  # plus "server"; the top-level override is read by a different name helper and
+  # does not reach the server's Service. Setting the top-level one instead names
+  # the Service "<instance_id>-prometheus-server", which this host would not
+  # match. Established by rendering the chart both ways.
+  #
+  # A same-namespace consumer reaches the query endpoint under this name
+  # directly; a cross-namespace consumer qualifies it caller-side. port follows
+  # the Service port the operator set; the server process itself always listens
+  # on the chart's fixed 9090 and the Service forwards to it.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+
+  # This Recipe reads from infra.overrides:
+  #   image               - map[string]string (server.image.* fields; overrides the tag pin)
+  #   config_reload_image - map[string]string (configmapReload.prometheus.image.* fields)
+  #   requests            - { cpu: string, memory: string } (server resource requests)
+  #   storage_class       - string (server.persistentVolume.storageClass for the data PVC)
+  #   nodeSelector        - map[string]string (server pod scheduling)
+  #   tolerations         - []object (server pod scheduling)
+  valuesMapping: |
+    ## ── Subcharts this Component does not describe ─────────────
+    ## The chart can also deploy an alert manager, a node exporter, a
+    ## kube-state-metrics instance and a push gateway. The Component publishes a
+    ## query endpoint for one metrics server and describes none of those, so they
+    ## are switched off rather than rendered unreferenced. Each is its own product
+    ## and belongs to its own component if it is wanted.
+    alertmanager:
+      enabled: false
+    kube-state-metrics:
+      enabled: false
+    prometheus-node-exporter:
+      enabled: false
+    prometheus-pushgateway:
+      enabled: false
+
+    ## ── Configuration-reload sidecar image pin ─────────────────
+    ## The chart runs a second container beside the server, watching the
+    ## configuration ConfigMap and asking the server to reload it. It is one of
+    ## the images this Recipe renders, so it is pinned here rather than left to
+    ## whatever the chart's own default becomes at the next chart version.
+    ## Override the whole block via infra.overrides.config_reload_image.
+    configmapReload:
+      prometheus:
+        image:
+          {{- if and .infra.overrides .infra.overrides.config_reload_image }}
+          {{- range $k, $v := .infra.overrides.config_reload_image }}
+          {{ $k }}: "{{ $v }}"
+          {{- end }}
+          {{- else }}
+          repository: quay.io/prometheus-operator/prometheus-config-reloader
+          tag: "v0.94.0"
+          {{- end }}
+
+    server:
+      ## ── Pin the chart's resource names to the instance id ────
+      ## Names the query-endpoint Service exactly "<instance_id>", matching
+      ## provides.host. Read the comment above provides for why this is the
+      ## server-scoped override rather than the chart's top-level one.
+      fullnameOverride: "{{ .context.instance_id }}"
+
+      ## ── Server image pin ─────────────────────────────────────
+      ## The chart leaves the tag empty and falls back to its own appVersion,
+      ## which makes the render move whenever the chart moves; pin it explicitly
+      ## instead. The repository is the chart's own default rather than the
+      ## workload-synthesis realization's, so the image this realization runs is
+      ## the one its chart is tested against, and it is why the Component's
+      ## engine_version says the chart-backed realization pins its own tag.
+      ## Override the whole block via infra.overrides.image.
+      image:
+        {{- if and .infra.overrides .infra.overrides.image }}
+        {{- range $k, $v := .infra.overrides.image }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+        {{- else }}
+        repository: quay.io/prometheus/prometheus
+        tag: "v3.14.0"
+        {{- end }}
+
+      ## ── Query-endpoint Service ───────────────────────────────
+      ## infra.port sets the Service port. The server process listens on the
+      ## chart's fixed 9090 and the Service forwards to it, so an operator moving
+      ## the port moves the published address and not the listener.
+      service:
+        type: ClusterIP
+        servicePort: {{ .infra.port }}
+
+      ## ── Time-series database volume ──────────────────────────
+      persistentVolume:
+        enabled: true
+        size: "{{ .infra.storage.size }}"
+        {{- if and .infra.overrides .infra.overrides.storage_class }}
+        storageClass: "{{ .infra.overrides.storage_class }}"
+        {{- end }}
+
+      ## ── Server resources ─────────────────────────────────────
+      resources:
+        limits:
+          cpu: "{{ .infra.compute.cpu }}"
+          memory: "{{ .infra.compute.memory }}"
+        {{- if and .infra.overrides .infra.overrides.requests }}
+        requests:
+          cpu: "{{ .infra.overrides.requests.cpu }}"
+          memory: "{{ .infra.overrides.requests.memory }}"
+        {{- end }}
+
+      ## ── Scheduling overrides ─────────────────────────────────
+      {{- if .infra.overrides }}
+      {{- if .infra.overrides.nodeSelector }}
+      nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+      {{- end }}
+      {{- if .infra.overrides.tolerations }}
+      tolerations: {{ toJson .infra.overrides.tolerations }}
+      {{- end }}
+      {{- end }}
+
+    ## ── Scrape configuration ───────────────────────────────────
+    ## Every component wired on the `scrape_target` socket becomes one scrape
+    ## job: its resolved host and port from the enriched topology pipe are the
+    ## job's target, and the edge's per-connection values tune the job's label,
+    ## cadence and metrics path. This is the same mapping the workload-synthesis
+    ## realization performs, so a developer who wired the topology once gets the
+    ## same jobs from either realization.
+    ##
+    ## The jobs below are ADDED to the chart's own cluster-discovery jobs rather
+    ## than replacing them, so this realization scrapes both the targets the
+    ## topology wires and whatever the cluster advertises through the annotations
+    ## the chart's jobs match on. That is a deliberate difference from the
+    ## workload-synthesis realization, which carries only the wired targets
+    ## because it has no grant to discover anything else.
+    ##
+    ## job_name keeps a template fallback because its default is the edge alias —
+    ## per-edge context, which no static value in the socket's valueSchema can
+    ## express. The two keys below take their defaults from that valueSchema, so
+    ## they read the edge value directly and this template holds no second copy.
+    ## 🔴 Only `scrape_configs` is authored here. The chart's own
+    ## `prometheus.yml` already carries `global` and `rule_files`, and setting
+    ## either again from this overlay emits the key TWICE in the rendered
+    ## configuration rather than replacing it — a duplicate mapping key that
+    ## renders green and that Prometheus reads to the last occurrence, silently
+    ## discarding the chart's defaults. Established by rendering it both ways.
+    serverFiles:
+      prometheus.yml:
+        scrape_configs:
+        {{- range $alias, $edge := .context.uses }}
+        {{- if eq $edge.socket "scrape_target" }}
+        {{- $v := default (dict) $edge.values }}
+          - job_name: {{ default $alias (get $v "job_name") }}
+            scrape_interval: {{ get $v "scrape_interval" }}
+            metrics_path: {{ get $v "metrics_path" }}
+            static_configs:
+              - targets:
+                  - {{ $edge.provides.host }}:{{ $edge.provides.port }}
+        {{- end }}
+        {{- end }}
+
+  sourceDigests:
+    - kind: helm-https-chart
+      url: https://prometheus-community.github.io/helm-charts
+      chart: prometheus
+      version: 29.31.1
+      digest: sha256:a2925c9c0677dbc2ccf9b9f7b75dd1de44b1ee0b8f58a7f061d1ee1b47617984
