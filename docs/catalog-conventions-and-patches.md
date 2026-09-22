@@ -1225,8 +1225,12 @@ Two obligations follow a sourced Recipe:
 - **Pin the generated resource names.** Bind the chart's `fullnameOverride` to
   `.context.instance_id` so a Service the Component publishes through `provides`
   is named something the render actually emits. A `provides.host` that names no
-  emitted Service is a broken contract that no gate catches, because both sides
-  render successfully.
+  emitted Service is a broken contract, and a build reports nothing either way,
+  because both sides render successfully. This catalog's own checks refuse a
+  sourced Helm Recipe that publishes a host while pinning no name. That catches
+  the structural omission which causes the defect rather than the defect itself:
+  the check reads authored YAML and renders nothing, so confirming the published
+  address against a Service the chart really emits stays the author's to do.
 
 ### Target-expected names are the Recipe's translation
 
