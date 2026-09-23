@@ -510,7 +510,7 @@ older versions. The `<entity>.yaml` filename is kind-conventional:
 | Feature | `feature.yaml` |
 | Plugin | `plugin.yaml` |
 | Aggregate | `aggregate.yaml` |
-| Recipe / FeatureRecipe | `recipe.yaml` (co-located `source/`, `mappings/`, `artifacts/` sit beside it inside the version dir) |
+| Recipe / FeatureRecipe | `recipe.yaml` (co-located `source/`, `mappings/`, `artifacts/` and the `entity.lock` a resolution writes sit beside it inside the version dir) |
 | SchemaLibrary / MappingLibrary / WorkloadLibrary / ArtifactsLibrary | `library.yaml` |
 
 Recipe and FeatureRecipe deliberately share the `recipe.yaml` filename. The walker
