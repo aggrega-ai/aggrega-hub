@@ -2175,8 +2175,8 @@ in `metadata.pluginType`. The identity coordinate is the pair
 are **derived** from that pair. The same bare name under a different
 `pluginType` is a different plugin, so the socket travels with the plugin's
 identity through its `metadata.pluginType`, and the derived coordinate places it
-at a distinct location. The raw `.wasm` binary the entity pins by digest is
-published as its own artifact alongside the entity.
+at a distinct location. The entity and its `.wasm` publish as one OCI manifest:
+the entity is the manifest's config and the `.wasm` is its single layer.
 
 The core plugin entities are **generated, not hand-authored** — one per guest
 embedded in the compiler, filed under the socket directory its `pluginType`
