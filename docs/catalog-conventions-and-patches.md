@@ -21,7 +21,7 @@ aggrega-catalog/
 ├── schemalibrary/{name}/{version}/library.yaml
 ├── mappinglibrary/{name}/{version}/library.yaml
 ├── workloadlibrary/{name}/{version}/library.yaml
-└── artifactslibrary/{name}/{version}/library.yaml
+└── artifactlibrary/{name}/{version}/library.yaml
 ```
 
 The `{version}` segment is mandatory on every kind; see "Per-version directory
@@ -35,10 +35,10 @@ identity:
 | SchemaLibrary | `schemalibrary/` | Reusable JSON Schema 2020-12 fragments | `$ref:` from a Component or Feature |
 | MappingLibrary | `mappinglibrary/` | Reusable Go template fragments | `valuesMapping: { $import: <Library>#/mappings/<entry> }` |
 | WorkloadLibrary | `workloadlibrary/` | Reusable Workload template fragments | `workload: { $import: <Library>#/workloads/<entry> }` on a Recipe |
-| ArtifactsLibrary | `artifactslibrary/` | Named artifact bundles — a set of output files imported as one unit | `artifacts.<name>: { $import: <Library>#/artifacts/<entry> }` on a Recipe or FeatureRecipe |
+| ArtifactLibrary | `artifactlibrary/` | Named artifact bundles — a set of output files imported as one unit | `artifacts.<name>: { $import: <Library>#/artifacts/<entry> }` on a Recipe or FeatureRecipe |
 
 SchemaLibrary and MappingLibrary are the baseline tier. WorkloadLibrary and
-ArtifactsLibrary are opt-in for catalogs that need cross-Recipe workload or
+ArtifactLibrary are opt-in for catalogs that need cross-Recipe workload or
 artifact reuse; both accept Go templates as their only authoring mode. See the
 "Shared schema and mapping reuse" section below.
 
@@ -516,7 +516,7 @@ entity is pinned or published. The `<entity>.yaml` filename is kind-conventional
 | Plugin | `plugin.yaml` |
 | Aggregate | `aggregate.yaml` |
 | Recipe / FeatureRecipe | `recipe.yaml` (co-located `source/`, `mappings/`, `artifacts/` and the `entity.lock` the pin step writes sit beside it inside the version dir) |
-| SchemaLibrary / MappingLibrary / WorkloadLibrary / ArtifactsLibrary | `library.yaml` |
+| SchemaLibrary / MappingLibrary / WorkloadLibrary / ArtifactLibrary | `library.yaml` |
 
 Recipe and FeatureRecipe deliberately share the `recipe.yaml` filename. The walker
 is layout-agnostic (it indexes by authored `name:version`), so this layout is an
@@ -554,7 +554,7 @@ The `ops/` prefix is NOT used. All Recipes are Domain 3 (Ops) by definition.
 ### Library-kind names are bare PascalCase
 
 The four library kinds — SchemaLibrary, MappingLibrary, WorkloadLibrary,
-ArtifactsLibrary — follow their own naming rule, and it differs from Components
+ArtifactLibrary — follow their own naming rule, and it differs from Components
 and Features on two counts: the name carries **no publisher prefix** (not even
 `core/`), and it is **PascalCase** while its directory segment is kebab-case.
 
