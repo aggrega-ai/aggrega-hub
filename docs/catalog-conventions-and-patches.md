@@ -494,15 +494,20 @@ Domain 3 entities use the execution engine as the first path segment:
 ```
 
 The `<version>` directory segment MUST equal the entity's `metadata.version` on
-every kind, Plugin included. The publish-time bundler rejects a mismatch
-(`ErrEntityVersionPathMismatch`) for the kinds it bundles. A Plugin publishes by a
-route of its own — its entity and its `.wasm` are packed into one manifest, tagged
-by `metadata.version`, at the repository location its socket coordinate derives —
-and that route reads the version from the entity rather than from the directory, so
-for Plugin the per-version layout is a catalog convention rather than a
-publish-time halt. One published version is one directory, so the source tree holds
-every version of an entity side by side rather than relying on git history for
-older versions. The `<entity>.yaml` filename is kind-conventional:
+every kind, Plugin included. That is a catalog convention, upheld by review rather
+than by a check: a publication reads the version from the entity, never from the
+directory, so a mismatch publishes at the version the entity declares and the
+directory is simply misleading. One published version is one directory, so the
+source tree holds every version of an entity side by side rather than relying on git
+history for older versions.
+
+**What is enforced is that each version directory holds one entity.** Every kind has
+a directory of its own except Aggregate, Release and Manifest, and `aggrega pin` and
+`aggrega push` refuse an entity of any other kind that has another entity beside it,
+naming the entity in the way. A file beside the entity that is not an entity
+document — a chart, a mapping, an artifact, the `entity.lock` — is not in the way. A
+catalog load and a lint leave such a directory alone; the refusal arrives when the
+entity is pinned or published. The `<entity>.yaml` filename is kind-conventional:
 
 | Kind | Filename |
 | --- | --- |
@@ -515,7 +520,8 @@ older versions. The `<entity>.yaml` filename is kind-conventional:
 
 Recipe and FeatureRecipe deliberately share the `recipe.yaml` filename. The walker
 is layout-agnostic (it indexes by authored `name:version`), so this layout is an
-authoring + publishing convention enforced by the bundler, not a load-time rule.
+authoring and publishing convention, not a load-time rule; its one enforced half is
+the one-entity-per-directory rule above, held at pin and at publication.
 
 ## 2. Naming Conventions
 
