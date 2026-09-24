@@ -510,7 +510,7 @@ older versions. The `<entity>.yaml` filename is kind-conventional:
 | Feature | `feature.yaml` |
 | Plugin | `plugin.yaml` |
 | Aggregate | `aggregate.yaml` |
-| Recipe / FeatureRecipe | `recipe.yaml` (co-located `source/`, `mappings/`, `artifacts/` and the `entity.lock` a resolution writes sit beside it inside the version dir) |
+| Recipe / FeatureRecipe | `recipe.yaml` (co-located `source/`, `mappings/`, `artifacts/` and the `entity.lock` the pin step writes sit beside it inside the version dir) |
 | SchemaLibrary / MappingLibrary / WorkloadLibrary / ArtifactsLibrary | `library.yaml` |
 
 Recipe and FeatureRecipe deliberately share the `recipe.yaml` filename. The walker
@@ -2117,6 +2117,20 @@ change to that content — because the compiler moved, or because a dependency's
 realization changed — is not what the comparison sees. The first half has a gate
 behind it and halts; the second has none: nothing detects it, and no version
 promise covers it.
+
+**A version also records the bytes its pinned inputs had when it was
+published.** A Recipe or FeatureRecipe that reads a remote `source:` written out
+in full, or a file an `artifacts` entry imports with `$import`, carries a pin for
+each in the `entity.lock` beside it, and that file sits inside the version
+directory the digest covers. `aggrega push` refuses such an entity until its lock
+records every pin the pin step, `aggrega pin`, would record at that moment, so
+the published version carries those digests. An upstream that later serves
+different bytes under the same source version does not slip in under the same
+entity version: a republish refuses the pin that no longer matches, and pinning
+again changes the lock, which is a content change like any other and is published
+under a new version. A source whose coordinates are filled in from a template
+names an artifact only once a Release fills it in; its pin lives in that
+Release's lockfile, outside anything the entity's version covers.
 
 The shape worth recognising, because the entity edit can look smaller than the
 output change: a FeatureRecipe whose `valuesMapping` gains a conditional passing
