@@ -1326,8 +1326,12 @@ Both carry the FeatureRecipe name `generated-secret`, so a Manifest must
 reference the intended one **provider-qualified** —
 `terraform/generated-secret:1.0.0`, not `generated-secret:1.0.0`. A bare name
 resolves only when exactly one capability in the catalog carries it; with two
-carrying this one, a bare reference matches both, resolves to neither, and the
-attachment is reported unmapped when the build checks resolution completeness.
+carrying this one, a bare reference matches both and resolves to neither, and the
+pull halts on it — as matching no entity in the catalog, or, where it goes on to
+look the reference up in a registry, as lacking the provider segment a registry
+reference needs. The rule is the name's, not the Feature's: `provided-secret`,
+which realizes `core/secret-provided` on both `helm` and `compose`, is referenced
+the same way, as `helm/provided-secret:1.0.0` or `compose/provided-secret:1.0.0`.
 
 The canonical examples are
 [`recipe/terraform/mariadb-rds/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/terraform/mariadb-rds/1.0.0/recipe.yaml)
@@ -1460,11 +1464,12 @@ Some clients read their credential from a **file** rather than an environment
 variable — a Google Cloud service-account key, for example, is a JSON file the
 client libraries locate through the `GOOGLE_APPLICATION_CREDENTIALS` environment
 variable. The delivery reuses the referenceable-secret family unchanged: the
-credential is materialized as a Secret by a `core/referenced-secret` attachment,
-and the consuming Recipe mounts that Secret as a file and points the client's
-credential-path variable at the mounted file. No new Secret-emitting Feature is
-authored — the file mount and the credential-path variable are the only additions
-on the consumer.
+credential is held in the Secret a `core/referenced-secret` attachment names —
+one its realization emits, or, bound to `k8s-existing-secret`, one that already
+exists in the namespace — and the consuming Recipe mounts that Secret as a file
+and points the client's credential-path variable at the mounted file. No new
+Secret-emitting Feature is authored — the file mount and the credential-path
+variable are the only additions on the consumer.
 
 The consumer Component declares a secret slot that allowlists the file mount:
 
@@ -1621,10 +1626,19 @@ Per engine, the wiring the reference Recipe emits:
   the consuming service. No service definition for the referenced resource.
 
 The credential slot is filled by a referenced credential — the
-`core/referenced-secret` Feature — rather than a provisioned one, so the secret
-material comes from outside the Release. An optional governance Feature can
-ride the same edge to carry policy context for the referenced resource without
-coupling it to provisioning.
+`core/referenced-secret` Feature — rather than a provisioned one, and the
+realization the Manifest binds decides whether the secret material stays outside
+the Release. On helm, `k8s-existing-secret` points at a Secret that already
+exists and `k8s-external-secret` has a secret-store operator fetch the
+credential into one, so neither writes the material into the rendered output;
+`k8s-secret-from-parameter` writes it in, which suits evaluation only.
+`core/referenced-secret` has no compose realization, because the target has no
+secret-reference primitive (see "What the `compose` target expresses" below):
+there the credential arrives on the inject pipe, and a `core/secret-value`
+attachment bound to `dotenv-secret` keeps the material out of the emitted file
+when its origin is a Compose variable reference such as `${DB_PASSWORD}`. An
+optional governance Feature can ride the same edge to carry policy context for
+the referenced resource without coupling it to provisioning.
 
 **Reference is not adoption.** Hosting (`self-hosted | managed | external`) is
 the who-operates axis; the resource *lifecycle* — provision → adopt → reference
@@ -1684,7 +1698,8 @@ upstream on the application's behalf, so the credential never reaches the
 application. The credential is a referenceable Secret filled through the
 `core/referenced-secret` credential Feature on the component's credential slot; a
 security-policy custom resource binds it to the backend. A black-box credential
-slot still publishes its produced resource's locator to the Recipe, so the recipe
+slot still publishes its resource's locator to the Recipe — the name of the Secret
+the credential's realization emits, or of one that already exists — so the recipe
 reads the Secret's name for the security policy without exposing the value.
 
 **The exemplar.** Strimzi Kafka is the template for this pattern: `core/messaging/kafka`
@@ -1801,7 +1816,7 @@ account reads exactly as authoritative as a right one.
 | `initContainers` | **Realized** as a companion service the main service waits on, through `depends_on` with `service_completed_successfully`. |
 | `services.<n>` | A `NodePort` or `LoadBalancer` entry publishes its ports on the host. A `ClusterIP` or `Headless` entry publishes nothing, so a port an operator sets reaches no emitted byte. |
 | `replicas` | **Dropped, with a warning** naming it. |
-| An attached credential | Arrives on the inject pipe and is delivered as a **literal environment value** in the emitted file. The target has no secret-reference primitive for a `secretKeyRef`-style pointer to resolve, so the material sits in the artifact rather than being pointed at from it. |
+| An attached credential | Arrives on the inject pipe and is delivered as a **literal environment value** in the emitted file, written as the credential delivered it — so the material sits in the artifact, unless the delivered value is itself a Compose variable reference such as `${DB_PASSWORD}`, which Docker Compose substitutes from the shell environment or a `.env` file when the stack starts. The target has no secret-reference primitive for a `secretKeyRef`-style pointer to resolve, so neither credential Feature that publishes only a locator — `core/referenced-secret`, `core/referenced-secret-set` — has a `compose` realization, and attaching one the Manifest leaves unmapped halts the build. |
 | `containers.<n>.lifecycle`, `containers.<n>.envFrom` | **The build halts.** The target has neither primitive, and dropping either silently would change what the Release means. |
 
 Two consequences for a Recipe author:
