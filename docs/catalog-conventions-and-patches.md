@@ -1960,6 +1960,21 @@ string and resolves nothing about it.
   key, rather than advertising an address other than the one authored. A path of
   `/` alone is not a path.
 
+### The certificate an entry point presents
+
+An entity that terminates TLS for traffic arriving from outside the cluster names
+the certificate it presents as **`infra.tls_secret`** — one name for the concept at
+every scope it appears: the ingress Feature for the Ingress it emits, a gateway
+Component for its listener. The value is the name of an existing Secret of type
+`kubernetes.io/tls` in the namespace the resource naming it lands in, and the
+realization **references it and never issues it**: it emits neither that Secret
+nor a request for a certificate, so the Secret is the operator's, or a certificate
+controller's, to provide. Every realization honours the key or refuses the build
+naming it, and while the key is unset it emits nothing for it, so a Release that
+names no certificate renders byte for byte as before. This is a catalog
+convention, not something the compiler checks: it pipes the Secret's name as a
+string and knows nothing of what the Secret holds.
+
 ### The datastore family template
 
 Every datastore component targets the same shape, distilled from the PostgreSQL
