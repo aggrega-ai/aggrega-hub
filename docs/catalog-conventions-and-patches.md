@@ -1997,7 +1997,15 @@ copying whichever sibling happens to be nearest.
   a silent drop.** The key stays single-named and single-homed rather than split per
   target: the size means the same thing everywhere, and a stateful member needs its
   volume on the local target too or it would not be the same datastore the Kubernetes
-  target deploys.
+  target deploys. **`storage.type` declares no default: the class defaults to the
+  cluster's own.** On a Kubernetes realization it is the volume's storage class, and
+  the claim names one only when the Release does: a claim that names no class is
+  provisioned from the cluster's default storage class, while an empty class asks for
+  a volume with no class at all. The helm workload synthesis omits an empty class on
+  its own; a Recipe handing the key to a chart or a custom resource guards the line
+  with `{{- with … }}` rather than rendering it empty. On a managed realization the
+  same key is the provider's volume type, and each managed Recipe supplies its own
+  fallback where it renders the key.
 - **`provides`** — `host` and `port` are required; `user`, `database` and
   `protocol` are declared **only where the engine has the concept**. Redis, Valkey
   and Memcached have no user or database — do not invent them to make the family
