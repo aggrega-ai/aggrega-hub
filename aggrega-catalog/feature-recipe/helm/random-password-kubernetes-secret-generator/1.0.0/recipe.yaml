@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: random-password-kubernetes-secret-generator
+  version: 1.0.0
+  description: >
+    Helm realization of core/random-password through the
+    kubernetes-secret-generator controller. It renders, from a co-located Helm
+    chart, a StringSecret, which the controller reconciles into a Secret of the
+    same name holding a generated password; the rendered output names the
+    StringSecret and carries no value. The name is values.name where one is
+    supplied, and otherwise {instance_id}-{attachment_name}, with underscores in
+    the attachment name folded to hyphens so the name is a valid Kubernetes
+    object name. The password is written under values.key, and the published
+    provides point a consumer at that Secret and that key.
+
+    The password is drawn once: the controller generates a field only while it
+    is empty and the StringSecret does not ask for regeneration, so a password
+    shared by a running database and its clients does not change under them. The
+    Secret is owned by the StringSecret and removed with it. The controller
+    produces exactly values.length characters by encoding random bytes: with
+    values.symbols off the encoding is hexadecimal, so the password holds digits
+    and the letters a to f only; with it on the encoding is the controller's
+    default, base64, which adds upper-case letters and the characters + and /.
+
+    The kubernetes-secret-generator controller must be running in the cluster;
+    the catalog does not install it. The build halts unless the Release affirms
+    it with infra.control_plane_present. Reach for this realization where that
+    controller runs in the cluster, and for random-password-external-secrets
+    where the External Secrets Operator runs instead — it is installed by
+    core/security/external-secrets.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/random-password:1.0.0
+
+  # The Secret's name, derived once, exactly as random-password-external-secrets
+  # derives it: values.name honoured when supplied, the host component and the
+  # attachment name composed otherwise. provides and valuesMapping both read this
+  # local, so the name the consumer references and the name the chart emits are
+  # one string.
+  #
+  # DELIBERATE NEAR-DUPLICATE, and it must be kept in step by hand. The expression
+  # is character-for-character the one random-password-external-secrets holds,
+  # and the two MUST agree: they are the two helm realizations of
+  # core/random-password, so a Manifest may bind either for the same attachment,
+  # and a second attachment referencing the credential by its derived name would
+  # silently point at another Secret if swapping realizations changed that name.
+  # A local is a plain template string, so no mapping library can hold it. Change
+  # one and change the other in the same edit.
+  locals:
+    secret_name: '{{ default (printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-")) .values.name }}'
+
+  provides:
+    name: "{{ .locals.secret_name }}"
+    key: "{{ .values.key }}"
+
+  # The controller must already be running before the StringSecret becomes a
+  # password; without one it fills nothing, and every workload referencing the
+  # Secret fails to start. The compiler cannot inspect cluster state, so the
+  # Operator affirms the prerequisite on this attachment in the Release, and an
+  # unaffirmed build halts here.
+  assertions:
+    generator_controller_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail "the kubernetes-secret-generator controller must be running in the target cluster before this attachment emits its password request; once it is present, affirm the prerequisite by setting infra.control_plane_present to true on this attachment in the Release" -}}
+      {{- end -}}
+
+  # Resource Generation via the co-located chart. The StringSecret's name is the
+  # published provides.name and its one field is provides.key. The controller has
+  # no punctuation switch, so values.symbols is honoured through the encoding it
+  # applies: hexadecimal holds no punctuation, base64 does. The length is passed
+  # as a string because that is the type the controller's resource declares for
+  # it.
+  #
+  # The chart is also passed the scope's namespace, when the scope declares one,
+  # so the StringSecret, and the Secret the controller creates beside it, land
+  # beside the workload that references the Secret rather than wherever the
+  # applying tool defaults to. Empty when no scope declares one, and the chart
+  # then omits the field — matching a synthesized workload, which also emits no
+  # namespace and is placed by the applying tool.
+  source: ./chart
+  valuesMapping: |
+    secretName: "{{ .provides.name }}"
+    dataKey: "{{ .provides.key }}"
+    length: {{ .values.length }}
+    encoding: "{{ if .values.symbols }}base64{{ else }}hex{{ end }}"
+    {{- $ns := "" }}
+    {{- if .context.annotations }}
+      {{- if .context.annotations.release }}
+        {{- $raw := index .context.annotations.release "aggrega.ai/namespace" }}
+        {{- if $raw }}{{- $ns = $raw }}{{- end }}
+      {{- end }}
+    {{- end }}
+    namespace: "{{ $ns }}"

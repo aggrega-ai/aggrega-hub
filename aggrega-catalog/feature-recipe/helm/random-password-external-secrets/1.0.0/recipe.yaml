@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: random-password-external-secrets
+  version: 1.0.0
+  description: >
+    Helm realization of core/random-password through the External Secrets
+    Operator. It renders, from a co-located Helm chart, a Password generator and
+    an ExternalSecret that fills a Secret from it, so the operator's controller
+    draws the password inside the cluster and writes it into the Secret; the
+    rendered output names the generator and the Secret and carries no value. The
+    Secret, the generator and the ExternalSecret share one name: values.name
+    where one is supplied, and otherwise {instance_id}-{attachment_name}, with
+    underscores in the attachment name folded to hyphens so the name is a valid
+    Kubernetes object name. The password is written under values.key, and the
+    published provides point a consumer at that Secret and that key.
+
+    The password is drawn once. The generator produces a new value on every
+    invocation, so the ExternalSecret is set to create the Secret once and never
+    refresh it, and a password shared by a running database and its clients does
+    not change under them. The controller does recreate the Secret, with a new
+    value, if the Secret is deleted, and the Secret is removed with the
+    ExternalSecret that owns it.
+
+    The External Secrets Operator must be running in the cluster, with its
+    generator resources installed — core/security/external-secrets installs both
+    — and the build halts unless the Release affirms it with
+    infra.control_plane_present. Reach for this realization where the External
+    Secrets Operator runs in the cluster, and for
+    random-password-kubernetes-secret-generator where the
+    kubernetes-secret-generator controller runs instead.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/random-password:1.0.0
+
+  # The Secret's name, derived once. An operator or author who must point a
+  # second attachment at this credential supplies values.name and it is honoured
+  # exactly; otherwise the name composes the host component and the attachment
+  # name, as every component-scope credential realization in the family does, so
+  # one Feature attached twice to one component does not collide with itself. An
+  # omitted optional value arrives empty, so `default` supplies the derived name.
+  # provides and valuesMapping both read this local, so the name the consumer
+  # references and the name the chart emits are one string.
+  #
+  # DELIBERATE NEAR-DUPLICATE, kept in step by hand: the expression is
+  # character-for-character the one random-password-kubernetes-secret-generator
+  # holds, because a Manifest may bind either helm realization for the same
+  # attachment and a reference written against the derived name must not move
+  # when it does. A local is a plain template string, so no mapping library can
+  # hold it. Change one and change the other in the same edit.
+  locals:
+    secret_name: '{{ default (printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-")) .values.name }}'
+
+  provides:
+    name: "{{ .locals.secret_name }}"
+    key: "{{ .values.key }}"
+
+  # A generator request only becomes a password once the controller that
+  # reconciles it is running in the target cluster; without one it fills
+  # nothing, and every workload referencing the Secret fails to start. The
+  # compiler is ahead-of-time and cannot inspect cluster state, so the
+  # prerequisite is declared instead: the Operator affirms it on this attachment
+  # in the Release, and an unaffirmed build halts here rather than emitting a
+  # request nothing will fill.
+  assertions:
+    generator_controller_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail "the External Secrets Operator must be running in the target cluster, with its generator resources installed, before this attachment emits its password request; once it is present, affirm the prerequisite by setting infra.control_plane_present to true on this attachment in the Release" -}}
+      {{- end -}}
+
+  # Resource Generation via the co-located chart. Every name the chart emits is
+  # the published provides.name, and the data key is provides.key, so the
+  # rendered request and the consumer's reference cannot drift apart.
+  #
+  # Two settings here are this realization's own, not the Feature's. The
+  # generator is allowed to repeat characters, because without repeats a long
+  # password asks for more distinct digits than there are and the generator
+  # refuses it. And the ExternalSecret carries both a create-once refresh policy
+  # and a zero refresh interval, so the Secret is written once whichever of the
+  # two the running controller reads.
+  #
+  # The chart is also passed the scope's namespace, when the scope declares one,
+  # so the emitted resources land beside the workload that references the Secret
+  # rather than wherever the applying tool defaults to — a reference does not
+  # resolve a Secret in another namespace. Empty when no scope declares one, and
+  # the chart then omits the field — matching a synthesized workload, which also
+  # emits no namespace and is placed by the applying tool.
+  source: ./chart
+  valuesMapping: |
+    secretName: "{{ .provides.name }}"
+    dataKey: "{{ .provides.key }}"
+    length: {{ .values.length }}
+    symbols: {{ .values.symbols }}
+    {{- $ns := "" }}
+    {{- if .context.annotations }}
+      {{- if .context.annotations.release }}
+        {{- $raw := index .context.annotations.release "aggrega.ai/namespace" }}
+        {{- if $raw }}{{- $ns = $raw }}{{- end }}
+      {{- end }}
+    {{- end }}
+    namespace: "{{ $ns }}"

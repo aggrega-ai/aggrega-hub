@@ -1388,7 +1388,10 @@ credential slot in `spec.featuresSchema`, and its Recipes wire that slot
 **conditionally** — the credential subsystem when a credential is attached, an
 inline development default when none is. This keeps the slot non-breaking: a
 Release that attaches no credential still renders and runs, byte-identically
-to a Recipe with no slot at all.
+to a Recipe with no slot at all. The default is the same for every reader of the
+catalog, so it serves evaluation; a Release that must not run on it binds the
+slot — with a credential it supplies, or with one the target generates (see "A
+credential the target generates" below).
 
 The shared Component declares an optional, transparent slot — no `required:`,
 and `inject: [env]` so a synthesized Workload may reference it as an env secret.
@@ -1549,6 +1552,73 @@ For a runnable end-to-end walkthrough, see the worked example
 [`component/example/compute/gcp-credentialed-service/`](../aggrega-catalog/component/example/compute/gcp-credentialed-service/1.0.0/component.yaml)
 and its Recipe
 [`recipe/helm/gcp-credentialed-service/`](../aggrega-catalog/recipe/helm/gcp-credentialed-service/1.0.0/recipe.yaml).
+
+### A credential the target generates
+
+Where a Release supplies no credential, a self-managed datastore's Recipe falls
+back on its inline development default, and a module falls back on its
+parameter's default — values every reader of the catalog knows. Reach for
+[`core/random-password`](../aggrega-catalog/feature/core/random-password/1.0.0/feature.yaml)
+wherever that must not happen and no one should have to write the credential
+down: the target generates it.
+
+The build cannot be where it is made. The compiler's output is identical for
+identical input and never carries a secret's value, so a password drawn at build
+time would change on every build and sit in the rendered files. Each
+FeatureRecipe renders a **request** instead — a generator resource naming the
+secret resource it fills — and the target draws the value at deploy time. The
+rendered output names the generator and the resource, and carries no value.
+
+| Capability | FeatureRecipe | What it renders | What the target needs running |
+| --- | --- | --- | --- |
+| `helm` | `random-password-external-secrets` | an External Secrets Operator `Password` generator and an `ExternalSecret` that fills a Secret from it once and never refreshes it | the External Secrets Operator with its generator resources, which `core/security/external-secrets` installs |
+| `helm` | `random-password-kubernetes-secret-generator` | a `StringSecret`, which the kubernetes-secret-generator controller reconciles into a Secret of the same name | that controller, which the catalog does not install |
+| `terraform` | `terraform/random-password` | a module of its own holding a `random_password` resource and an output named by `values.key` | nothing: Terraform draws the value on apply and keeps it in the plan and state, which is where it must be protected |
+| `cloudformation` | `cloudformation/random-password` | an `AWS::SecretsManager::Secret` that generates its own string under `values.key` | nothing: Secrets Manager generates the value when the stack creates the secret |
+
+The two terraform and cloudformation realizations share the name
+`random-password`, so a Manifest references each provider-qualified, as it does
+`generated-secret`.
+
+- **The runtime prerequisite is affirmed, not assumed.** A helm realization's
+  request fills nothing until its controller runs, and the compiler cannot
+  inspect the cluster, so both helm FeatureRecipes halt the build unless the
+  Release sets `infra.control_plane_present: true` on the attachment — the key
+  `core/public-ingress` reads, with the same meaning, for its ingress
+  controller. Each helm description names its sibling and the controller that
+  selects it.
+- **Where it cannot be used.** Compose runs no controller and has no resource
+  that generates a value, so no realization ships for it, and a build binding
+  `core/random-password` on compose halts with `E0099`: *"no feature recipe
+  implements this type"*. Supply the credential with `core/secret-value` there.
+- **Its settings are the ones every generator honours.** `length` and
+  `symbols` are read off the four products: each takes a length, and each can
+  leave punctuation out. Finer control over character classes exists on some
+  of them and not on all, so it is not offered. `symbols` is off by default,
+  because a password is often placed inside a URL or a connection string.
+- **A consumer reads it unchanged.** It carries `feature.aggrega.ai/kind:
+  secret` and publishes the `name` and `key` locator `core/referenced-secret`
+  publishes, so a slot selecting the credential family admits it and a Recipe
+  reading `.features.<slot>.provides` needs no edit. On terraform the pair is
+  the attachment's module call and its output, which a consumer joins into
+  `${module.<call>.<output>}`; that reference resolves in the boundary's root
+  configuration, so the consuming Recipe is a `source:` Recipe.
+- **Sharing one generated credential takes one request.** Every attachment
+  renders its own request and every request draws its own password, so
+  attaching `core/random-password` on each of two components — or once at a
+  scope that cascades to both — gives a database and its client two different
+  passwords; with `values.name` pinned the two requests derive one name and the
+  build halts on it (`E0038`). Attach it on one component with `values.name`
+  pinned, and `core/referenced-secret` bound to `k8s-existing-secret` on the
+  others, with `origin` set to the same name; write both from one parameter so
+  they cannot disagree. One request is rendered and every workload references
+  its Secret.
+  This is available where `core/referenced-secret` has an existing-Secret
+  realization, which is `helm`.
+- **It is not `core/generated-secret`.** That Feature hands a credential to an
+  engine that already owns it — a managed database, a database controller — and
+  renders nothing. `core/random-password` renders the request itself, for a
+  workload whose Recipe expects to be handed a credential.
 
 ### The `workload:` authoring contract
 
