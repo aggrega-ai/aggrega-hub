@@ -1852,6 +1852,7 @@ account reads exactly as authoritative as a right one.
 | Several named files mounted as a **directory** | **Not expressible.** One config is one file, and the target performs no key expansion: pointing the mount at a directory path writes a single file at that path. A value shaped as a map of filename to content — bootstrap scripts, a drop-in directory — has no `compose` realization. |
 | `volumes.<n>.persistent` | The volume is **created and named**; the declared `size` reaches no emitted byte, and nothing reports it. The target has no volume-size concept. |
 | `containers.<n>.resources` | **Realized** as `deploy.resources` — `cpu` as fractional cores, `memory` as an exact byte count. An operator's sizing is honored here, not dropped. |
+| `containers.<n>.health` | **One healthcheck per service.** Of the probes a container declares, `live` is translated, else `ready`, else `startup`, and a warning names the ones dropped. The check runs **inside the image**: an `http` probe becomes `curl -f` against the port whose name sorts first and a `tcp` probe becomes `nc -z`, both through the image's shell, while an `exec` probe runs its command directly. A `depends_on` entry derived from a `uses` edge has `service_started` semantics, so it orders start-up and does not wait for the target to report healthy. |
 | `initContainers` | **Realized** as a companion service the main service waits on, through `depends_on` with `service_completed_successfully`. |
 | `services.<n>` | A `NodePort` or `LoadBalancer` entry publishes its ports on the host. A `ClusterIP` or `Headless` entry publishes nothing, so a port an operator sets reaches no emitted byte. |
 | `replicas` | **Dropped, with a warning** naming it. |
@@ -1867,6 +1868,53 @@ Two consequences for a Recipe author:
   reads it, rather than in a Recipe comment.
 - **The volume-size row is the knob rule's standing exception**, and it is named
   rather than silent: see the datastore family template below.
+
+### Health checks on server workloads
+
+A Recipe realizing a Component whose `component.aggrega.ai/type` is `server` or
+`stateful-server` declares the health checks its product documents. Without a
+readiness probe a rollout counts a container ready as soon as it has started, which
+for a slow server can be well before it answers a request. **This is a catalog
+convention, not something the compiler checks:** a workload with no `health` block
+renders exactly as authored.
+
+- **Readiness at least, a startup probe where the product documents one, and a
+  liveness probe whose delay and threshold fit the product's start time.** Each
+  endpoint comes from the product's own documentation, or from its own chart or
+  release manifest at the release the Recipe runs — never from a guess — and so does
+  each timing wherever the product states one; the comment beside the probe says
+  which. Where the product's own guidance declares no liveness probe, the Recipe
+  declares none either.
+- **A product that documents no health endpoint takes a `tcp` probe on its serving
+  port.**
+- **An `http` probe is sent to the container port whose name sorts first
+  alphabetically,** because the probe carries a path and no port (see the
+  [Workload reference](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/entities/workload.md)).
+  A product serving health on a second port is reached in one of three ways:
+  declare that port under a name that sorts first and publish it on no Service, as
+  [`recipe/helm/keycloak`](../aggrega-catalog/recipe/helm/keycloak/1.0.0/recipe.yaml)
+  does with `management` beside `tcp`; use a `tcp` probe; or use an `exec` probe
+  running a client the image carries. **Never rename a port a Service, a Feature
+  default or a consumer already names** to make it sort first.
+- **On `compose` a service carries one healthcheck, and it runs inside the image**
+  (the health row of the table above). A compose Recipe declares one `ready` probe:
+  a second slot reaches no output and only adds a warning to every build. Establish
+  that the image carries the tool the check runs before declaring it — a check whose
+  tool is missing reports a healthy container unhealthy for ever while every build
+  stays green. Where the image carries no shell, client or socket tool and the
+  product ships no health command, the Recipe declares no healthcheck rather than
+  one that cannot run.
+- **A chart-wrapping Recipe inherits the chart's probes,** read from a real build.
+  Where the chart leaves a workload that serves requests without a readiness probe,
+  the Recipe sets the chart's own probe values to add one; a probe the chart has no
+  value for is not forced.
+- **A Recipe that installs a controller authors the controller's own probes** in
+  the manifest it emits — the ones the project's own chart or release manifest gives
+  that controller at the release its image comes from. A controller that, as the
+  Recipe runs it, registers no health check takes a `tcp` probe on its serving port.
+- **A Recipe that emits a custom resource leaves the probes to the controller that
+  creates the pods.** Where the resource exposes a probe field and the controller
+  already fills it, the field stays unset.
 
 ### The datastore family template
 
