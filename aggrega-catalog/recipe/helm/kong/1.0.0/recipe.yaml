@@ -47,6 +47,10 @@ spec:
     port: "{{ .infra.proxy_port }}"
     protocol: "http"
   workload: |
+    {{- /* Kong's Status API port: the product's own default. It is the single
+           authored home for the listen address below, the container port and
+           the probes that read it. */ -}}
+    {{- $statusPort := 8007 -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # Kong holds no durable state — the PostgreSQL backend is the system of
@@ -87,7 +91,9 @@ spec:
         # the KONG_PG_* connection. KONG_PG_PASSWORD is delivered via the optional
         # `password` credential slot (env secret when attached) or an inline
         # development default when unattached. The admin API listens in-cluster
-        # only — the synthesized Service is a ClusterIP.
+        # only — the synthesized Service is a ClusterIP. The read-only Status
+        # API listens on loopback by default; it is bound on every address so
+        # the kubelet can reach it, and no Service publishes it.
         variables:
           KONG_DATABASE: postgres
           KONG_PG_HOST: "{{ .context.inject.env.KONG_PG_HOST }}"
@@ -96,6 +102,7 @@ spec:
           KONG_PG_DATABASE: "{{ .context.inject.env.KONG_PG_DATABASE }}"
           KONG_PROXY_LISTEN: "0.0.0.0:{{ .infra.proxy_port }}, 0.0.0.0:8443 ssl"
           KONG_ADMIN_LISTEN: "0.0.0.0:{{ .infra.admin_port }}"
+          KONG_STATUS_LISTEN: "0.0.0.0:{{ $statusPort }}"
     {{- if not (hasKey (default dict .features) "password") }}
           KONG_PG_PASSWORD: apppass
     {{- end }}
@@ -105,8 +112,28 @@ spec:
             from: password
             as: env
     {{- end }}
+        # `status` sorts before `tcp`, so an http probe is sent to the Status
+        # API rather than the proxy; the proxy port keeps its name, which the
+        # Service reads.
         ports:
+          status: {{ $statusPort }}
           tcp: {{ .infra.proxy_port }}
+        # Kong reports readiness at /status/ready, which answers once the
+        # database connects and the router is built, and liveness at /status.
+        # The timings are the ones the product's own chart gives these probes.
+        health:
+          ready:
+            http: /status/ready
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          live:
+            http: /status
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
         resources:
           requests:
             cpu: "{{ .infra.compute.cpu }}"
