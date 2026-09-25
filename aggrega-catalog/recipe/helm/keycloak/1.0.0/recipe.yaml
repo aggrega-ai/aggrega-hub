@@ -26,7 +26,14 @@ metadata:
     attached the password is supplied via the credential subsystem. The
     bootstrap admin account is seeded on first
     startup from a username value and a separate optional admin credential slot,
-    with an inline development default when unattached. provides.host is the
+    with an inline development default when unattached. With
+    `infra.external_base_url` set, the server's hostname is that full URL, so
+    the issuer and every address the server advertises follow it; unset, the
+    server takes its address from each incoming request. With
+    `values.realm_imports` set, each entry becomes a file in a ConfigMap
+    mounted at the server's import directory and the server starts with its
+    realm import switched on; unset, neither the ConfigMap nor the mount is
+    emitted. provides.host is the
     bare, self-contained in-cluster service name of the synthesized Service — it
     carries no namespace, so the recipe is independent of where it is deployed.
     A consumer in another namespace qualifies the host with the target namespace
@@ -53,6 +60,33 @@ spec:
     host: "{{ .context.instance_id }}-default"
     port: "{{ .infra.http_port }}"
     protocol: "http"
+  # The server reads a file in its import directory as a realm only when the
+  # file is named "<realm>-realm.json", so an entry named any other way would be
+  # mounted and never imported. Halt on it here, where the fix is renaming one
+  # key in the Aggregate.
+  assertions:
+    realm_import_file_names: >-
+      {{- range $name, $_ := optional .values "realm_imports" dict -}}
+      {{- if not (hasSuffix "-realm.json" $name) -}}
+      {{- fail (printf "values.realm_imports entry %q is not named <realm>-realm.json, so the server would never import it; name each entry after the realm it defines, for example demo-realm.json for the realm demo" $name) -}}
+      {{- end -}}
+      {{- end -}}
+  # The realms the server imports on startup, one file per values.realm_imports
+  # entry, mounted whole at the server's import directory. Presence-guarded on
+  # the value: unset, the entry renders empty and no ConfigMap is emitted.
+  artifacts:
+    realm-import-configmap.yaml: |
+      {{- if .values.realm_imports -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-realm-import
+      data:
+      {{- range $name, $content := .values.realm_imports }}
+        {{ $name }}: |
+      {{ $content | trimSuffix "\n" | indent 4 }}
+      {{- end }}
+      {{- end }}
   workload: |
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
@@ -70,13 +104,25 @@ spec:
         # connection. KC_DB_PASSWORD is delivered via the optional `password`
         # credential slot (env secret when attached) or an inline development
         # default when unattached. KC_HTTP_ENABLED and KC_HOSTNAME_STRICT=false
-        # make the server self-contained with no real hostname. KC_HEALTH_ENABLED
+        # make the server self-contained with no real hostname while
+        # infra.external_base_url is unset. Set, KC_HOSTNAME carries it as a full
+        # URL — scheme, host, port and path — so the issuer, the discovery
+        # document and every link the server writes use that address rather than
+        # the request's, and the server ignores KC_HOSTNAME_STRICT whenever a
+        # hostname is configured. KC_HEALTH_ENABLED
         # switches the health endpoints on, and KC_HTTP_MANAGEMENT_PORT serves
         # them on the Component's management_port. The bootstrap
         # admin account is seeded on first startup from the admin_user value and
         # the optional `admin_password` credential slot (env secret when attached,
-        # inline development default when unattached).
+        # inline development default when unattached). With values.realm_imports
+        # set, the server starts with --import-realm and imports every realm file
+        # mounted at /opt/keycloak/data/import, skipping a realm that already
+        # exists.
+    {{- if .values.realm_imports }}
+        args: [start, --import-realm]
+    {{- else }}
         args: [start]
+    {{- end }}
         variables:
           KC_DB: postgres
           KC_DB_URL_HOST: "{{ .context.inject.env.KC_DB_URL_HOST }}"
@@ -85,6 +131,9 @@ spec:
           KC_DB_USERNAME: "{{ .context.inject.env.KC_DB_USERNAME }}"
           KC_HTTP_ENABLED: "true"
           KC_HOSTNAME_STRICT: "false"
+    {{- with .infra.external_base_url }}
+          KC_HOSTNAME: "{{ . }}"
+    {{- end }}
           KC_HEALTH_ENABLED: "true"
           KC_HTTP_MANAGEMENT_PORT: "{{ .infra.management_port }}"
           KC_BOOTSTRAP_ADMIN_USERNAME: "{{ .values.admin_user }}"
@@ -143,6 +192,18 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+    {{- if .values.realm_imports }}
+        volumeMounts:
+          - name: realm-import
+            path: /opt/keycloak/data/import
+            readonly: true
+    {{- end }}
+    {{- if .values.realm_imports }}
+    volumes:
+      realm-import:
+        configmap:
+          source: "{{ .context.instance_id }}-realm-import"
+    {{- end }}
     services:
       default:
         type: ClusterIP

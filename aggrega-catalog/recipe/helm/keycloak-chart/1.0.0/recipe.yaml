@@ -32,7 +32,17 @@ metadata:
     infra.source_version. provides.host is the bare, self-contained in-cluster
     Service name — it carries no namespace, so the recipe is independent of where
     it is deployed; a consumer in another namespace qualifies the host with the
-    target namespace on its own side (caller-side routing).
+    target namespace on its own side (caller-side routing). With
+    `infra.external_base_url` set, the server's hostname is that full URL,
+    delivered through the chart's `extraEnv`, so the issuer and every address
+    the server advertises follow it; unset, the server takes its address from
+    each incoming request. The chart serves the server under the path `/auth`,
+    so an ingress in front of it maps the address's path onto that one. With
+    `values.realm_imports` set, each entry becomes a file in a ConfigMap this
+    Recipe emits beside the chart, mounted at the server's import directory
+    through the chart's `extraVolumes` and `extraVolumeMounts`, and the chart's
+    `args` start the server with its realm import switched on; unset, none of
+    those values is set and no ConfigMap is emitted.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -69,6 +79,37 @@ spec:
     host: "{{ .context.instance_id }}-http"
     port: "{{ .infra.http_port }}"
     protocol: "http"
+
+  # The server reads a file in its import directory as a realm only when the
+  # file is named "<realm>-realm.json", so an entry named any other way would be
+  # mounted and never imported. Halt on it here, where the fix is renaming one
+  # key in the Aggregate.
+  assertions:
+    realm_import_file_names: >-
+      {{- range $name, $_ := optional .values "realm_imports" dict -}}
+      {{- if not (hasSuffix "-realm.json" $name) -}}
+      {{- fail (printf "values.realm_imports entry %q is not named <realm>-realm.json, so the server would never import it; name each entry after the realm it defines, for example demo-realm.json for the realm demo" $name) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The realms the server imports on startup, one file per values.realm_imports
+  # entry. The chart renders no ConfigMap of its own, so this Recipe emits it
+  # beside the chart, and the chart's extraVolumes and extraVolumeMounts below
+  # mount it whole at the server's import directory. Presence-guarded on the
+  # value: unset, the entry renders empty and no ConfigMap is emitted.
+  artifacts:
+    realm-import-configmap.yaml: |
+      {{- if .values.realm_imports -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-realm-import
+      data:
+      {{- range $name, $content := .values.realm_imports }}
+        {{ $name }}: |
+      {{ $content | trimSuffix "\n" | indent 4 }}
+      {{- end }}
+      {{- end }}
 
   # This Recipe reads from infra.overrides:
   #   image        - map[string]string (image.* fields; overrides the tag pin)
@@ -170,12 +211,21 @@ spec:
     ## The admin account is seeded on first startup from the admin_user value and
     ## the optional `admin_password` credential slot — bound by name when
     ## attached, an inline development default when not, the same two shapes the
-    ## workload-synthesis realization offers. Hostname resolution is left to the
-    ## incoming request, so the server is self-contained with no real hostname
-    ## configured, which is what the workload-synthesis realization does too.
+    ## workload-synthesis realization offers. While infra.external_base_url is
+    ## unset, hostname resolution is left to the incoming request, so the server
+    ## is self-contained with no real hostname configured, which is what the
+    ## workload-synthesis realization does too. Set, KC_HOSTNAME carries it as a
+    ## full URL — scheme, host, port and path — so the issuer, the discovery
+    ## document and every link the server writes use that address rather than
+    ## the request's, and the server ignores KC_HOSTNAME_STRICT whenever a
+    ## hostname is configured.
     extraEnv: |
       - name: KC_HOSTNAME_STRICT
         value: "false"
+      {{- with .infra.external_base_url }}
+      - name: KC_HOSTNAME
+        value: "{{ . }}"
+      {{- end }}
       - name: KC_BOOTSTRAP_ADMIN_USERNAME
         value: "{{ .values.admin_user }}"
       {{- if hasKey (default dict .features) "admin_password" }}
@@ -199,6 +249,28 @@ spec:
         cpu: "{{ .infra.overrides.requests.cpu }}"
         memory: "{{ .infra.overrides.requests.memory }}"
       {{- end }}
+
+    ## ── Realm import on startup ────────────────────────────────
+    ## Set only with values.realm_imports. extraVolumes and extraVolumeMounts
+    ## mount the ConfigMap this Recipe emits at the server's import directory,
+    ## and args starts the server with --import-realm, which imports every realm
+    ## file there and skips a realm that already exists. The chart starts its
+    ## pods one at a time, and a server does not report ready until its import
+    ## has finished, so the first replica creates a realm and the rest find it
+    ## already there.
+    {{- if .values.realm_imports }}
+    args:
+      - start
+      - --import-realm
+    extraVolumes: |
+      - name: realm-import
+        configMap:
+          name: "{{ .context.instance_id }}-realm-import"
+    extraVolumeMounts: |
+      - name: realm-import
+        mountPath: /opt/keycloak/data/import
+        readOnly: true
+    {{- end }}
 
     ## ── Scheduling overrides ───────────────────────────────────
     {{- if .infra.overrides }}
