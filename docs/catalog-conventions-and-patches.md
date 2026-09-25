@@ -479,6 +479,33 @@ Nothing checks this and an author may leave it out — the convention is here
 because the halt names the key that is missing and not the reason the catalog
 left it empty.
 
+**A credential the components of a module share is a module parameter.** An
+Aggregate importing a module hands it `type`, `active` and `parameters` and
+nothing else, so an attachment the module does not make itself never reaches a
+component inside it. The module declares one parameter per distinct credential,
+with a pinned development default its description says is for evaluation, and
+attaches `core/referenced-secret` on every slot that shares it — `origin` read
+from the parameter, `key` a literal — so the one credential is authored once and
+cannot drift between the components that must agree on it; an importer supplying
+its own declares a parameter of its own and passes it down through its
+`aggregates` entry. What the parameter means follows the realization the
+importer's Manifest binds: the credential itself under
+`k8s-secret-from-parameter`, the name of a Secret that already exists under
+`k8s-existing-secret`. So the default is a valid Kubernetes object name that also
+meets any length the product requires of the credential, and the parameter's
+description says what the value is under each. Every Manifest whose Aggregate
+imports the module maps `core/referenced-secret`, or the build halts, and the
+module's description says so. The shape stops where the Feature cannot follow. A
+module that also builds on `compose` attaches nothing, because that target has no
+realization of a Feature holding a credential by reference; its description says
+its components run on their Recipes' development credentials and that a reader
+needing real ones composes the components directly. And a slot no consumer can
+present stays unattached, because filling it switches authentication on for
+clients with no way to authenticate — the store's password in `core/livekit`,
+which neither the media server nor the bridge declares a slot to present.
+`core/keycloak`, `core/harbor`, `core/thanos` and `core/livekit` are the shipped
+shape; `core/kong` and `core/ferretdb` show the `compose` limit.
+
 ### Recipe/FeatureRecipe Provider Segment
 
 Domain 3 entities use the execution engine as the first path segment:

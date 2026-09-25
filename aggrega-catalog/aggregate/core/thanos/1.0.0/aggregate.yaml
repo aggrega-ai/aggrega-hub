@@ -13,20 +13,61 @@ metadata:
     and a Thanos Query front end that fans PromQL requests out over the gateway's
     StoreAPI — wired by two internal edges: the store's `objstore` edge carries
     the object store's host and port into the S3 endpoint, and the query's `store`
-    edge carries the gateway's host and port into the StoreAPI endpoint. The Store
-    Gateway and the object store share one credential; the module uses a shared
-    inline development default, so the stack runs self-contained with no external
-    secret. This module is the read/query tier only: the S3 bucket must be
-    pre-created and a writer (a Thanos Receive tier or a Prometheus sidecar) must
-    feed metric blocks into the object store — both are runtime prerequisites,
-    not module workloads. The module exports the query front end as `query`, the
-    PromQL endpoint consumers connect to.
+    edge carries the gateway's host and port into the StoreAPI endpoint. This
+    module is the read/query tier only: the S3 bucket must be pre-created and a
+    writer (a Thanos Receive tier or a Prometheus sidecar) must feed metric blocks
+    into the object store — both are runtime prerequisites, not module workloads.
+    The module exports the query front end as `query`, the PromQL endpoint
+    consumers connect to.
+
+    The Store Gateway and the object store share one credential: the gateway
+    authenticates to the object store as its root account, so the secret key the
+    gateway presents is the object store's root password. It is one module
+    parameter an importing Aggregate passes down, `s3_secret_key`, delivered to
+    both components through their own credential slots so it is authored once and
+    cannot drift between them. The module attaches the `core/referenced-secret`
+    Feature on both slots, so each workload carries a reference to a Secret
+    rather than the value itself, and the Manifest of every Release whose
+    Aggregate imports the module maps `core/referenced-secret`, or the build
+    halts. The realization that mapping binds decides what the parameter means:
+    `k8s-secret-from-parameter` reads it as the credential itself and emits a
+    Secret carrying it, while `k8s-existing-secret` reads it as the name of a
+    Secret that already exists in the namespace, holding the credential under the
+    data key `s3-secret-key`. The parameter carries a pinned default so the module
+    renders self-contained. The default is a development credential every reader
+    of this catalog holds, so it is for evaluation and local development. A
+    Release carrying real traffic supplies its own through the importing
+    Aggregate, which declares a parameter of its own and passes it down through
+    its `aggregates` entry for the Release to fulfill.
 spec:
+  parameters:
+    # The object store's root password, and the secret key the Store Gateway
+    # presents to it: the gateway's access key is the object store's root user,
+    # so the gateway authenticates as that root account. It is a module
+    # parameter attached to both slots rather than two separate attachment
+    # values so that the one secret is authored once and cannot drift between
+    # the two components that must agree on it.
+    #
+    # The pinned default is what lets the module render self-contained. It is a
+    # development credential: every reader of this catalog holds it, so a
+    # Release carrying real traffic supplies its own through the importing
+    # Aggregate. It is also a valid Kubernetes object name, so it serves under
+    # either realization of the Feature.
+    s3_secret_key:
+      type: string
+      default: "thanos-s3-secret-for-evaluation-only"
+      description: Root password of the object store, and the secret key the Store Gateway presents to it as that root account. What the value is depends on the core/referenced-secret realization the Manifest binds - the secret itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the secret under the data key s3-secret-key, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
   components:
     objstore:
       type: core/storage/minio
       values:
         root_user: admin
+      features:
+        root_password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.s3_secret_key }}"
+            key: s3-secret-key
     store:
       type: core/observability/thanos-store
       values:
@@ -40,6 +81,12 @@ spec:
               env:
                 - { in: THANOS_S3_HOST, from: host }
                 - { in: THANOS_S3_PORT, from: port }
+      features:
+        s3_secret_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.s3_secret_key }}"
+            key: s3-secret-key
     query:
       type: core/observability/thanos-query
       uses:
