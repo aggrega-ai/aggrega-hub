@@ -1916,6 +1916,50 @@ renders exactly as authored.
   creates the pods.** Where the resource exposes a probe field and the controller
   already fills it, the field stays unset.
 
+### The address a server is reached at
+
+Some servers write their own address into what they hand out: an identity server
+into every token it issues, a dashboard into every link and every redirect after
+sign-in, a registry into the pull commands it shows, a workflow server into the
+webhook addresses it publishes, an object store or a secrets server into the API
+address it hands its clients. Left unconfigured, such a product typically falls
+back to an address it derives for itself — from the request that reached it, from
+its own host name, or from `localhost` — and behind an ingress that is rarely the
+address a client outside the cluster uses. **This is a catalog convention, not
+something the compiler checks:** the compiler pipes the authored address as a
+string and resolves nothing about it.
+
+- **The Component declares the address as `infra.external_base_url`** — one name
+  for the concept across the catalog, whichever product it configures. It sits in
+  `infra` because it is the address as assembled at the ingress tier, which
+  differs for each environment the same Aggregate lands in, so the Release sets
+  it. Its description says what the product composes from it and what the Recipe
+  falls back to when it is omitted. It is the base URL an ingress assembles; an
+  address of another kind — the domain a controller gives the routes it serves,
+  or a media address handed to real-time clients — is not this key.
+- **Every Recipe of that Component honours it, or refuses the build naming the
+  key.** A Recipe honours it through whatever setting its product reads — an
+  environment variable, a flag, the chart's own value — and says in its
+  description, and in a comment beside the setting, which one. A Component whose
+  address one Recipe honours and another silently drops breaks the knob rule
+  above.
+- **Adding the key changes no existing render.** While the key is unset a Recipe
+  emits nothing for it — or, where a chart always carries the setting, gives it
+  exactly the value it rendered before — so a Release that does not set the
+  address renders byte for byte as it did before the Component offered it.
+- **The address never moves where the server serves.** The server serves its
+  routes in the same place whether the key is set or not, and the ingress in
+  front of it maps the address's path onto them, so its health checks and every
+  consumer that composes its address from its published host and port reach it
+  exactly as before. Where the product would otherwise move its routes under the
+  address's path, the Recipe also sets the product's own setting that keeps them
+  in place — the Prometheus and Thanos Query Recipes pass `--web.route-prefix=/`
+  beside the address. Where the product cannot honour a path at all — it takes an
+  origin only, or drops the path from the address it advertises — the Recipe
+  refuses an address carrying one, with a build-time `assertions` entry naming the
+  key, rather than advertising an address other than the one authored. A path of
+  `/` alone is not a path.
+
 ### The datastore family template
 
 Every datastore component targets the same shape, distilled from the PostgreSQL
