@@ -1318,29 +1318,41 @@ renders nothing. A Release that binds the slot this way emits output
 byte-identical to the same Release with no attachment at all — the slot is
 satisfied, and no second secret exists to drift out of step.
 
-The standard library ships that wiring for both managed-database capabilities:
+The standard library ships that wiring for both managed-database capabilities —
 [`feature-recipe/terraform/generated-secret`](../aggrega-catalog/feature-recipe/terraform/generated-secret/1.0.0/recipe.yaml)
 and
-[`feature-recipe/cloudformation/generated-secret`](../aggrega-catalog/feature-recipe/cloudformation/generated-secret/1.0.0/recipe.yaml).
-Both carry the FeatureRecipe name `generated-secret`, so a Manifest must
-reference the intended one **provider-qualified** —
-`terraform/generated-secret:1.0.0`, not `generated-secret:1.0.0`. A bare name
-resolves only when exactly one capability in the catalog carries it; with two
-carrying this one, a bare reference matches both and resolves to neither, and the
-pull halts on it — as matching no entity in the catalog, or, where it goes on to
-look the reference up in a registry, as lacking the provider segment a registry
-reference needs. The rule is the name's, not the Feature's: `provided-secret`,
-which realizes `core/secret-provided` on both `helm` and `compose`, is referenced
-the same way, as `helm/provided-secret:1.0.0` or `compose/provided-secret:1.0.0`.
+[`feature-recipe/cloudformation/generated-secret`](../aggrega-catalog/feature-recipe/cloudformation/generated-secret/1.0.0/recipe.yaml)
+— and for `helm`,
+[`feature-recipe/helm/generated-secret`](../aggrega-catalog/feature-recipe/helm/generated-secret/1.0.0/recipe.yaml),
+for a controller that owns the credential (below). They share the FeatureRecipe
+name `generated-secret`, so a Manifest must reference the intended one
+**provider-qualified** — `terraform/generated-secret:1.0.0`, not
+`generated-secret:1.0.0`. A bare name resolves only when exactly one capability
+in the catalog carries it; with more than one carrying this one, a bare reference
+matches each of them and resolves to none, and the pull halts on it — as matching
+no entity in the catalog, or, where it goes on to look the reference up in a
+registry, as lacking the provider segment a registry reference needs. The rule is
+the name's, not the Feature's: `provided-secret`, which realizes
+`core/secret-provided` on both `helm` and `compose`, is referenced the same way, as
+`helm/provided-secret:1.0.0` or `compose/provided-secret:1.0.0`.
 
 The canonical examples are
 [`recipe/terraform/mariadb-rds/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/terraform/mariadb-rds/1.0.0/recipe.yaml)
 and
 [`recipe/cloudformation/mariadb-rds/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/cloudformation/mariadb-rds/1.0.0/recipe.yaml).
-This guidance applies to managed services only — Recipes targeting
-self-managed datastores (Helm Bitnami chart, Compose container) still use the
-credential FeatureRecipe path because no upstream managed-secret flag exists
-for those targets.
+
+The same binding serves a self-managed datastore whose controller-driven Recipe
+leaves the credential to its controller.
+[`recipe/helm/mariadb-cluster`](../aggrega-catalog/recipe/helm/mariadb-cluster/1.0.0/recipe.yaml)
+with `infra.credentials: generated` emits a `MariaDB` custom resource that names
+no root-password Secret, the mariadb-operator controller generates the password
+into a Secret it creates and owns, and the Component's required `root_password`
+slot is bound to `helm/generated-secret`. Bind it only where the Recipe reads
+nothing from the slot: a Recipe that delivers the credential itself, such as the
+synthesis `helm/mariadb`, cannot take it, and the build halts. Otherwise, Recipes
+targeting self-managed datastores (Helm Bitnami chart, Compose container) still
+use the credential FeatureRecipe path, because no upstream managed-secret flag
+exists for those targets.
 
 ### Optional credential slots for self-managed datastores
 
