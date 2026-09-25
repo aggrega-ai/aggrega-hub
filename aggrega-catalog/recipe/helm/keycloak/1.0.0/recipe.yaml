@@ -15,10 +15,16 @@ metadata:
     stateless. The backend identity resolved from the `backend` uses-edge (host,
     port, user, database) arrives on .context.inject.env and composes Keycloak's
     database connection. Keycloak provisions and migrates its own schema on
-    startup, so no separate migration step is needed. The connection is rendered
-    password-free where possible: with no credential attached the Recipe uses an
-    inline development default, and with one attached the password is supplied
-    via the credential subsystem. The bootstrap admin account is seeded on first
+    startup, so no separate migration step is needed. The server's health
+    endpoints are switched on and served on the management port the
+    Component's `management_port` sets, declared on the container and published
+    by no Service, and the Deployment probes them: a startup probe holds the
+    liveness and readiness probes back while the server boots, and the
+    readiness probe keeps traffic away until the server answers requests. The
+    connection is rendered password-free where possible: with no credential
+    attached the Recipe uses an inline development default, and with one
+    attached the password is supplied via the credential subsystem. The
+    bootstrap admin account is seeded on first
     startup from a username value and a separate optional admin credential slot,
     with an inline development default when unattached. provides.host is the
     bare, self-contained in-cluster service name of the synthesized Service — it
@@ -28,8 +34,8 @@ metadata:
     build must complete with nothing fetched, or where no chart repository is
     reachable from it; reach for `keycloak-chart`, which renders the codecentric
     Keycloak.X chart, where the server will be scaled out — that realization
-    carries the ordered pods, the headless Service, the replicated cache stack
-    and the health probes a single synthesized Deployment does not.
+    carries the ordered pods, the headless Service and the replicated cache
+    stack a single synthesized Deployment does not.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -64,7 +70,9 @@ spec:
         # connection. KC_DB_PASSWORD is delivered via the optional `password`
         # credential slot (env secret when attached) or an inline development
         # default when unattached. KC_HTTP_ENABLED and KC_HOSTNAME_STRICT=false
-        # make the server self-contained with no real hostname. The bootstrap
+        # make the server self-contained with no real hostname. KC_HEALTH_ENABLED
+        # switches the health endpoints on, and KC_HTTP_MANAGEMENT_PORT serves
+        # them on the Component's management_port. The bootstrap
         # admin account is seeded on first startup from the admin_user value and
         # the optional `admin_password` credential slot (env secret when attached,
         # inline development default when unattached).
@@ -77,6 +85,8 @@ spec:
           KC_DB_USERNAME: "{{ .context.inject.env.KC_DB_USERNAME }}"
           KC_HTTP_ENABLED: "true"
           KC_HOSTNAME_STRICT: "false"
+          KC_HEALTH_ENABLED: "true"
+          KC_HTTP_MANAGEMENT_PORT: "{{ .infra.management_port }}"
           KC_BOOTSTRAP_ADMIN_USERNAME: "{{ .values.admin_user }}"
     {{- if not (hasKey (default dict .features) "password") }}
           KC_DB_PASSWORD: apppass
@@ -97,8 +107,35 @@ spec:
             from: admin_password
             as: env
     {{- end }}
+        # Keycloak serves its health endpoints on its management port, not on
+        # the HTTP port, and an http probe is sent to the container port whose
+        # name sorts first. `management` sorts before `tcp`, so the probes below
+        # reach the management port while the Service keeps forwarding to the
+        # HTTP port it names. The management port is declared on the container
+        # only: it stays reachable in-cluster and is published by no Service.
         ports:
+          management: {{ .infra.management_port }}
           tcp: {{ .infra.http_port }}
+        # The startup probe holds the liveness and readiness probes back while
+        # the server boots, which can take a minute or more, so a slow start is
+        # not mistaken for a hung server and restarted. Its budget — up to 15 s
+        # plus 60 checks 5 s apart — and the readiness and liveness timings are
+        # the ones the Keycloak.X chart gives its own probes of this server; the
+        # paths are the ones Keycloak documents for each probe.
+        health:
+          startup:
+            http: /health/started
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 1
+            failureThreshold: 60
+          ready:
+            http: /health/ready
+            initialDelaySeconds: 10
+            timeoutSeconds: 1
+          live:
+            http: /health/live
+            timeoutSeconds: 5
         resources:
           requests:
             cpu: "{{ .infra.compute.cpu }}"
