@@ -13,16 +13,70 @@ metadata:
     its backend — wired by an internal edge that carries the backend's host,
     port, user, and database into the server's connection. The server
     provisions and migrates its own schema on startup, so no separate migration
-    step is needed. The server and the backend share one password; the module
-    uses a shared inline development default. The module exports the server as
-    `http`, the identity endpoint consumers connect to.
+    step is needed. The module exports the server as `http`, the identity
+    endpoint consumers connect to.
+
+    Two credentials hold the stack together, and each is a module parameter an
+    importing Aggregate passes down. `db_password` is the one password the
+    server and the backend share, delivered to both through their own
+    credential slots so it is authored once and cannot drift between them;
+    `admin_password` is the password of the server's bootstrap administrator
+    account. The module attaches the `core/referenced-secret` Feature on each
+    of those slots, so every workload carries a reference to a Secret rather
+    than the value itself, and the Manifest of every Release whose Aggregate
+    imports the module maps `core/referenced-secret`, or the build halts. The
+    realization that mapping binds decides what the two parameters mean:
+    `k8s-secret-from-parameter` reads each as the credential itself and emits
+    a Secret carrying it, while `k8s-existing-secret` reads each as the name
+    of a Secret that already exists in the namespace, holding the database
+    password under the data key `db-password` and the administrator password
+    under `admin-password` — one Secret may carry both. Both parameters carry
+    a pinned default so the module renders self-contained. The defaults are
+    development credentials every reader of this catalog holds, so they are
+    for evaluation and local development. A Release carrying real traffic
+    supplies its own through the importing Aggregate, which declares
+    parameters of its own and passes them down through its `aggregates` entry
+    for the Release to fulfill.
+
+    Because the module fills the backend's credential slot, the backend is
+    realized by a Recipe that reads that slot. `postgres-cloudnative-pg`, whose
+    controller owns the database's credentials itself, halts the build when the
+    slot is filled, so a Manifest importing this module maps the backend to
+    another PostgreSQL realization.
 spec:
+  parameters:
+    # The password the server authenticates to its backend with, and the one
+    # the backend is initialized with. It is a module parameter attached to
+    # both slots rather than two separate attachment values so that the one
+    # password is authored once and cannot drift between the two components
+    # that must agree on it.
+    #
+    # The pinned default is what lets the module render self-contained. It is a
+    # development credential: every reader of this catalog holds it, so a
+    # Release carrying real traffic supplies its own through the importing
+    # Aggregate.
+    db_password:
+      type: string
+      default: "keycloak-db-password-for-evaluation-only"
+      description: Password the server and its PostgreSQL backend share. What the value is depends on the core/referenced-secret realization the Manifest binds - the password itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the password under the data key db-password, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+    # The password of the server's bootstrap administrator account, local to
+    # the server. Same shape, same reasons, as db_password above.
+    admin_password:
+      type: string
+      default: "keycloak-admin-password-for-evaluation-only"
+      description: Password of the server's bootstrap administrator account, seeded on first startup. What the value is depends on the core/referenced-secret realization the Manifest binds - the password itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the password under the data key admin-password, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
   components:
     backend:
       type: core/datastore/postgres
       values:
         user: keycloak
         database: keycloak
+      features:
+        password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
     server:
       type: core/security/keycloak
       uses:
@@ -35,5 +89,16 @@ spec:
                 - { in: KC_DB_URL_PORT, from: port }
                 - { in: KC_DB_USERNAME, from: user }
                 - { in: KC_DB_URL_DATABASE, from: database }
+      features:
+        password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+        admin_password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.admin_password }}"
+            key: admin-password
   exportedComponents:
     http: server
