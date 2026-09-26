@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: context-propagation-envoy-gateway
+  version: 1.0.0
+  description: >
+    Component-scope FeatureRecipe for core/context-propagation on the Envoy
+    Gateway ingress gateway, core/gateway/envoy-gateway. It emits one client
+    traffic policy attached to the gateway that component emits, on its
+    `https` listener: the gateway then requests a certificate from every client,
+    verifies it against the certificate authority held in the Secret
+    infra.client_ca_secret names (under the key ca.crt), and turns away a
+    client presenting none or one that does not chain to it. For every request
+    it forwards it replaces any x-forwarded-client-cert header the client sent
+    with one describing the certificate it verified — its subject and the URI
+    and DNS names it carries, beside the certificate's hash, which the gateway
+    always adds — so the service behind the route reads an identity the gateway
+    checked rather than one a client asserted. The listener exists only where
+    the gateway serves HTTPS, which is its tls_secret. The gateway declares
+    dataplane.aggrega.ai/caller-identity: client-certificate, so this recipe
+    halts on any other propagation_mode, and it halts when the attachment is
+    carried by any component other than core/gateway/envoy-gateway, whose
+    gateway is the one the policy names. The policy is named for the component
+    and the attachment, so two attachments on one gateway emit two policies.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/context-propagation:1.0.0
+  # executionScope omitted -> component: renders once per attached component.
+  #
+  # Neither assertion can read the host component's labels, so the mechanism
+  # the gateway declares is stated in the message, and the guard above it is
+  # what keeps that statement true.
+  assertions:
+    carrier_emits_the_gateway: >-
+      {{- if ne .metadata.component "core/gateway/envoy-gateway" -}}
+      {{- fail (printf "core/context-propagation attachment %q on %q is bound to the Envoy Gateway realization, which emits a policy naming the gateway core/gateway/envoy-gateway emits; %s emits no such gateway, so the policy would attach to nothing. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    mode_is_the_client_certificate: >-
+      {{- if ne .values.propagation_mode "client_certificate" -}}
+      {{- fail (printf "core/context-propagation attachment %q on %q asks for propagation_mode %s, but core/gateway/envoy-gateway declares dataplane.aggrega.ai/caller-identity: client-certificate — the identity it forwards is the certificate the client presented, verified against infra.client_ca_secret, and it composes no identity headers of its own. Set propagation_mode to client_certificate, or attach the Feature to a gateway declaring the injected-header mechanism" .metadata.feature_instance .metadata.instance_id .values.propagation_mode) -}}
+      {{- end -}}
+
+  # The policy names the gateway by the component's instance id, which is the
+  # name the gateway component's own Recipe gives the gateway it emits, and the
+  # `https` listener, which is the name that Recipe gives the HTTPS listener it
+  # adds where tls_secret is set. It emits no namespace, as the gateway does
+  # not, so the two land together; a policy only takes effect in its gateway's
+  # namespace. Replacing the header rather than appending to it is what keeps
+  # a client from supplying an identity of its own.
+  artifacts:
+    clienttrafficpolicy.yaml: |
+      apiVersion: gateway.envoyproxy.io/v1alpha1
+      kind: ClientTrafficPolicy
+      metadata:
+        name: {{ .context.instance_id }}-{{ .attachment_name | replace "_" "-" }}
+      spec:
+        targetRefs:
+          - group: gateway.networking.k8s.io
+            kind: Gateway
+            name: {{ .context.instance_id }}
+            sectionName: https
+        tls:
+          clientValidation:
+            caCertificateRefs:
+              - kind: Secret
+                group: ""
+                name: {{ .infra.client_ca_secret }}
+        headers:
+          xForwardedClientCert:
+            mode: SanitizeSet
+            certDetailsToAdd:
+              - Subject
+              - URI
+              - DNS

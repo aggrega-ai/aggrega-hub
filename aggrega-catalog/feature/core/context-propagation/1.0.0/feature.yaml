@@ -6,17 +6,68 @@ kind: Feature
 metadata:
   name: core/context-propagation
   version: 1.0.0
+  description: >
+    Carries the original caller's identity across the gateway hop, so the
+    service behind a gateway can decide on who called rather than on the
+    gateway that relayed the call. It attaches to a component standing in the
+    request path that declares it can convey a caller's identity
+    (dataplane.aggrega.ai/caller-identity, whichever value), and that
+    component passes the caller's identity along on each request it forwards.
+    propagation_mode names which identity travels, and the two modes are two
+    different identities rather than two strengths of one: client_certificate
+    forwards details of the TLS certificate the client presented, which the
+    component first verifies against a certificate authority the Release
+    names; injected_header forwards headers the component composes after
+    authenticating the caller against its own key store. A component
+    implements one mechanism, declared as the value of its caller-identity
+    label, and a realization refuses a mode its component does not implement,
+    naming the mode asked for and the mechanism the component declares. The
+    Feature covers the hop from the gateway to what the gateway forwards to,
+    and no further: identity between two workloads that call each other
+    directly, with no gateway between them, is checked at the receiving
+    workload, which is a service mesh's hop rather than a gateway's, and
+    attaching this Feature does not protect it.
   annotations:
     security.aggrega.ai/class: "trust"
     security.aggrega.ai/trust_mechanism: "context_propagation"
     routing.aggrega.ai/tier: "gateway"
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
 spec:
-  appliesTo: "gateway.aggrega.ai/intelligence=semantic"
+  # Selects on the capability's presence, not on its value. Which mechanism a
+  # component implements is its label's value, and which one a Release needs
+  # is propagation_mode on the attachment; a selector can read the first and
+  # never the second. So the attachment is admitted wherever caller identity is
+  # declared, and the realization refuses a mode its component does not
+  # implement, in a message naming both — which a selector naming a value
+  # could not do.
+  appliesTo: "dataplane.aggrega.ai/caller-identity"
   interoperability:
     conflictsWith: []
   schema:
     values:
       $ref: "BaseComponents#/schemas/BaseFeatureParameter"
       properties:
-        propagationMode: { type: string, enum: [jwt, mTLS, opaque], default: jwt }
-      required: [propagationMode]
+        propagation_mode:
+          type: string
+          enum: [client_certificate, injected_header]
+          description: "Which identity travels to the service behind the component. client_certificate forwards details of the TLS certificate the client presented, once the component has verified it against the certificate authority named in infra.client_ca_secret. injected_header forwards headers the component composes after authenticating the caller itself. The value names what the service behind the component is prepared to read, so it carries no default."
+      required: [propagation_mode]
+    infra:
+      # The certificate authority a client certificate must chain to is a
+      # property of the cluster the Release lands in, so it is operator
+      # sizing. It carries no default because no Secret name could be right for
+      # every cluster, and it is read only in client_certificate mode.
+      client_ca_secret:
+        type: string
+        description: "Name of an existing Secret, in the component's own namespace, holding under the key ca.crt the certificate authority a client certificate must chain to. The component requests a certificate from each client and verifies it against this authority before forwarding its details. Read in client_certificate mode, where the build halts until it is set; injected_header mode does not read it. The Secret is referenced and never created here."
+  # A certificate is only worth forwarding once it has been verified, and every
+  # component offering the certificate mechanism verifies against an authority
+  # the Release names, so this is a rule of the Feature rather than of one
+  # realization.
+  assertions:
+    client_certificate_authority_named: >-
+      {{- if and (eq .values.propagation_mode "client_certificate") (not (optional .infra "client_ca_secret" "")) -}}
+      {{- fail "this core/context-propagation attachment asks for propagation_mode client_certificate but names no certificate authority to verify a client's certificate against: set infra.client_ca_secret on the attachment in the Release to the Secret holding that authority under the key ca.crt" -}}
+      {{- end -}}

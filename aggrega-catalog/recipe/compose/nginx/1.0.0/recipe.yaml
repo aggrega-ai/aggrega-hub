@@ -13,7 +13,13 @@ metadata:
     `upstream` uses-edge arrive on .context.inject.env and are written into a
     minimal NGINX server configuration whose proxy_pass forwards matching
     requests to that upstream. provides.host is the bare service name, resolved
-    on the compose network.
+    on the compose network. Each core/traffic-shadowing attachment on the
+    component adds a mirror to that location, sending a copy of every forwarded
+    request, with its original URI, to the service the attachment's infra
+    names, whose response NGINX discards. NGINX cannot copy a share of the
+    requests, so the FeatureRecipe realizing the attachment
+    (traffic-shadowing-nginx) halts on a share below 100. With no such
+    attachment the configuration carries no mirror.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -28,6 +34,21 @@ spec:
     protocol: "http"
 
   workload: |
+    {{- /*
+      One mirror per core/traffic-shadowing attachment, in attachment-name
+      order, which is the order a template ranges over a map in. Each names an
+      upstream group for the copy's destination, so the internal location can
+      pass the original request URI ($request_uri) without NGINX needing a
+      resolver at runtime: a proxy_pass carrying a variable looks its host up
+      among the server groups first. No attachment, no mirror: the range is
+      empty and the server block is exactly the one written without it.
+    */ -}}
+    {{- $mirrors := list -}}
+    {{- range $name, $f := (default dict .features) -}}
+    {{- if eq $f.type "core/traffic-shadowing" -}}
+    {{- $mirrors = append $mirrors (dict "group" (printf "mirror_%s" $name) "location" (printf "/__mirror_%s" $name) "server" (printf "%s:%v" $f.infra.service_name $f.infra.service_port)) -}}
+    {{- end -}}
+    {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     containers:
@@ -35,11 +56,16 @@ spec:
         image: "nginx:{{ .infra.engine_version }}"
         # The upstream target resolved from the `upstream` uses-edge arrives on
         # the inject pipe (.context.inject.env). It is written into the NGINX
-        # server config at start-up and forwarded via proxy_pass.
+        # server config at start-up and forwarded via proxy_pass. Each mirror
+        # adds its upstream group ahead of the server block, a mirror directive
+        # in the forwarded location, and the internal location the copy is sent
+        # from. The NGINX variable is written $$request_uri because Compose
+        # reads $ in the file it is given as the start of a variable of its
+        # own, and $$ is how that file spells a literal $.
         command:
           - /bin/sh
           - -c
-          - "echo 'server { listen {{ .infra.port }}; location {{ .values.upstream_path }} { proxy_pass http://{{ .context.inject.env.NGINX_UPSTREAM_HOST }}:{{ .context.inject.env.NGINX_UPSTREAM_PORT }}; } }' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
+          - "echo '{{ range $mirrors }}upstream {{ .group }} { server {{ .server }}; } {{ end }}server { listen {{ .infra.port }}; location {{ .values.upstream_path }} { {{ range $mirrors }}mirror {{ .location }}; {{ end }}proxy_pass http://{{ .context.inject.env.NGINX_UPSTREAM_HOST }}:{{ .context.inject.env.NGINX_UPSTREAM_PORT }}; }{{ range $mirrors }} location = {{ .location }} { internal; proxy_pass http://{{ .group }}$$request_uri; }{{ end }} }' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
         ports:
           http: {{ .infra.port }}
         # NGINX documents no health endpoint, and the one location this server

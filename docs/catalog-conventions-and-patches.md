@@ -268,12 +268,13 @@ Three rules bind the family, and each has already been got wrong once:
   shared value here is the thing to revisit if a second product gains it.
 
 Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
-`upstream-tls: trust-anchor`), `core/gateway/contour` (`request-mirroring:
-sampled`, `caller-identity: client-certificate`, `upstream-tls: trust-anchor`),
+`upstream-tls: trust-anchor`), `core/gateway/contour` and
+`core/gateway/envoy-gateway` (each `request-mirroring: sampled`,
+`caller-identity: client-certificate`, `upstream-tls: trust-anchor`),
 `core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/litellm`
 (`caller-identity: injected-header`, `prompt-guard: pattern-list`,
-`upstream-tls: trust-anchor`). Three of the four carry no
-`gateway.aggrega.ai/intelligence` value and the fourth carries `semantic` — and
+`upstream-tls: trust-anchor`). Four of the five carry no
+`gateway.aggrega.ai/intelligence` value and the fifth carries `semantic` — and
 that mixture is the separation working rather than an exception to it. The
 intelligence label names a **product tier** — whether the router parses the
 request body — while this family names **capabilities**, so the two answer
