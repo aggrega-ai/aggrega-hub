@@ -30,13 +30,20 @@ metadata:
     realization relies on, as a second file beside the configuration, and the
     configuration registers it under litellm_settings.callbacks; what the hook
     does is stated on that realization. With no such attachment neither
-    appears. The gateway's public origin is emitted as
-    PROXY_BASE_URL only when infra.external_base_url is set, and the build halts
-    when that address carries a path. With the pii_analyzer and pii_anonymizer
+    appears. Likewise, while a core/data-masking attachment masks replies by
+    entity type, the ConfigMap carries the module that attachment's reply-side
+    guardrail is loaded from, as a further file beside the configuration, and
+    while any such attachment leaves allow_streamed_replies off the
+    configuration also registers that module's refusal of streamed requests
+    under litellm_settings.callbacks; what both do is stated on that
+    realization, and with no such attachment neither appears. The gateway's
+    public origin is emitted as PROXY_BASE_URL only when
+    infra.external_base_url is set, and the build halts when that address
+    carries a path. With the pii_analyzer and pii_anonymizer
     sockets wired, the endpoint each service publishes reaches the gateway as
     PRESIDIO_ANALYZER_API_BASE and PRESIDIO_ANONYMIZER_API_BASE, the variables
     its Presidio integration reads wherever a guardrail names no address of its
-    own; this Recipe writes no guardrail, so nothing reads them until one is
+    own; this Recipe writes no guardrail entry, so nothing reads them until one is
     configured, and the build halts when only one of the two is wired. With
     neither wired, neither variable is emitted. provides.host is the bare,
     self-contained in-cluster service name of the synthesized ClusterIP Service
@@ -70,6 +77,13 @@ spec:
     # second data key and the callback the configuration registers both read
     # it, so the file and its registration cannot name different modules.
     caller_identity_module: caller_identity
+    # The module the reply-side masking guardrails are loaded from, and the two
+    # classes in it: the configuration entry a core/data-masking attachment's
+    # realization writes names a module and a class from here, and the file
+    # below defines them from here, so the entry cannot name one the file lacks.
+    reply_masking_module: reply_masking
+    reply_masking_class: ReplyMasking
+    buffered_reply_masking_class: BufferedReplyMasking
     # Published for an attachment's realization to check against, and never
     # emitted. A FeatureRecipe reads this Recipe's locals and not the
     # component's values, so the facts it checks an attachment against are
@@ -141,14 +155,35 @@ spec:
     # in, so the file lands where it is looked for. The hook sends the identity
     # to the aliases every such attachment lists in infra.destinations. With no
     # such attachment, neither the registration nor the file is emitted.
+    #
+    # While a core/data-masking attachment lists entities with scope response or
+    # both, the ConfigMap carries the reply-masking module the attachment's
+    # realization names in its reply-side guardrail entry, and while any such
+    # attachment leaves infra.allow_streamed_replies off, the body registers
+    # that module's refusal of streamed requests. The realization decides the
+    # same condition from the same attachment to write its entry, because the
+    # choice of file here cannot be handed to it; should the two ever disagree,
+    # each fails closed: an entry naming a module absent here stops the gateway
+    # from starting, and without the registration the entry's guardrail still
+    # refuses a streamed reply before any of it is sent. With no such
+    # attachment, neither the module nor the registration is emitted.
     litellm-gateway-config.configmap.yaml: |
       {{- $identity := false }}
       {{- $listed := list }}
+      {{- $replyMasking := false }}
+      {{- $refuseStreams := false }}
       {{- range $name, $attachment := (default dict .features) }}
       {{- if eq (toString $attachment.type) "core/context-propagation" }}
       {{- $identity = true }}
       {{- range $alias := optional (optional $attachment "infra" dict) "destinations" list }}
       {{- if not (has $alias $listed) }}{{ $listed = append $listed $alias }}{{ end }}
+      {{- end }}
+      {{- end }}
+      {{- if eq (toString $attachment.type) "core/data-masking" }}
+      {{- $masking := optional $attachment "values" dict }}
+      {{- if and (optional $masking "entities" list) (ne (toString (optional $masking "scope" "request")) "request") }}
+      {{- $replyMasking = true }}
+      {{- if not (optional (optional $attachment "infra" dict) "allow_streamed_replies" false) }}{{ $refuseStreams = true }}{{ end }}
       {{- end }}
       {{- end }}
       {{- end -}}
@@ -169,10 +204,17 @@ spec:
       {{- end }}
           router_settings:
             routing_strategy: {{ .values.routing_strategy }}
-      {{- if $identity }}
+      {{- if or $identity $refuseStreams }}
           litellm_settings:
             callbacks:
+      {{- if $identity }}
               - {{ .locals.caller_identity_module }}.hook
+      {{- end }}
+      {{- if $refuseStreams }}
+              - {{ .locals.reply_masking_module }}.refuse_streamed_requests
+      {{- end }}
+      {{- end }}
+      {{- if $identity }}
         {{ .locals.caller_identity_module }}.py: |
           """Caller identity for the requests this gateway sends upstream.
 
@@ -281,6 +323,101 @@ spec:
 
 
           hook = CallerIdentity()
+      {{- end }}
+      {{- if $replyMasking }}
+        {{ .locals.reply_masking_module }}.py: |
+          """Masking of the gateway's replies by entity type.
+
+          Delivered beside the gateway's configuration while core/data-masking masks
+          replies by entity type. The configuration's reply-side guardrail entries
+          name one of the two guardrail classes below. Both mask a reply sent in one
+          piece through the gateway's own Presidio integration, which fails the
+          request when a recognizer cannot be reached or answers with an error. They
+          differ on a streamed reply, whose masking the gateway would otherwise do
+          in a way that passes the reply on unmasked when a recognizer cannot be
+          reached. {{ .locals.reply_masking_class }} refuses a streamed reply before any of it is sent,
+          and the configuration also registers refuse_streamed_requests, which
+          refuses a streamed request before it is forwarded at all.
+          {{ .locals.buffered_reply_masking_class }} holds a streamed reply until all of it has arrived,
+          masks it as one piece and sends it as one piece; when anything about that
+          fails, it refuses the request before any of the reply is sent.
+          """
+          from fastapi import HTTPException
+          from litellm.integrations.custom_logger import CustomLogger
+          from litellm.llms.base_llm.base_model_iterator import convert_model_response_to_streaming
+          from litellm.main import stream_chunk_builder
+          from litellm.proxy.guardrails.guardrail_hooks.presidio import _OPTIONAL_PresidioPIIMasking
+          from litellm.types.utils import ModelResponse, ModelResponseStream
+
+          STREAM_REFUSED = (
+              "This gateway masks the entities in its replies and does not stream a reply "
+              "it masks that way, so a request asking for a streamed reply is refused. "
+              "Send it with stream set to false, or without stream, to receive the whole "
+              "reply masked, in one piece."
+          )
+
+
+          class RefuseStreamedRequests(CustomLogger):
+              async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+                  # The gateway streams a reply only when stream is true itself, and
+                  # serves any other value in one piece, so only that is refused. A
+                  # stream begun some other way meets the reply-side guardrail's own
+                  # refusal instead.
+                  if data.get("stream") is True:
+                      raise HTTPException(status_code=400, detail=STREAM_REFUSED)
+                  return data
+
+
+          refuse_streamed_requests = RefuseStreamedRequests()
+
+
+          class {{ .locals.reply_masking_class }}(_OPTIONAL_PresidioPIIMasking):
+              # The gateway picks how to run a guardrail on a reply sent in one piece
+              # by whether the guardrail's own class declares this method, so it is
+              # declared here to keep that path exactly the built-in guardrail's.
+              apply_guardrail = _OPTIONAL_PresidioPIIMasking.apply_guardrail
+
+              def __init__(self, **kwargs):
+                  # A reply-side guardrail: every reply is masked, and no stand-in is
+                  # mapped back to an original.
+                  kwargs["apply_to_output"] = True
+                  kwargs["output_parse_pii"] = False
+                  super().__init__(**kwargs)
+
+              async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data):
+                  # Takes the place of the gateway's own masking of a streamed reply.
+                  # Raised before anything is yielded, so none of the reply is sent.
+                  raise HTTPException(status_code=400, detail=STREAM_REFUSED)
+                  yield
+
+
+          class {{ .locals.buffered_reply_masking_class }}({{ .locals.reply_masking_class }}):
+              async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data):
+                  # The whole reply is held and masked as one piece, because entities are
+                  # found over the whole text and a piece sent early could carry part of
+                  # one. Nothing is yielded until all of it is masked, and any failure is
+                  # raised before that one yield, while the gateway can still answer with
+                  # an error rather than with part of a reply.
+                  try:
+                      chunks = []
+                      async for chunk in response:
+                          if not isinstance(chunk, ModelResponseStream):
+                              raise ValueError("the reply arrives as " + type(chunk).__name__ + " pieces, which are not masked")
+                          chunks.append(chunk)
+                      if not chunks:
+                          return
+                      whole = stream_chunk_builder(chunks=chunks, messages=request_data.get("messages"))
+                      if not isinstance(whole, ModelResponse):
+                          raise ValueError("the streamed reply could not be assembled into one reply")
+                      self._preserve_usage_from_last_chunk(whole, chunks)
+                      await self._process_response_for_pii(response=whole, request_data=request_data, mode="mask")
+                      masked = convert_model_response_to_streaming(whole)
+                  except Exception as e:
+                      raise Exception(
+                          "The reply was not sent: masking it failed (" + str(e) + "), and a streamed "
+                          "reply is sent only once all of it is masked."
+                      ) from e
+                  yield masked
       {{- end }}
   workload: |
     {{- $configDir := "/etc/litellm" -}}

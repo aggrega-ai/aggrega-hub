@@ -28,23 +28,35 @@ metadata:
     becomes <PERSON>, or with action restore a numbered stand-in such as
     <PERSON_1> that the gateway maps back to the name in its reply to the same
     request. Both services receive the unmasked text, recognition runs in
-    English, and it can miss an entity. When either service cannot be reached,
-    or the analyzer answers with an error, the gateway fails the request with
-    HTTP 500 and forwards nothing. The gateway masks entities in requests
-    only: while it masks a streamed reply, an analyzer it cannot reach makes it
-    pass that reply on unmasked, so this recipe halts on entities with scope
-    response or both, and patterns remain available for replies. It also halts
-    on an entity type the analyzer does not recognize in English, which the
-    analyzer would otherwise ignore without a word, on action restore without
-    entities or with any scope but request, on entities with the recognizer
-    sockets unwired, and when the attachment is carried by any component other
-    than core/gateway/litellm. While the masking is attached the gateway hands
-    its logging integrations a redacted copy of every request's messages and
-    every reply, and a caller cannot turn that off from the request; its debug
+    English, and it can miss an entity. When the analyzer cannot be reached or
+    answers with an error, or the anonymizer cannot be reached while there is
+    something to replace, the gateway fails the request with HTTP 500: masking
+    a request, it forwards nothing, and masking a reply sent in one piece, it
+    sends none of the reply. Entities in replies are masked by a guardrail
+    loaded from a module the gateway's own Recipe delivers beside its
+    configuration, in place of the gateway's built-in masking of a streamed
+    reply, which passes the reply on unmasked when the analyzer cannot be
+    reached. By default a request with stream set to true is then refused with
+    HTTP 400 before it is forwarded, telling the caller to ask for the reply in
+    one piece. With allow_streamed_replies set on the attachment in the
+    Release, the gateway instead holds the whole streamed reply, masks it as
+    one piece and sends it as a single chunk once all of it is masked, so the
+    caller receives the reply all at once at the end rather than word by word;
+    when masking it fails for any reason, including a recognizer that cannot
+    be reached or answers with an error, the caller receives HTTP 500 and none
+    of the reply. Patterns keep streaming. The recipe halts on an entity type
+    the analyzer does not recognize in English, which the analyzer would
+    otherwise ignore without a word, on action restore without entities or
+    with any scope but request, on entities with the recognizer sockets
+    unwired, and when the attachment is carried by any component other than
+    core/gateway/litellm. While the masking is attached the gateway hands its
+    logging integrations a redacted copy of every request's messages and every
+    reply, and a caller cannot turn that off from the request; its debug
     output, which the gateway's Recipe does not turn on, still carries the
-    unmasked text. The gateway leaves tool-call arguments, images and files
-    unmasked, and passes a request of a kind it does not scan through
-    unchanged. A Release binds this recipe for core/data-masking in its
+    unmasked text. The gateway leaves images, files and a reply's separate
+    reasoning text unmasked, and tool-call arguments too in requests and in
+    replies sent in one piece, and passes a request of a kind it does not scan
+    through unchanged. A Release binds this recipe for core/data-masking in its
     Manifest.
   maintainers:
     - name: "Massimiliano Ferrero"
@@ -72,13 +84,13 @@ spec:
       {{- if and (eq (optional .values "action" "redact") "restore") (ne $scope "request") -}}
       {{- fail (printf "core/data-masking attachment %q on %q asks for action restore with scope %s, but core/gateway/litellm declares dataplane.aggrega.ai/content-masking: entity-recognition and restores by mapping the stand-ins in its reply back to the originals, so a reply it restores is not masked; set scope to request, or set action to redact" .metadata.feature_instance .metadata.instance_id $scope) -}}
       {{- end -}}
-    # The gateway fails a request when its recognizer cannot be reached, but
-    # while it masks a streamed reply it passes the reply on unmasked instead,
-    # so entity masking is refused wherever it would cover a reply.
-    entities_on_requests_only: >-
-      {{- $scope := optional .values "scope" "request" -}}
-      {{- if and (optional .values "entities" list) (ne $scope "request") -}}
-      {{- fail (printf "core/data-masking attachment %q on %q lists entities with scope %s, but core/gateway/litellm declares dataplane.aggrega.ai/content-masking: entity-recognition and, when the analyzer it calls cannot be reached while it masks a streamed reply, passes that reply to the caller unmasked; mask entities with scope request, and mask replies with patterns in an attachment of their own" .metadata.feature_instance .metadata.instance_id $scope) -}}
+    # Entities in replies are masked by a guardrail class the gateway's own
+    # Recipe delivers in a module beside the configuration and publishes the
+    # names of; a Recipe publishing none would leave the entry naming nothing
+    # the gateway can load.
+    reply_masking_is_delivered: >-
+      {{- if and (optional .values "entities" list) (ne (optional .values "scope" "request") "request") (not (optional .locals "reply_masking_module" "")) -}}
+      {{- fail (printf "core/data-masking attachment %q on %q masks entities in replies, which core/gateway/litellm does through a module its Recipe delivers beside the configuration, but the Recipe rendering %q delivers none; bind the component in the Manifest to a Recipe that does, or set scope to request" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
       {{- end -}}
     # The entity types the Presidio analyzer that core/security/presidio-analyzer
     # runs reports it recognizes in English. A type outside the list is ignored
@@ -113,7 +125,11 @@ spec:
     # Recipe fills from the pii_analyzer and pii_anonymizer sockets. It always
     # lists the entity types, and that list is also what makes the gateway fail
     # a request when the analyzer answers with an error, where with no list it
-    # would pass the text on unmasked.
+    # would pass the text on unmasked. Entities in requests are masked by the
+    # gateway's built-in Presidio guardrail; entities in replies by a guardrail
+    # class loaded from the module the gateway's Recipe delivers, named through
+    # that Recipe's locals, which refuses a streamed reply unless the
+    # attachment sets allow_streamed_replies, and then masks it whole.
     - id: write_masking_guardrails
       plugin: pipeline-step/litellm-gateway-config:1.0.0
       function: step
@@ -122,6 +138,8 @@ spec:
         {{- $patterns := optional .values "patterns" list }}
         {{- $entities := optional .values "entities" list }}
         {{- $id := printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-") }}
+        {{- $piiEntities := "" }}
+        {{- range $e := $entities }}{{ $piiEntities = printf "%s\n                %s: MASK" $piiEntities ($e | toJson) }}{{ end }}
         section: guardrails
         identifiedBy: guardrail_name
         entries:
@@ -145,7 +163,7 @@ spec:
                   action: MASK
         {{- end }}
         {{- end }}
-        {{- if $entities }}
+        {{- if and $entities (ne $scope "response") }}
           - guardrail_name: {{ $id }}-entities
             litellm_params:
               guardrail: presidio
@@ -155,10 +173,15 @@ spec:
         {{- if eq (optional .values "action" "redact") "restore" }}
               output_parse_pii: true
         {{- end }}
-              pii_entities_config:
-        {{- range $e := $entities }}
-                {{ $e | toJson }}: MASK
+              pii_entities_config:{{ $piiEntities }}
         {{- end }}
+        {{- if and $entities (ne $scope "request") }}
+          - guardrail_name: {{ $id }}-reply-entities
+            litellm_params:
+              guardrail: {{ .locals.reply_masking_module }}.{{ if optional .infra "allow_streamed_replies" false }}{{ .locals.buffered_reply_masking_class }}{{ else }}{{ .locals.reply_masking_class }}{{ end }}
+              default_on: true
+              mode: post_call
+              pii_entities_config:{{ $piiEntities }}
         {{- end }}
     # While the masking is attached the gateway hands its logging integrations
     # a redacted copy of every request's messages and every reply.
