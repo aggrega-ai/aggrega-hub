@@ -27,12 +27,18 @@ metadata:
     connection string is emitted only when infra.database_url is set; with none
     the gateway runs stateless. The gateway's public origin is emitted as
     PROXY_BASE_URL only when infra.external_base_url is set, and the build halts
-    when that address carries a path. provides.host is the bare, self-contained
-    in-cluster service name of the synthesized ClusterIP Service — it carries no
-    namespace, so the recipe is independent of where it is deployed. A consumer
-    in another namespace qualifies the host with the target namespace on its own
-    side (caller-side routing). The configuration contract is authored against
-    LiteLLM v1.85.1.
+    when that address carries a path. With the pii_analyzer and pii_anonymizer
+    sockets wired, the endpoint each service publishes reaches the gateway as
+    PRESIDIO_ANALYZER_API_BASE and PRESIDIO_ANONYMIZER_API_BASE, the variables
+    its Presidio integration reads wherever a guardrail names no address of its
+    own; this Recipe writes no guardrail, so nothing reads them until one is
+    configured, and the build halts when only one of the two is wired. With
+    neither wired, neither variable is emitted. provides.host is the bare,
+    self-contained in-cluster service name of the synthesized ClusterIP Service
+    — it carries no namespace, so the recipe is independent of where it is
+    deployed. A consumer in another namespace qualifies the host with the target
+    namespace on its own side (caller-side routing). The configuration contract
+    is authored against LiteLLM v1.85.1.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -84,6 +90,19 @@ spec:
       {{- fail (printf "infra.external_base_url %q carries the path %q, but the gateway takes its public address as an origin only, so the links it composes would point where it is not served; set it to the scheme, host and port alone, for example https://llm.example.com" . $u.path) -}}
       {{- end -}}
       {{- end -}}
+    # The gateway's Presidio integration calls the analyzer and then the
+    # anonymizer for every text it masks, and a guardrail missing either address
+    # fails as it is set up, so one socket wired without the other is always a
+    # mistake. Halt on it here, naming the socket left empty.
+    recognizer_sockets_wired_together: >-
+      {{- $analyzer := hasKey .uses "pii_analyzer" -}}
+      {{- $anonymizer := hasKey .uses "pii_anonymizer" -}}
+      {{- if and $analyzer (not $anonymizer) -}}
+      {{- fail "the pii_analyzer socket is wired and the pii_anonymizer socket is not, but the gateway's Presidio integration hands every text the analyzer reports on to the anonymizer and cannot use either service alone; wire a core/security/presidio-anonymizer to pii_anonymizer as well, or remove the pii_analyzer edge" -}}
+      {{- end -}}
+      {{- if and $anonymizer (not $analyzer) -}}
+      {{- fail "the pii_anonymizer socket is wired and the pii_analyzer socket is not, but the gateway's Presidio integration replaces only the spans the analyzer reports and cannot use either service alone; wire a core/security/presidio-analyzer to pii_analyzer as well, or remove the pii_anonymizer edge" -}}
+      {{- end -}}
   artifacts:
     # The gateway's routing table. Every entry of the developer's model map
     # becomes one published alias and the upstream target it resolves to, and the
@@ -117,6 +136,8 @@ spec:
             routing_strategy: {{ .values.routing_strategy }}
   workload: |
     {{- $configDir := "/etc/litellm" -}}
+    {{- $recognizer := false -}}
+    {{- range $alias, $edge := .context.uses }}{{ if or (eq $edge.socket "pii_analyzer") (eq $edge.socket "pii_anonymizer") }}{{ $recognizer = true }}{{ end }}{{ end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     form: stateless
@@ -143,7 +164,14 @@ spec:
         # origin the gateway composes its sign-in callback, its admin-console
         # redirect and the address in its alerts from. Unset, it is not emitted
         # and the gateway takes each of those from the request that arrives.
-    {{- if or .infra.database_url .infra.external_base_url }}
+        # With the recognizer sockets wired, each service's published endpoint
+        # arrives on its edge, matched by socket name rather than by the alias
+        # the topology chose, and is delivered under the variable the gateway's
+        # Presidio integration reads when a guardrail names no address itself.
+        # Each is written inside the loop over the edges, so a second service
+        # wired to the same socket writes the variable twice and the build
+        # refuses the duplicate rather than keeping one address silently.
+    {{- if or .infra.database_url .infra.external_base_url $recognizer }}
         variables:
     {{- end }}
     {{- if .infra.database_url }}
@@ -151,6 +179,14 @@ spec:
     {{- end }}
     {{- with .infra.external_base_url }}
           PROXY_BASE_URL: "{{ . }}"
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "pii_analyzer" }}
+          PRESIDIO_ANALYZER_API_BASE: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- if eq $edge.socket "pii_anonymizer" }}
+          PRESIDIO_ANONYMIZER_API_BASE: "{{ $edge.provides.endpoint }}"
+    {{- end }}
     {{- end }}
     {{- if or (hasKey (default dict .features) "master_key") (hasKey (default dict .features) "provider_key") }}
         attachments:

@@ -127,7 +127,8 @@ cognitive browse axis of the catalog's three-axis label scheme:
 - **Axis 3 — capability labels** (`<role>.aggrega.ai/<dimension>`):
   e.g. `agent.aggrega.ai/autonomy`, `model.aggrega.ai/capability`,
   `tool.aggrega.ai/impact`, `gateway.aggrega.ai/intelligence`,
-  `datastore.aggrega.ai/engine`, `pipeline.aggrega.ai/mode`. These carry
+  `datastore.aggrega.ai/engine`, `pipeline.aggrega.ai/mode`,
+  `security.aggrega.ai/text-anonymization`. These carry
   the behavioral subsets selectors and policies discriminate on. Most are
   per-category, but `<role>` names the **concern** rather than the category
   where several categories share one: `dataplane.aggrega.ai/<dimension>` names
@@ -281,6 +282,31 @@ request body — while this family names **capabilities**, so the two answer
 different questions and a component may honestly carry both. What a component's
 tier value never tells a reader is which of these capabilities it has: the AI
 gateway carries three of them, and no amount of reading its tier would say so.
+
+### The `security.aggrega.ai/text-anonymization` label
+
+`security.aggrega.ai/text-anonymization` records which role a service plays in
+masking sensitive data in text where that work is split across two services —
+one finds the sensitive spans in a text and reports them, the other rewrites the
+spans it is handed — and it is what a consumer's socket selects on to be handed
+the right address. A consumer that masks text through such a pair calls both, so
+it declares a socket per role and each selector names the value it needs:
+
+| Value | What the value asserts |
+| --- | --- |
+| `analyzer` | The component finds sensitive spans in the text it is sent — an entity type, a position and a confidence for each — and changes nothing. |
+| `anonymizer` | The component rewrites the spans a caller hands it, by the operator the caller names for each entity type, and finds nothing on its own. |
+
+The value names the role, not the interface. Components today:
+`core/security/presidio-analyzer` (`analyzer`) and
+`core/security/presidio-anonymizer` (`anonymizer`), which speak the Presidio HTTP
+API; `core/gateway/litellm` selects them on its `pii_analyzer` and
+`pii_anonymizer` sockets. The compiler routes the address a selected component
+publishes and checks nothing about what answers there, so a component carrying a
+value here that speaks a different API is refused by nothing and fails when it
+is called; each socket's comment names the API its consumer speaks. As with the
+data-path family, a value is added in the same act as the first component to
+carry it.
 
 ### The `component.aggrega.ai/upstream-licensing` label
 
