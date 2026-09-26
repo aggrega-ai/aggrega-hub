@@ -492,19 +492,25 @@ its own declares a parameter of its own and passes it down through its
 importer's Manifest binds: the credential itself under
 `k8s-secret-from-parameter`, the name of a Secret that already exists under
 `k8s-existing-secret`. So the default is a valid Kubernetes object name that also
-meets any length the product requires of the credential, and the parameter's
-description says what the value is under each. Every Manifest whose Aggregate
-imports the module maps `core/referenced-secret`, or the build halts, and the
-module's description says so. The shape stops where the Feature cannot follow. A
+meets what the product requires of the credential — a length, the characters it
+refuses — and the parameter's description says what the value is under each.
+Every Manifest whose Aggregate imports the module maps `core/referenced-secret`,
+or the build halts, and the module's description says so. The shape stops where
+the Feature cannot follow. A
 module that also builds on `compose` attaches nothing, because that target has no
 realization of a Feature holding a credential by reference; its description says
 its components run on their Recipes' development credentials and that a reader
 needing real ones composes the components directly. And a slot no consumer can
 present stays unattached, because filling it switches authentication on for
 clients with no way to authenticate — the store's password in `core/livekit`,
-which neither the media server nor the bridge declares a slot to present.
-`core/keycloak`, `core/harbor`, `core/thanos` and `core/livekit` are the shipped
-shape; `core/kong` and `core/ferretdb` show the `compose` limit.
+which neither the media server nor the bridge declares a slot to present. So
+does a credential that is a slot on some consumers and a plain value on another,
+because one parameter would then be a Secret's name on one side and the literal
+credential on the other — the object store's access key in `core/agenta`, a slot
+on both API tiers and the store's own `root_user`. `core/keycloak`, `core/harbor`,
+`core/thanos`, `core/livekit`, `core/agenta` and `core/dify` are the shipped
+shape, the last two leaving credentials unattached for those reasons;
+`core/kong` and `core/ferretdb` show the `compose` limit.
 
 ### Recipe/FeatureRecipe Provider Segment
 

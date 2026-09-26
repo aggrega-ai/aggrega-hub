@@ -49,15 +49,45 @@ metadata:
     services or the node's metadata endpoint. The proxy's allowlist of private
     destinations is empty, and widening it is an explicit act.
 
-    The whole module shares one set of pinned development credentials — the
-    backend password, the application secret under which stored model-provider
-    credentials are encrypted, the sandbox execution key, and the two keys the
-    plugin runtime and the API server present to each other — so it runs
-    self-contained with no external secret. These defaults are for evaluation
-    and local development; a Release holding real model-provider credentials
-    attaches its own to the credential slots each component declares. While the
-    sandbox execution key is at its default, any workload that can reach the
-    sandbox can execute code through it.
+    Five credentials hold the platform together, and each is a module parameter
+    an importing Aggregate passes down: `db_password`, the password the backend
+    is initialized with and the API server, the worker, the scheduler and the
+    plugin runtime authenticate with; `secret_key`, the application secret under
+    which stored model-provider credentials are encrypted, held by the API server
+    and the worker; `code_execution_key`, the key the sandbox requires of the API
+    server and the worker; and `plugin_daemon_key` and `inner_api_key`, the two
+    keys the plugin runtime, the API server and the worker present to each other.
+    Each reaches every component that holds it through that component's own
+    credential slot, so it is authored once and cannot drift between the
+    components that must agree on it. The module attaches the
+    `core/referenced-secret` Feature on each of those slots, so every workload
+    carries a reference to a Secret rather than the value itself, and the
+    Manifest of every Release whose Aggregate imports the module maps
+    `core/referenced-secret`, or the build halts. The realization that mapping
+    binds decides what the parameters mean: `k8s-secret-from-parameter` reads
+    each as the credential itself and emits a Secret carrying it, while
+    `k8s-existing-secret` reads each as the name of a Secret that already exists
+    in the namespace, holding the credential under the data key its parameter's
+    description names — one Secret may carry all five. Every parameter carries a
+    pinned default so the module renders self-contained. The defaults are
+    development credentials every reader of this catalog holds, so they are for
+    evaluation and local development. A Release carrying real traffic supplies
+    its own through the importing Aggregate, which declares parameters of its own
+    and passes them down through its `aggregates` entry for the Release to
+    fulfill. While the sandbox execution key is at its default, any workload that
+    can reach the sandbox can execute code through it.
+
+    Two credentials are left unattached, and the stores behind them run without
+    authentication: the cache's password and the vector datastore's API key.
+    Filling either slot switches authentication on at that store, and no
+    component reaching it declares a slot to present the credential, so the
+    store would refuse every one of its clients.
+
+    Because the module fills the backend's credential slot, the backend is
+    realized by a Recipe that reads that slot. `postgres-cloudnative-pg`, whose
+    controller owns the database's credentials itself, halts the build when the
+    slot is filled, so a Manifest importing this module maps the backend to
+    another PostgreSQL realization.
 
     This module is the working platform core, and three parts of a full Dify
     deployment are deliberately out of scope. It ships no internal reverse
@@ -82,12 +112,54 @@ metadata:
     browser endpoint; and the plugin runtime as `plugins`, the endpoint the
     plugin path routes to.
 spec:
+  parameters:
+    # Each parameter below is one credential the platform's components must agree
+    # on, and fills every credential slot that holds it. They are module
+    # parameters because an Aggregate importing this module hands it parameters
+    # and nothing else, so a parameter is the one way a Release reaches a
+    # credential slot on a component inside it — and one parameter per credential
+    # means it is authored once and cannot drift between the components that must
+    # agree on it.
+    #
+    # Each pinned default is what lets the module render self-contained. It is a
+    # development credential: every reader of this catalog holds it, so a Release
+    # carrying real traffic supplies its own through the importing Aggregate.
+    # Each default is also a valid Kubernetes object name, so it serves under
+    # either realization of the Feature.
+    db_password:
+      type: string
+      default: "dify-db-password-for-evaluation-only"
+      description: Password the PostgreSQL backend is initialized with, and the one the API server, the task worker, the scheduler and the plugin runtime authenticate to it with. What the value is depends on the core/referenced-secret realization the Manifest binds - the password itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the password under the data key db-password, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+    secret_key:
+      type: string
+      default: "dify-secret-key-for-evaluation-only"
+      description: Application secret the API server signs session cookies with and encrypts stored model-provider credentials under, and the one the task worker decrypts them with. What the value is depends on the core/referenced-secret realization the Manifest binds - the secret itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the secret under the data key secret-key, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+    code_execution_key:
+      type: string
+      default: "dify-code-execution-key-for-evaluation-only"
+      description: Key the code sandbox requires on every execution request, which the API server and the task worker present. While it is at its default, any workload that can reach the sandbox can execute code through it. What the value is depends on the core/referenced-secret realization the Manifest binds - the key itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the key under the data key code-execution-key, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+    plugin_daemon_key:
+      type: string
+      default: "dify-plugin-daemon-key-for-evaluation-only"
+      description: Key the plugin runtime requires of every caller, which the API server and the task worker present on every call they make to it. What the value is depends on the core/referenced-secret realization the Manifest binds - the key itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the key under the data key plugin-daemon-key, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+    inner_api_key:
+      type: string
+      default: "dify-inner-api-key-for-evaluation-only"
+      description: Key the plugin runtime presents on every call back into the internal API, which the API server and the task worker compare against their own. What the value is depends on the core/referenced-secret realization the Manifest binds - the key itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the key under the data key inner-api-key, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
   components:
     db:
       type: core/datastore/postgres
       values:
         user: dify
         database: dify
+      features:
+        password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+    # No credential is attached to the cache or the vector datastore: see the
+    # description for why both run without authentication.
     cache:
       type: core/datastore/redis
     vector:
@@ -104,6 +176,12 @@ spec:
               env:
                 - { in: SSRF_PROXY_HOST, from: host }
                 - { in: SSRF_PROXY_PORT, from: port }
+      features:
+        code_execution_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.code_execution_key }}"
+            key: code-execution-key
     plugins:
       type: core/ai-agent/dify-plugin-daemon
       uses:
@@ -132,6 +210,22 @@ spec:
               env:
                 - { in: API_HOST, from: host }
                 - { in: API_PORT, from: port }
+      features:
+        password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+        plugin_daemon_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.plugin_daemon_key }}"
+            key: plugin-daemon-key
+        inner_api_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.inner_api_key }}"
+            key: inner-api-key
     api:
       type: core/ai-agent/dify
       uses:
@@ -185,6 +279,32 @@ spec:
               env:
                 - { in: SSRF_PROXY_HOST, from: host }
                 - { in: SSRF_PROXY_PORT, from: port }
+      features:
+        password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+        secret_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.secret_key }}"
+            key: secret-key
+        code_execution_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.code_execution_key }}"
+            key: code-execution-key
+        plugin_daemon_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.plugin_daemon_key }}"
+            key: plugin-daemon-key
+        inner_api_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.inner_api_key }}"
+            key: inner-api-key
     worker:
       type: core/ai-agent/dify-worker
       uses:
@@ -238,6 +358,32 @@ spec:
               env:
                 - { in: SSRF_PROXY_HOST, from: host }
                 - { in: SSRF_PROXY_PORT, from: port }
+      features:
+        password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+        secret_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.secret_key }}"
+            key: secret-key
+        code_execution_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.code_execution_key }}"
+            key: code-execution-key
+        plugin_daemon_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.plugin_daemon_key }}"
+            key: plugin-daemon-key
+        inner_api_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.inner_api_key }}"
+            key: inner-api-key
     scheduler:
       type: core/ai-agent/dify-worker-beat
       uses:
@@ -260,6 +406,12 @@ spec:
               env:
                 - { in: REDIS_HOST, from: host }
                 - { in: REDIS_PORT, from: port }
+      features:
+        password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
     console:
       type: core/ai-agent/dify-web
       uses:

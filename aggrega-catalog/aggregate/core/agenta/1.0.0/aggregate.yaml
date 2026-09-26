@@ -74,15 +74,59 @@ metadata:
     property of this topology rather than of any single component, and widening
     the runner's wiring removes it.
 
-    The whole module shares one set of pinned development credentials — the
-    backend password, the key the platform's internal tokens are signed with, the
-    key stored provider credentials are encrypted under, the key the two API
-    tiers present to each other, the token the runner requires, and the object
-    store's access pair — so it runs self-contained with no external secret.
-    These defaults are for evaluation and local development; a Release
-    holding real model-provider credentials attaches its own to the credential
-    slots each component declares. While the runner's token is at its default,
-    anything that can reach the runner can start an agent run.
+    Seven credentials hold the platform together, and each is a module parameter
+    an importing Aggregate passes down: `db_password`, the password the backend
+    is initialized with and every component reaching it authenticates with;
+    `auth_key`, the key the platform signs its own internal tokens with;
+    `crypt_key`, the key stored model-provider credentials are encrypted under;
+    `services_internal_key`, the key the two API tiers and the queue-consuming
+    worker present to each other; `runner_token`, the token the runner requires
+    on every call; `store_secret_key`, the object store's root password, which
+    the two API tiers present as their secret key; and `auth_core_api_key`, the
+    key the authentication core requires of every caller. Each reaches every
+    component that holds it through that component's own credential slot, so it
+    is authored once and cannot drift between the components that must agree on
+    it. The module attaches the `core/referenced-secret` Feature on each of those
+    slots, so every workload carries a reference to a Secret rather than the
+    value itself, and the Manifest of every Release whose Aggregate imports the
+    module maps `core/referenced-secret`, or the build halts. The realization that
+    mapping binds decides what the parameters mean: `k8s-secret-from-parameter`
+    reads each as the credential itself and emits a Secret carrying it, while
+    `k8s-existing-secret` reads each as the name of a Secret that already exists
+    in the namespace, holding the credential under the data key its parameter's
+    description names — one Secret may carry all seven. Every parameter carries a
+    pinned default so the module renders self-contained. The defaults are
+    development credentials every reader of this catalog holds, so they are for
+    evaluation and local development. A Release carrying real traffic supplies
+    its own through the importing Aggregate, which declares parameters of its own
+    and passes them down through its `aggregates` entry for the Release to
+    fulfill. While the runner's token is at its default, anything that can reach
+    the runner can start an agent run.
+
+    Attaching the authentication core's key changes what the core accepts. The
+    core issues no key of its own and, with none attached, answers every caller
+    that can reach it; this module attaches one, so the core refuses any call
+    that does not present `auth_core_api_key`, and the API, the model-facing
+    service and both front ends present it. The core also refuses to start on a
+    key shorter than 20 characters or carrying anything but letters, digits, `=`
+    and `-`. The default meets that rule and is still the one every reader
+    holds, so it too is for evaluation.
+
+    Three credentials are left unattached, each for a reason the module cannot
+    work around. The volatile and the durable Redis-compatible instances both
+    run without authentication: filling their credential slot switches
+    authentication on, and none of the five components reaching either declares
+    a slot to present a password, so every one of them would be refused. And the
+    object store's access key stays its development value, the store's root user
+    `admin`: the two API tiers take it through a credential slot, but the store
+    takes it as a plain value, so one parameter would mean the name of a Secret
+    on one side and the literal key on the other.
+
+    Because the module fills the backend's credential slot, the backend is
+    realized by a Recipe that reads that slot. `postgres-cloudnative-pg`, whose
+    controller owns the database's credentials itself, halts the build when the
+    slot is filled, so a Manifest importing this module maps the backend to
+    another PostgreSQL realization.
 
     This module is the working platform core, and four parts of a full
     deployment are deliberately out of scope. It ships no internal reverse
@@ -107,6 +151,56 @@ metadata:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
 spec:
+  parameters:
+    # Each parameter below is one credential the platform's components must agree
+    # on, and fills every credential slot that holds it. They are module
+    # parameters because an Aggregate importing this module hands it parameters
+    # and nothing else, so a parameter is the one way a Release reaches a
+    # credential slot on a component inside it — and one parameter per credential
+    # means it is authored once and cannot drift between the components that must
+    # agree on it.
+    #
+    # Each pinned default is what lets the module render self-contained. It is a
+    # development credential: every reader of this catalog holds it, so a Release
+    # carrying real traffic supplies its own through the importing Aggregate.
+    # Each default is also a valid Kubernetes object name and meets what its
+    # product requires of the credential, so it serves under either realization
+    # of the Feature.
+    db_password:
+      type: string
+      default: "agenta-db-password-for-evaluation-only"
+      description: Password the PostgreSQL backend is initialized with, and the one the authentication core, the schema-migration step, both API tiers, both worker tiers and the scheduler authenticate to it with. What the value is depends on the core/referenced-secret realization the Manifest binds - the password itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the password under the data key db-password, with k8s-existing-secret. The platform's services place the password inside their connection URLs as it is, so keep it to characters a URL does not reserve. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+    auth_key:
+      type: string
+      default: "agenta-auth-key-for-evaluation-only"
+      description: Key the platform signs its own internal tokens with, held by both API tiers, both worker tiers, the scheduler and both front ends. What the value is depends on the core/referenced-secret realization the Manifest binds - the key itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the key under the data key auth-key, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+    crypt_key:
+      type: string
+      default: "agenta-crypt-key-for-evaluation-only"
+      description: Key the stored model-provider credentials and connected-application tokens are encrypted under, held by the same seven components as auth_key. Changing it makes what is already stored unreadable. What the value is depends on the core/referenced-secret realization the Manifest binds - the key itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the key under the data key crypt-key, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+    services_internal_key:
+      type: string
+      default: "agenta-services-internal-key-for-evaluation-only"
+      description: Key the control-plane API, the model-facing service and the queue-consuming worker present to each other on internal calls. The platform treats an empty value, or the placeholder replace-me its own examples ship, as no key at all. What the value is depends on the core/referenced-secret realization the Manifest binds - the key itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the key under the data key services-internal-key, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+    runner_token:
+      type: string
+      default: "agenta-runner-token-for-evaluation-only"
+      description: Token the runner requires on every incoming call, which both API tiers present. While it is at its default, anything that can reach the runner can start an agent run. What the value is depends on the core/referenced-secret realization the Manifest binds - the token itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the token under the data key runner-token, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+    # The object store's root password is also the secret key both API tiers
+    # present to it, because they authenticate as its root user. That user,
+    # admin, is not a parameter: the store takes it as a plain value, so it is
+    # not a credential the Feature can deliver on both sides.
+    store_secret_key:
+      type: string
+      default: "agenta-store-secret-key-for-evaluation-only"
+      description: Root password of the object store, and the S3 secret key both API tiers present to it as its root user. What the value is depends on the core/referenced-secret realization the Manifest binds - the secret itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the secret under the data key store-secret-key, with k8s-existing-secret. Keep it at least 8 characters, the shortest secret key the object store accepts. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+    # Unattached, the authentication core issues no key and answers every caller
+    # that can reach it. This module attaches one, so the core requires this key
+    # of every caller, and both API tiers and both front ends present it.
+    auth_core_api_key:
+      type: string
+      default: "agenta-auth-core-api-key-for-evaluation-only"
+      description: API key the authentication core requires of every caller, and the one both API tiers and both front ends present to it. What the value is depends on the core/referenced-secret realization the Manifest binds - the key itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the key under the data key auth-core-api-key, with k8s-existing-secret. The core refuses to start unless the key is at least 20 characters of letters, digits, = and - alone, and the default meets that rule. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
   components:
     # The relational backend. Its initialization creates the three databases the
     # module needs: the platform's own model, its traces, and the authentication
@@ -127,16 +221,31 @@ spec:
           10-agenta-databases.sql: |
             CREATE DATABASE agenta_core OWNER agenta;
             CREATE DATABASE agenta_tracing OWNER agenta;
-    # The discardable instance: sessions, cached reads, rate-limit counters.
+      features:
+        password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+    # The discardable instance: sessions, cached reads, rate-limit counters. No
+    # credential is attached: see the description for why both instances run
+    # without authentication.
     cache:
       type: core/datastore/redis
     # The instance work is put on and taken from. Separate from the cache above
     # so that losing a cache never loses queued work.
     queue:
       type: core/datastore/redis
-    # Where the files an agent writes are kept.
+    # Where the files an agent writes are kept. Its root user stays the
+    # component's default, admin, which both API tiers name as their access key.
     store:
       type: core/storage/minio
+      features:
+        root_password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.store_secret_key }}"
+            key: store-secret-key
     # The authentication core. It holds its accounts in a database on the same
     # backend the rest of the module uses.
     auth:
@@ -151,6 +260,17 @@ spec:
                 - { in: POSTGRESQL_PORT, from: port }
                 - { in: POSTGRESQL_USER, from: user }
                 - { in: POSTGRESQL_DATABASE_NAME, from: database }
+      features:
+        backend_password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+        api_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_core_api_key }}"
+            key: auth-core-api-key
     # The schema-migration step. It creates the tables the five services below
     # expect, so the module sequences it ahead of them.
     migrations:
@@ -164,8 +284,15 @@ spec:
                 - { in: BACKEND_HOST, from: host }
                 - { in: BACKEND_PORT, from: port }
                 - { in: BACKEND_USER, from: user }
+      features:
+        backend_password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
     # The agent runner. Wired to the API alone, deliberately: see the isolation
-    # paragraph in the description above.
+    # paragraph in the description above. Its one credential is the token it
+    # requires of its callers.
     runner:
       type: core/ai-agent/agenta-runner
       uses:
@@ -175,6 +302,12 @@ spec:
             inject:
               env:
                 - { in: API_ENDPOINT, from: endpoint }
+      features:
+        runner_token:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.runner_token }}"
+            key: runner-token
     # The control-plane API: the platform's own data plane.
     api:
       type: core/ai-agent/agenta-api
@@ -220,6 +353,44 @@ spec:
             inject:
               env:
                 - { in: RUNNER_ENDPOINT, from: endpoint }
+      # Every credential slot but the object store's access key, which stays the
+      # store's root user: see the description.
+      features:
+        backend_password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+        auth_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_key }}"
+            key: auth-key
+        crypt_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.crypt_key }}"
+            key: crypt-key
+        services_internal_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.services_internal_key }}"
+            key: services-internal-key
+        runner_token:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.runner_token }}"
+            key: runner-token
+        store_secret_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.store_secret_key }}"
+            key: store-secret-key
+        auth_core_api_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_core_api_key }}"
+            key: auth-core-api-key
     # The model-facing service: completions, chat, and starting an agent run.
     services:
       type: core/ai-agent/agenta-services
@@ -265,6 +436,44 @@ spec:
             inject:
               env:
                 - { in: RUNNER_ENDPOINT, from: endpoint }
+      # The same credentials as the control-plane API, and for the same reason
+      # the object store's access key is left out.
+      features:
+        backend_password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+        auth_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_key }}"
+            key: auth-key
+        crypt_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.crypt_key }}"
+            key: crypt-key
+        services_internal_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.services_internal_key }}"
+            key: services-internal-key
+        runner_token:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.runner_token }}"
+            key: runner-token
+        store_secret_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.store_secret_key }}"
+            key: store-secret-key
+        auth_core_api_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_core_api_key }}"
+            key: auth-core-api-key
     # Drains the platform's continuous streams into the tracing database.
     worker_streams:
       type: core/ai-agent/agenta-worker-streams
@@ -291,6 +500,22 @@ spec:
               env:
                 - { in: QUEUE_HOST, from: host }
                 - { in: QUEUE_PORT, from: port }
+      features:
+        backend_password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+        auth_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_key }}"
+            key: auth-key
+        crypt_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.crypt_key }}"
+            key: crypt-key
     # Runs the platform's discrete background jobs: webhooks, triggers, agent
     # turns and evaluations.
     worker_queues:
@@ -324,6 +549,27 @@ spec:
             inject:
               env:
                 - { in: SERVICES_ENDPOINT, from: endpoint }
+      features:
+        backend_password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+        auth_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_key }}"
+            key: auth-key
+        crypt_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.crypt_key }}"
+            key: crypt-key
+        services_internal_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.services_internal_key }}"
+            key: services-internal-key
     # Decides when a time-triggered thing is due and enqueues it.
     scheduler:
       type: core/ai-agent/agenta-cron
@@ -350,6 +596,22 @@ spec:
               env:
                 - { in: QUEUE_HOST, from: host }
                 - { in: QUEUE_PORT, from: port }
+      features:
+        backend_password:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.db_password }}"
+            key: db-password
+        auth_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_key }}"
+            key: auth-key
+        crypt_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.crypt_key }}"
+            key: crypt-key
     # The browser console.
     console:
       type: core/ai-agent/agenta-web
@@ -372,6 +634,22 @@ spec:
             inject:
               env:
                 - { in: AUTH_CORE_ENDPOINT, from: endpoint }
+      features:
+        auth_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_key }}"
+            key: auth-key
+        crypt_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.crypt_key }}"
+            key: crypt-key
+        auth_core_api_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_core_api_key }}"
+            key: auth-core-api-key
     # The small-screen front end.
     mobile:
       type: core/ai-agent/agenta-web-mobile
@@ -394,6 +672,22 @@ spec:
             inject:
               env:
                 - { in: AUTH_CORE_ENDPOINT, from: endpoint }
+      features:
+        auth_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_key }}"
+            key: auth-key
+        crypt_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.crypt_key }}"
+            key: crypt-key
+        auth_core_api_key:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.auth_core_api_key }}"
+            key: auth-core-api-key
   exportedComponents:
     api: api
     services: services
