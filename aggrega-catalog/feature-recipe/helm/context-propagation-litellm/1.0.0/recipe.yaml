@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: context-propagation-litellm
+  version: 1.0.0
+  description: >
+    Component-scope FeatureRecipe for core/context-propagation on the AI
+    gateway core/gateway/litellm. The identity it forwards is the gateway's
+    own: the virtual key a caller presents, which the gateway verifies against
+    the keys it issued, so this recipe halts unless the gateway's master_key
+    credential slot is attached and its infra.database_url is set, naming
+    whichever is missing; the Release supplies both, and nothing here creates
+    either. The work is done by a request hook the gateway's own Recipe
+    delivers beside its configuration and registers there whenever a
+    core/context-propagation attachment is present; this recipe carries the
+    checks and emits nothing. On every request, whichever model alias it asks
+    for, the hook removes each header whose name begins x-litellm- — read with
+    surrounding space trimmed, letter case ignored and an underscore taken for
+    a hyphen — from the parts of the request body the gateway turns into
+    upstream headers: headers, extra_headers,
+    provider_specific_header.extra_headers, and the headers and extra_headers
+    of each model_list entry. The gateway's Recipe leaves client-header
+    forwarding off, so no x-litellm- header travels upstream from a caller's
+    HTTP headers either, and a caller cannot supply an identity of its own.
+    On a request for a model alias infra.destinations lists, the hook
+    then adds x-litellm-user_api_key_user_id, x-litellm-user_api_key_team_id
+    and x-litellm-user_api_key_org_id, naming the user, the team and the
+    organization of the key it verified, each only where the key has one, and
+    nothing else about the key: not its hash, its spend, its budget, its
+    owner's email or its metadata. A request made with the master key names
+    nobody and carries none of them. The headers reach the upstream of a
+    listed alias only: when a request falls back from a listed alias to one
+    that is not listed they are removed before it is sent, and a request that
+    reaches a listed alias only by falling back from one that is not listed
+    carries none. Other headers a caller places in those parts of the request
+    body still reach the upstream, as the gateway passes them. The entries of
+    infra.destinations are model aliases the gateway's model map publishes, and
+    the build halts when the list is missing or names an alias the map does
+    not publish, naming it. The gateway declares
+    dataplane.aggrega.ai/caller-identity: injected-header, so this recipe
+    halts on any other propagation_mode, and it halts when the attachment is
+    carried by any component other than core/gateway/litellm, whose Recipe is
+    the one that delivers the hook. A Release binds this recipe for
+    core/context-propagation in its Manifest.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/context-propagation:1.0.0
+  # executionScope omitted -> component: the checks run once per attached
+  # component.
+  #
+  # No assertion can read the host component's labels or its values. So the
+  # mechanism the gateway declares is stated in each message, the guard at the
+  # top is what keeps that statement true, and what the gateway was authored
+  # with — its model aliases and whether a bookkeeping database is set — is
+  # read from the locals its Recipe publishes for exactly this, which an
+  # assertion here sees.
+  assertions:
+    component_renders_the_body: >-
+      {{- if ne .metadata.component "core/gateway/litellm" -}}
+      {{- fail (printf "core/context-propagation attachment %q on %q is bound to the LiteLLM realization, which relies on the request hook core/gateway/litellm's Recipe delivers; %s delivers no such hook. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    mode_is_the_injected_header: >-
+      {{- if ne .values.propagation_mode "injected_header" -}}
+      {{- fail (printf "core/context-propagation attachment %q on %q asks for propagation_mode %s, but core/gateway/litellm declares dataplane.aggrega.ai/caller-identity: injected-header — the identity it forwards is the headers it composes after verifying a caller's virtual key, and it verifies no client certificate. Set propagation_mode to injected_header, or attach the Feature to a gateway declaring the client-certificate mechanism" .metadata.feature_instance .metadata.instance_id .values.propagation_mode) -}}
+      {{- end -}}
+    # The gateway names a caller only when the caller presents a virtual key
+    # the gateway issued, which needs its administrative key to issue keys
+    # with and its bookkeeping database to hold them. Without either, every
+    # caller is the same unnamed user, and forwarding that would only look
+    # like an identity.
+    gateway_verifies_its_callers: >-
+      {{- $missing := list -}}
+      {{- if not (hasKey .features "master_key") -}}
+      {{- $missing = append $missing "its master_key credential slot is not attached" -}}
+      {{- end -}}
+      {{- if not (optional .locals "bookkeeping_database" "") -}}
+      {{- $missing = append $missing "its infra.database_url is not set" -}}
+      {{- end -}}
+      {{- if $missing -}}
+      {{- fail (printf "core/context-propagation attachment %q on %q forwards the identity core/gateway/litellm verifies from the virtual key a caller presents, but %s; the gateway issues and verifies virtual keys only with an administrative key and a bookkeeping database. In the Release, attach a credential to the master_key slot and set infra.database_url on %q" .metadata.feature_instance .metadata.instance_id (join " and " $missing) .metadata.instance_id) -}}
+      {{- end -}}
+    destinations_are_model_aliases: >-
+      {{- $published := fromJson (optional .locals "model_aliases" "[]") -}}
+      {{- $named := optional .infra "destinations" list -}}
+      {{- if not $named -}}
+      {{- fail (printf "core/context-propagation attachment %q on %q names no destinations, and core/gateway/litellm sends the caller's identity only to the upstream of the model aliases the attachment lists; set infra.destinations on the attachment in the Release to the aliases whose upstream may receive it, from: %s" .metadata.feature_instance .metadata.instance_id (join ", " $published)) -}}
+      {{- end -}}
+      {{- range $alias := $named -}}
+      {{- if not (has $alias $published) -}}
+      {{- fail (printf "core/context-propagation attachment %q on %q lists the destination %q, but the model map of core/gateway/litellm publishes no such alias, so the identity would go nowhere; list only aliases the map publishes: %s" $.metadata.feature_instance $.metadata.instance_id $alias (join ", " $published)) -}}
+      {{- end -}}
+      {{- end -}}

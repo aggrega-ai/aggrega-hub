@@ -25,7 +25,12 @@ metadata:
     carrying the credential, which is what keeps the credential inside the
     gateway and out of the calling application. The bookkeeping database
     connection string is emitted only when infra.database_url is set; with none
-    the gateway runs stateless. The gateway's public origin is emitted as
+    the gateway runs stateless. While a core/context-propagation attachment is
+    present, the ConfigMap also carries the request hook that attachment's
+    realization relies on, as a second file beside the configuration, and the
+    configuration registers it under litellm_settings.callbacks; what the hook
+    does is stated on that realization. With no such attachment neither
+    appears. The gateway's public origin is emitted as
     PROXY_BASE_URL only when infra.external_base_url is set, and the build halts
     when that address carries a path. With the pii_analyzer and pii_anonymizer
     sockets wired, the endpoint each service publishes reaches the gateway as
@@ -61,6 +66,17 @@ spec:
     config_file: config.yaml
     config_map_name: "{{ .context.instance_id }}-config"
     provider_key_variable: LITELLM_PROVIDER_API_KEY
+    # The module the caller-identity hook is delivered as: the ConfigMap's
+    # second data key and the callback the configuration registers both read
+    # it, so the file and its registration cannot name different modules.
+    caller_identity_module: caller_identity
+    # Published for an attachment's realization to check against, and never
+    # emitted. A FeatureRecipe reads this Recipe's locals and not the
+    # component's values, so the facts it checks an attachment against are
+    # stated here once: every alias the model map publishes, as a JSON list,
+    # and "true" when infra.database_url is set, empty when it is not.
+    model_aliases: '{{ $aliases := list }}{{ range .values.models }}{{ $aliases = append $aliases .name }}{{ end }}{{ toJson $aliases }}'
+    bookkeeping_database: '{{ if optional .infra "database_url" "" }}true{{ end }}'
   # provides is evaluated before the workload and cannot read it, so the port has
   # one authored home in .infra.port that every reader dereferences — provides.port
   # and provides.endpoint here, and below the proxy's own listen-port argument, the
@@ -116,7 +132,26 @@ spec:
     # name and the runtime reads the value from the environment — and the
     # administrative key is not named here at all, because the proxy reads its
     # variable directly from the environment at startup.
+    #
+    # While a core/context-propagation attachment is present, the same ConfigMap
+    # also carries the caller-identity hook as a second data key, and the body
+    # registers it under litellm_settings.callbacks. The whole ConfigMap is
+    # mounted as the directory the proxy is pointed at, and the proxy loads a
+    # module its configuration names from the directory that configuration sits
+    # in, so the file lands where it is looked for. The hook sends the identity
+    # to the aliases every such attachment lists in infra.destinations. With no
+    # such attachment, neither the registration nor the file is emitted.
     litellm-gateway-config.configmap.yaml: |
+      {{- $identity := false }}
+      {{- $listed := list }}
+      {{- range $name, $attachment := (default dict .features) }}
+      {{- if eq (toString $attachment.type) "core/context-propagation" }}
+      {{- $identity = true }}
+      {{- range $alias := optional (optional $attachment "infra" dict) "destinations" list }}
+      {{- if not (has $alias $listed) }}{{ $listed = append $listed $alias }}{{ end }}
+      {{- end }}
+      {{- end }}
+      {{- end -}}
       apiVersion: v1
       kind: ConfigMap
       metadata:
@@ -134,6 +169,119 @@ spec:
       {{- end }}
           router_settings:
             routing_strategy: {{ .values.routing_strategy }}
+      {{- if $identity }}
+          litellm_settings:
+            callbacks:
+              - {{ .locals.caller_identity_module }}.hook
+        {{ .locals.caller_identity_module }}.py: |
+          """Caller identity for the requests this gateway sends upstream.
+
+          Delivered beside the gateway's configuration and registered there under
+          litellm_settings.callbacks while core/context-propagation is attached. On
+          every request it removes each header whose name begins x-litellm- from the
+          parts of the request body the gateway turns into upstream headers, so a
+          caller cannot supply an identity of its own. On a request for a listed model
+          alias it then adds the user, the team and the organization of the virtual
+          key the gateway verified, and nothing else about that key. A request made
+          with the master key names nobody and carries none of them.
+          """
+          from litellm.constants import LITELLM_PROXY_MASTER_KEY_ALIAS
+          from litellm.integrations.custom_logger import CustomLogger
+
+          # The model aliases whose upstream receives the caller's identity.
+          LISTED = frozenset([{{ range $i, $alias := $listed }}{{ if $i }}, {{ end }}{{ toJson $alias }}{{ end }}])
+
+          # The header each verified field travels under. These are the names the
+          # gateway's own header forwarding uses, so a service reading them reads one
+          # set of names whichever part of the gateway wrote them.
+          IDENTITY = (
+              ("x-litellm-user_api_key_user_id", "user_id"),
+              ("x-litellm-user_api_key_team_id", "team_id"),
+              ("x-litellm-user_api_key_org_id", "org_id"),
+          )
+
+          # The request fields the gateway turns into upstream headers. It merges them
+          # in this order, the later winning, and provider_specific_header.extra_headers
+          # over both; a model_list entry's litellm_params carries the same two.
+          HEADER_FIELDS = ("headers", "extra_headers")
+
+
+          def _is_gateway_header(name):
+              # Header names are matched loosely further on, so they are compared the
+              # same way here: surrounding space trimmed, letter case ignored, and an
+              # underscore read as a hyphen.
+              if not isinstance(name, str):
+                  return False
+              return name.strip().lower().replace("_", "-").startswith("x-litellm-")
+
+
+          def _without_gateway_headers(headers):
+              if not isinstance(headers, dict):
+                  return headers
+              return dict((k, v) for k, v in headers.items() if not _is_gateway_header(k))
+
+
+          def _strip(fields):
+              # Each part is replaced by a filtered copy rather than edited in place, so
+              # a request the gateway retries or falls back with is not changed under it.
+              for key in HEADER_FIELDS:
+                  if key in fields:
+                      fields[key] = _without_gateway_headers(fields[key])
+              specific = fields.get("provider_specific_header")
+              if isinstance(specific, dict) and "extra_headers" in specific:
+                  specific = dict(specific)
+                  specific["extra_headers"] = _without_gateway_headers(specific["extra_headers"])
+                  fields["provider_specific_header"] = specific
+              entries = fields.get("model_list")
+              if isinstance(entries, list):
+                  for entry in entries:
+                      params = entry.get("litellm_params") if isinstance(entry, dict) else None
+                      if isinstance(params, dict):
+                          _strip(params)
+
+
+          def _listed(alias):
+              return isinstance(alias, str) and alias in LISTED
+
+
+          def _model_group(kwargs):
+              for key in ("metadata", "litellm_metadata"):
+                  meta = kwargs.get(key)
+                  if isinstance(meta, dict) and meta.get("model_group"):
+                      return meta["model_group"]
+              return None
+
+
+          class CallerIdentity(CustomLogger):
+              async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+                  _strip(data)
+                  if not _listed(data.get("model")):
+                      return data
+                  if user_api_key_dict.api_key == LITELLM_PROXY_MASTER_KEY_ALIAS:
+                      return data
+                  identity = []
+                  for header, field in IDENTITY:
+                      value = getattr(user_api_key_dict, field, None)
+                      if value:
+                          identity.append((header, str(value)))
+                  if identity:
+                      headers = data.get("headers")
+                      headers = dict(headers) if isinstance(headers, dict) else {}
+                      headers.update(identity)
+                      data["headers"] = headers
+                  return data
+
+              async def async_pre_call_deployment_hook(self, kwargs, call_type):
+                  # Runs on every call to a model, fallbacks included, after the call's
+                  # model alias is known. A call to an alias that is not listed loses
+                  # the identity written for the alias the request first asked for.
+                  if not _listed(_model_group(kwargs)):
+                      _strip(kwargs)
+                  return kwargs
+
+
+          hook = CallerIdentity()
+      {{- end }}
   workload: |
     {{- $configDir := "/etc/litellm" -}}
     {{- $recognizer := false -}}
