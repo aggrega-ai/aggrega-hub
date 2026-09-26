@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: prompt-deny-patterns-litellm
+  version: 1.0.0
+  description: >
+    Component-scope FeatureRecipe for core/prompt-deny-patterns on the AI
+    gateway core/gateway/litellm, whose realization renders its routing table
+    as a configuration body. The control it turns on is a guardrail the running
+    proxy reads out of that body rather than a resource of its own, so this
+    recipe emits no file: it adds one entry to the guardrails list of the
+    configuration the attached gateway already renders, and every other byte of
+    that body is left as the gateway's own Recipe authored it. The entry turns
+    on the gateway's built-in content filter before a request is forwarded,
+    with one blocking rule per entry of deny_patterns, and marks it to run on
+    every request rather than only on those that ask for it, so a caller cannot
+    turn it off from the request. The gateway compiles each expression when it
+    builds the guardrail and matches it ignoring letter case; in a chat
+    completion it matches the text of every message, whatever its role, each
+    message on its own. A request any expression matches is refused with HTTP
+    403 naming the rule by its position in the list — deny_pattern_1 for the
+    first — so the caller learns which rule matched but not the expression.
+    Images are not examined, because no image model is configured. Two things
+    stay outside it: an administrator can exempt a key or a team from the
+    gateway's always-on guardrails in that key's or team's own settings, and a
+    request of a kind the gateway maps to no guardrail is forwarded unchecked —
+    chat and text completions, the messages API and the responses API are
+    among the kinds it maps. The guardrail is named for the component and the
+    attachment, so two attachments on one gateway add two entries. The gateway
+    declares dataplane.aggrega.ai/prompt-guard: pattern-list and its filter
+    only refuses a request that matches, so this recipe halts on
+    allow_patterns rather than forwarding requests an allow list would have
+    turned away, and it halts when the attachment is carried by any component
+    other than core/gateway/litellm, whose configuration body is the one the
+    entry is written into.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/prompt-deny-patterns:1.0.0
+  # executionScope omitted -> component: the pipeline runs once per attached
+  # component and receives that component's rendered documents.
+  #
+  # Neither assertion can read the host component's labels, so the capability
+  # the gateway declares is stated in the message, and the guard above it is
+  # what keeps that statement true.
+  assertions:
+    component_renders_the_body: >-
+      {{- if ne .metadata.component "core/gateway/litellm" -}}
+      {{- fail (printf "core/prompt-deny-patterns attachment %q on %q is bound to the LiteLLM realization, which writes its guardrail into the configuration body core/gateway/litellm renders; %s renders no such body. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    deny_list_only: >-
+      {{- if optional .values "allow_patterns" "" -}}
+      {{- fail (printf "core/prompt-deny-patterns attachment %q on %q sets allow_patterns, but core/gateway/litellm declares dataplane.aggrega.ai/prompt-guard: pattern-list and its pattern guardrail only refuses a request that matches; it has no list a request must match to be forwarded. Remove allow_patterns, or bind the attachment to a realization for a gateway whose pattern guard also admits by pattern" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+  # One entry in the gateway's top-level guardrails list, found again by its
+  # name, so a second attachment adds a second entry rather than replacing the
+  # first. pre_call runs the filter before the request is forwarded;
+  # default_on runs it on every request, where without it the filter runs only
+  # for a request that names it. Each expression is written as a JSON string,
+  # so its backslashes and quotes reach the gateway exactly as authored.
+  pipeline:
+    - id: write_deny_guardrail
+      plugin: pipeline-step/litellm-gateway-config:1.0.0
+      function: step
+      with: |
+        section: guardrails
+        identifiedBy: guardrail_name
+        entries:
+          - guardrail_name: {{ printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-") }}
+            litellm_params:
+              guardrail: litellm_content_filter
+              mode: pre_call
+              default_on: true
+              patterns:
+        {{- range $i, $p := .values.deny_patterns }}
+                - pattern_type: regex
+                  name: {{ printf "deny_pattern_%d" (add1 $i) }}
+                  pattern: {{ $p | toJson }}
+                  action: BLOCK
+        {{- end }}
