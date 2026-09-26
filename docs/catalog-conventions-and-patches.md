@@ -1621,6 +1621,16 @@ The two terraform and cloudformation realizations share the name
   its Secret.
   This is available where `core/referenced-secret` has an existing-Secret
   realization, which is `helm`.
+- **A module's credential is generated from the Aggregate importing it.** That
+  Aggregate cannot attach anything to the components inside the module, so it
+  carries the request itself: a free `core/random-password` attachment on a
+  component of its own, with `values.name` pinned and `values.key` set to the
+  data key the module's attachment reads — its parameter's description names
+  it — and the same name passed down as the module's parameter, with the
+  Manifest binding `core/referenced-secret` to `k8s-existing-secret`. A Release
+  cannot carry the request in its place: an attachment a Release declares
+  takes no `values`, so its key would stay the Feature's default rather than
+  the one the module reads.
 - **It is not `core/generated-secret`.** That Feature hands a credential to an
   engine that already owns it — a managed database, a database controller — and
   renders nothing. `core/random-password` renders the request itself, for a
