@@ -7,16 +7,32 @@ metadata:
   name: core/data-masking
   version: 1.0.0
   description: >
-    Declares that content passing through an AI gateway should have sensitive
-    material removed before it travels further, and in which of three ways:
-    replaced outright, substituted for a stand-in that can be turned back, or
-    reduced to a digest. They differ in what survives the treatment — nothing,
-    something recoverable, or something that can only be compared — which is
-    the choice an Aggregate makes when it picks one. No FeatureRecipe in the
-    standard library implements this today, so a Release that attaches it
-    halts the build naming the type rather than rendering anything: the
-    control is declared here, and the realization that would honour it is not
-    yet authored.
+    Replaces sensitive text in the chat and completion traffic an AI gateway
+    routes with a placeholder, so the original does not travel past the
+    gateway. It attaches to a gateway that declares it can mask that payload
+    (dataplane.aggrega.ai/content-masking, whichever value) and acts on the
+    text of the messages: on requests before they reach the model provider, on
+    replies before they reach the caller, or both, as scope says. What is
+    masked is what the attachment lists — regular expressions under patterns,
+    and entity types under entities, which a recognizer service the gateway
+    calls detects — and an attachment listing neither halts the build, because
+    no list is assumed on its behalf. With action redact a match is replaced
+    for good. With action restore it is replaced by a numbered stand-in that
+    the gateway maps back to the original in its reply, so the model provider
+    receives the stand-in and the caller still gets the value back; the mapping
+    lives only for that request, and only entities a recognizer detected can be
+    restored. Masking changes what travels past the gateway and nothing else:
+    it refuses no request on its content, and it is not sufficient on its own.
+    Text no listed pattern matches and no recognizer detects passes unchanged;
+    the gateway itself, and any recognizer it calls, handle the unmasked text;
+    masking replies does not change what the provider already received; and
+    traffic that does not pass through the gateway is not touched. A
+    realization never passes text on unmasked because a recognizer it depends
+    on cannot be reached: it fails the request, or refuses at build time a
+    combination its gateway cannot hold to that. It refuses an entity type its
+    recognizer does not know rather than masking nothing for it, and it states
+    which scopes it honours for entities, what its gateway leaves unmasked,
+    and what it keeps out of the gateway's own logs.
   annotations:
     security.aggrega.ai/class: "data_plane_guardrail"
     security.aggrega.ai/guardrail: "data_masking"
@@ -25,12 +41,55 @@ metadata:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
 spec:
-  appliesTo: "gateway.aggrega.ai/intelligence=semantic"
+  # Selects on the capability's presence, not on its value. Masking listed
+  # patterns works on every gateway able to mask at all; recognizing entity
+  # types and restoring originals ask for more, and a realization for a
+  # gateway that cannot do either refuses the value itself, naming the
+  # fidelity the gateway declares.
+  appliesTo: "dataplane.aggrega.ai/content-masking"
   interoperability:
     conflictsWith: []
+  # No list is assumed when none is given. A default set would decide on the
+  # reader's behalf what counts as sensitive in their traffic, and an
+  # attachment that masks nothing would read as protection it does not give.
+  assertions:
+    names_what_it_masks: >-
+      {{- if not (or (optional .values "patterns" list) (optional .values "entities" list)) -}}
+      {{- fail (printf "core/data-masking attachment %q on %q lists neither patterns nor entities, so it would mask nothing; list the regular expressions to mask under patterns, the entity types a recognizer detects under entities, or both" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
   schema:
     values:
       $ref: "BaseComponents#/schemas/BaseFeatureParameter"
       properties:
-        action: { type: string, enum: [redact, tokenize, hash], default: redact }
+        action:
+          type: string
+          enum: [redact, restore]
+          default: redact
+          description: "What a match is replaced with. redact replaces it for good. restore replaces it with a numbered stand-in the gateway maps back to the original in its reply to the caller; the mapping lives only for that request, only entity types a recognizer detected can be restored, and a restored reply reaches the caller unmasked."
+        scope:
+          type: string
+          enum: [request, response, both]
+          default: request
+          description: "Where masking applies. request masks the messages before they reach the model provider; response masks the reply before it reaches the caller, after the provider has already received the request unmasked; both does the two. A realization whose gateway cannot mask entities in a reply without risking passing it on unmasked refuses response and both for entities, and says so."
+        patterns:
+          type: array
+          description: "Regular expressions whose matches are masked. Each carries a name, which the placeholder shows in place of the matched text, and the expression itself, handed to the gateway exactly as written in the expression syntax that gateway reads. An expression matches what it literally describes and nothing else: another format, other spacing or another spelling of the same value passes unmasked."
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                min: 1
+                description: "The name the placeholder shows in place of a match."
+              regex:
+                type: string
+                min: 1
+                description: "The regular expression whose matches are masked."
+            required: [name, regex]
+        entities:
+          type: array
+          description: "Entity types a recognizer service detects and the gateway masks, written in that recognizer's own vocabulary, for example PERSON or EMAIL_ADDRESS. Recognition is statistical: it can miss an entity and can mask text that is not one. Listing any needs the gateway to be wired to a recognizer, which each realization names, and a realization refuses a type its recognizer does not know."
+          items:
+            type: string
+            min: 1
       required: [action]

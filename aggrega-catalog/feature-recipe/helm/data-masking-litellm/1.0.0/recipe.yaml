@@ -1,0 +1,171 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: data-masking-litellm
+  version: 1.0.0
+  description: >
+    Component-scope FeatureRecipe for core/data-masking on the AI gateway
+    core/gateway/litellm, whose realization renders its routing table as a
+    configuration body. The masking is a setting the running proxy reads out
+    of that body rather than a resource of its own, so this recipe emits no
+    file: it writes guardrail entries and one logging setting into the
+    configuration the attached gateway already renders, and every other byte
+    of that body is left as the gateway's own Recipe authored it. Each entry
+    runs on every request that reaches the gateway, and a caller cannot switch
+    it off from the request; an administrator can exempt a key or a team from
+    the gateway's always-on guardrails in that key's or team's own settings.
+    Listed patterns are matched inside the gateway, with no other service,
+    ignoring letter case, against the text of every message whatever its role;
+    a match is replaced for good by the pattern's name in capitals in
+    brackets, [PROJECT_CODE_REDACTED] for a pattern named project_code. The
+    gateway compiles each expression when it starts, and one that does not
+    compile stops it starting. Listed entity types are found by the Presidio
+    analyzer and replaced by the Presidio anonymizer that the gateway calls
+    through its pii_analyzer and pii_anonymizer sockets: a person's name
+    becomes <PERSON>, or with action restore a numbered stand-in such as
+    <PERSON_1> that the gateway maps back to the name in its reply to the same
+    request. Both services receive the unmasked text, recognition runs in
+    English, and it can miss an entity. When either service cannot be reached,
+    or the analyzer answers with an error, the gateway fails the request with
+    HTTP 500 and forwards nothing. The gateway masks entities in requests
+    only: while it masks a streamed reply, an analyzer it cannot reach makes it
+    pass that reply on unmasked, so this recipe halts on entities with scope
+    response or both, and patterns remain available for replies. It also halts
+    on an entity type the analyzer does not recognize in English, which the
+    analyzer would otherwise ignore without a word, on action restore without
+    entities or with any scope but request, on entities with the recognizer
+    sockets unwired, and when the attachment is carried by any component other
+    than core/gateway/litellm. While the masking is attached the gateway hands
+    its logging integrations a redacted copy of every request's messages and
+    every reply, and a caller cannot turn that off from the request; its debug
+    output, which the gateway's Recipe does not turn on, still carries the
+    unmasked text. The gateway leaves tool-call arguments, images and files
+    unmasked, and passes a request of a kind it does not scan through
+    unchanged. A Release binds this recipe for core/data-masking in its
+    Manifest.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/data-masking:1.0.0
+  # executionScope omitted -> component: the pipeline runs once per attached
+  # component and receives that component's rendered documents.
+  #
+  # No assertion can read the host component's labels, so the capability the
+  # gateway declares is stated in each message, and the guard at the top is
+  # what keeps that statement true.
+  assertions:
+    component_renders_the_body: >-
+      {{- if ne .metadata.component "core/gateway/litellm" -}}
+      {{- fail (printf "core/data-masking attachment %q on %q is bound to the LiteLLM realization, which writes its guardrails into the configuration body core/gateway/litellm renders; %s renders no such body. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    restore_needs_entities: >-
+      {{- if and (eq (optional .values "action" "redact") "restore") (not (optional .values "entities" list)) -}}
+      {{- fail (printf "core/data-masking attachment %q on %q asks for action restore, but core/gateway/litellm declares dataplane.aggrega.ai/content-masking: entity-recognition and maps a stand-in back to the original only for an entity type its recognizer replaced; a match of a pattern is replaced for good. List entities, or set action to redact" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+    restore_on_requests_only: >-
+      {{- $scope := optional .values "scope" "request" -}}
+      {{- if and (eq (optional .values "action" "redact") "restore") (ne $scope "request") -}}
+      {{- fail (printf "core/data-masking attachment %q on %q asks for action restore with scope %s, but core/gateway/litellm declares dataplane.aggrega.ai/content-masking: entity-recognition and restores by mapping the stand-ins in its reply back to the originals, so a reply it restores is not masked; set scope to request, or set action to redact" .metadata.feature_instance .metadata.instance_id $scope) -}}
+      {{- end -}}
+    # The gateway fails a request when its recognizer cannot be reached, but
+    # while it masks a streamed reply it passes the reply on unmasked instead,
+    # so entity masking is refused wherever it would cover a reply.
+    entities_on_requests_only: >-
+      {{- $scope := optional .values "scope" "request" -}}
+      {{- if and (optional .values "entities" list) (ne $scope "request") -}}
+      {{- fail (printf "core/data-masking attachment %q on %q lists entities with scope %s, but core/gateway/litellm declares dataplane.aggrega.ai/content-masking: entity-recognition and, when the analyzer it calls cannot be reached while it masks a streamed reply, passes that reply to the caller unmasked; mask entities with scope request, and mask replies with patterns in an attachment of their own" .metadata.feature_instance .metadata.instance_id $scope) -}}
+      {{- end -}}
+    # The entity types the Presidio analyzer that core/security/presidio-analyzer
+    # runs reports it recognizes in English. A type outside the list is ignored
+    # by the analyzer when it is listed beside one it knows, so the attachment
+    # would mask nothing for it and nothing would say so.
+    entity_types_the_analyzer_knows: >-
+      {{- $known := list "CREDIT_CARD" "CRYPTO" "DATE_TIME" "EMAIL_ADDRESS" "IBAN_CODE" "IP_ADDRESS" "LOCATION" "MAC_ADDRESS" "MEDICAL_LICENSE" "NRP" "PERSON" "PHONE_NUMBER" "UK_NHS" "URL" "US_BANK_NUMBER" "US_DRIVER_LICENSE" "US_ITIN" "US_PASSPORT" "US_SSN" -}}
+      {{- range $e := optional .values "entities" list -}}
+      {{- if not (has $e $known) -}}
+      {{- fail (printf "core/data-masking attachment %q on %q lists the entity type %q, which the Presidio analyzer core/gateway/litellm calls does not recognize in English; listed beside types it does recognize it would mask nothing and say nothing. List only types from: %s" $.metadata.feature_instance $.metadata.instance_id $e (join ", " $known)) -}}
+      {{- end -}}
+      {{- end -}}
+    entities_need_the_recognizer: >-
+      {{- if optional .values "entities" list -}}
+      {{- $analyzer := hasKey .uses "pii_analyzer" -}}
+      {{- $anonymizer := hasKey .uses "pii_anonymizer" -}}
+      {{- if not (and $analyzer $anonymizer) -}}
+      {{- $unwired := "neither its pii_analyzer socket nor its pii_anonymizer socket is wired" -}}
+      {{- if $analyzer }}{{ $unwired = "its pii_anonymizer socket is not wired" }}{{ end -}}
+      {{- if $anonymizer }}{{ $unwired = "its pii_analyzer socket is not wired" }}{{ end -}}
+      {{- fail (printf "core/data-masking attachment %q on %q lists entities, which core/gateway/litellm finds and replaces through the Presidio analyzer and anonymizer it calls, but %s; wire a core/security/presidio-analyzer to pii_analyzer and a core/security/presidio-anonymizer to pii_anonymizer on %q, or list patterns instead of entities" .metadata.feature_instance .metadata.instance_id $unwired .metadata.instance_id) -}}
+      {{- end -}}
+      {{- end -}}
+  pipeline:
+    # One entry per recognizer in the gateway's top-level guardrails list, each
+    # found again by its name, so a second attachment adds entries rather than
+    # replacing the first's. default_on runs an entry on every request, where
+    # without it the entry runs only for a request that names it. Each pattern
+    # is written as a JSON string, so its backslashes and quotes reach the
+    # gateway exactly as authored. The entity entry names no address: the
+    # gateway reads the recognizer's addresses from the environment its own
+    # Recipe fills from the pii_analyzer and pii_anonymizer sockets. It always
+    # lists the entity types, and that list is also what makes the gateway fail
+    # a request when the analyzer answers with an error, where with no list it
+    # would pass the text on unmasked.
+    - id: write_masking_guardrails
+      plugin: pipeline-step/litellm-gateway-config:1.0.0
+      function: step
+      with: |
+        {{- $scope := optional .values "scope" "request" }}
+        {{- $patterns := optional .values "patterns" list }}
+        {{- $entities := optional .values "entities" list }}
+        {{- $id := printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-") }}
+        section: guardrails
+        identifiedBy: guardrail_name
+        entries:
+        {{- if $patterns }}
+          - guardrail_name: {{ $id }}
+            litellm_params:
+              guardrail: litellm_content_filter
+              default_on: true
+        {{- if eq $scope "both" }}
+              mode: [pre_call, post_call]
+        {{- else if eq $scope "response" }}
+              mode: post_call
+        {{- else }}
+              mode: pre_call
+        {{- end }}
+              patterns:
+        {{- range $p := $patterns }}
+                - pattern_type: regex
+                  name: {{ $p.name | toJson }}
+                  pattern: {{ $p.regex | toJson }}
+                  action: MASK
+        {{- end }}
+        {{- end }}
+        {{- if $entities }}
+          - guardrail_name: {{ $id }}-entities
+            litellm_params:
+              guardrail: presidio
+              default_on: true
+              mode: pre_call
+              presidio_filter_scope: input
+        {{- if eq (optional .values "action" "redact") "restore" }}
+              output_parse_pii: true
+        {{- end }}
+              pii_entities_config:
+        {{- range $e := $entities }}
+                {{ $e | toJson }}: MASK
+        {{- end }}
+        {{- end }}
+    # While the masking is attached the gateway hands its logging integrations
+    # a redacted copy of every request's messages and every reply.
+    - id: turn_off_message_logging
+      plugin: pipeline-step/litellm-gateway-config:1.0.0
+      function: step
+      with: |
+        section: litellm_settings
+        settings:
+          turn_off_message_logging: true

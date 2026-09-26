@@ -239,6 +239,7 @@ The dimensions and their value sets:
 | --- | --- | --- |
 | `request-mirroring` | `full-rate`, `sampled` | The component can copy a matching request to a second destination and discard that destination's response. `full-rate` copies every matching request and offers no setting that narrows it; `sampled` offers a settable share, so a component that can sample carries `sampled` and not both. |
 | `caller-identity` | `client-certificate`, `injected-header` | The component can convey the original caller's identity to the service behind it, and the value names which mechanism does it. `client-certificate`: the client's own TLS certificate details travel to the backend. `injected-header`: the component authenticates the caller itself and composes headers naming them, which travel upstream on the forwarded request. |
+| `content-masking` | `entity-recognition` | The component can replace sensitive text in the chat and completion payload it is routing with a placeholder before the text travels further. `entity-recognition` names the fidelity: it replaces matches of patterns supplied in its configuration and also entity types that a recognizer service it calls detects. A component that could only replace pattern matches would carry a narrower value, added in the same act as the first component to carry it. |
 | `prompt-guard` | `pattern-list` | The component can inspect the chat and completion payload it is routing and refuse a request on its content. `pattern-list` names the fidelity: the match is against patterns supplied in its configuration. The dimension is deliberately narrower than content inspection in general — a component here reads the model payload it already parses to route, and not one of them inspects an arbitrary HTTP body. |
 | `upstream-tls` | `trust-anchor` | The component can require the service it forwards to present a certificate chaining to a trust anchor the Release supplies. |
 
@@ -273,15 +274,15 @@ Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 `core/gateway/envoy-gateway` (each `request-mirroring: sampled`,
 `caller-identity: client-certificate`, `upstream-tls: trust-anchor`),
 `core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/litellm`
-(`caller-identity: injected-header`, `prompt-guard: pattern-list`,
-`upstream-tls: trust-anchor`). Four of the five carry no
+(`caller-identity: injected-header`, `content-masking: entity-recognition`,
+`prompt-guard: pattern-list`, `upstream-tls: trust-anchor`). Four of the five carry no
 `gateway.aggrega.ai/intelligence` value and the fifth carries `semantic` — and
 that mixture is the separation working rather than an exception to it. The
 intelligence label names a **product tier** — whether the router parses the
 request body — while this family names **capabilities**, so the two answer
 different questions and a component may honestly carry both. What a component's
 tier value never tells a reader is which of these capabilities it has: the AI
-gateway carries three of them, and no amount of reading its tier would say so.
+gateway carries several of them, and no amount of reading its tier would say so.
 
 ### The `security.aggrega.ai/text-anonymization` label
 
