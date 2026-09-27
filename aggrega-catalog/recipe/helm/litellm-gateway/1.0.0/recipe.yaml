@@ -30,13 +30,14 @@ metadata:
     realization relies on, as a second file beside the configuration, and the
     configuration registers it under litellm_settings.callbacks; what the hook
     does is stated on that realization. With no such attachment neither
-    appears. Likewise, while a core/data-masking attachment masks by entity
-    type, the ConfigMap carries the module that attachment's guardrails are
-    loaded from, as a further file beside the configuration, and while any
-    attachment masking replies by entity type leaves allow_streamed_replies
-    off the configuration also registers that module's refusal of streamed
-    requests under litellm_settings.callbacks; what both do is stated on that
-    realization, and with no such attachment neither appears. The gateway's
+    appears. Likewise, while a core/data-masking attachment lists entity
+    types or patterns, the ConfigMap carries the module that attachment's
+    guardrails are loaded from, as a further file beside the configuration,
+    and while any attachment masking replies by entity type leaves
+    allow_streamed_replies off the configuration also registers that module's
+    refusal of streamed requests under litellm_settings.callbacks; what both
+    do is stated on that realization, and with no such attachment neither
+    appears. The gateway's
     public origin is emitted as PROXY_BASE_URL only when
     infra.external_base_url is set, and the build halts when that address
     carries a path. With the pii_analyzer and pii_anonymizer
@@ -77,14 +78,15 @@ spec:
     # second data key and the callback the configuration registers both read
     # it, so the file and its registration cannot name different modules.
     caller_identity_module: caller_identity
-    # The module the entity-masking guardrails are loaded from, and the three
-    # classes in it: each configuration entry a core/data-masking attachment's
-    # realization writes names a module and a class from here, and the file
-    # below defines them from here, so an entry cannot name one the file lacks.
-    entity_masking_module: entity_masking
+    # The module the masking guardrails are loaded from, and the classes in it:
+    # each configuration entry a core/data-masking attachment's realization
+    # writes names a module and a class from here, and the file below defines
+    # them from here, so an entry cannot name one the file lacks.
+    masking_module: data_masking
     request_tool_call_masking_class: RequestToolCallMasking
     reply_masking_class: ReplyMasking
     buffered_reply_masking_class: BufferedReplyMasking
+    tool_call_pattern_masking_class: ToolCallPatternMasking
     # Published for an attachment's realization to check against, and never
     # emitted. A FeatureRecipe reads this Recipe's locals and not the
     # component's values, so the facts it checks an attachment against are
@@ -157,10 +159,10 @@ spec:
     # to the aliases every such attachment lists in infra.destinations. With no
     # such attachment, neither the registration nor the file is emitted.
     #
-    # While a core/data-masking attachment lists entities, the ConfigMap carries
-    # the entity-masking module the attachment's realization names in its
-    # guardrail entries, and while any attachment listing entities with scope
-    # response or both leaves infra.allow_streamed_replies off, the body
+    # While a core/data-masking attachment lists entities or patterns, the
+    # ConfigMap carries the masking module the attachment's realization names
+    # in its guardrail entries, and while any attachment listing entities with
+    # scope response or both leaves infra.allow_streamed_replies off, the body
     # registers that module's refusal of streamed requests. The realization
     # decides the same conditions from the same attachment to write its
     # entries, because the choice of file here cannot be handed to it; should
@@ -172,7 +174,7 @@ spec:
     litellm-gateway-config.configmap.yaml: |
       {{- $identity := false }}
       {{- $listed := list }}
-      {{- $entityMasking := false }}
+      {{- $masking := false }}
       {{- $refuseStreams := false }}
       {{- range $name, $attachment := (default dict .features) }}
       {{- if eq (toString $attachment.type) "core/context-propagation" }}
@@ -182,10 +184,10 @@ spec:
       {{- end }}
       {{- end }}
       {{- if eq (toString $attachment.type) "core/data-masking" }}
-      {{- $masking := optional $attachment "values" dict }}
-      {{- if optional $masking "entities" list }}
-      {{- $entityMasking = true }}
-      {{- if and (ne (toString (optional $masking "scope" "request")) "request") (not (optional (optional $attachment "infra" dict) "allow_streamed_replies" false)) }}{{ $refuseStreams = true }}{{ end }}
+      {{- $values := optional $attachment "values" dict }}
+      {{- if or (optional $values "entities" list) (optional $values "patterns" list) }}{{ $masking = true }}{{ end }}
+      {{- if optional $values "entities" list }}
+      {{- if and (ne (toString (optional $values "scope" "request")) "request") (not (optional (optional $attachment "infra" dict) "allow_streamed_replies" false)) }}{{ $refuseStreams = true }}{{ end }}
       {{- end }}
       {{- end }}
       {{- end -}}
@@ -213,7 +215,7 @@ spec:
               - {{ .locals.caller_identity_module }}.hook
       {{- end }}
       {{- if $refuseStreams }}
-              - {{ .locals.entity_masking_module }}.refuse_streamed_requests
+              - {{ .locals.masking_module }}.refuse_streamed_requests
       {{- end }}
       {{- end }}
       {{- if $identity }}
@@ -326,18 +328,31 @@ spec:
 
           hook = CallerIdentity()
       {{- end }}
-      {{- if $entityMasking }}
-        {{ .locals.entity_masking_module }}.py: |
-          """Masking of the gateway's traffic by entity type.
+      {{- if $masking }}
+        {{ .locals.masking_module }}.py: |
+          """Masking of the gateway's traffic by entity type and by listed pattern.
 
-          Delivered beside the gateway's configuration while core/data-masking masks
-          by entity type. Every text the classes below mask goes through check_pii,
-          the gateway's own Presidio integration's masking of one text, which fails
-          the request when a recognizer cannot be reached or answers with an error.
-          {{ .locals.request_tool_call_masking_class }} runs before a request is forwarded, beside the
+          Delivered beside the gateway's configuration while core/data-masking lists
+          entity types or patterns. Every text the entity classes below mask goes
+          through check_pii, the gateway's own Presidio integration's masking of one
+          text, which fails the request when a recognizer cannot be reached or
+          answers with an error; every text {{ .locals.tool_call_pattern_masking_class }} masks goes through
+          the gateway's own content filter's masking of one text, with the entry's
+          patterns.
+          {{ .locals.request_tool_call_masking_class }} runs before a request is forwarded and before the
           gateway's own Presidio guardrail, which masks the text of the request's
-          messages but passes on the tool calls of its earlier turns as they came:
-          it masks the arguments of those tool calls.
+          messages but passes on the tool calls of its earlier turns as they came,
+          and which the configuration keeps off the chat route's tool turns, where
+          it would mask a result as one text: it masks the arguments of those tool
+          calls, and the results of them the conversation carries, a result that is
+          JSON value by value and any other result as one text.
+          {{ .locals.tool_call_pattern_masking_class }} masks with the listed patterns the tool calls a
+          request's earlier turns carry and a reply's, beside the gateway's own
+          content filter, which masks the text of the messages. In a streamed chat
+          reply it holds the tool-call parts until the choice they belong to
+          finishes and sends them masked, in one piece, just before the chunk that
+          finishes it; a streamed reply on the messages or responses route arrives
+          in pieces of another kind, which it passes on as they come.
           {{ .locals.reply_masking_class }} and {{ .locals.buffered_reply_masking_class }} mask a reply: its text,
           through the gateway's own handler for its kind of reply, its tool-call
           arguments, and, unless the entry sets mask_reasoning to false, its
@@ -352,12 +367,13 @@ spec:
           fails, it refuses the request before any of the reply is sent.
           Tool-call arguments are masked value by value, never as one text: they are
           read as JSON, every string value at any depth and every number whose
-          digits are recognized as an entity are masked, the keys are not, and the
-          JSON is written back, a recognized number becoming the placeholder as a
-          string. Arguments that are not JSON, other than empty ones, are never
-          passed on: a reply carrying them is refused before any of it is sent, and
-          a request carrying them in its conversation is refused before it is
-          forwarded.
+          digits are recognized or matched are masked, the keys are not, and the
+          JSON is written back, such a number becoming the placeholder as a string.
+          Arguments that are not JSON, other than empty ones, are never passed on: a
+          reply carrying them is refused before any of it is sent, a streamed reply
+          masked by pattern sends none of its tool calls and ends with an error after
+          the text already sent, and a request carrying them in its conversation is
+          refused before it is forwarded.
           """
           import json
 
@@ -365,8 +381,9 @@ spec:
           from litellm.integrations.custom_logger import CustomLogger
           from litellm.llms.base_llm.base_model_iterator import convert_model_response_to_streaming
           from litellm.main import stream_chunk_builder
+          from litellm.proxy.guardrails.guardrail_hooks.litellm_content_filter.content_filter import ContentFilterGuardrail
           from litellm.proxy.guardrails.guardrail_hooks.presidio import _OPTIONAL_PresidioPIIMasking
-          from litellm.types.utils import ModelResponse, ModelResponseStream
+          from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices
 
           STREAM_REFUSED = (
               "This gateway masks the entities in its replies and does not stream a reply "
@@ -387,8 +404,14 @@ spec:
               "value by value. Send each tool call's arguments as the JSON it was made with."
           )
 
+          STREAMED_TOOL_CALLS_NOT_JSON = (
+              "The reply's tool calls were not sent: the model returned tool-call arguments "
+              "that are not JSON, and this gateway masks tool-call arguments only value by "
+              "value, so it sends none of them. The text of the reply before them was sent."
+          )
 
-          class ArgumentsNotJson(ValueError):
+
+          class NotJson(ValueError):
               pass
 
 
@@ -418,8 +441,8 @@ spec:
 
 
           class _Number(str):
-              # A JSON number exactly as the arguments wrote it: the recognizer reads the
-              # digits as written, and a number it does not flag is written back as it was.
+              # A JSON number exactly as the text wrote it: the recognizer reads the digits
+              # as written, and a number it does not flag is written back as it was.
               pass
 
 
@@ -432,20 +455,20 @@ spec:
               raise ValueError(name + " is not JSON")
 
 
-          def _read_arguments(text):
+          def _read_json(text):
               try:
                   return json.loads(
                       text, parse_int=_Number, parse_float=_Number, parse_constant=_refuse_constant, object_pairs_hook=_Members
                   )
               except ValueError:
-                  raise ArgumentsNotJson() from None
+                  raise NotJson() from None
 
 
-          def _write_arguments(value):
+          def _write_json(value):
               if isinstance(value, _Members):
-                  return "{" + ", ".join(json.dumps(key) + ": " + _write_arguments(item) for key, item in value) + "}"
+                  return "{" + ", ".join(json.dumps(key) + ": " + _write_json(item) for key, item in value) + "}"
               if isinstance(value, list):
-                  return "[" + ", ".join(_write_arguments(item) for item in value) + "]"
+                  return "[" + ", ".join(_write_json(item) for item in value) + "]"
               if isinstance(value, _Number):
                   return str(value)
               return json.dumps(value)
@@ -467,20 +490,42 @@ spec:
               return value
 
 
-          async def _masked_arguments(text, mask):
-              # Arguments with nothing in them carry nothing to mask and pass as they are;
-              # arguments nothing in which is masked keep every byte they had.
+          async def _masked_json(text, mask):
+              # Text with nothing in it carries nothing to mask and passes as it is; JSON
+              # nothing in which is masked keeps every byte it had. Text that is not JSON
+              # raises NotJson, and each caller decides what that means.
               if not text.strip():
                   return text
-              value = _read_arguments(text)
+              value = _read_json(text)
               masked = await _masked_value(value, mask)
-              return text if masked == value else _write_arguments(masked)
+              return text if masked == value else _write_json(masked)
+
+
+          async def _masked_result(text, mask):
+              # A tool result is masked value by value when it is JSON, and as one text
+              # when it is not.
+              try:
+                  return await _masked_json(text, mask)
+              except NotJson:
+                  return await mask(text)
 
 
           async def _mask_arguments_of(holder, name, mask):
               text = _field(holder, name) if holder is not None else None
               if isinstance(text, str):
-                  _set_field(holder, name, await _masked_arguments(text, mask))
+                  _set_field(holder, name, await _masked_json(text, mask))
+
+
+          async def _mask_result_of(holder, name, mask):
+              # A result is one text or a list of parts, each of which carries its text.
+              value = _field(holder, name)
+              if isinstance(value, str):
+                  _set_field(holder, name, await _masked_result(value, mask))
+              elif isinstance(value, list):
+                  for part in value:
+                      text = _field(part, "text")
+                      if isinstance(text, str):
+                          _set_field(part, "text", await _masked_result(text, mask))
 
 
           async def _mask_tool_call_arguments(container, mask):
@@ -502,7 +547,7 @@ spec:
                   for block in content if isinstance(content, list) else []:
                       if _field(block, "type") == "tool_use" and _field(block, "input") is not None:
                           text = json.dumps(_field(block, "input"))
-                          masked = await _masked_arguments(text, mask)
+                          masked = await _masked_json(text, mask)
                           if masked != text:
                               _set_field(block, "input", json.loads(masked))
               for items in (_field(container, "input"), _field(container, "output")):
@@ -511,13 +556,40 @@ spec:
                           await _mask_arguments_of(item, "arguments", mask)
 
 
-          def _masker(guardrail, request_data, numbered):
+          async def _mask_tool_results(request, mask):
+              # The results of earlier tool calls a request's conversation carries, in each
+              # shape the gateway's routes use: a chat tool or function turn's content, a
+              # tool_result block's content on the messages route, and a
+              # function_call_output item's output on the responses route.
+              for turn in _field(request, "messages") or []:
+                  if _field(turn, "role") in ("tool", "function"):
+                      await _mask_result_of(turn, "content", mask)
+                      continue
+                  content = _field(turn, "content")
+                  for block in content if isinstance(content, list) else []:
+                      if _field(block, "type") == "tool_result":
+                          await _mask_result_of(block, "content", mask)
+              items = _field(request, "input")
+              for item in items if isinstance(items, list) else []:
+                  if _field(item, "type") == "function_call_output":
+                      await _mask_result_of(item, "output", mask)
+
+
+          def _masker(guardrail, request_data):
               config = guardrail.get_presidio_settings_from_request_data(request_data or {})
 
               async def mask(text):
                   return await guardrail.check_pii(
-                      text=text, output_parse_pii=numbered, presidio_config=config, request_data=request_data
+                      text=text, output_parse_pii=False, presidio_config=config, request_data=request_data
                   )
+
+              return mask
+
+
+          def _pattern_masker(guardrail):
+              # The content filter's own masking of one text, with the entry's listed patterns.
+              async def mask(text):
+                  return guardrail._filter_single_text(text)
 
               return mask
 
@@ -526,20 +598,13 @@ spec:
               # This class does not declare apply_guardrail itself, so the gateway hands it
               # the whole request before forwarding it, rather than only its text.
 
-              def __init__(self, output_parse_pii=False, **kwargs):
-                  # With action restore the entry sets output_parse_pii: each stand-in is
-                  # then numbered and recorded for the request, as the gateway's own
-                  # guardrail records those of the text, so its one mapping back in the
-                  # reply covers both. It is kept here rather than passed on, so that this
-                  # entry runs before the request only and maps nothing back itself.
-                  super().__init__(**kwargs)
-                  self.numbered = output_parse_pii is True
-
               async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+                  mask = _masker(self, data)
                   try:
-                      await _mask_tool_call_arguments(data, _masker(self, data, self.numbered))
-                  except ArgumentsNotJson:
+                      await _mask_tool_call_arguments(data, mask)
+                  except NotJson:
                       raise HTTPException(status_code=400, detail=HISTORY_NOT_JSON) from None
+                  await _mask_tool_results(data, mask)
                   return data
 
 
@@ -577,9 +642,9 @@ spec:
 
               async def _mask_tool_calls(self, reply, request_data):
                   try:
-                      await _mask_tool_call_arguments(reply, _masker(self, request_data, False))
-                  except ArgumentsNotJson:
-                      raise ArgumentsNotJson(REPLY_NOT_JSON) from None
+                      await _mask_tool_call_arguments(reply, _masker(self, request_data))
+                  except NotJson:
+                      raise NotJson(REPLY_NOT_JSON) from None
 
               async def _mask_reasoning(self, reply, request_data):
                   # Every piece of reasoning text goes through check_pii, the gateway's own
@@ -675,7 +740,7 @@ spec:
                       if self.mask_reasoning:
                           await self._mask_reasoning(whole, request_data)
                       masked = convert_model_response_to_streaming(whole)
-                  except ArgumentsNotJson:
+                  except NotJson:
                       raise
                   except Exception as e:
                       raise Exception(
@@ -683,6 +748,110 @@ spec:
                           "reply is sent only once all of it is masked."
                       ) from e
                   yield masked
+
+
+          class _HeldToolCalls:
+              # The tool-call parts of one choice of a streamed reply, put back together.
+
+              def __init__(self):
+                  self.calls = {}
+                  self.function = None
+
+              def add(self, delta):
+                  for part in _field(delta, "tool_calls") or []:
+                      index = _field(part, "index") or 0
+                      call = self.calls.setdefault(index, {"id": None, "type": None, "name": None, "arguments": ""})
+                      function = _field(part, "function")
+                      call["id"] = call["id"] or _field(part, "id")
+                      call["type"] = call["type"] or _field(part, "type")
+                      call["name"] = call["name"] or _field(function, "name")
+                      call["arguments"] += _field(function, "arguments") or ""
+                  part = _field(delta, "function_call")
+                  if part is not None:
+                      if self.function is None:
+                          self.function = {"name": None, "arguments": ""}
+                      self.function["name"] = self.function["name"] or _field(part, "name")
+                      self.function["arguments"] += _field(part, "arguments") or ""
+
+              async def masked(self, mask):
+                  # The fields of one delta carrying every held call whole, its arguments masked
+                  # value by value; NotJson when any of them is not JSON.
+                  fields = {}
+                  if self.calls:
+                      fields["tool_calls"] = []
+                      for index in sorted(self.calls):
+                          call = self.calls[index]
+                          arguments = await _masked_json(call["arguments"], mask)
+                          fields["tool_calls"].append(
+                              {
+                                  "index": index,
+                                  "id": call["id"],
+                                  "type": call["type"] or "function",
+                                  "function": {"name": call["name"], "arguments": arguments},
+                              }
+                          )
+                  if self.function is not None:
+                      arguments = await _masked_json(self.function["arguments"], mask)
+                      fields["function_call"] = {"name": self.function["name"], "arguments": arguments}
+                  return fields
+
+
+          class {{ .locals.tool_call_pattern_masking_class }}(ContentFilterGuardrail):
+              # Masks tool-call arguments with the entry's listed patterns, through the content
+              # filter's own masking of one text: in the tool calls a request's earlier turns
+              # carry, and in a reply's. The gateway's own content filter entry beside it masks
+              # the text of the messages. This class does not declare apply_guardrail itself,
+              # so the gateway hands it the whole request and the whole reply.
+
+              async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+                  try:
+                      await _mask_tool_call_arguments(data, _pattern_masker(self))
+                  except NotJson:
+                      raise HTTPException(status_code=400, detail=HISTORY_NOT_JSON) from None
+                  return data
+
+              async def async_post_call_success_hook(self, data, user_api_key_dict, response):
+                  try:
+                      await _mask_tool_call_arguments(response, _pattern_masker(self))
+                  except NotJson:
+                      raise NotJson(REPLY_NOT_JSON) from None
+                  return response
+
+              async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data):
+                  # The content filter masks a streamed reply's text as it streams and never its
+                  # tool calls, so their parts are held here: each chunk goes on without them,
+                  # and when the choice they belong to finishes they are masked whole, value by
+                  # value, and sent in one piece just before the chunk that finishes it. When
+                  # their arguments are not JSON none of them is sent, and the stream ends with
+                  # an error after the text already sent.
+                  held = {}
+                  async for chunk in response:
+                      if isinstance(chunk, ModelResponseStream):
+                          for choice in chunk.choices or []:
+                              delta = getattr(choice, "delta", None)
+                              if delta is not None and (getattr(delta, "tool_calls", None) or getattr(delta, "function_call", None)):
+                                  held.setdefault(getattr(choice, "index", 0) or 0, _HeldToolCalls()).add(delta)
+                                  delta.tool_calls = None
+                                  delta.function_call = None
+                          for choice in chunk.choices or []:
+                              index = getattr(choice, "index", 0) or 0
+                              if getattr(choice, "finish_reason", None) and index in held:
+                                  yield await self._held_chunk(chunk, index, held.pop(index))
+                      yield chunk
+                  for index in sorted(held):
+                      yield await self._held_chunk(None, index, held[index])
+
+              async def _held_chunk(self, like, index, calls):
+                  try:
+                      fields = await calls.masked(_pattern_masker(self))
+                  except NotJson:
+                      raise NotJson(STREAMED_TOOL_CALLS_NOT_JSON) from None
+                  return ModelResponseStream(
+                      id=getattr(like, "id", None),
+                      created=getattr(like, "created", None),
+                      model=getattr(like, "model", None),
+                      choices=[StreamingChoices(index=index, delta=Delta(**fields))],
+                  )
       {{- end }}
   workload: |
     {{- $configDir := "/etc/litellm" -}}
