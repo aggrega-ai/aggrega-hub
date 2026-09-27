@@ -332,12 +332,15 @@ spec:
           replies by entity type. The configuration's reply-side guardrail entries
           name one of the two guardrail classes below. Both mask a reply sent in one
           piece through the gateway's own Presidio integration, which fails the
-          request when a recognizer cannot be reached or answers with an error. They
-          differ on a streamed reply, whose masking the gateway would otherwise do
-          in a way that passes the reply on unmasked when a recognizer cannot be
-          reached. {{ .locals.reply_masking_class }} refuses a streamed reply before any of it is sent,
-          and the configuration also registers refuse_streamed_requests, which
-          refuses a streamed request before it is forwarded at all.
+          request when a recognizer cannot be reached or answers with an error, and,
+          unless the entry sets mask_reasoning to false, hand the reply's reasoning
+          text, in the fields _mask_reasoning names, to that same integration too.
+          They differ on a streamed reply, whose masking the gateway would otherwise
+          do in a way that passes the reply on unmasked when a recognizer cannot be
+          reached.
+          {{ .locals.reply_masking_class }} refuses a streamed reply before any of it is sent, and the
+          configuration also registers refuse_streamed_requests, which refuses a
+          streamed request before it is forwarded at all.
           {{ .locals.buffered_reply_masking_class }} holds a streamed reply until all of it has arrived,
           masks it as one piece and sends it as one piece; when anything about that
           fails, it refuses the request before any of the reply is sent.
@@ -371,18 +374,97 @@ spec:
           refuse_streamed_requests = RefuseStreamedRequests()
 
 
-          class {{ .locals.reply_masking_class }}(_OPTIONAL_PresidioPIIMasking):
-              # The gateway picks how to run a guardrail on a reply sent in one piece
-              # by whether the guardrail's own class declares this method, so it is
-              # declared here to keep that path exactly the built-in guardrail's.
-              apply_guardrail = _OPTIONAL_PresidioPIIMasking.apply_guardrail
+          def _field(holder, name):
+              return holder.get(name) if isinstance(holder, dict) else getattr(holder, name, None)
 
-              def __init__(self, **kwargs):
+
+          def _set_field(holder, name, value):
+              if isinstance(holder, dict):
+                  holder[name] = value
+              else:
+                  setattr(holder, name, value)
+
+
+          class {{ .locals.reply_masking_class }}(_OPTIONAL_PresidioPIIMasking):
+              # This class does not declare apply_guardrail itself, so the gateway hands
+              # a reply sent in one piece to async_post_call_success_hook below, reply
+              # and all, rather than only the reply's text.
+
+              def __init__(self, mask_reasoning=True, **kwargs):
                   # A reply-side guardrail: every reply is masked, and no stand-in is
-                  # mapped back to an original.
+                  # mapped back to an original. mask_reasoning comes from the entry's
+                  # own settings; only false turns the masking of reasoning text off.
                   kwargs["apply_to_output"] = True
                   kwargs["output_parse_pii"] = False
                   super().__init__(**kwargs)
+                  self.mask_reasoning = mask_reasoning is not False
+
+              async def async_post_call_success_hook(self, data, user_api_key_dict, response):
+                  # The reply's text is masked through the gateway's own handler for its
+                  # kind of reply, which is the path the built-in guardrail takes; then
+                  # its reasoning text, in the fields _mask_reasoning names.
+                  from litellm.proxy.utils import unified_guardrail
+
+                  data["guardrail_to_apply"] = self
+                  masked = await unified_guardrail.async_post_call_success_hook(
+                      data=data, user_api_key_dict=user_api_key_dict, response=response
+                  )
+                  if masked is not None:
+                      response = masked
+                  if self.mask_reasoning:
+                      await self._mask_reasoning(response, data)
+                  return response
+
+              async def _mask_reasoning(self, reply, request_data):
+                  # Every piece of reasoning text goes through check_pii, the gateway's own
+                  # masking of one text, so what is found, what replaces it and what
+                  # happens when a recognizer fails are the integration's. The same
+                  # reasoning often travels in two or three of the fields below, so each
+                  # distinct text is masked once and every such copy receives the result.
+                  # A thinking block's signature and a redacted block's data are the
+                  # provider's encrypted copies and are left as they are, and a field a
+                  # provider names in a way of its own is not among those below.
+                  masked = {}
+                  config = self.get_presidio_settings_from_request_data(request_data or {})
+
+                  async def text(holder, name):
+                      value = _field(holder, name)
+                      if isinstance(value, str) and value:
+                          if value not in masked:
+                              masked[value] = await self.check_pii(
+                                  text=value, output_parse_pii=False, presidio_config=config, request_data=request_data
+                              )
+                          _set_field(holder, name, masked[value])
+
+                  async def blocks(items):
+                      for block in items or []:
+                          kind = _field(block, "type")
+                          if kind == "thinking":
+                              await text(block, "thinking")
+                          elif kind == "reasoning":
+                              for part in list(_field(block, "summary") or []) + list(_field(block, "content") or []):
+                                  await text(part, "text")
+
+                  if isinstance(reply, dict):
+                      # A reply on the provider-native messages route.
+                      if reply.get("type") == "message":
+                          await blocks(reply.get("content"))
+                      return
+                  for choice in _field(reply, "choices") or []:
+                      message = _field(choice, "message")
+                      if message is None:
+                          continue
+                      # The chat reply's own reasoning fields, and the copies of them it
+                      # carries among its provider-specific fields.
+                      for holder in (message, _field(message, "provider_specific_fields")):
+                          if holder is None:
+                              continue
+                          await text(holder, "reasoning_content")
+                          await text(holder, "reasoning")
+                          await blocks(_field(holder, "thinking_blocks"))
+                          await blocks(_field(holder, "reasoning_items"))
+                  # A reply on the responses route.
+                  await blocks(_field(reply, "output"))
 
               async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data):
                   # Takes the place of the gateway's own masking of a streamed reply.
@@ -411,6 +493,8 @@ spec:
                           raise ValueError("the streamed reply could not be assembled into one reply")
                       self._preserve_usage_from_last_chunk(whole, chunks)
                       await self._process_response_for_pii(response=whole, request_data=request_data, mode="mask")
+                      if self.mask_reasoning:
+                          await self._mask_reasoning(whole, request_data)
                       masked = convert_model_response_to_streaming(whole)
                   except Exception as e:
                       raise Exception(
