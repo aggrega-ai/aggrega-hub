@@ -1,0 +1,472 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: ArtifactLibrary
+metadata:
+  name: LiteLLMGuard
+  version: 1.0.0
+  description: |
+    The request guard and the path allowlist a LiteLLM proxy runs behind, as
+    one bundle every Recipe running that proxy imports. Together they are what
+    stops a caller of the proxy from changing where it sends a request or with
+    which credential, so the text that draws that line lives here once, rather
+    than as a copy in each Recipe that a later edit could leave behind.
+
+    RequestGuard emits one ConfigMap carrying two files. The first is a module
+    the proxy loads as a callback: on every request it forwards only the request
+    fields the proxy itself declares for the route the request took, the keys the
+    proxy adds to a request on that route, and any the Release names in
+    infra.admitted_request_fields, and it refuses every other field with an
+    error naming it, forwarding nothing. The fields that would let a caller
+    re-target or re-key a call are refused even where the proxy declares them,
+    and a Release naming one of them in infra.admitted_request_fields stops the
+    build, naming the field. The second file configures an nginx reverse proxy
+    that listens on infra.port in front of the LiteLLM proxy: it forwards only
+    the routes the module checks, the model listing, the health routes and key
+    management, and, where the importing Recipe turns them on, the routes that
+    create, read, update and delete an organization; every other path is
+    answered 403 with nothing forwarded.
+
+    The importing Recipe runs both. It registers the module under
+    litellm_settings.callbacks, mounts the ConfigMap into the proxy's container
+    and into the reverse proxy's, starts the proxy on the loopback address and
+    the reverse proxy on this configuration. Those are its own configuration and
+    workload, which a bundle cannot write, so it declares as locals the values
+    they share with this bundle, and the bundle stops the build, naming the
+    local, when one is missing or differs from its own: request_filter_module
+    (request_field_filter), path_allowlist_file (path-allowlist.conf),
+    gateway_address (127.0.0.1), gateway_port (the port after infra.port, or the
+    one before it when infra.port is 65535) and request_guard_config_map_name
+    (the instance name followed by -request-guard). It also declares
+    forward_organization_routes, "true" or "false", choosing whether the
+    organization routes are forwarded; any other value stops the build. The
+    importing Component declares infra.port, and infra.admitted_request_fields
+    where a Release may admit further fields.
+
+    The module reads each route's field list from the proxy when it loads, so a
+    list that cannot be read stops the proxy from starting. The bundle is
+    authored against LiteLLM v1.85.1.
+spec:
+  artifacts:
+    # One file, one ConfigMap, holding both texts: the module and the reverse
+    # proxy's configuration are only meaningful together, and a Recipe that
+    # imports the bundle gets both or neither.
+    #
+    # The template reads the importing Recipe's context: .infra.port and
+    # .infra.admitted_request_fields from the Component, .context.instance_id,
+    # and the locals listed in the description. It checks every local before
+    # it writes anything, because a local the importing Recipe does not declare
+    # reads as empty here rather than stopping the build, and a module name, a
+    # file name or a port that differs on the two sides would leave a proxy
+    # that loads no guard, a reverse proxy with no configuration, or one
+    # forwarding to a port nothing listens on.
+    RequestGuard:
+      request-guard.yaml: |
+        {{- /* The values this bundle shares with the Recipe importing it. Each has its home here, as a constant or
+          computed from the Component's infra.port, and the importing Recipe restates it as a local because its own
+          configuration and workload, which this bundle cannot write, read it too. A local the Recipe does not declare
+          reads as empty here, so each is checked before anything is written: absent, or not the value below, and the
+          build stops naming it. */}}
+        {{- $bundle := "LiteLLMGuard#/artifacts/RequestGuard" }}
+        {{- $module := "request_field_filter" }}
+        {{- $allowlistFile := "path-allowlist.conf" }}
+        {{- $address := "127.0.0.1" }}
+        {{- $port := add1 (int .infra.port) }}
+        {{- if eq (int .infra.port) 65535 }}{{ $port = 65534 }}{{ end }}
+        {{- $configMapName := printf "%s-request-guard" .context.instance_id }}
+        {{- $have := "" }}
+        {{- $have = optional .locals "request_filter_module" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local request_filter_module, which is the module name its configuration registers under litellm_settings.callbacks and this bundle delivers the request guard under; declare it as %q" $bundle $module) }}
+        {{- else if ne $have $module }}
+        {{- fail (printf "the Recipe importing %s declares the local request_filter_module as %q, but that local is the module name its configuration registers under litellm_settings.callbacks and this bundle delivers the request guard under, and this bundle's side of it is %q; declare it as %q" $bundle $have $module $module) }}
+        {{- end }}
+        {{- $have = optional .locals "path_allowlist_file" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local path_allowlist_file, which is the file name its path allowlist container is pointed at and this bundle delivers the allowlist's configuration under; declare it as %q" $bundle $allowlistFile) }}
+        {{- else if ne $have $allowlistFile }}
+        {{- fail (printf "the Recipe importing %s declares the local path_allowlist_file as %q, but that local is the file name its path allowlist container is pointed at and this bundle delivers the allowlist's configuration under, and this bundle's side of it is %q; declare it as %q" $bundle $have $allowlistFile $allowlistFile) }}
+        {{- end }}
+        {{- $have = optional .locals "gateway_address" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local gateway_address, which is the address its gateway listens on and the path allowlist forwards to; declare it as %q" $bundle $address) }}
+        {{- else if ne $have $address }}
+        {{- fail (printf "the Recipe importing %s declares the local gateway_address as %q, but that local is the address its gateway listens on and the path allowlist forwards to, and this bundle's side of it is %q; declare it as %q" $bundle $have $address $address) }}
+        {{- end }}
+        {{- $have = optional .locals "gateway_port" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local gateway_port, which is the port its gateway listens on and the path allowlist forwards to, the one after infra.port or the one before it when infra.port is 65535; declare it as %q" $bundle (toString $port)) }}
+        {{- else if ne $have (toString $port) }}
+        {{- fail (printf "the Recipe importing %s declares the local gateway_port as %q, but that local is the port its gateway listens on and the path allowlist forwards to, the one after infra.port or the one before it when infra.port is 65535, and this bundle's side of it is %q; declare it as %q" $bundle $have (toString $port) (toString $port)) }}
+        {{- end }}
+        {{- $have = optional .locals "request_guard_config_map_name" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local request_guard_config_map_name, which is the name of the ConfigMap its workload mounts, which this bundle emits; declare it as %q" $bundle $configMapName) }}
+        {{- else if ne $have $configMapName }}
+        {{- fail (printf "the Recipe importing %s declares the local request_guard_config_map_name as %q, but that local is the name of the ConfigMap its workload mounts, which this bundle emits, and this bundle's side of it is %q; declare it as %q" $bundle $have $configMapName $configMapName) }}
+        {{- end }}
+        {{- /* Whether the path allowlist forwards the routes that create, read, update and delete an organization. The
+          importing Recipe chooses, "true" or "false"; any other value stops the build. */}}
+        {{- $have = optional .locals "forward_organization_routes" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local forward_organization_routes, which takes \"true\" or \"false\": whether the path allowlist forwards the routes that create, read, update and delete an organization; declare it as one of the two" $bundle) }}
+        {{- else if not (has $have (list "true" "false")) }}
+        {{- fail (printf "the Recipe importing %s declares the local forward_organization_routes as %q, but it takes \"true\" or \"false\": whether the path allowlist forwards the routes that create, read, update and delete an organization; declare it as one of the two" $bundle $have) }}
+        {{- end }}
+        {{- $organizations := eq $have "true" }}
+        {{- /* The one home of the request fields the guard refuses even where LiteLLM declares them for the route: each
+          re-targets a call, re-keys it, re-routes it, re-prices it, or carries an arbitrary field to the model server
+          behind the gateway. The module below renders it into its deny set, and the check after it reads the same
+          list, so a field a Release admits and a field the guard refuses are checked against one source. */}}
+        {{- $deny := list "additional_drop_params" "api_base" "api_key" "api_version" "base_url" "configurable_clientside_auth_params" "custom_llm_provider" "default_headers" "deployment_id" "extra_body" "extra_headers" "fallbacks" "guardrails" "headers" "litellm_credential_name" "max_retries" "mock_response" "model_list" "num_retries" "organization" "request_timeout" "tags" "use_litellm_proxy" }}
+        {{- /* The request fields the Release admits on top of each route's own, from infra.admitted_request_fields. It
+          widens what a caller may send and must not re-open what the guard refuses on every Release, so a field the
+          deny set names stops the build, naming the field, rather than being admitted. */}}
+        {{- $admitted := optional .infra "admitted_request_fields" list }}
+        {{- range $field := $admitted }}
+        {{- if has $field $deny }}
+        {{- fail (printf "infra.admitted_request_fields names %q, which the gateway refuses on every Release because it lets a caller change where a request is sent or with which credential; admit only fields that are safe to forward, and remove %q" $field $field) }}
+        {{- end }}
+        {{- end }}
+        {{- /* One path segment of a model name or a key in a route below: it opens with a letter or a digit, so no
+          segment is a dot segment, and it carries no percent sign, so nothing in it is decoded further on. */}}
+        {{- $segment := "[A-Za-z0-9][A-Za-z0-9._:@+~-]*" -}}
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: {{ $configMapName }}
+        data:
+          {{ $module }}.py: |
+            """Refuse a request field the gateway was not configured to forward.
+
+            Mounted beside the gateway's configuration and registered on every Release
+            as the first entry of litellm_settings.callbacks, so it runs before any hook
+            that reads the body. On every request it forwards only the fields LiteLLM
+            itself declares for the route the request took, the keys the proxy adds to a
+            request on that route while processing it, and any the Release admits; every
+            other field is refused with HTTP 400 naming it, and nothing is forwarded. This
+            is what stops a caller changing where the gateway sends a request or with which
+            credential: a request-body model_list, api_key, extra_body,
+            additional_drop_params, fallbacks or an unknown field is refused rather than
+            passed on, so a caller cannot send a provider key of its own. The fields the
+            gateway refuses are read from the one deny set the bundle carrying it holds;
+            further fields the Release names in infra.admitted_request_fields are admitted
+            on every route. The refusal is checked at the pre-call hook, where a caller's
+            field is visible as a caller's field, and again at the per-deployment hook that
+            sees fallbacks, as defence in depth. Every list this reads from LiteLLM is read
+            when the module loads, so a list that cannot be read stops the gateway from
+            starting rather than letting it serve with a narrower or a wider guard.
+            """
+            import inspect
+
+            import litellm
+            from fastapi import HTTPException
+            from litellm.integrations.custom_logger import CustomLogger
+            from litellm.types.llms.anthropic import ANTHROPIC_API_HEADERS, AnthropicMessagesRequest
+            from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
+
+            # The fields refused even where LiteLLM declares them for the route, rendered
+            # from the bundle's single home for the set, so this guard and the check
+            # that keeps them out of the admitted list refuse the same fields.
+            DENY = frozenset([{{ range $i, $f := $deny }}{{ if $i }}, {{ end }}{{ $f | toJson }}{{ end }}])
+
+            # The fields the Release admits on top of each route's own, from
+            # infra.admitted_request_fields. Empty unless the Release sets it, and a field
+            # in the deny set never reaches here — the bundle halts the build on one.
+            ADMITTED = frozenset([{{ range $i, $f := $admitted }}{{ if $i }}, {{ end }}{{ $f | toJson }}{{ end }}])
+
+            # One key the proxy adds on every route is a caller-injection vector under the
+            # same name, so it is neither admitted nor refused by name:
+            # provider_specific_header. When a request arrives with the anthropic-version
+            # header the official Anthropic client always sends, the proxy folds that
+            # protocol header into data["provider_specific_header"], overwriting any body
+            # value, and its extra_headers then carry only the protocol headers the proxy
+            # itself forwards — safe, and the Anthropic client's default request depends on
+            # it. But a caller can also put provider_specific_header in the request body,
+            # and on a request without that header the proxy leaves it, so its
+            # extra_headers reach the upstream verbatim: a header-injection path. So on
+            # every route this key passes only when its extra_headers carry nothing but
+            # those protocol headers, read from the same LiteLLM set the proxy folds them
+            # from; anything else is refused like any other field a caller was not
+            # configured to send.
+            PROVIDER_SPECIFIC_HEADER = "provider_specific_header"
+
+
+            def _provider_specific_header_is_proxys(value):
+                # True only for the shape the proxy synthesizes: a mapping whose extra_headers
+                # name nothing but the proxy's own protocol headers. A caller-supplied value
+                # carrying any other header returns False and is refused.
+                if not isinstance(value, dict):
+                    return False
+                extra = value.get("extra_headers")
+                if extra is None:
+                    return True
+                if not isinstance(extra, dict):
+                    return False
+                safe = {h.lower() for h in ANTHROPIC_API_HEADERS}
+                return all(isinstance(k, str) and k.lower() in safe for k in extra)
+
+
+            # The key a second policy is written into this module under, as data rather
+            # than as a second hook: a FeatureRecipe writes callback_settings.<this name>
+            # through the gateway-config pipeline step, LiteLLM loads it at start-up, and
+            # this module reads it in _policy_refusals. It is this callback's own name, so
+            # only this one refusal hook is ever registered.
+            POLICY_KEY = "{{ $module }}"
+
+            UNKNOWN_CALL_TYPE = (
+                "This gateway forwards only the request types it is configured for and does "
+                "not recognise this one, so the request is refused. Use the chat "
+                "completions, completions, embeddings, responses, messages, image, "
+                "moderation, transcription or rerank route."
+            )
+
+
+            def _declared(fn):
+                # The named parameters of one of LiteLLM's own entry points. The async entry
+                # points are (*args, **kwargs) wrappers that declare nothing, so each route
+                # reads its sync function.
+                return frozenset(p.name for p in inspect.signature(fn).parameters.values()
+                                 if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY))
+
+
+            def _keys(typed_request):
+                # The fields a typed request object of LiteLLM's declares. The responses and
+                # messages payload fields travel in these rather than as parameters.
+                return frozenset(typed_request.__annotations__)
+
+
+            # Every request type the gateway serves, keyed by the name the proxy hands this
+            # hook for it, each with two sets. The first is the fields LiteLLM declares for
+            # that route, read from LiteLLM itself. The second is the keys the proxy adds to
+            # a request on that route before this hook sees it — the call's own
+            # bookkeeping, the request as it arrived, and on some routes a field it
+            # synthesizes. LiteLLM declares these nowhere they could be read from, so each
+            # set is the one observed on that route of the pinned proxy, streamed and not;
+            # refusing one would refuse a request the gateway itself shaped, and a key the
+            # proxy adds on one route is not admitted on another. A request type absent
+            # from this table is refused: a route the guard cannot vet is where an
+            # unchecked field would slip through.
+            _ROUTES = {
+                "acompletion": (
+                    frozenset(litellm.OPENAI_CHAT_COMPLETION_PARAMS) | _declared(litellm.completion),
+                    frozenset(["litellm_call_id", "litellm_logging_obj", "metadata", "proxy_server_request", "secret_fields"]),
+                ),
+                "atext_completion": (
+                    _declared(litellm.text_completion),
+                    frozenset(["litellm_call_id", "litellm_logging_obj", "metadata", "proxy_server_request", "secret_fields"]),
+                ),
+                "aembedding": (
+                    _declared(litellm.embedding),
+                    frozenset(["litellm_call_id", "litellm_logging_obj", "metadata", "proxy_server_request", "secret_fields"]),
+                ),
+                "aresponses": (
+                    _declared(litellm.responses) | _keys(ResponsesAPIOptionalRequestParams),
+                    frozenset(["litellm_call_id", "litellm_logging_obj", "litellm_metadata", "proxy_server_request", "secret_fields"]),
+                ),
+                "anthropic_messages": (
+                    _declared(litellm.anthropic_messages) | _keys(AnthropicMessagesRequest),
+                    frozenset(["litellm_call_id", "litellm_logging_obj", "litellm_metadata", "proxy_server_request", "secret_fields"]),
+                ),
+                "image_generation": (
+                    # The proxy writes an image request's prompt into messages for the
+                    # hooks, and turns it back into the prompt before the call is made.
+                    _declared(litellm.image_generation),
+                    frozenset(["messages", "metadata", "proxy_server_request", "secret_fields"]),
+                ),
+                "moderation": (
+                    _declared(litellm.moderation),
+                    frozenset(["metadata", "proxy_server_request", "secret_fields"]),
+                ),
+                "transcription": (
+                    _declared(litellm.transcription),
+                    frozenset(["metadata", "proxy_server_request", "secret_fields", "user"]),
+                ),
+                "rerank": (
+                    _declared(litellm.rerank),
+                    frozenset(["metadata", "proxy_server_request", "secret_fields"]),
+                ),
+            }
+
+            # What each route forwards, computed once when the module loads.
+            _ALLOWED = {
+                name: (declared | added | ADMITTED) - DENY
+                for name, (declared, added) in _ROUTES.items()
+            }
+
+
+            def _canonical(call_type):
+                name = str(call_type)
+                if "." in name:
+                    name = name.rsplit(".", 1)[-1]
+                return name
+
+
+            def _allowed(call_type):
+                return _ALLOWED.get(_canonical(call_type))
+
+
+            def _policy_refusals():
+                # A second policy is data, never a second hook: a FeatureRecipe writes
+                # callback_settings.<POLICY_KEY>.policies through the gateway-config step,
+                # LiteLLM loads it into litellm.callback_settings at start-up, and this
+                # reads it. Each policy may name further fields to refuse, so an attachment
+                # tightens what the gateway forwards without loosening the always-on
+                # allowlist.
+                settings = getattr(litellm, "callback_settings", None)
+                if not isinstance(settings, dict):
+                    return []
+                mine = settings.get(POLICY_KEY)
+                if not isinstance(mine, dict):
+                    return []
+                policies = mine.get("policies")
+                if not isinstance(policies, list):
+                    return []
+                refused = []
+                for policy in policies:
+                    fields = policy.get("refuse_fields") if isinstance(policy, dict) else None
+                    if isinstance(fields, list):
+                        refused += fields
+                return refused
+
+
+            def _refuse(fields):
+                named = ", ".join(sorted(set(fields)))
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "This gateway forwards only the request fields it is configured for, "
+                        "and refuses the rest rather than dropping them, so the request was "
+                        "not forwarded. Remove: " + named + "."
+                    ),
+                )
+
+
+            class RequestFieldFilter(CustomLogger):
+                async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+                    if not isinstance(data, dict):
+                        return data
+                    allowed = _allowed(call_type)
+                    if allowed is None:
+                        raise HTTPException(status_code=400, detail=UNKNOWN_CALL_TYPE)
+                    refused = []
+                    for key in data:
+                        if key == PROVIDER_SPECIFIC_HEADER:
+                            if _provider_specific_header_is_proxys(data[key]):
+                                continue
+                        elif key in allowed:
+                            continue
+                        refused.append(key)
+                    refused += [key for key in _policy_refusals() if key in data]
+                    if refused:
+                        _refuse(refused)
+                    return data
+
+                async def async_pre_call_deployment_hook(self, kwargs, call_type):
+                    # Defence in depth. The pre-call hook above is the site that refuses a
+                    # caller's field, where it is still visible as the caller's. By the time
+                    # a call reaches this per-deployment hook the gateway's own resolved
+                    # credential and the routing table's own target are present, and a caller
+                    # cannot reach an upstream through this hook without first passing the
+                    # pre-call hook. A caller-shaped routing field surviving to here would
+                    # mean that check was bypassed, so it is refused rather than forwarded.
+                    if isinstance(kwargs, dict):
+                        surviving = [key for key in ("model_list", "fallbacks") if key in kwargs]
+                        if surviving:
+                            _refuse(surviving)
+                    return kwargs
+
+
+            filter = RequestFieldFilter()
+          {{ $allowlistFile }}: |
+            # The path allowlist in front of the gateway. The gateway listens on its
+            # loopback address inside the pod only; this reverse proxy listens on the
+            # port callers reach and forwards a request only when its method and path
+            # are one of the routes the gateway serves, listed below. It matches the
+            # request target exactly as the caller sent it, which is also exactly what
+            # it forwards, so no encoded character, dot segment, doubled slash or change
+            # of letter case can make a refused path look like an allowed one. Every
+            # other request is answered 403 and nothing of it is forwarded.
+            worker_processes 1;
+            error_log /dev/stderr notice;
+            events {
+                worker_connections 4096;
+            }
+            http {
+                access_log /dev/stdout;
+                server_tokens off;
+                map "$request_method $request_uri" $gateway_route {
+                    default 0;
+                    # The request types the gateway's request guard checks, each in
+                    # the spellings the gateway serves whatever the model alias: chat
+                    # completions, completions, embeddings, responses, messages, image
+                    # generation, moderation, transcription and rerank. A spelling
+                    # that carries the model name in its path, as the engine-style and
+                    # Azure-style paths do, is not among them: there the proxy reads
+                    # words in the path, the alias included, to decide how it records
+                    # a request, so the guard would serve some alias names and refuse
+                    # others.
+                    "~^(POST|OPTIONS) /(v1/)?chat/completions(\?|$)" 1;
+                    "~^(POST|OPTIONS) /cursor/chat/completions(\?|$)" 1;
+                    "~^(POST|OPTIONS) /(v1/)?completions(\?|$)" 1;
+                    "~^(POST|OPTIONS) /(v1/)?embeddings(\?|$)" 1;
+                    "~^(POST|OPTIONS) /(v1/|openai/v1/)?responses(\?|$)" 1;
+                    "~^(POST|OPTIONS) /v1/messages(\?|$)" 1;
+                    "~^(POST|OPTIONS) /(v1/)?images/generations(\?|$)" 1;
+                    "~^(POST|OPTIONS) /(v1/)?moderations(\?|$)" 1;
+                    "~^(POST|OPTIONS) /(v1/)?audio/transcriptions(\?|$)" 1;
+                    "~^(POST|OPTIONS) /(v1/|v2/)?rerank(\?|$)" 1;
+                    # The model listing of the OpenAI-compatible API, and one model's
+                    # entry in it. Neither calls an upstream.
+                    "~^(GET|OPTIONS) /(v1/)?models(/{{ $segment }})?(\?|$)" 1;
+                    # Key management, which the gateway guards with its administrative
+                    # key and keeps in its bookkeeping database. None calls an upstream.
+                    "~^(GET|OPTIONS) /key/(info|list|aliases)(\?|$)" 1;
+                    "~^(POST|OPTIONS) /key/(generate|service-account/generate|update|bulk_update|delete|regenerate|block|unblock)(\?|$)" 1;
+                    "~^(POST|OPTIONS) /key/{{ $segment }}/(regenerate|reset_spend)(\?|$)" 1;
+                    "~^(POST|OPTIONS) /(v2/key/info|team/key/bulk_update)(\?|$)" 1;
+            {{- if $organizations }}
+                    # Creating, reading, updating and deleting an organization, which a
+                    # key naming an organization needs, since the organization must
+                    # exist before a key can name it. The gateway answers these to its
+                    # administrative key, and reading also to an administrator of that
+                    # organization; none calls an upstream. The listing of
+                    # organizations is not forwarded, because the gateway answers it
+                    # for other keys too.
+                    "~^(POST|OPTIONS) /organization/new(\?|$)" 1;
+                    "~^(GET|OPTIONS) /organization/info(\?|$)" 1;
+                    "~^(PATCH|OPTIONS) /organization/update(\?|$)" 1;
+                    "~^(DELETE|OPTIONS) /organization/delete(\?|$)" 1;
+            {{- end }}
+                    # The health routes the pod's readiness probe and its operators read.
+                    "~^(GET|OPTIONS) /health/(readiness|liveliness)(\?|$)" 1;
+                }
+                server {
+                    listen {{ .infra.port }};
+                    # What is forwarded passes as it arrived: header names carrying an
+                    # underscore are kept, no body size is imposed, a request body and a
+                    # streamed reply are passed on as they are read rather than held,
+                    # and a reply is waited for as long as the gateway itself waits for
+                    # its upstream by default. The Host header is the caller's, so an
+                    # address the gateway composes from the request is the one the
+                    # caller used.
+                    underscores_in_headers on;
+                    client_max_body_size 0;
+                    default_type application/json;
+                    location / {
+                        if ($gateway_route = 0) {
+                            return 403 '{"error": {"message": "This gateway serves its model routes, the model listing, its health checks{{ if $organizations }}, key management and the creating, reading, updating and deleting of organizations{{ else }} and key management{{ end }}, and refuses every other path, the rest of its administrative routes included, without forwarding it.", "type": "invalid_request_error", "param": null, "code": "path_not_served"} }';
+                        }
+                        proxy_pass http://{{ $address }}:{{ $port }};
+                        proxy_http_version 1.1;
+                        proxy_set_header Host $http_host;
+                        proxy_pass_header Server;
+                        proxy_redirect off;
+                        proxy_request_buffering off;
+                        proxy_buffering off;
+                        proxy_read_timeout 6000s;
+                        proxy_send_timeout 6000s;
+                    }
+                }
+            }
