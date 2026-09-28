@@ -1091,12 +1091,13 @@ That digest is what a consumer's `release.lock` pins. When it moves, every lockf
 holding the old one is out of date, and the next build halts instead of rendering:
 
 ```text
-lockfile: out of date; it no longer matches the current catalog: entity
+lockfile: out of date; it no longer matches what its Release resolves to: entity
 "core/datastore/mariadb" changed: lockfile=(1.0.0,sha256:5c2ea291…)
 current=(1.0.0,sha256:2392e621…)
 ```
 
-The halt names the refresh that clears it. Once the consumer's lockfile is
+The halt names the refresh that clears it, an ordinary
+`aggrega pull --release <release>`. Once the consumer's lockfile is
 refreshed the build proceeds and renders output byte-identical to what the old pin
 produced — the rendered output does not change, because the parsed entity did not.
 `aggrega pull --verify` reports the same drift without writing, for a consumer that
