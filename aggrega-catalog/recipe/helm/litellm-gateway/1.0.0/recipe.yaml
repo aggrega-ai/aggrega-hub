@@ -34,7 +34,28 @@ metadata:
     slip an unrecognised field through to the model server, nor send a provider
     key of its own in place of the gateway's, even one it holds legitimately — the
     fields the guard refuses are the ones a caller could otherwise use to send the
-    gateway's credential somewhere it was not meant to go. The bookkeeping
+    gateway's credential somewhere it was not meant to go. The guard sees only the
+    routes that hand it the request, so on every Release the proxy listens on the
+    pod's loopback address alone and a second container, running the official
+    nginx image (BSD-2-Clause), stands in front of it on infra.port, the port the
+    Service targets, as a path allowlist: it forwards only the routes the gateway
+    serves — the chat completions, completions, embeddings, responses, messages,
+    image generation, moderation, transcription and rerank routes the guard
+    checks, in the spellings the gateway serves whatever the model alias; the
+    model listing; the health routes; and, of the administrative routes, key
+    management and the creating, reading, updating and deleting of
+    organizations, which a key naming an organization needs — and answers every
+    other path 403 with nothing forwarded. So the proxy's token-count routes, its
+    pass-through routes to providers' own APIs, its other administrative routes
+    (teams, users, budgets, spend and request logs, and model and configuration
+    management among them) and its administrative console are not reachable
+    through this gateway; a caller that counts tokens does so on its own side.
+    The model routes whose path carries the model name, the engine-style and
+    Azure-style paths, are refused too: on them the proxy reads words in the
+    path, the alias included, to decide how it records a request, so the guard
+    would serve some alias names and refuse others. The allowlist's
+    configuration is a further file of the ConfigMap, and the pod is ready only
+    once a request through it would be served. The bookkeeping
     database connection string is emitted only when infra.database_url is set;
     with none the gateway runs stateless. While a core/context-propagation
     attachment is present, the ConfigMap also carries the request hook that attachment's
@@ -116,6 +137,25 @@ spec:
     # module template renders them into the guard beside the route allowlist. Empty
     # unless the Release sets the key.
     admitted_request_fields: '{{ optional .infra "admitted_request_fields" list | toJson }}'
+    # The path allowlist in front of the gateway. The gateway listens on the
+    # pod's loopback address only, so nothing outside the pod reaches it
+    # directly, and a reverse proxy in a second container listens on
+    # infra.port and forwards only the routes the gateway serves. The address
+    # and the port are read by the gateway's own listen arguments, by the
+    # reverse proxy's forwarding target and by the gateway's probes, so each
+    # has this one home. The loopback port is the one after infra.port, or the
+    # one before it when infra.port is the highest there is, so it never
+    # collides with the port callers reach and adds no rule on infra.port.
+    gateway_address: 127.0.0.1
+    gateway_port: '{{ if eq (int .infra.port) 65535 }}65534{{ else }}{{ add1 (int .infra.port) }}{{ end }}'
+    # The reverse proxy's configuration: the ConfigMap's data key it is carried
+    # under and the file the reverse proxy is pointed at both read this name.
+    path_allowlist_file: path-allowlist.conf
+    # The tag of the official nginx image the reverse proxy runs, the one
+    # core/gateway/nginx defaults to. It is written here rather than taken from
+    # infra, because the reverse proxy is part of how this Recipe realizes the
+    # gateway and no Release setting chooses it.
+    path_allowlist_image_tag: 1.27.5-alpine
     # Published for an attachment's realization to check against, and never
     # emitted. A FeatureRecipe reads this Recipe's locals and not the
     # component's values, so the facts it checks an attachment against are
@@ -125,8 +165,9 @@ spec:
     bookkeeping_database: '{{ if optional .infra "database_url" "" }}true{{ end }}'
   # provides is evaluated before the workload and cannot read it, so the port has
   # one authored home in .infra.port that every reader dereferences — provides.port
-  # and provides.endpoint here, and below the proxy's own listen-port argument, the
-  # container port and the Service; the literal is never repeated. endpoint is the
+  # and provides.endpoint here, and below the path allowlist's listen port, its
+  # container port and the Service, with the proxy's own loopback port derived
+  # from it in the locals; the literal is never repeated. endpoint is the
   # OpenAI-compatible base URL a caller wiring to the gateway reads, assembled
   # from the same host and port as the other keys.
   #
@@ -214,6 +255,12 @@ spec:
     # reply entry's guardrail still refuses a streamed reply before any of it
     # is sent. With no such attachment, neither the module nor the
     # registration is emitted.
+    #
+    # On every Release the ConfigMap also carries the path allowlist's
+    # configuration, as its last data key: the reverse proxy in the pod's second
+    # container is pointed at that file, and the gateway itself reads none of it.
+    # It forwards the routes the gateway serves and answers every other path
+    # with 403, forwarding nothing — below, route by route.
     litellm-gateway-config.configmap.yaml: |
       {{- $identity := false }}
       {{- $listed := list }}
@@ -1137,6 +1184,98 @@ spec:
                       choices=[StreamingChoices(index=index, delta=Delta(**fields))],
                   )
       {{- end }}
+      {{- /* One path segment of a model name or a key in a route below: it opens with a letter or a digit, so no
+        segment is a dot segment, and it carries no percent sign, so nothing in it is decoded further on. */}}
+      {{- $segment := "[A-Za-z0-9][A-Za-z0-9._:@+~-]*" }}
+        {{ .locals.path_allowlist_file }}: |
+          # The path allowlist in front of the gateway. The gateway listens on its
+          # loopback address inside the pod only; this reverse proxy listens on the
+          # port callers reach and forwards a request only when its method and path
+          # are one of the routes the gateway serves, listed below. It matches the
+          # request target exactly as the caller sent it, which is also exactly what
+          # it forwards, so no encoded character, dot segment, doubled slash or change
+          # of letter case can make a refused path look like an allowed one. Every
+          # other request is answered 403 and nothing of it is forwarded.
+          worker_processes 1;
+          error_log /dev/stderr notice;
+          events {
+              worker_connections 4096;
+          }
+          http {
+              access_log /dev/stdout;
+              server_tokens off;
+              map "$request_method $request_uri" $gateway_route {
+                  default 0;
+                  # The request types the gateway's request guard checks, each in
+                  # the spellings the gateway serves whatever the model alias: chat
+                  # completions, completions, embeddings, responses, messages, image
+                  # generation, moderation, transcription and rerank. A spelling
+                  # that carries the model name in its path, as the engine-style and
+                  # Azure-style paths do, is not among them: there the proxy reads
+                  # words in the path, the alias included, to decide how it records
+                  # a request, so the guard would serve some alias names and refuse
+                  # others.
+                  "~^(POST|OPTIONS) /(v1/)?chat/completions(\?|$)" 1;
+                  "~^(POST|OPTIONS) /cursor/chat/completions(\?|$)" 1;
+                  "~^(POST|OPTIONS) /(v1/)?completions(\?|$)" 1;
+                  "~^(POST|OPTIONS) /(v1/)?embeddings(\?|$)" 1;
+                  "~^(POST|OPTIONS) /(v1/|openai/v1/)?responses(\?|$)" 1;
+                  "~^(POST|OPTIONS) /v1/messages(\?|$)" 1;
+                  "~^(POST|OPTIONS) /(v1/)?images/generations(\?|$)" 1;
+                  "~^(POST|OPTIONS) /(v1/)?moderations(\?|$)" 1;
+                  "~^(POST|OPTIONS) /(v1/)?audio/transcriptions(\?|$)" 1;
+                  "~^(POST|OPTIONS) /(v1/|v2/)?rerank(\?|$)" 1;
+                  # The model listing of the OpenAI-compatible API, and one model's
+                  # entry in it. Neither calls an upstream.
+                  "~^(GET|OPTIONS) /(v1/)?models(/{{ $segment }})?(\?|$)" 1;
+                  # Key management, which the gateway guards with its administrative
+                  # key and keeps in its bookkeeping database. None calls an upstream.
+                  "~^(GET|OPTIONS) /key/(info|list|aliases)(\?|$)" 1;
+                  "~^(POST|OPTIONS) /key/(generate|service-account/generate|update|bulk_update|delete|regenerate|block|unblock)(\?|$)" 1;
+                  "~^(POST|OPTIONS) /key/{{ $segment }}/(regenerate|reset_spend)(\?|$)" 1;
+                  "~^(POST|OPTIONS) /(v2/key/info|team/key/bulk_update)(\?|$)" 1;
+                  # Creating, reading, updating and deleting an organization, which a
+                  # key naming an organization needs, since the organization must
+                  # exist before a key can name it. The gateway answers these to its
+                  # administrative key, and reading also to an administrator of that
+                  # organization; none calls an upstream. The listing of
+                  # organizations is not forwarded, because the gateway answers it
+                  # for other keys too.
+                  "~^(POST|OPTIONS) /organization/new(\?|$)" 1;
+                  "~^(GET|OPTIONS) /organization/info(\?|$)" 1;
+                  "~^(PATCH|OPTIONS) /organization/update(\?|$)" 1;
+                  "~^(DELETE|OPTIONS) /organization/delete(\?|$)" 1;
+                  # The health routes the pod's readiness probe and its operators read.
+                  "~^(GET|OPTIONS) /health/(readiness|liveliness)(\?|$)" 1;
+              }
+              server {
+                  listen {{ .infra.port }};
+                  # What is forwarded passes as it arrived: header names carrying an
+                  # underscore are kept, no body size is imposed, a request body and a
+                  # streamed reply are passed on as they are read rather than held,
+                  # and a reply is waited for as long as the gateway itself waits for
+                  # its upstream by default. The Host header is the caller's, so an
+                  # address the gateway composes from the request is the one the
+                  # caller used.
+                  underscores_in_headers on;
+                  client_max_body_size 0;
+                  default_type application/json;
+                  location / {
+                      if ($gateway_route = 0) {
+                          return 403 '{"error": {"message": "This gateway serves its model routes, the model listing, its health checks, key management and the creating, reading, updating and deleting of organizations, and refuses every other path, the rest of its administrative routes included, without forwarding it.", "type": "invalid_request_error", "param": null, "code": "path_not_served"} }';
+                      }
+                      proxy_pass http://{{ .locals.gateway_address }}:{{ .locals.gateway_port }};
+                      proxy_http_version 1.1;
+                      proxy_set_header Host $http_host;
+                      proxy_pass_header Server;
+                      proxy_redirect off;
+                      proxy_request_buffering off;
+                      proxy_buffering off;
+                      proxy_read_timeout 6000s;
+                      proxy_send_timeout 6000s;
+                  }
+              }
+          }
   workload: |
     {{- $configDir := "/etc/litellm" -}}
     {{- $recognizer := false -}}
@@ -1156,13 +1295,18 @@ spec:
         # the entry the emitted ConfigMap shares.
         # The image entrypoint execs the proxy with the container args as its
         # command line, and supplying args replaces the image's own default
-        # arguments — so the listen port is passed here explicitly rather than
-        # inherited, dereferencing its single authored home.
+        # arguments — so the listen address and port are passed here explicitly
+        # rather than inherited, each dereferencing its single authored home.
+        # The proxy listens on the pod's loopback address only: callers reach it
+        # through the path allowlist below, which listens on infra.port, and
+        # nothing outside the pod can reach the proxy past it.
         args:
           - "--config"
           - "{{ $configDir }}/{{ .locals.config_file }}"
+          - "--host"
+          - "{{ .locals.gateway_address }}"
           - "--port"
-          - "{{ .infra.port }}"
+          - "{{ .locals.gateway_port }}"
         # With infra.external_base_url set, PROXY_BASE_URL carries it: the
         # origin the gateway composes its sign-in callback, its admin-console
         # redirect and the address in its alerts from. Unset, it is not emitted
@@ -1209,27 +1353,39 @@ spec:
             from: provider_key
             as: env
     {{- end }}
-        ports:
-          http: {{ .infra.port }}
         # The proxy documents /health/readiness and /health/liveliness as its
         # readiness and liveness contract; neither makes a model call. Readiness
         # fails while a configured bookkeeping database is unreachable. The
         # start-up probe and every timing are the ones the product's own chart
         # gives these probes: readiness is asked for up to 300 s before the
         # liveness probe takes over.
+        #
+        # The proxy declares no port: it listens on the loopback address, which
+        # a probe sent to the pod's own address cannot reach. So its start-up and
+        # liveness probes run inside this container and ask it on the loopback
+        # address, with the interpreter the image runs the proxy with, and a
+        # liveness failure restarts this container — the one that stopped
+        # answering. Readiness is asked through the path allowlist instead, on
+        # its container below, so the pod is ready only once a caller's request
+        # would be served.
         health:
           startup:
-            http: /health/readiness
+            exec:
+              - python3
+              - -I
+              - -S
+              - -c
+              - "import urllib.request; urllib.request.urlopen('http://{{ .locals.gateway_address }}:{{ .locals.gateway_port }}/health/readiness', timeout=4)"
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 30
-          ready:
-            http: /health/readiness
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
           live:
-            http: /health/liveliness
+            exec:
+              - python3
+              - -I
+              - -S
+              - -c
+              - "import urllib.request; urllib.request.urlopen('http://{{ .locals.gateway_address }}:{{ .locals.gateway_port }}/health/liveliness', timeout=4)"
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 5
@@ -1247,6 +1403,44 @@ spec:
         volumeMounts:
           - name: config
             path: "{{ $configDir }}"
+      # The path allowlist: the official nginx image, configured only by the
+      # file the ConfigMap carries, run in the foreground in place of the image's
+      # own start-up scripts, which would edit a configuration this container
+      # does not use. It listens on infra.port, the port the Service targets, and
+      # forwards the routes the gateway serves to the proxy on the loopback
+      # address; every other path is answered 403 with nothing forwarded. Its
+      # readiness probe asks the proxy's readiness route through it, so a pod
+      # whose proxy or allowlist is not answering takes no traffic. The
+      # resources are sized for its one worker process relaying requests over
+      # the loopback address, and set as both request and limit, as the proxy's
+      # are, so the pod keeps the same resource class it has with the proxy alone.
+      path-allowlist:
+        image: "nginx:{{ .locals.path_allowlist_image_tag }}"
+        command:
+          - nginx
+          - -c
+          - "{{ $configDir }}/{{ .locals.path_allowlist_file }}"
+          - -g
+          - "daemon off;"
+        ports:
+          http: {{ .infra.port }}
+        health:
+          ready:
+            http: /health/readiness
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: 250m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 128Mi
+        volumeMounts:
+          - name: config
+            path: "{{ $configDir }}"
+            readonly: true
     volumes:
       config:
         configmap:
