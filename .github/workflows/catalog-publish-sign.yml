@@ -6,13 +6,40 @@ name: Publish and sign catalog
 # here: the Plugin kind is generated and published by the CLI-tag pipeline, not
 # from this repository, and the publish script already excludes it.
 #
-# NOT YET LIVE. The destination registry, its pull/push credentials, the tooling
-# image tag, and the self-hosted runner are all operator-configured and are not
-# wired here. Until they exist this workflow is
-# authored but unexercised — it has never run against a real registry. The
-# manual-dispatch entry defaults to a dry run, so an unconfigured or accidental
-# invocation prints what it would do without publishing, signing, or moving the
-# marker.
+# Two jobs, in this order:
+#
+#   registry      checks, before anything is selected, that the registry accepts
+#                 the stored credential (one authenticated GET /v2/, which pushes
+#                 nothing and opens no upload session), then that the tooling
+#                 image the publish job runs inside exists, waiting a bounded
+#                 time for it. It runs on a GitHub-hosted runner, so a wait for
+#                 the image never holds the runner the CLI's own publisher needs
+#                 to publish that image.
+#   publish-sign  runs inside the tooling image, publishes and signs the
+#                 selected entities, and advances the publish marker.
+#
+# The credential check runs on every run, a dry run included, so a manual dry
+# run is also how to prove that the stored credential matches the registry. The
+# manual-dispatch entry defaults to a dry run: once the registry job passes, it
+# prints the reference set it would push and the sign command, publishing,
+# signing and moving nothing.
+#
+# The first publish into an empty registry, including one emptied by a reinstall
+# while the marker tag remains, is a manual run with mode=full and
+# dry_run=false, which publishes the whole catalog and establishes the marker:
+#   gh workflow run catalog-publish-sign.yml -f mode=full -f dry_run=false
+# A differential run with no marker tag halts and says so; one from a marker
+# left over from before the registry was emptied publishes only what changed
+# after it.
+#
+# Settings, by name:
+#   variables  CATALOG_REGISTRY   the registry to publish to, as its host
+#              REGISTRY_USERNAME  the registry username
+#              TOOLING_IMAGE_TAG  the tag of the tooling image the publish job
+#                                 runs inside, such as stable
+#              AGGREGA_RUNNER     the runner label for the publish job
+#                                 (optional, a hosted runner by default)
+#   secrets    REGISTRY_PASSWORD  the registry password
 
 on:
   # A merge that lands catalog changes publishes them (a real, non-dry-run
@@ -25,7 +52,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Compute and print the reference set (and the sign command) without any publish, signing, or marker move."
+        description: "Check the stored registry credential, then compute and print the reference set (and the sign command) without any publish, signing, or marker move."
         required: false
         default: true
         type: boolean
@@ -47,8 +74,81 @@ permissions:
   contents: write
   id-token: write
 
+env:
+  # Destination registry host. A repository variable the operator sets once;
+  # the placeholder default names a host that never resolves, so an unset
+  # variable fails the credential check, which names the variable.
+  REGISTRY: ${{ vars.CATALOG_REGISTRY || 'registry.invalid' }}
+
 jobs:
+  registry:
+    # A job of its own, because the publish job runs inside the tooling image and
+    # the runner pulls a job's container image before any of its steps run: a
+    # missing image or a refused credential would fail that job before a step
+    # could say what to fix. Here each is checked by a step whose failure names
+    # the setting to check. It runs on a GitHub-hosted runner, so waiting for the
+    # image runs beside the CLI's publisher, which creates the image, rather than
+    # holding the runner that publisher needs. It reads the repository and
+    # writes nothing.
+    runs-on: ubuntu-latest
+    # The image wait below gives up after 30 minutes; this bounds the job even
+    # if a request hangs.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Read by registry-gate.sh from the environment, never placed on a
+      # command line.
+      REGISTRY_USERNAME: ${{ vars.REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Check out the registry gate script
+        # The gate script under .github/scripts is all this job reads from the
+        # repository.
+        uses: actions/checkout@v4
+
+      - name: Check the stored registry credential
+        # One GET /v2/ with the stored credential; anything but 200 fails,
+        # naming the settings to check and reporting only the HTTP status. An
+        # empty password or username is refused before any request.
+        run: |
+          .github/scripts/registry-gate.sh credential \
+            --registry-url "https://$REGISTRY" \
+            --registry-setting CATALOG_REGISTRY \
+            --username-setting REGISTRY_USERNAME \
+            --password-setting REGISTRY_PASSWORD
+
+      - name: Wait for the tooling image
+        # The publish job runs inside hub.aggrega.ai/tools/aggrega, which only
+        # the CLI's release publisher creates. Release tags pushed together
+        # start the publishers within seconds of each other, so on an empty
+        # registry this waits for the image: a check every 30 seconds for at
+        # most 30 minutes, long enough for a CLI publish started at the same
+        # moment, or queued behind one other job on the runner, to reach the
+        # step that pushes the image. A refused credential is not retried. On a
+        # timeout the failure names the missing image and the re-run that
+        # finishes the job once the CLI is published.
+        id: image
+        env:
+          TOOLING_IMAGE_TAG: ${{ vars.TOOLING_IMAGE_TAG }}
+        run: |
+          .github/scripts/registry-gate.sh image \
+            --registry-url https://hub.aggrega.ai \
+            --repository tools/aggrega \
+            --tag "$TOOLING_IMAGE_TAG" \
+            --tag-setting TOOLING_IMAGE_TAG \
+            --username-setting REGISTRY_USERNAME \
+            --password-setting REGISTRY_PASSWORD \
+            --timeout 1800 \
+            --interval 30
+
   publish-sign:
+    needs: registry
     # Configurable runner label. The default hosted runner is fine for a light
     # catalog diff; point the AGGREGA_RUNNER repository variable at a
     # self-hosted label to move heavy work off metered hosted minutes.
@@ -77,10 +177,11 @@ jobs:
     # PIN SEAM — the tooling-image tag comes from the TOOLING_IMAGE_TAG
     # repository variable, which the operator sets once (for example, to
     # `stable`, the moving tag the publisher points at the most recently
-    # published image). The job derives its execution image from exactly this
-    # line; the registry-and-name prefix is fixed and only the tag is
-    # operator-set. An unset variable yields an empty tag, which cannot resolve
-    # a real image.
+    # published image). The registry job composes the execution image from the
+    # fixed registry-and-name prefix hub.aggrega.ai/tools/aggrega and that tag,
+    # and hands it to this job once the image exists; only the tag is
+    # operator-set. An unset variable fails the registry job, which names the
+    # variable.
     #
     # Tracking the moving `stable` tag means a newly published tooling image is
     # adopted on the next run without editing this file. The ABI-compatibility
@@ -93,15 +194,12 @@ jobs:
     # The registry is authenticated even on pull, so the image is pulled with the
     # same registry credentials used to push.
     container:
-      image: hub.aggrega.ai/tools/aggrega:${{ vars.TOOLING_IMAGE_TAG }}
+      image: ${{ needs.registry.outputs.image }}
       credentials:
         username: ${{ vars.REGISTRY_USERNAME }}
         password: ${{ secrets.REGISTRY_PASSWORD }}
 
     env:
-      # Destination registry host:port. A repository variable the operator sets
-      # once; the placeholder default cannot publish anywhere real.
-      REGISTRY: ${{ vars.CATALOG_REGISTRY || 'registry.invalid:0' }}
       # Registry credentials — needed on EVERY job because the registry is
       # authenticated on push AND pull. Read via the environment (not
       # interpolated into a run script) to avoid expression injection. The
@@ -156,8 +254,9 @@ jobs:
         run: scripts/check-tooling-abi.sh
 
       - name: Authenticate to the registry
-        # Only a real publish contacts the registry. A dry run does no network,
-        # so it skips login and stays runnable without live credentials.
+        # Only a real publish logs in. A dry run contacts the registry only to
+        # check the credential, find the tooling image and pull it, none of
+        # which reads a stored login.
         if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
         run: |
           # login reads the password from AGGREGA_REGISTRY_PASSWORD; the username

@@ -267,10 +267,20 @@ else
   # renamed (present-on-disk) files and drops deletions — a removed entity has
   # nothing to push and retirement is a separate concern.
   if ! base="$(marker_read)"; then
-    echo "publish-diff: marker tag '$MARKER' not found." >&2
-    echo "  This looks like a first publish. Run with --full to publish the whole" >&2
-    echo "  catalog and establish the marker, or create the tag manually:" >&2
-    echo "    git -C '$HUB_ROOT' tag $MARKER <baseline-commit>" >&2
+    echo "publish-diff: marker tag '$MARKER' not found, so a differential run has no commit to diff from." >&2
+    echo "  The first publish into an empty registry, including one emptied since the catalog was" >&2
+    echo "  last published, is an explicit full run: it publishes the whole catalog and" >&2
+    echo "  establishes the marker." >&2
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+      echo "  Start one by dispatching the catalog publish workflow in full mode:" >&2
+      echo "    gh workflow run catalog-publish-sign.yml${GITHUB_REPOSITORY:+ --repo $GITHUB_REPOSITORY} -f mode=full -f dry_run=false" >&2
+    else
+      echo "  Start one by running this script again with --full added to its options, for example:" >&2
+      echo "    $0 --full --registry $REGISTRY" >&2
+    fi
+    echo "  Create the marker tag by hand only when the registry already holds the catalog as of" >&2
+    echo "  the commit you tag, because a diff from that tag publishes only what changed after it:" >&2
+    echo "    git -C '$HUB_ROOT' tag $MARKER <commit-the-registry-holds>" >&2
     exit 1
   fi
   # git diff emits repo-relative paths; make them absolute for push + peeking.
