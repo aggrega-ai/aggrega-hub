@@ -437,23 +437,37 @@ spec:
           JSON value by value and any other result as one text; and it masks the
           request fields that guardrail does not read, in _mask_request_fields.
           {{ .locals.field_pattern_masking_class }} masks with the listed patterns the same tool calls,
-          tool results and fields a request carries, and a reply's tool calls,
-          beside the gateway's own content filter, which masks the text of the
-          messages and which the configuration keeps off the chat route's tool turns
-          on requests. In a streamed chat reply it holds the tool-call parts until
-          the choice they belong to finishes and sends them masked, in one piece,
-          just before the chunk that finishes it.
+          tool results and fields a request carries, and a reply's tool calls and
+          the parts _mask_reply_parts names, beside the gateway's own content filter,
+          which masks the text of the messages and which the configuration keeps off
+          the chat route's tool turns on requests. In a streamed chat reply it holds
+          the tool-call parts until the choice they belong to finishes and sends them
+          masked, in one piece, just before the chunk that finishes it.
           {{ .locals.reply_masking_class }} and {{ .locals.buffered_reply_masking_class }} mask a reply: its text,
           through the gateway's own handler for its kind of reply, its tool-call
-          arguments, and, unless the entry sets mask_reasoning to false, its
-          reasoning text, in the fields _mask_reasoning names. They differ on a
-          streamed reply, whose masking the gateway would otherwise do in a way that
-          passes the reply on unmasked when a recognizer cannot be reached.
+          arguments, the parts _mask_reply_parts names, and, unless the entry sets
+          mask_reasoning to false, its reasoning text, in the fields _mask_reasoning
+          names. They differ on a streamed reply, whose masking the gateway would
+          otherwise do in a way that passes the reply on unmasked when a recognizer
+          cannot be reached.
           {{ .locals.reply_masking_class }} refuses a streamed reply before any of it is sent; the request
           guard has already refused a request asking for one.
           {{ .locals.buffered_reply_masking_class }} holds a streamed reply until all of it has arrived,
-          masks it as one piece and sends it as one piece; when anything about that
-          fails, it refuses the request before any of the reply is sent.
+          masks it as one piece and sends it as one piece; when masking it fails, it
+          refuses the request before any of the reply is sent, and an error the
+          provider raises while the reply arrives reaches the caller as that error.
+          A reply also carries parts its model or provider adds on its own: a refusal,
+          citations and annotations, a web search's query and its results, and fields
+          under names of the provider's own, on the reply, a choice, a message or a
+          streamed chunk, or as an output item or a content block of a kind of its
+          own. Where an entry masks replies, _mask_reply_parts masks every string in
+          them, value by value, and leaves as they are the words that say what a part
+          is, the identifiers that tie parts together and a provider's encrypted
+          tokens; in a streamed chat reply masked by pattern, a chunk's parts are
+          masked as the chunk passes. And an error the model call raises reaches the
+          caller without the message the provider wrote in it, which can quote text
+          the masking never saw: the message is replaced on the exception the gateway
+          answers from, and the error keeps its status code and its type.
           Tool-call arguments are masked value by value, never as one text: they are
           read as JSON, every string value at any depth and every number whose
           digits are recognized or matched are masked, the keys are not, and the
@@ -466,11 +480,14 @@ spec:
           """
           import json
 
+          import openai
           from fastapi import HTTPException
           from litellm.llms.base_llm.base_model_iterator import convert_model_response_to_streaming
+          from litellm.llms.base_llm.chat.transformation import BaseLLMException
           from litellm.main import stream_chunk_builder
           from litellm.proxy.guardrails.guardrail_hooks.litellm_content_filter.content_filter import ContentFilterGuardrail
           from litellm.proxy.guardrails.guardrail_hooks.presidio import _OPTIONAL_PresidioPIIMasking
+          from litellm.types.guardrails import GuardrailEventHooks
           from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices
 
           STREAM_REFUSED = (
@@ -496,6 +513,12 @@ spec:
               "The reply's tool calls were not sent: the model returned tool-call arguments "
               "that are not JSON, and this gateway masks tool-call arguments only value by "
               "value, so it sends none of them. The text of the reply before them was sent."
+          )
+
+          PROVIDER_ERROR_WITHHELD = (
+              "The call to the model failed{status}. This gateway masks sensitive text in its "
+              "replies, so it does not pass on the message the model provider returned with "
+              "the error, which can quote text from the request or from the reply."
           )
 
 
@@ -780,6 +803,123 @@ spec:
               await _mask_caller_metadata(request, mask)
 
 
+          # The reasoning fields of a chat reply's message, and their copies among its
+          # provider-specific fields, which _mask_reasoning masks unless mask_reasoning is false.
+          _REASONING = frozenset(["reasoning_content", "reasoning", "thinking_blocks", "reasoning_items"])
+
+          # The fields of a reply, of its choices and of its messages that are not parts
+          # _mask_reply_parts masks: the reply's own identifiers and bookkeeping; its text and its
+          # tool calls, masked by the gateway's own handler and by _mask_tool_call_arguments; its
+          # reasoning; its audio and its token probabilities, whose request options the request
+          # guard refuses while replies are masked; and its images, which are not text.
+          _REPLY_OWN = frozenset(["id", "object", "created", "model", "system_fingerprint", "choices", "usage", "service_tier"])
+          _CHOICE_OWN = frozenset(["index", "finish_reason", "message", "delta", "logprobs", "text"])
+          _MESSAGE_OWN = frozenset(["content", "role", "tool_calls", "function_call", "audio", "images", "provider_specific_fields"]) | _REASONING
+          _MESSAGES_REPLY_OWN = frozenset(["id", "type", "role", "model", "content", "stop_reason", "stop_sequence", "usage"])
+
+          # Inside a part: the words that say what it is, the identifiers that tie parts together,
+          # and a provider's encrypted tokens, which a client hands back exactly as they came.
+          _PART_OWN = frozenset(["type", "id", "call_id", "tool_use_id", "status", "signature", "encrypted_content", "encrypted_index"])
+          _TEXT_PART_OWN = _PART_OWN | frozenset(["text", "logprobs"])
+
+
+          def _names(holder):
+              if isinstance(holder, dict):
+                  return list(holder)
+              dump = getattr(holder, "model_dump", None)
+              return list(dump()) if dump is not None else []
+
+
+          async def _masked_part(value, mask):
+              # Every string at any depth is masked, one by one, and no key is; the fields in
+              # _PART_OWN are left as they are.
+              if isinstance(value, dict):
+                  return {key: item if key in _PART_OWN else await _masked_part(item, mask) for key, item in value.items()}
+              if isinstance(value, (list, tuple)):
+                  return [await _masked_part(item, mask) for item in value]
+              if isinstance(value, str):
+                  return await mask(value) if value else value
+              if getattr(value, "model_dump", None) is not None:
+                  await _mask_fields(value, _PART_OWN, mask)
+              return value
+
+
+          async def _mask_fields(holder, own, mask):
+              # Every field of the holder but the ones named in own, whatever the field is called.
+              for name in _names(holder):
+                  if name not in own:
+                      value = _field(holder, name)
+                      if value is not None:
+                          _set_field(holder, name, await _masked_part(value, mask))
+
+
+          async def _mask_reply_parts(reply, mask):
+              # The parts of a reply its model or provider adds beside its text, its tool calls and
+              # its reasoning, in each shape the gateway's routes return: a refusal, citations and
+              # annotations, a web search's query and its results, and every field of a name of the
+              # provider's own, on the reply, a choice, a message or a streamed chunk, or as an
+              # output item or a content block of a kind of its own.
+              if isinstance(reply, dict) and reply.get("type") == "message":
+                  # A reply on the messages route: a text block's citations, and every block other
+                  # than text, tool use and thinking, a web search's call and results among them.
+                  await _mask_fields(reply, _MESSAGES_REPLY_OWN, mask)
+                  for block in reply.get("content") or []:
+                      kind = _field(block, "type")
+                      if kind == "text":
+                          await _mask_fields(block, _TEXT_PART_OWN, mask)
+                      elif kind not in ("tool_use", "thinking", "redacted_thinking"):
+                          await _mask_fields(block, _PART_OWN, mask)
+                  return
+              output = _field(reply, "output")
+              if isinstance(output, list):
+                  # A reply on the responses route: the fields its own type does not declare, a
+                  # message's refusal and the annotations of its text, and every item other than a
+                  # message, a function call and reasoning, a web search call among them.
+                  declared = frozenset(getattr(type(reply), "model_fields", None) or ["id", "object", "created_at", "status", "model", "output", "usage"])
+                  await _mask_fields(reply, declared, mask)
+                  for item in output:
+                      kind = _field(item, "type")
+                      if kind == "message":
+                          for part in _field(item, "content") or []:
+                              await _mask_fields(part, _TEXT_PART_OWN if _field(part, "type") == "output_text" else _PART_OWN, mask)
+                      elif kind not in ("function_call", "reasoning"):
+                          await _mask_fields(item, _PART_OWN, mask)
+                  return
+              choices = _field(reply, "choices")
+              if not isinstance(choices, list):
+                  return
+              # A chat reply, one piece or a streamed chunk, or a completion.
+              await _mask_fields(reply, _REPLY_OWN, mask)
+              for choice in choices:
+                  await _mask_fields(choice, _CHOICE_OWN, mask)
+                  for name in ("message", "delta"):
+                      holder = _field(choice, name)
+                      if holder is None:
+                          continue
+                      await _mask_fields(holder, _MESSAGE_OWN, mask)
+                      specific = _field(holder, "provider_specific_fields")
+                      if isinstance(specific, dict):
+                          await _mask_fields(specific, _REASONING, mask)
+
+
+          def _withhold_provider_message(exception):
+              # An error the call to the model raised carries the message the provider answered
+              # with, which can quote text the masking never saw: the gateway's own error for a
+              # provider's answer, or, on the messages route, the provider's error as it came. The
+              # message is replaced on the exception itself, which every route the gateway serves
+              # reads when it answers with the error, and the error keeps its status code, type and
+              # code.
+              # An error the gateway raises itself, such as a refusal of the request guard's or a
+              # recognizer that cannot be reached, is not one of these and keeps its message.
+              if not isinstance(exception, (openai.APIError, BaseLLMException)):
+                  return
+              status = getattr(exception, "status_code", None)
+              exception.message = PROVIDER_ERROR_WITHHELD.format(status=" with HTTP " + str(status) if status else "")
+              exception.args = (exception.message,)
+              if getattr(exception, "provider_specific_fields", None):
+                  exception.provider_specific_fields = None
+
+
           def _masker(guardrail, request_data):
               config = guardrail.get_presidio_settings_from_request_data(request_data or {})
 
@@ -832,6 +972,7 @@ spec:
                   # The reply's text is masked through the gateway's own handler for its
                   # kind of reply, which is the path the built-in guardrail takes; then
                   # its tool-call arguments, which that handler passes on as they came;
+                  # then the parts _mask_reply_parts names, which it does not read either;
                   # then its reasoning text, in the fields _mask_reasoning names.
                   from litellm.proxy.utils import unified_guardrail
 
@@ -842,9 +983,17 @@ spec:
                   if masked is not None:
                       response = masked
                   await self._mask_tool_calls(response, data)
+                  await _mask_reply_parts(response, _masker(self, data))
                   if self.mask_reasoning:
                       await self._mask_reasoning(response, data)
                   return response
+
+              async def async_post_call_failure_hook(self, request_data, original_exception, user_api_key_dict, traceback_str=None):
+                  # While this entry masks replies, an error the call to the model raised
+                  # reaches the caller without the message the provider returned with it.
+                  if self.should_run_guardrail(data=request_data or {}, event_type=GuardrailEventHooks.post_call):
+                      _withhold_provider_message(original_exception)
+                  return None
 
               async def _mask_tool_calls(self, reply, request_data):
                   try:
@@ -916,13 +1065,16 @@ spec:
                   # found over the whole text and a piece sent early could carry part of
                   # one. Nothing is yielded until all of it is masked, and any failure is
                   # raised before that one yield, while the gateway can still answer with
-                  # an error rather than with part of a reply.
+                  # an error rather than with part of a reply. An error the provider raises
+                  # while the reply arrives is raised as it came, so the gateway answers
+                  # with that error, and without the provider's message.
+                  chunks = []
+                  async for chunk in response:
+                      chunks.append(chunk)
                   try:
-                      chunks = []
-                      async for chunk in response:
+                      for chunk in chunks:
                           if not isinstance(chunk, ModelResponseStream):
                               raise ValueError("the reply arrives as " + type(chunk).__name__ + " pieces, which are not masked")
-                          chunks.append(chunk)
                       if not chunks:
                           return
                       whole = stream_chunk_builder(chunks=chunks, messages=request_data.get("messages"))
@@ -943,6 +1095,7 @@ spec:
                       for message, name, value in held:
                           setattr(message, name, value)
                       await self._mask_tool_calls(whole, request_data)
+                      await _mask_reply_parts(whole, _masker(self, request_data))
                       if self.mask_reasoning:
                           await self._mask_reasoning(whole, request_data)
                       masked = convert_model_response_to_streaming(whole)
@@ -1006,10 +1159,10 @@ spec:
               # Masks with the entry's listed patterns, through the content filter's own
               # masking of one text, what the gateway's own content filter entry beside it does
               # not read: the tool calls a request's earlier turns carry, the results of them,
-              # and the request fields _mask_request_fields names; and a reply's tool calls.
-              # That entry masks the text of the messages. This class does not declare
-              # apply_guardrail itself, so the gateway hands it the whole request and the whole
-              # reply.
+              # and the request fields _mask_request_fields names; and a reply's tool calls and
+              # the parts _mask_reply_parts names. That entry masks the text of the messages.
+              # This class does not declare apply_guardrail itself, so the gateway hands it the
+              # whole request and the whole reply.
 
               async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
                   mask = _pattern_masker(self)
@@ -1026,7 +1179,15 @@ spec:
                       await _mask_tool_call_arguments(response, _pattern_masker(self))
                   except NotJson:
                       raise NotJson(REPLY_NOT_JSON) from None
+                  await _mask_reply_parts(response, _pattern_masker(self))
                   return response
+
+              async def async_post_call_failure_hook(self, request_data, original_exception, user_api_key_dict, traceback_str=None):
+                  # While this entry masks replies, an error the call to the model raised
+                  # reaches the caller without the message the provider returned with it.
+                  if self.should_run_guardrail(data=request_data or {}, event_type=GuardrailEventHooks.post_call):
+                      _withhold_provider_message(original_exception)
+                  return None
 
               async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data):
                   # The content filter masks a streamed reply's text as it streams and never its
@@ -1034,10 +1195,12 @@ spec:
                   # and when the choice they belong to finishes they are masked whole, value by
                   # value, and sent in one piece just before the chunk that finishes it. When
                   # their arguments are not JSON none of them is sent, and the stream ends with
-                  # an error after the text already sent.
+                  # an error after the text already sent. The parts _mask_reply_parts names are
+                  # masked in each chunk as it passes.
                   held = {}
                   async for chunk in response:
                       if isinstance(chunk, ModelResponseStream):
+                          await _mask_reply_parts(chunk, _pattern_masker(self))
                           for choice in chunk.choices or []:
                               delta = getattr(choice, "delta", None)
                               if delta is not None and (getattr(delta, "tool_calls", None) or getattr(delta, "function_call", None)):
