@@ -464,10 +464,14 @@ spec:
           them, value by value, and leaves as they are the words that say what a part
           is, the identifiers that tie parts together and a provider's encrypted
           tokens; in a streamed chat reply masked by pattern, a chunk's parts are
-          masked as the chunk passes. And an error the model call raises reaches the
-          caller without the message the provider wrote in it, which can quote text
-          the masking never saw: the message is replaced on the exception the gateway
-          answers from, and the error keeps its status code and its type.
+          masked as the chunk passes. What masking cannot read — spoken audio and its
+          transcript, an image, and the probabilities of the tokens the model chose —
+          is withheld: _withhold_unreadable takes it out of the reply, one piece or
+          streamed, and the caller receives the rest. And an error the model call
+          raises reaches the caller without the message the provider wrote in it,
+          which can quote text the masking never saw: the message is replaced on the
+          exception the gateway answers from, and the error keeps its status code and
+          its type.
           Tool-call arguments are masked value by value, never as one text: they are
           read as JSON, every string value at any depth and every number whose
           digits are recognized or matched are masked, the keys are not, and the
@@ -810,8 +814,8 @@ spec:
           # The fields of a reply, of its choices and of its messages that are not parts
           # _mask_reply_parts masks: the reply's own identifiers and bookkeeping; its text and its
           # tool calls, masked by the gateway's own handler and by _mask_tool_call_arguments; its
-          # reasoning; its audio and its token probabilities, whose request options the request
-          # guard refuses while replies are masked; and its images, which are not text.
+          # reasoning; and its audio, its images and its token probabilities, which masking cannot
+          # read and _withhold_unreadable takes out of the reply instead.
           _REPLY_OWN = frozenset(["id", "object", "created", "model", "system_fingerprint", "choices", "usage", "service_tier"])
           _CHOICE_OWN = frozenset(["index", "finish_reason", "message", "delta", "logprobs", "text"])
           _MESSAGE_OWN = frozenset(["content", "role", "tool_calls", "function_call", "audio", "images", "provider_specific_fields"]) | _REASONING
@@ -853,12 +857,51 @@ spec:
                           _set_field(holder, name, await _masked_part(value, mask))
 
 
+          def _withhold(holder, name):
+              if holder is not None and _field(holder, name) is not None:
+                  _set_field(holder, name, None)
+
+
+          def _withhold_unreadable(reply):
+              # What a reply carries that masking text cannot read: spoken audio and its transcript,
+              # an image, and the probabilities of the tokens the model chose, which carry those
+              # tokens and their alternatives. The request guard refuses the options that ask for them
+              # while replies are masked, so what arrives came unasked, and it is taken out of the
+              # reply rather than passed on: a chat reply's or a streamed chunk's audio and images
+              # and each choice's token probabilities, a completion's token probabilities, the result
+              # of a responses reply's image generation and the token probabilities of its text, and
+              # an image block of a reply on the messages route.
+              if isinstance(reply, dict) and reply.get("type") == "message":
+                  content = reply.get("content")
+                  if isinstance(content, list):
+                      reply["content"] = [block for block in content if _field(block, "type") != "image"]
+                  return
+              output = _field(reply, "output")
+              if isinstance(output, list):
+                  for item in output:
+                      kind = _field(item, "type")
+                      if kind == "image_generation_call":
+                          _withhold(item, "result")
+                      elif kind == "message":
+                          for part in _field(item, "content") or []:
+                              _withhold(part, "logprobs")
+                  return
+              for choice in _field(reply, "choices") or []:
+                  _withhold(choice, "logprobs")
+                  for name in ("message", "delta"):
+                      holder = _field(choice, name)
+                      _withhold(holder, "audio")
+                      _withhold(holder, "images")
+
+
           async def _mask_reply_parts(reply, mask):
               # The parts of a reply its model or provider adds beside its text, its tool calls and
               # its reasoning, in each shape the gateway's routes return: a refusal, citations and
               # annotations, a web search's query and its results, and every field of a name of the
               # provider's own, on the reply, a choice, a message or a streamed chunk, or as an
-              # output item or a content block of a kind of its own.
+              # output item or a content block of a kind of its own. What masking cannot read is
+              # withheld first.
+              _withhold_unreadable(reply)
               if isinstance(reply, dict) and reply.get("type") == "message":
                   # A reply on the messages route: a text block's citations, and every block other
                   # than text, tool use and thinking, a web search's call and results among them.
