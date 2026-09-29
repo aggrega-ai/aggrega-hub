@@ -21,7 +21,43 @@ metadata:
     optional provider_key slot is attached the upstream credential reaches the
     proxy the same way, under the variable named in values.provider_key_variable,
     and the configuration body names that variable rather than carrying the
-    credential. The bookkeeping database connection string is emitted only when
+    credential. On every Release a second ConfigMap carries a request-guard
+    module, mounted in a directory of its own beside the configuration's and
+    registered under litellm_settings.callbacks, so it runs before the proxy
+    forwards a request: it forwards only the request fields the proxy declares
+    for the route the request took, plus any the Release names in
+    infra.admitted_request_fields, and refuses the rest with an error naming the
+    field, forwarding nothing. So a caller cannot point the proxy at an address
+    of its own through a request-body model list, inject an upstream header, or
+    slip an unrecognised field through to the model server, nor send a provider
+    key of its own in place of the proxy's, even one it holds legitimately — the
+    fields the guard refuses are the ones a caller could otherwise use to send
+    the proxy's credential somewhere it was not meant to go. The guard sees only
+    the routes that hand it the request, so on every Release the proxy listens on
+    the pod's loopback address alone and a second container, running the
+    official nginx image (BSD-2-Clause), stands in front of it on infra.port, the
+    port the Service targets, as a path allowlist: it forwards only the routes
+    the proxy serves — the chat completions, completions, embeddings, responses,
+    messages, image generation, moderation, transcription and rerank routes the
+    guard checks, in the spellings the proxy serves whatever the model alias; the
+    model listing; the health routes; and, of the administrative routes, key
+    management — and answers every other path 403 with nothing forwarded. So the
+    proxy's token-count routes, its pass-through routes to providers' own APIs,
+    its other administrative routes (organizations, teams, users, budgets, spend
+    and request logs, and model and configuration management among them) and its
+    administrative console are not reachable through this Recipe's Service; a
+    caller that counts tokens does so on its own side. The model routes whose
+    path carries the model name, the engine-style and Azure-style paths, are
+    refused too: on them the proxy reads words in the path, the alias included,
+    to decide how it records a request, so the guard would serve some alias names
+    and refuse others. The allowlist's configuration is the other file of that
+    second ConfigMap, and the pod is ready only once a request through it would
+    be served. The guard and the allowlist come from the
+    LiteLLMGuard#/artifacts/RequestGuard bundle, which the Helm Recipe of
+    core/gateway/litellm imports as well, so the line they draw has one text in
+    both; the bundle stops the build when a name, an address or a port it shares
+    with this Recipe's configuration and workload differs from its own. The
+    bookkeeping database connection string is emitted only when
     infra.database_url is set; with none the proxy runs stateless. The proxy's
     public origin is emitted as PROXY_BASE_URL only when infra.external_base_url
     is set, and the build halts when that address carries a path.
@@ -48,12 +84,60 @@ spec:
   locals:
     config_file: config.yaml
     config_map_name: "{{ .context.instance_id }}-config"
+    # The request-guard module, delivered on every Release by the LiteLLMGuard
+    # bundle imported below: the file it is carried as and the callback the
+    # configuration registers both read this name. The bundle holds the name as
+    # well, and stops the build when this local differs from it, so the file and
+    # its registration cannot disagree. The fields the guard refuses on every
+    # Release, and the check that a Release does not admit one of them, are the
+    # bundle's, not this Recipe's.
+    request_filter_module: request_field_filter
+    # The path allowlist in front of the proxy. The proxy listens on the pod's
+    # loopback address only, so nothing outside the pod reaches it directly, and
+    # a reverse proxy in a second container listens on infra.port and forwards
+    # only the routes the proxy serves. The address and the port are read by the
+    # proxy's own listen arguments and by its probes, and the reverse proxy's
+    # forwarding target, which the bundle writes, is the same address and port:
+    # the bundle holds the address and computes the port from infra.port by the
+    # same rule, and stops the build when either local differs. The two locals
+    # carry the names the bundle reads them by. The loopback port is the one
+    # after infra.port, or the one before it when infra.port is the highest there
+    # is, so it never collides with the port callers reach and adds no rule on
+    # infra.port.
+    gateway_address: 127.0.0.1
+    gateway_port: '{{ if eq (int .infra.port) 65535 }}65534{{ else }}{{ add1 (int .infra.port) }}{{ end }}'
+    # The reverse proxy's configuration: the file the bundle carries it as and
+    # the file the reverse proxy is pointed at both read this name, which the
+    # bundle holds as well and checks this local against.
+    path_allowlist_file: path-allowlist.conf
+    # The tag of the official nginx image the reverse proxy runs, the one
+    # core/gateway/nginx defaults to. It is written here rather than taken from
+    # infra, because the reverse proxy is part of how this Recipe realizes the
+    # proxy and no Release setting chooses it.
+    path_allowlist_image_tag: 1.27.5-alpine
+    # The bundle's ConfigMap: the name it is emitted under, which the workload's
+    # volume sources and the bundle checks this local against, and the directory
+    # both containers mount it at. That directory is one of its own, beside the
+    # configuration's rather than inside it, so no mount sits within another
+    # ConfigMap's directory, and the configuration registers the guard by the
+    # full path of its file there. The proxy reads a registration's last dot as
+    # the one before the hook's name and every other dot as a directory
+    # separator, so this path carries no dot.
+    request_guard_config_map_name: "{{ .context.instance_id }}-request-guard"
+    request_guard_dir: /etc/litellm-request-guard
+    # Whether the reverse proxy forwards the routes that create, read, update and
+    # delete an organization, as "true" or "false"; the bundle reads it. Off
+    # here: nothing this component offers reads a key's organization, so those
+    # routes are refused like the rest of the administrative routes.
+    forward_organization_routes: "false"
   # provides is evaluated before the workload and cannot read it, so the port has
   # one authored home in .infra.port that every reader dereferences — provides.port
-  # and provides.endpoint here, and below the proxy's own listen-port argument, the
-  # container port and the Service; the literal is never repeated. endpoint is the
-  # OpenAI-compatible base URL an ai-agent consumer reads (mapped to
-  # OPENAI_BASE_URL), assembled from the same host and port as the other keys.
+  # and provides.endpoint here, the path allowlist's listen port, which the
+  # bundle writes, and below its container port and the Service, with the
+  # proxy's own loopback port derived from it in the locals; the literal is
+  # never repeated. endpoint is the OpenAI-compatible base URL an ai-agent
+  # consumer reads (mapped to OPENAI_BASE_URL), assembled from the same host and
+  # port as the other keys.
   #
   # host and endpoint spell the Service name out twice on purpose. A provides
   # entry cannot read another provides entry, and the name has to match the
@@ -79,20 +163,20 @@ spec:
       {{- end -}}
       {{- end -}}
   artifacts:
-    # The proxy's configuration body. This body is deliberately near-duplicated
-    # by the compose recipe for the same component rather than shared, because
-    # the per-target mechanics genuinely differ: helm carries the body in a
-    # ConfigMap resource this recipe emits, while compose has no config-resource
-    # primitive and passes the same routing decision on the proxy's command line.
-    # An ArtifactLibrary bundle is the future single-source home for a body both
-    # targets can emit unchanged; it is not that today, so do not consolidate the
-    # two into a shape one target cannot express.
+    # The proxy's configuration body: the alias it publishes, the upstream
+    # target behind it, and, on every Release, the request guard's registration.
     #
     # No credential value appears here. The upstream credential is named through
     # the proxy's own environment indirection — the body carries the variable
     # name and the runtime reads the value from the environment — and the
     # administrative key is not named here at all, because the proxy reads its
     # variable directly from the environment at startup.
+    #
+    # The guard's module is not a file of this ConfigMap: the bundle imported
+    # below delivers it in a ConfigMap of its own, mounted at request_guard_dir
+    # beside this one's directory, so the registration names the module by the
+    # full path of its file there, and the proxy loads a module named by a full
+    # path from that path.
     litellm-config.configmap.yaml: |
       apiVersion: v1
       kind: ConfigMap
@@ -107,6 +191,23 @@ spec:
       {{- if hasKey (default dict .features) "provider_key" }}
                 api_key: os.environ/{{ .values.provider_key_variable }}
       {{- end }}
+          litellm_settings:
+            callbacks:
+              - {{ .locals.request_guard_dir }}/{{ .locals.request_filter_module }}.filter
+    # The request guard and the path allowlist, from the bundle the Helm Recipe
+    # of core/gateway/litellm imports as well, so the line they draw — which
+    # request fields a caller may send and which paths it may reach — has one
+    # text in both. The bundle emits one ConfigMap, named by
+    # request_guard_config_map_name, carrying the guard module, which holds the
+    # fields refused on every Release, and the reverse proxy's configuration,
+    # which lists the routes it forwards; the workload mounts it at
+    # request_guard_dir in both containers. It stops the build when a Release
+    # admits a refused field in infra.admitted_request_fields, and when a name,
+    # the address or the port it shares with this Recipe's locals above differs
+    # from its own. forward_organization_routes keeps the organization routes
+    # off.
+    request-guard:
+      $import: LiteLLMGuard#/artifacts/RequestGuard
   workload: |
     {{- $configDir := "/etc/litellm" -}}
     apiVersion: aggrega.ai/v1alpha1
@@ -124,13 +225,18 @@ spec:
         # the entry the emitted ConfigMap shares.
         # The image entrypoint execs the proxy with the container args as its
         # command line, and supplying args replaces the image's own default
-        # arguments — so the listen port is passed here explicitly rather than
-        # inherited, dereferencing its single authored home.
+        # arguments — so the listen address and port are passed here explicitly
+        # rather than inherited, each dereferencing its single authored home.
+        # The proxy listens on the pod's loopback address only: callers reach it
+        # through the path allowlist below, which listens on infra.port, and
+        # nothing outside the pod can reach the proxy past it.
         args:
           - "--config"
           - "{{ $configDir }}/{{ .locals.config_file }}"
+          - "--host"
+          - "{{ .locals.gateway_address }}"
           - "--port"
-          - "{{ .infra.port }}"
+          - "{{ .locals.gateway_port }}"
         # With infra.external_base_url set, PROXY_BASE_URL carries it: the
         # origin the proxy composes its sign-in callback, its admin-console
         # redirect and the address in its alerts from. Unset, it is not emitted
@@ -161,27 +267,39 @@ spec:
             from: provider_key
             as: env
     {{- end }}
-        ports:
-          http: {{ .infra.port }}
         # The proxy documents /health/readiness and /health/liveliness as its
         # readiness and liveness contract; neither makes a model call or needs
         # a key. Readiness fails while a configured bookkeeping database is
         # unreachable. The start-up probe and every timing are the ones the
         # product's own chart gives these probes: readiness is asked for up to
         # 300 s before the liveness probe takes over.
+        #
+        # The proxy declares no port: it listens on the loopback address, which
+        # a probe sent to the pod's own address cannot reach. So its start-up and
+        # liveness probes run inside this container and ask it on the loopback
+        # address, with the interpreter the image runs the proxy with, and a
+        # liveness failure restarts this container — the one that stopped
+        # answering. Readiness is asked through the path allowlist instead, on
+        # its container below, so the pod is ready only once a caller's request
+        # would be served.
         health:
           startup:
-            http: /health/readiness
+            exec:
+              - python3
+              - -I
+              - -S
+              - -c
+              - "import urllib.request; urllib.request.urlopen('http://{{ .locals.gateway_address }}:{{ .locals.gateway_port }}/health/readiness', timeout=4)"
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 30
-          ready:
-            http: /health/readiness
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
           live:
-            http: /health/liveliness
+            exec:
+              - python3
+              - -I
+              - -S
+              - -c
+              - "import urllib.request; urllib.request.urlopen('http://{{ .locals.gateway_address }}:{{ .locals.gateway_port }}/health/liveliness', timeout=4)"
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 5
@@ -192,13 +310,61 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+        # The configuration's ConfigMap as the directory the proxy is pointed
+        # at, and the bundle's ConfigMap at a directory of its own beside it,
+        # where the configuration's registration finds the request guard.
         volumeMounts:
           - name: config
             path: "{{ $configDir }}"
+          - name: request-guard
+            path: "{{ .locals.request_guard_dir }}"
+            readonly: true
+      # The path allowlist: the official nginx image, configured only by the
+      # file the bundle's ConfigMap carries, which it mounts and nothing else,
+      # run in the foreground in place of the image's own start-up scripts,
+      # which would edit a configuration this container does not use. It
+      # listens on infra.port, the port the Service targets, and forwards the
+      # routes the proxy serves to it on the loopback address; every other path
+      # is answered 403 with nothing forwarded. Its readiness probe asks the
+      # proxy's readiness route through it, so a pod whose proxy or allowlist is
+      # not answering takes no traffic. The resources are sized for its one
+      # worker process relaying requests over the loopback address, and set as
+      # both request and limit, as the proxy's are, so the pod keeps the same
+      # resource class it has with the proxy alone.
+      path-allowlist:
+        image: "nginx:{{ .locals.path_allowlist_image_tag }}"
+        command:
+          - nginx
+          - -c
+          - "{{ .locals.request_guard_dir }}/{{ .locals.path_allowlist_file }}"
+          - -g
+          - "daemon off;"
+        ports:
+          http: {{ .infra.port }}
+        health:
+          ready:
+            http: /health/readiness
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: 250m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 128Mi
+        volumeMounts:
+          - name: request-guard
+            path: "{{ .locals.request_guard_dir }}"
+            readonly: true
     volumes:
       config:
         configmap:
           source: "{{ .locals.config_map_name }}"
+      request-guard:
+        configmap:
+          source: "{{ .locals.request_guard_config_map_name }}"
     services:
       default:
         type: ClusterIP
