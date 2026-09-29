@@ -11,9 +11,10 @@ metadata:
     core/gateway/litellm, whose realization renders its routing table as a
     configuration body. The masking is a setting the running proxy reads out
     of that body rather than a resource of its own, so this recipe emits no
-    file: it writes guardrail entries and one logging setting into the
-    configuration the attached gateway already renders, and every other byte
-    of that body is left as the gateway's own Recipe authored it. Each entry
+    file: it writes guardrail entries, one logging setting and one request
+    policy into the configuration the attached gateway already renders, and
+    every other byte of that body is left as the gateway's own Recipe authored
+    it. Each entry
     runs on every request that reaches the gateway, and a caller cannot switch
     it off from the request; an administrator can exempt a key or a team from
     the gateway's always-on guardrails in that key's or team's own settings.
@@ -37,7 +38,43 @@ metadata:
     analyzer cannot be reached or answers with an error, or the anonymizer
     cannot be reached while there is something to replace, the gateway fails
     the request with HTTP 500: masking a request, it forwards nothing, and
-    masking a reply sent in one piece, it sends none of the reply. Entities in
+    masking a reply sent in one piece, it sends none of the reply. The policy is
+    the closed world this recipe asks the gateway to hold while the attachment
+    is present: the request guard the gateway runs on every Release refuses,
+    with HTTP 400 naming what to change and before anything is forwarded, every
+    request its masking does not reach. It serves the chat completions,
+    completions, embeddings, responses and messages routes, and refuses image
+    generation, moderation, transcription and rerank, whose text it does not
+    mask. It forwards only the request fields it masks — among them the
+    options whose value the API defines as a word from a fixed set, such as
+    reasoning_effort or service_tier, since the gateway does not check the
+    word — the fields that carry a number or a switch, and the developer's own
+    definitions of tools and functions, response formats and stop sequences,
+    which pass as sent; every other field is refused — among
+    them safety_identifier and prompt_cache_key, previous_response_id, include,
+    background, web_search_options, mcp_servers, container, context_management
+    and extra_query — and so is a field the Release admits in
+    infra.admitted_request_fields. It forwards tools of the caller's own, and
+    refuses a tool the provider runs itself, such as web search. While
+    requests are masked it forwards only the parts of a conversation it masks
+    or passes as sent — text, tool calls and their results, a document given as
+    text, a search result, and the reasoning of an earlier turn, which passes as
+    sent — and refuses every other part: an image, a file, a document given as
+    data, by address or as a content list, audio, a refusal, citations or
+    annotations of an earlier reply, a provider's own tool turns, an item
+    referenced by id, and a prompt or input written as token numbers; with
+    allow_non_text_content set on the attachment in the Release, images, files,
+    documents given as data or by address and audio are forwarded as the caller
+    sent them, unmasked. While replies are masked it refuses a streamed request
+    on every route but chat completions, logprobs and top_logprobs, an audio
+    output and more than one choice on a streamed request. A request that
+    carries other text beside the messages is masked there too, by the entries
+    that mask tool calls: a messages-route system prompt, a responses
+    request's instructions and prompt variables, a chat request's predicted
+    output and the name of a turn (not a legacy function turn's, which is the
+    function's name), a completions suffix, a document's or a search result's
+    text, title and context, the user field, those options, and the metadata
+    the caller sent — every string value, value by value, and no key. Entities in
     replies are masked by a guardrail loaded from a module the gateway's own
     Recipe delivers beside its
     configuration, in place of the gateway's built-in masking of a streamed
@@ -89,21 +126,22 @@ metadata:
     other than empty ones, are never masked as one text: a reply carrying them
     is refused with HTTP 500 and none of it is sent, and a request carrying
     them in its conversation is refused with HTTP 400 before it is forwarded.
-    Listed patterns are matched against tool-call arguments the same way,
-    value by value, by an entry of their own beside the content filter: in the
-    tool calls a request's earlier turns carry, on the chat, messages and
-    responses routes, and in a reply's tool calls, in a reply sent in one piece
-    on those three routes and in a streamed chat reply. A streamed chat reply's
-    text keeps streaming, and its tool calls are held until the reply finishes
-    and then sent whole and masked, just before its last chunk; when their
-    arguments are not JSON, none of the tool calls is sent and the stream ends
-    with an error after the text already sent. Patterns are not matched against
-    a reply's reasoning text, nor against the result of an earlier tool call on
-    the messages and responses routes, which reaches the model provider as the
-    caller sent it (on the chat route such a result is masked as one text). A
-    reply streamed on the messages or responses route is not masked by
-    patterns at all, neither its text nor its tool calls; there, only a reply
-    sent in one piece is masked. So an attachment listing patterns with scope
+    Listed patterns are matched against tool-call arguments and tool results
+    the same way, value by value, by an entry of their own beside the content
+    filter: in the tool calls a request's earlier turns carry and the results of
+    those calls, on the chat, messages and responses routes, and in a reply's
+    tool calls, in a reply sent in one piece on those three routes and in a
+    streamed chat reply; the content filter is kept off the chat route's tool
+    turns on requests, so a result there is masked by that entry alone, and a
+    legacy function turn's result is masked by both, as for entity types. A
+    streamed chat reply's text keeps streaming, and its tool calls are held
+    until the reply finishes and then sent whole and masked, just before its
+    last chunk; when their arguments are not JSON, none of the tool calls is
+    sent and the stream ends with an error after the text already sent.
+    Patterns are not matched against a reply's reasoning text. A streamed reply
+    on the messages or responses route would not be masked by patterns at all,
+    so while patterns mask replies such a request is refused before it is
+    forwarded, as on every route but chat. So an attachment listing patterns with scope
     response or both builds only with mask_reasoning set to false on it in the
     Release, and that attachment then masks none of a reply's reasoning text,
     with its patterns or with any entity types it lists; to have a reply's
@@ -119,9 +157,8 @@ metadata:
     logging integrations a redacted copy of every request's messages and every
     reply, and a caller cannot turn that off from the request; its debug
     output, which the gateway's Recipe does not turn on, still carries the
-    unmasked text. The gateway leaves images and files unmasked, and it passes
-    a request of a kind it does not scan through unchanged. A Release binds
-    this recipe for core/data-masking in its Manifest.
+    unmasked text. A Release binds this recipe for core/data-masking in its
+    Manifest.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -165,9 +202,9 @@ spec:
       {{- if and (optional .values "patterns" list) (ne $scope "request") (not $reasoningOff) -}}
       {{- fail (printf "core/data-masking attachment %q on %q lists patterns with scope %s while mask_reasoning is on, but core/gateway/litellm declares dataplane.aggrega.ai/content-masking: entity-recognition and matches patterns against a reply's message text only, never its reasoning text, so what the patterns match would reach the caller unmasked in the reasoning text a reasoning model returns. Set mask_reasoning to false on this attachment in the Release, which lets reasoning text reach the caller unmasked; or mask replies by entity type in an attachment of its own, whose reasoning text is masked, and keep the patterns in an attachment with mask_reasoning false or with scope request" .metadata.feature_instance .metadata.instance_id $scope) -}}
       {{- end -}}
-    # Tool-call arguments and tool results in a request's conversation, and
-    # everything a reply carries by entity type, are masked by guardrail
-    # classes the gateway's own Recipe delivers in a module beside the
+    # Tool-call arguments, tool results and the further request fields a
+    # request carries, and everything a reply carries by entity type, are
+    # masked by guardrail classes the gateway's own Recipe delivers in a module beside the
     # configuration and publishes the names of; a Recipe publishing none would
     # leave the entries naming nothing the gateway can load.
     masking_module_is_delivered: >-
@@ -209,21 +246,25 @@ spec:
     # a request when the analyzer answers with an error, where with no list it
     # would pass the text on unmasked. Listed patterns are matched in the text
     # of the messages by the gateway's content filter, and in tool-call
-    # arguments by an entry of their own right after it, given the same mode
-    # and the same patterns, each computed once. The text of a request's
-    # messages is masked by entity type by the gateway's built-in Presidio
-    # guardrail. The tool calls its earlier turns carry, which that guardrail
-    # passes on, and the results of those calls are masked by an entry of
-    # their own, value by value where they are JSON, written before the
-    # built-in one: the built-in guardrail masks a JSON result as one text,
-    # which can leave it no longer JSON, so it runs only after the walk, and
-    # skip_tool_message_in_guardrail keeps it off the chat route's tool turns
-    # altogether. A legacy function turn is not a tool turn to it, so that
-    # result is masked once more as one text. A reply is masked by a further
-    # entry, which refuses a streamed reply unless the attachment sets
-    # allow_streamed_replies, and then masks it whole. The tool-call entries
-    # and the reply's name a guardrail class loaded from the module the
-    # gateway's Recipe delivers, named through that Recipe's locals. The reply
+    # arguments, tool results and the request fields the content filter does
+    # not read by an entry of their own right after it, given the same mode
+    # and the same patterns, each computed once; while requests are masked,
+    # skip_tool_message_in_guardrail keeps the content filter off the chat
+    # route's tool turns, so a result there is masked by that entry alone. The
+    # text of a request's messages is masked by entity type by the gateway's
+    # built-in Presidio guardrail. The tool calls its earlier turns carry, which
+    # that guardrail passes on, the results of those calls, and the request
+    # fields it does not read are masked by an entry of their own, value by
+    # value where they are JSON, written before the built-in one: the built-in
+    # guardrail masks a JSON result as one text, which can leave it no longer
+    # JSON, so it runs only after the walk, and skip_tool_message_in_guardrail
+    # keeps it off the chat route's tool turns altogether. A legacy function
+    # turn is not a tool turn to either guardrail, so that result is masked
+    # once more as one text. A reply is masked by a further entry, which
+    # refuses a streamed reply unless the attachment sets
+    # allow_streamed_replies, and then masks it whole. The field entries and
+    # the reply's name a guardrail class loaded from the module the gateway's
+    # Recipe delivers, named through that Recipe's locals. The reply
     # entry always states mask_reasoning, false only
     # when the Release sets it false on the attachment, and the class masks the
     # reply's reasoning text unless it reads false there.
@@ -251,17 +292,20 @@ spec:
               default_on: true
               mode: {{ $patternMode }}
               patterns:{{ $patternList }}
-          - guardrail_name: {{ $id }}-tool-call-patterns
+        {{- if ne $scope "response" }}
+              skip_tool_message_in_guardrail: true
+        {{- end }}
+          - guardrail_name: {{ $id }}-field-patterns
             litellm_params:
-              guardrail: {{ .locals.masking_module }}.{{ .locals.tool_call_pattern_masking_class }}
+              guardrail: {{ .locals.masking_module }}.{{ .locals.field_pattern_masking_class }}
               default_on: true
               mode: {{ $patternMode }}
               patterns:{{ $patternList }}
         {{- end }}
         {{- if and $entities (ne $scope "response") }}
-          - guardrail_name: {{ $id }}-tool-call-entities
+          - guardrail_name: {{ $id }}-field-entities
             litellm_params:
-              guardrail: {{ .locals.masking_module }}.{{ .locals.request_tool_call_masking_class }}
+              guardrail: {{ .locals.masking_module }}.{{ .locals.field_entity_masking_class }}
               default_on: true
               mode: pre_call
               pii_entities_config:{{ $piiEntities }}
@@ -282,6 +326,53 @@ spec:
               mode: post_call
               mask_reasoning: {{ $infra := default dict .infra }}{{ if and (hasKey $infra "mask_reasoning") (eq (toString (index $infra "mask_reasoning")) "false") }}false{{ else }}true{{ end }}
               pii_entities_config:{{ $piiEntities }}
+        {{- end }}
+    # The closed world: what this gateway is not shown to mask is refused before
+    # it is forwarded, by the request guard every Recipe running this gateway
+    # delivers, as a policy this step writes into the guard's settings under a
+    # member of this attachment's own, so a second attachment's policy sits
+    # beside this one rather than replacing it. The request types served are the
+    # ones whose text is masked; the fields served are those carrying no
+    # caller's text (numbers, switches and fixed words), those the masking
+    # reaches, and the developer's own definitions of tools, response formats
+    # and stop sequences, which pass as sent; the parts served, while requests
+    # are masked, are text, tool calls and results, documents given as text,
+    # search results and the reasoning of earlier turns, which passes as sent,
+    # and images, files and audio only with allow_non_text_content; the tools
+    # served are the caller's own. While replies are masked, the options that
+    # would open a channel the reply masking does not read are refused, and so
+    # is a streamed request on every route but chat, and on chat as well while
+    # entity types are masked in replies without allow_streamed_replies.
+    - id: write_request_policy
+      plugin: pipeline-step/litellm-gateway-config:1.0.0
+      function: step
+      with: |
+        {{- $scope := optional .values "scope" "request" }}
+        {{- $entities := optional .values "entities" list }}
+        {{- $id := printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-") }}
+        {{- $reason := "masks sensitive text in the requests it forwards" }}
+        {{- if eq $scope "response" }}{{ $reason = "masks sensitive text in its replies" }}{{ else if eq $scope "both" }}{{ $reason = "masks sensitive text in the requests it forwards and in its replies" }}{{ end }}
+        {{- $fields := list "best_of" "cache_control" "dimensions" "echo" "encoding_format" "frequency_penalty" "function_call" "functions" "inference_geo" "input" "instructions" "logit_bias" "max_completion_tokens" "max_output_tokens" "max_tokens" "max_tool_calls" "messages" "metadata" "modalities" "model" "n" "output_config" "output_format" "parallel_tool_calls" "partial_images" "prediction" "presence_penalty" "prompt" "prompt_cache_retention" "reasoning" "reasoning_effort" "response_format" "seed" "service_tier" "speed" "stop" "stop_sequences" "store" "stream" "stream_options" "suffix" "system" "temperature" "text" "text_format" "thinking" "timeout" "tool_choice" "tools" "top_k" "top_p" "truncation" "user" "verbosity" }}
+        {{- if eq $scope "request" }}{{ $fields = concat $fields (list "audio" "logprobs" "top_logprobs") | sortAlpha }}{{ end }}
+        {{- $parts := list "document.text" "item.function_call" "item.function_call_output" "item.message" "item.reasoning" "input_text" "message.cache_control" "message.function_call" "message.name" "message.reasoning_content" "message.thinking_blocks" "message.tool_call_id" "message.tool_calls" "output_text" "redacted_thinking" "search_result" "text" "thinking" "tool_result" "tool_use" }}
+        {{- if optional .infra "allow_non_text_content" false }}{{ $parts = concat $parts (list "document.base64" "document.file" "document.url" "file" "image.base64" "image.file" "image.url" "image_url" "input_audio" "input_file" "input_image" "video_url") | sortAlpha }}{{ end }}
+        {{- $streams := list "aembedding" "anthropic_messages" "aresponses" "atext_completion" }}
+        {{- if and $entities (not (optional .infra "allow_streamed_replies" false)) }}{{ $streams = list "acompletion" "aembedding" "anthropic_messages" "aresponses" "atext_completion" }}{{ end }}
+        section: callback_settings
+        settings:
+          request_field_filter.{{ $id }}:
+            policies:
+              - reason: {{ $reason | toJson }}
+                served_request_types: [acompletion, aembedding, anthropic_messages, aresponses, atext_completion]
+                served_fields: {{ $fields | toJson }}
+                served_tools: [client, function]
+        {{- if ne $scope "response" }}
+                served_parts: {{ $parts | toJson }}
+        {{- end }}
+        {{- if ne $scope "request" }}
+                refuse_streamed: {{ $streams | toJson }}
+                max_streamed_choices: 1
+                refuse_output_modalities: [audio]
         {{- end }}
     # While the masking is attached the gateway hands its logging integrations
     # a redacted copy of every request's messages and every reply.

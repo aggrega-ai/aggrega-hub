@@ -62,6 +62,32 @@ metadata:
     The module reads each route's field list from the proxy when it loads, so a
     list that cannot be read stops the proxy from starting. The bundle is
     authored against LiteLLM v1.85.1.
+
+    A Feature's realization can make the module refuse more, as data rather than
+    as a hook of its own: it writes one or more policies into the proxy's
+    callback settings, under the module's name, or under the module's name
+    followed by a dot and a name of the realization's own, so that one
+    attachment's policy never replaces another's. A policy only tightens: it
+    never admits a field the module refuses. Its keys are served_request_types,
+    the request types served, every other refused (chat completions are
+    acompletion, completions atext_completion, embeddings aembedding, responses
+    aresponses, messages anthropic_messages, and image_generation, moderation,
+    transcription and rerank the rest); served_fields, the top-level fields a
+    request may carry besides the ones the proxy itself adds on its route;
+    served_parts, the kinds of part a request's conversation may carry, a kind
+    being a part's type followed by its source's type where it has one, a chat
+    turn's own field as message. and the field's name, a responses input item as
+    item. and its type, and a prompt or input written as token numbers as tokens;
+    served_tools, the types of tool a request may declare, a messages-route tool
+    of the caller's own reading as client; refuse_fields, fields refused by name;
+    refuse_streamed, the request types on which a request asking for a streamed
+    reply is refused; max_streamed_choices, the most choices a streamed request
+    may ask for; refuse_output_modalities, output modalities a request may not
+    ask for; and reason, the clause each refusal gives as the policy's purpose. A
+    key a policy leaves out restricts nothing. A request a policy refuses is
+    answered with HTTP 400 saying why and what to change, and nothing is
+    forwarded; a policy carrying a key the module does not know, or a value of
+    another shape, refuses every request with HTTP 500 until it is corrected.
 spec:
   artifacts:
     # One file holding both texts: the module and the reverse proxy's
@@ -220,6 +246,14 @@ spec:
             sees fallbacks, as defence in depth. Every list this reads from LiteLLM is read
             when the module loads, so a list that cannot be read stops the gateway from
             starting rather than letting it serve with a narrower or a wider guard.
+
+            A policy an attachment's realization writes into this module's settings refuses
+            more, and never admits a field refused here: it can name the request types
+            served, the fields and the kinds of conversation part and tool a request may
+            carry, the request types whose streamed requests are refused, the most choices a
+            streamed request may ask for, and output modalities refused. A request a policy
+            refuses is answered with HTTP 400 saying why and what to change, and nothing is
+            forwarded; a policy this module cannot read refuses every request with HTTP 500.
             """
             import inspect
 
@@ -271,12 +305,44 @@ spec:
                 return all(isinstance(k, str) and k.lower() in safe for k in extra)
 
 
-            # The key a second policy is written into this module under, as data rather
-            # than as a second hook: a FeatureRecipe writes callback_settings.<this name>
-            # through the gateway-config pipeline step, LiteLLM loads it at start-up, and
-            # this module reads it in _policy_refusals. It is this callback's own name, so
+            # The key a further policy is written into this module under, as data rather
+            # than as a second hook: a FeatureRecipe writes callback_settings.<this name>,
+            # or callback_settings.<this name>.<a name of its own>, through the
+            # gateway-config pipeline step; LiteLLM loads callback_settings at start-up,
+            # and this module reads every such member in _policies. A member of its own
+            # per writer keeps one writer from replacing another's policy, because the
+            # step replaces a member it rewrites whole. It is this callback's own name, so
             # only this one refusal hook is ever registered.
             POLICY_KEY = "{{ $module }}"
+
+            # The request types a policy names, as a caller reads them.
+            ROUTE_NAMES = {
+                "acompletion": "chat completions",
+                "atext_completion": "completions",
+                "aembedding": "embeddings",
+                "aresponses": "responses",
+                "anthropic_messages": "messages",
+                "image_generation": "image generation",
+                "moderation": "moderation",
+                "transcription": "transcription",
+                "rerank": "rerank",
+            }
+
+            # The keys a policy may carry whose value is a list of names. A policy may also
+            # carry max_streamed_choices, a whole number of at least one, and reason, the
+            # clause its refusals give as its purpose. A key absent from a policy restricts
+            # nothing; a key this module does not know, or a value of another shape, refuses
+            # every request, because a policy that cannot be read must not pass for one that
+            # restricts nothing.
+            _LIST_KEYS = frozenset([
+                "refuse_fields", "served_request_types", "served_fields", "served_parts", "served_tools",
+                "refuse_streamed", "refuse_output_modalities",
+            ])
+
+            POLICY_UNREADABLE = (
+                "This gateway is configured with a request policy it cannot read, so it refuses "
+                "every request until that configuration is corrected."
+            )
 
             UNKNOWN_CALL_TYPE = (
                 "This gateway forwards only the request types it is configured for and does "
@@ -370,28 +436,203 @@ spec:
                 return _ALLOWED.get(_canonical(call_type))
 
 
-            def _policy_refusals():
-                # A second policy is data, never a second hook: a FeatureRecipe writes
-                # callback_settings.<POLICY_KEY>.policies through the gateway-config step,
-                # LiteLLM loads it into litellm.callback_settings at start-up, and this
-                # reads it. Each policy may name further fields to refuse, so an attachment
-                # tightens what the gateway forwards without loosening the always-on
-                # allowlist.
+            def _readable(policy):
+                if not isinstance(policy, dict):
+                    raise HTTPException(status_code=500, detail=POLICY_UNREADABLE)
+                for key, value in policy.items():
+                    if key in _LIST_KEYS:
+                        ok = isinstance(value, list) and all(isinstance(v, str) for v in value)
+                    elif key == "max_streamed_choices":
+                        ok = isinstance(value, int) and not isinstance(value, bool) and value >= 1
+                    elif key == "reason":
+                        ok = isinstance(value, str) and bool(value.strip())
+                    else:
+                        ok = False
+                    if not ok:
+                        raise HTTPException(status_code=500, detail=POLICY_UNREADABLE)
+                return policy
+
+
+            def _policies():
+                # A further policy is data, never a second hook: a FeatureRecipe writes
+                # callback_settings.<POLICY_KEY>, or callback_settings.<POLICY_KEY>.<its own
+                # name>, as a mapping carrying a policies list, through the gateway-config
+                # step; LiteLLM loads it into litellm.callback_settings at start-up, and this
+                # reads every such member, in the order of their names. Each policy only
+                # tightens what the gateway forwards: it refuses more, and never admits a
+                # field the always-on allowlist refuses.
                 settings = getattr(litellm, "callback_settings", None)
                 if not isinstance(settings, dict):
                     return []
-                mine = settings.get(POLICY_KEY)
-                if not isinstance(mine, dict):
-                    return []
-                policies = mine.get("policies")
-                if not isinstance(policies, list):
-                    return []
-                refused = []
-                for policy in policies:
-                    fields = policy.get("refuse_fields") if isinstance(policy, dict) else None
-                    if isinstance(fields, list):
-                        refused += fields
-                return refused
+                found = []
+                for key in sorted(k for k in settings if isinstance(k, str) and (k == POLICY_KEY or k.startswith(POLICY_KEY + "."))):
+                    member = settings[key]
+                    policies = member.get("policies") if isinstance(member, dict) else None
+                    if not isinstance(policies, list):
+                        raise HTTPException(status_code=500, detail=POLICY_UNREADABLE)
+                    found += [_readable(policy) for policy in policies]
+                return found
+
+
+            def _part_kinds(part, kinds):
+                # What a part of a conversation is: its type, followed by its source's type
+                # where it carries a source that has one (an image or a document on the
+                # messages route). A part carrying citations or annotations of an earlier
+                # reply adds a kind for them. A tool result's own parts, on the messages
+                # route, and a function call's output parts, on the responses route, are
+                # parts too.
+                if not isinstance(part, dict) or not isinstance(part.get("type"), str):
+                    kinds.add("untyped")
+                    return
+                kind = part["type"]
+                source = part.get("source")
+                if isinstance(source, dict) and isinstance(source.get("type"), str):
+                    kind += "." + source["type"]
+                kinds.add(kind)
+                for extra in ("citations", "annotations"):
+                    if isinstance(part.get(extra), list) and part.get(extra):
+                        kinds.add(part["type"] + "." + extra)
+                for nested in ("content", "output"):
+                    inner = part.get(nested) if part["type"] in ("tool_result", "function_call_output") else None
+                    for inner_part in inner if isinstance(inner, list) else []:
+                        _part_kinds(inner_part, kinds)
+
+
+            def _conversation_kinds(data, route):
+                # Every kind of part a request's conversation carries, where its route puts
+                # them: a chat or messages turn's content parts, and a chat turn's fields
+                # beyond its role and content as message.<field>; the messages route's
+                # system blocks; a responses input's items as item.<type>, and the parts of
+                # its messages and of its function call outputs; a responses prompt's
+                # variables that are parts; a chat prediction's parts; and a completions
+                # prompt or an embeddings input written as token numbers, as tokens.
+                kinds = set()
+                for message in data.get("messages") or [] if route in ("acompletion", "anthropic_messages") else []:
+                    if not isinstance(message, dict):
+                        kinds.add("message.untyped")
+                        continue
+                    for key, value in message.items():
+                        if key not in ("role", "content") and value is not None and value != "" and value != [] and value != {}:
+                            kinds.add("message." + str(key))
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        for part in content:
+                            _part_kinds(part, kinds)
+                    elif content is not None and not isinstance(content, str):
+                        kinds.add("content.untyped")
+                if route == "anthropic_messages":
+                    system = data.get("system")
+                    if isinstance(system, list):
+                        for part in system:
+                            _part_kinds(part, kinds)
+                    elif system is not None and not isinstance(system, str):
+                        kinds.add("system.untyped")
+                if route == "aresponses":
+                    items = data.get("input")
+                    for item in items if isinstance(items, list) else []:
+                        if not isinstance(item, dict):
+                            kinds.add("item.untyped")
+                            continue
+                        item_type = item.get("type") or ("message" if "role" in item else "untyped")
+                        kinds.add("item." + str(item_type))
+                        inner = item.get("content") if item_type == "message" else item.get("output") if item_type == "function_call_output" else None
+                        for part in inner if isinstance(inner, list) else []:
+                            _part_kinds(part, kinds)
+                    if items is not None and not isinstance(items, (str, list)):
+                        kinds.add("input.untyped")
+                    instructions = data.get("instructions")
+                    if instructions is not None and not isinstance(instructions, str):
+                        kinds.add("instructions.untyped")
+                    prompt = data.get("prompt")
+                    variables = prompt.get("variables") if isinstance(prompt, dict) else None
+                    for value in variables.values() if isinstance(variables, dict) else []:
+                        if isinstance(value, dict):
+                            _part_kinds(value, kinds)
+                if route == "acompletion":
+                    prediction = data.get("prediction")
+                    content = prediction.get("content") if isinstance(prediction, dict) else None
+                    for part in content if isinstance(content, list) else []:
+                        _part_kinds(part, kinds)
+                if route in ("atext_completion", "aembedding"):
+                    text = data.get("prompt" if route == "atext_completion" else "input")
+                    for value in text if isinstance(text, list) else [text]:
+                        if value is not None and not isinstance(value, str):
+                            kinds.add("tokens")
+                return kinds
+
+
+            def _tool_kinds(data, route):
+                # The type of each tool a request declares; a messages-route tool declaring no
+                # type, or "custom", is the caller's own tool and reads as client.
+                kinds = set()
+                for tool in data.get("tools") or []:
+                    tool_type = tool.get("type") if isinstance(tool, dict) else None
+                    if route == "anthropic_messages" and tool_type in (None, "custom"):
+                        kinds.add("client")
+                    else:
+                        kinds.add(tool_type if isinstance(tool_type, str) else "untyped")
+                return kinds
+
+
+            def _listed(names):
+                names = list(names)
+                return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+            def _policy_refusal(data, call_type):
+                # The first refusal a policy makes of this request, as the message it is
+                # answered with, or None when every policy serves it.
+                route = _canonical(call_type)
+                name = ROUTE_NAMES.get(route, route)
+                added = _ROUTES[route][1] if route in _ROUTES else frozenset()
+                streamed = data.get("stream") is True
+                for policy in _policies():
+                    why = "This gateway " + policy.get("reason", "applies a policy to the requests it forwards") + ", and "
+                    served = policy.get("served_request_types")
+                    if served is not None and route not in served:
+                        return (why + "it does not serve " + name + " requests while it does, so the request was not "
+                                "forwarded. It serves " + _listed(ROUTE_NAMES.get(r, r) for r in served) + " requests.")
+                    fields = {key for key in policy.get("refuse_fields", []) if key in data}
+                    served = policy.get("served_fields")
+                    if served is not None:
+                        fields |= {key for key in data if key not in served and key not in added and key != PROVIDER_SPECIFIC_HEADER}
+                    if fields:
+                        named = ", ".join(sorted(fields))
+                        return (why + "it does not forward a request carrying " + named + " while it does, so the "
+                                "request was not forwarded. Remove: " + named + ".")
+                    served = policy.get("served_parts")
+                    if served is not None:
+                        parts = sorted(_conversation_kinds(data, route) - set(served))
+                        if parts:
+                            return (why + "it does not forward a request whose conversation carries parts of these "
+                                    "kinds while it does: " + ", ".join(parts) + ", so the request was not forwarded. "
+                                    "Remove them. A kind is a part's type, followed by its source's type where it has "
+                                    "one; message.<field> is a field of a chat turn, and item.<type> an item of a "
+                                    "responses input.")
+                    served = policy.get("served_tools")
+                    if served is not None:
+                        tools = sorted(_tool_kinds(data, route) - set(served))
+                        if tools:
+                            return (why + "it does not forward a request declaring tools of these types while it does: "
+                                    + ", ".join(tools) + ", so the request was not forwarded. Remove them.")
+                    if streamed and route in policy.get("refuse_streamed", []):
+                        return (why + "it does not stream the reply to a " + name + " request while it does, so the "
+                                "request was not forwarded. Send it with stream set to false, or without stream, to "
+                                "receive the whole reply in one piece.")
+                    limit = policy.get("max_streamed_choices")
+                    choices = data.get("n")
+                    if streamed and limit is not None and choices is not None and not (
+                        isinstance(choices, int) and not isinstance(choices, bool) and choices <= limit
+                    ):
+                        return (why + "it streams at most " + str(limit) + " choice" + ("" if limit == 1 else "s") +
+                                " of a reply while it does, so the request was not forwarded. Send it with n set to " +
+                                str(limit) + ", or without stream.")
+                    modalities = data.get("modalities")
+                    refused = [m for m in policy.get("refuse_output_modalities", []) if isinstance(modalities, list) and m in modalities]
+                    if refused:
+                        return (why + "it does not return " + _listed(refused) + " output while it does, so the request "
+                                "was not forwarded. Remove " + _listed(refused) + " from modalities.")
+                return None
 
 
             def _refuse(fields):
@@ -421,9 +662,11 @@ spec:
                         elif key in allowed:
                             continue
                         refused.append(key)
-                    refused += [key for key in _policy_refusals() if key in data]
                     if refused:
                         _refuse(refused)
+                    refusal = _policy_refusal(data, call_type)
+                    if refusal is not None:
+                        raise HTTPException(status_code=400, detail=refusal)
                     return data
 
                 async def async_pre_call_deployment_hook(self, kwargs, call_type):
