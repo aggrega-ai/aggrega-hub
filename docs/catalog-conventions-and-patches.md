@@ -265,9 +265,8 @@ Three rules bind the family, and each has already been got wrong once:
   pin, and the ground for keeping it off this family is what a second value here
   would assert, not scarcity — a pin says which key a certificate must BE, where
   every value on this family says what one must SAY.** A certificate-name
-  assertion and a named trust anchor are neither of them pins. While one product
-  carries the capability it stays a dial on that Component's own surface; a
-  shared value here is the thing to revisit if a second product gains it.
+  assertion and a named trust anchor are neither of them pins. The one gateway
+  here able to pin carries it as a value on its own Component's surface.
 
 Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 `upstream-tls: trust-anchor`), `core/gateway/contour` and
@@ -2235,6 +2234,48 @@ A runtime guardrail or gateway binding to a node is a Feature (or its annotation
 shortcut), **not** a `uses` edge. A `uses` edge is dumb string-routing between
 components that already exist; a guardrail is new runtime configuration to attach,
 which is exactly what a Feature is for.
+
+### What earns a Feature: two independent products in the field
+
+A Feature is an attachment that brings something — resources, a pipeline step,
+wiring an operator attaches deliberately — and **it earns its name when at least
+two independent products in the field realize the capability it declares.** The
+products counted are products in the world, established from their own current
+configuration references, and not the components this catalog happens to ship: a
+capability two gateway products implement is portable whether the catalog carries
+one of those gateways, both of them, or neither.
+
+What the catalog ships is a separate question, answered one product at a time. A
+Feature may be declared before anything here realizes it — attaching it then halts
+the build naming the type, which is the honest state for a control no
+FeatureRecipe realizes — and it may be realized on one component or on several. Each realization is a FeatureRecipe for one product that honours the
+Feature in that product's own terms.
+
+**A capability that only one product in the field has is not a Feature.** It is a
+value on that product's own Component, where an operator sets it and reads it beside
+everything else that configures the product. A Recipe may declare `spec.pipeline`
+of its own, driven by the values and infrastructure the component was authored
+with, so that is where such a value is written into the product's configuration.
+
+Counting the field rather than the catalog has three consequences for how a
+Feature's options are authored:
+
+- **Derive the options from what the products implement.** Read how the products
+  realize the capability and declare the shape they share. Do not compose an ideal
+  set of options first and then look for products to realize it.
+- **One product's inability to honour an option is not grounds to drop it.** Where
+  two or more products ship a capability under names that group — one product calls
+  it cost-based routing, another balances on the lowest usage counted in cost, a
+  third sorts providers by price — the option is portable and the Feature keeps it.
+  A realization for a product that cannot honour the option refuses that value at
+  build time and says why; it never accepts the value and ignores it.
+- **An option no product implements is dropped**, rather than kept so the set reads
+  as complete.
+
+**This is a convention catalog authors uphold, not something the compiler
+enforces.** The compiler validates a Feature against its schema and pipes strings,
+so a Feature declaring options no product implements passes every gate and ships.
+The judgement stays with the author and the reviewer.
 
 ### The Feature taxonomy
 
