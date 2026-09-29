@@ -13,32 +13,47 @@ metadata:
     which credential, so the text that draws that line lives here once, rather
     than as a copy in each Recipe that a later edit could leave behind.
 
-    RequestGuard emits one ConfigMap carrying two files. The first is a module
-    the proxy loads as a callback: on every request it forwards only the request
-    fields the proxy itself declares for the route the request took, the keys the
-    proxy adds to a request on that route, and any the Release names in
+    RequestGuard carries two texts. The first is a module the proxy loads as a
+    callback: on every request it forwards only the request fields the proxy
+    itself declares for the route the request took, the keys the proxy adds to a
+    request on that route, and any the Release names in
     infra.admitted_request_fields, and it refuses every other field with an
     error naming it, forwarding nothing. The fields that would let a caller
     re-target or re-key a call are refused even where the proxy declares them,
     and a Release naming one of them in infra.admitted_request_fields stops the
-    build, naming the field. The second file configures an nginx reverse proxy
+    build, naming the field. The second text configures an nginx reverse proxy
     that listens on infra.port in front of the LiteLLM proxy: it forwards only
     the routes the module checks, the model listing, the health routes and key
     management, and, where the importing Recipe turns them on, the routes that
     create, read, update and delete an organization; every other path is
     answered 403 with nothing forwarded.
 
+    The importing Recipe chooses how the two texts reach its workload through
+    the local request_guard_delivery. With config_map the bundle emits one
+    ConfigMap carrying both as files, for a Kubernetes target. With
+    compose_configs it emits two compose configs, one per text, for the compose
+    target, which delivers a config as one file at the path it is mounted at.
+    Either way the two texts are the same. Any other value, or none, stops the
+    build.
+
     The importing Recipe runs both. It registers the module under
-    litellm_settings.callbacks, mounts the ConfigMap into the proxy's container
-    and into the reverse proxy's, starts the proxy on the loopback address and
-    the reverse proxy on this configuration. Those are its own configuration and
-    workload, which a bundle cannot write, so it declares as locals the values
-    they share with this bundle, and the bundle stops the build, naming the
-    local, when one is missing or differs from its own: request_filter_module
-    (request_field_filter), path_allowlist_file (path-allowlist.conf),
-    gateway_address (127.0.0.1), gateway_port (the port after infra.port, or the
-    one before it when infra.port is 65535) and request_guard_config_map_name
-    (the instance name followed by -request-guard). It also declares
+    litellm_settings.callbacks, mounts the module into the proxy's container and
+    the reverse proxy's configuration into the reverse proxy's, starts the proxy
+    on the loopback address and the reverse proxy on this configuration. Those
+    are its own configuration and workload, which a bundle cannot write, so it
+    declares as locals the values they share with this bundle, and the bundle
+    stops the build, naming the local, when one is missing or differs from its
+    own. Every importing Recipe declares request_filter_module
+    (request_field_filter), gateway_address (127.0.0.1) and gateway_port (the
+    port after infra.port, or the one before it when infra.port is 65535). With
+    config_map it also declares path_allowlist_file (path-allowlist.conf), the
+    file the ConfigMap carries the reverse proxy's configuration as, and
+    request_guard_config_map_name (the instance name followed by
+    -request-guard). With compose_configs it declares
+    request_guard_module_config_name and request_guard_allowlist_config_name
+    instead, the names of the two configs (the instance name followed by
+    -request-guard-module and by -request-guard-allowlist); the file each is
+    mounted as is the Recipe's own. It also declares
     forward_organization_routes, "true" or "false", choosing whether the
     organization routes are forwarded; any other value stops the build. The
     importing Component declares infra.port, and infra.admitted_request_fields
@@ -49,18 +64,21 @@ metadata:
     authored against LiteLLM v1.85.1.
 spec:
   artifacts:
-    # One file, one ConfigMap, holding both texts: the module and the reverse
-    # proxy's configuration are only meaningful together, and a Recipe that
-    # imports the bundle gets both or neither.
+    # One file holding both texts: the module and the reverse proxy's
+    # configuration are only meaningful together, and a Recipe that imports the
+    # bundle gets both or neither. The file is one ConfigMap or one compose
+    # fragment declaring two configs, as the importing Recipe's
+    # request_guard_delivery names, and the two texts are written once below and
+    # wrapped by whichever envelope is chosen, so neither target carries a copy.
     #
     # The template reads the importing Recipe's context: .infra.port and
     # .infra.admitted_request_fields from the Component, .context.instance_id,
     # and the locals listed in the description. It checks every local before
     # it writes anything, because a local the importing Recipe does not declare
     # reads as empty here rather than stopping the build, and a module name, a
-    # file name or a port that differs on the two sides would leave a proxy
-    # that loads no guard, a reverse proxy with no configuration, or one
-    # forwarding to a port nothing listens on.
+    # file name, a config name or a port that differs on the two sides would
+    # leave a proxy that loads no guard, a reverse proxy with no configuration,
+    # or one forwarding to a port nothing listens on.
     RequestGuard:
       request-guard.yaml: |
         {{- /* The values this bundle shares with the Recipe importing it. Each has its home here, as a constant or
@@ -75,18 +93,35 @@ spec:
         {{- $port := add1 (int .infra.port) }}
         {{- if eq (int .infra.port) 65535 }}{{ $port = 65534 }}{{ end }}
         {{- $configMapName := printf "%s-request-guard" .context.instance_id }}
+        {{- $moduleConfigName := printf "%s-request-guard-module" .context.instance_id }}
+        {{- $allowlistConfigName := printf "%s-request-guard-allowlist" .context.instance_id }}
         {{- $have := "" }}
+        {{- /* How the two texts reach the importing Recipe's workload, which that Recipe chooses because its workload
+          mounts them: "config_map", one ConfigMap carrying both as files, for a Kubernetes target; or
+          "compose_configs", two compose configs, one per text, for the compose target, which delivers a config as one
+          file at the path it is mounted at. Any other value stops the build. */}}
+        {{- $have = optional .locals "request_guard_delivery" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local request_guard_delivery, which takes \"config_map\" or \"compose_configs\": whether this bundle delivers the request guard and the path allowlist's configuration as one ConfigMap, for a Kubernetes target, or as two compose configs, one per file, for the compose target; declare it as one of the two" $bundle) }}
+        {{- else if not (has $have (list "config_map" "compose_configs")) }}
+        {{- fail (printf "the Recipe importing %s declares the local request_guard_delivery as %q, but it takes \"config_map\" or \"compose_configs\": whether this bundle delivers the request guard and the path allowlist's configuration as one ConfigMap, for a Kubernetes target, or as two compose configs, one per file, for the compose target; declare it as one of the two" $bundle $have) }}
+        {{- end }}
+        {{- $compose := eq $have "compose_configs" }}
         {{- $have = optional .locals "request_filter_module" "" }}
         {{- if not $have }}
         {{- fail (printf "the Recipe importing %s does not declare the local request_filter_module, which is the module name its configuration registers under litellm_settings.callbacks and this bundle delivers the request guard under; declare it as %q" $bundle $module) }}
         {{- else if ne $have $module }}
         {{- fail (printf "the Recipe importing %s declares the local request_filter_module as %q, but that local is the module name its configuration registers under litellm_settings.callbacks and this bundle delivers the request guard under, and this bundle's side of it is %q; declare it as %q" $bundle $have $module $module) }}
         {{- end }}
+        {{- /* The file name the ConfigMap carries the allowlist's configuration as. A compose config has no file name
+          of its own, the path it is mounted at being the Recipe's, so only the ConfigMap delivery shares one. */}}
+        {{- if not $compose }}
         {{- $have = optional .locals "path_allowlist_file" "" }}
         {{- if not $have }}
         {{- fail (printf "the Recipe importing %s does not declare the local path_allowlist_file, which is the file name its path allowlist container is pointed at and this bundle delivers the allowlist's configuration under; declare it as %q" $bundle $allowlistFile) }}
         {{- else if ne $have $allowlistFile }}
         {{- fail (printf "the Recipe importing %s declares the local path_allowlist_file as %q, but that local is the file name its path allowlist container is pointed at and this bundle delivers the allowlist's configuration under, and this bundle's side of it is %q; declare it as %q" $bundle $have $allowlistFile $allowlistFile) }}
+        {{- end }}
         {{- end }}
         {{- $have = optional .locals "gateway_address" "" }}
         {{- if not $have }}
@@ -100,11 +135,28 @@ spec:
         {{- else if ne $have (toString $port) }}
         {{- fail (printf "the Recipe importing %s declares the local gateway_port as %q, but that local is the port its gateway listens on and the path allowlist forwards to, the one after infra.port or the one before it when infra.port is 65535, and this bundle's side of it is %q; declare it as %q" $bundle $have (toString $port) (toString $port)) }}
         {{- end }}
+        {{- /* The names the importing Recipe's workload mounts what this bundle emits by: the ConfigMap's, or the two
+          compose configs'. */}}
+        {{- if $compose }}
+        {{- $have = optional .locals "request_guard_module_config_name" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local request_guard_module_config_name, which is the name of the compose config its workload mounts the request guard from, which this bundle emits; declare it as %q" $bundle $moduleConfigName) }}
+        {{- else if ne $have $moduleConfigName }}
+        {{- fail (printf "the Recipe importing %s declares the local request_guard_module_config_name as %q, but that local is the name of the compose config its workload mounts the request guard from, which this bundle emits, and this bundle's side of it is %q; declare it as %q" $bundle $have $moduleConfigName $moduleConfigName) }}
+        {{- end }}
+        {{- $have = optional .locals "request_guard_allowlist_config_name" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local request_guard_allowlist_config_name, which is the name of the compose config its workload mounts the path allowlist's configuration from, which this bundle emits; declare it as %q" $bundle $allowlistConfigName) }}
+        {{- else if ne $have $allowlistConfigName }}
+        {{- fail (printf "the Recipe importing %s declares the local request_guard_allowlist_config_name as %q, but that local is the name of the compose config its workload mounts the path allowlist's configuration from, which this bundle emits, and this bundle's side of it is %q; declare it as %q" $bundle $have $allowlistConfigName $allowlistConfigName) }}
+        {{- end }}
+        {{- else }}
         {{- $have = optional .locals "request_guard_config_map_name" "" }}
         {{- if not $have }}
         {{- fail (printf "the Recipe importing %s does not declare the local request_guard_config_map_name, which is the name of the ConfigMap its workload mounts, which this bundle emits; declare it as %q" $bundle $configMapName) }}
         {{- else if ne $have $configMapName }}
         {{- fail (printf "the Recipe importing %s declares the local request_guard_config_map_name as %q, but that local is the name of the ConfigMap its workload mounts, which this bundle emits, and this bundle's side of it is %q; declare it as %q" $bundle $have $configMapName $configMapName) }}
+        {{- end }}
         {{- end }}
         {{- /* Whether the path allowlist forwards the routes that create, read, update and delete an organization. The
           importing Recipe chooses, "true" or "false"; any other value stops the build. */}}
@@ -132,12 +184,23 @@ spec:
         {{- /* One path segment of a model name or a key in a route below: it opens with a letter or a digit, so no
           segment is a dot segment, and it carries no percent sign, so nothing in it is decoded further on. */}}
         {{- $segment := "[A-Za-z0-9][A-Za-z0-9._:@+~-]*" -}}
+        {{- /* The envelope. Each text below is written once and wrapped by the envelope the importing Recipe chose:
+          a ConfigMap key or a compose config's content. Both are block scalars holding the text at one indentation,
+          so in the compose fragment each config's content key sits one column deeper than its name, the shallowest
+          place a block scalar of that indentation can hang from; the compose target reads the fragment's configs and
+          writes them into the compose file, so that column reaches no emitted byte. */ -}}
+        {{- if $compose -}}
+        configs:
+          {{ $moduleConfigName }}:
+           content: |
+        {{- else -}}
         apiVersion: v1
         kind: ConfigMap
         metadata:
           name: {{ $configMapName }}
         data:
           {{ $module }}.py: |
+        {{- end }}
             """Refuse a request field the gateway was not configured to forward.
 
             Mounted beside the gateway's configuration and registered on every Release
@@ -379,7 +442,12 @@ spec:
 
 
             filter = RequestFieldFilter()
+        {{- if $compose }}
+          {{ $allowlistConfigName }}:
+           content: |
+        {{- else }}
           {{ $allowlistFile }}: |
+        {{- end }}
             # The path allowlist in front of the gateway. The gateway listens on its
             # loopback address inside the pod only; this reverse proxy listens on the
             # port callers reach and forwards a request only when its method and path

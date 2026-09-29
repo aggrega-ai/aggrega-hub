@@ -10,30 +10,71 @@ metadata:
   description: >
     LiteLLM as a self-hosted, OpenAI-compatible model proxy for local
     development via Docker Compose. Synthesized-mode Workload: image, command
-    line, environment and the published port are translated from the Workload
-    kind by the compose provider.
-    The routing decision reaches the proxy differently here than on Kubernetes,
-    and the difference is worth stating plainly. Compose has no config-resource
-    primitive, so this target carries no configuration file: it names the
-    provider-qualified target from values.upstream_model on the proxy's own
-    command line, which is the proxy's supported single-model route. Two
-    consequences follow. The proxy forwards every request to that one upstream
-    model whatever model name the caller sends, so the alias in values.model is
-    honoured for a caller and stays the value published on the edge, while the
-    proxy's own model listing reports the upstream target rather than the alias.
-    And a second model cannot be added on this target — a multi-model proxy is
-    realized by the helm target, which carries a configuration body in a
-    ConfigMap. On compose, run one proxy per upstream model.
+    line, environment, the configuration files the containers mount and their
+    health checks are translated from the Workload kind by the compose provider.
+    A compose config carries the proxy's configuration body, which publishes
+    the alias in values.model and points it at the provider-qualified target in
+    values.upstream_model, and the proxy reads that file through the --config
+    flag. So the proxy serves the alias and no other name, as on the helm
+    target: a request for another model name is refused, and the proxy's own
+    model listing reports the alias. The Component publishes one alias, which
+    the proxy serves on either target.
     Compose has no env-from-secret primitive, so an attached credential arrives
     on the inject pipe and is rendered as a plain environment variable: the
     administrative key under the variable the proxy reads at startup, and the
     upstream credential under the variable named in values.provider_key_variable
-    — which is therefore also the key the attached credential must publish under.
-    Unattached, neither variable is emitted. The bookkeeping database connection
-    string is emitted only when infra.database_url is set; with none the proxy
-    runs stateless. The proxy's public origin is emitted as PROXY_BASE_URL only
-    when infra.external_base_url is set, and the build halts when that address
-    carries a path. The command-line contract is authored against LiteLLM v1.85.1.
+    — which is therefore also the key the attached credential must publish under,
+    and the variable the configuration body names rather than carrying the
+    credential. Unattached, neither variable is emitted.
+    On every Release two further compose configs carry a request-guard module
+    and a path allowlist's configuration. The module is mounted in a directory
+    of its own beside the configuration's and registered under
+    litellm_settings.callbacks, so it runs before the proxy forwards a request:
+    it forwards only the request fields the proxy declares for the route the
+    request took, plus any the Release names in infra.admitted_request_fields,
+    and refuses the rest with an error naming the field, forwarding nothing. So
+    a caller cannot point the proxy at an address of its own through a
+    request-body model list, inject an upstream header, or slip an unrecognised
+    field through to the model server, nor send a provider key of its own in
+    place of the proxy's, even one it holds legitimately — the fields the guard
+    refuses are the ones a caller could otherwise use to send the proxy's
+    credential somewhere it was not meant to go. The guard sees only the routes
+    that hand it the request, so on every Release the proxy listens on the
+    loopback address alone and a second container, running the official nginx
+    image (BSD-2-Clause), stands in front of it on infra.port as a path
+    allowlist. This target runs that container as a service of its own, named
+    after the component instance with -path-allowlist appended, sharing the
+    proxy's network namespace, so the loopback address is the two services'
+    alone and a consumer that reaches the component's own service name on
+    infra.port reaches the allowlist. It forwards only the routes the proxy
+    serves — the chat completions, completions, embeddings, responses, messages,
+    image generation, moderation, transcription and rerank routes the guard
+    checks, in the spellings the proxy serves whatever the model alias; the
+    model listing; the health routes; and, of the administrative routes, key
+    management — and answers every other path 403 with nothing forwarded. So
+    the proxy's token-count routes, its pass-through routes to providers' own
+    APIs, its other administrative routes (organizations, teams, users, budgets,
+    spend and request logs, and model and configuration management among them)
+    and its administrative console are not reachable through this Recipe's
+    service; a caller that counts tokens does so on its own side. The model
+    routes whose path carries the model name, the engine-style and Azure-style
+    paths, are refused too: on them the proxy reads words in the path, the alias
+    included, to decide how it records a request, so the guard would serve some
+    alias names and refuse others. The guard and the allowlist come from the
+    LiteLLMGuard#/artifacts/RequestGuard bundle, which every Recipe running this
+    proxy imports, so the line they draw has one text wherever the proxy runs;
+    the bundle stops the build when a name, an address or a port it shares with
+    this Recipe's configuration and workload differs from its own. Each service
+    carries one health check, run inside its own image: the proxy's asks its
+    readiness route on the loopback address with the image's Python, and the
+    allowlist's asks the same route through the allowlist with the curl the
+    nginx image carries, so the allowlist reports healthy only once a caller's
+    request would be served. The bookkeeping database connection string is
+    emitted only when infra.database_url is set; with none the proxy runs
+    stateless. The proxy's public origin is emitted as PROXY_BASE_URL only when
+    infra.external_base_url is set, and the build halts when that address
+    carries a path. The configuration contract is authored against LiteLLM
+    v1.85.1.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -42,19 +83,83 @@ spec:
   implements: core/ai-model/litellm:1.0.0
   # This Recipe reads no infra.overrides keys.
   #
+  # Each entry below is the single authored home for a value the artifacts
+  # template and the workload template both have to agree on. They are separate
+  # templates, so a template variable bound in one is not visible in the other,
+  # and these entries are what keeps the emitted config and the container that
+  # reads it from drifting apart: config_file is the file the configuration is
+  # mounted as and the filename the proxy is pointed at, config_name is the
+  # name the config is declared under and the volume sources.
+  locals:
+    config_file: config.yaml
+    config_name: "{{ .context.instance_id }}-config"
+    # The request-guard module, delivered on every Release by the LiteLLMGuard
+    # bundle imported below: the file it is mounted as and the callback the
+    # configuration registers both read this name. The bundle holds the name as
+    # well, and stops the build when this local differs from it, so the file and
+    # its registration cannot disagree. The fields the guard refuses on every
+    # Release, and the check that a Release does not admit one of them, are the
+    # bundle's, not this Recipe's.
+    request_filter_module: request_field_filter
+    # The path allowlist in front of the proxy. The proxy listens on the
+    # loopback address only, so nothing outside the two services' shared
+    # network namespace reaches it directly, and a reverse proxy in a second
+    # container listens on infra.port and forwards only the routes the proxy
+    # serves. The address and the port are read by the proxy's own listen
+    # arguments and by its health check, and the reverse proxy's forwarding
+    # target, which the bundle writes, is the same address and port: the bundle
+    # holds the address and computes the port from infra.port by the same rule,
+    # and stops the build when either local differs. The two locals carry the
+    # names the bundle reads them by. The loopback port is the one after
+    # infra.port, or the one before it when infra.port is the highest there is,
+    # so it never collides with the port callers reach and adds no rule on
+    # infra.port.
+    gateway_address: 127.0.0.1
+    gateway_port: '{{ if eq (int .infra.port) 65535 }}65534{{ else }}{{ add1 (int .infra.port) }}{{ end }}'
+    # The file the reverse proxy's configuration is mounted as and the file the
+    # reverse proxy is pointed at both read this name. A compose config carries
+    # no file name of its own, so the name is this Recipe's alone here.
+    path_allowlist_file: path-allowlist.conf
+    # The tag of the official nginx image the reverse proxy runs, the one
+    # core/gateway/nginx defaults to. It is written here rather than taken from
+    # infra, because the reverse proxy is part of how this Recipe realizes the
+    # proxy and no Release setting chooses it.
+    path_allowlist_image_tag: 1.27.5-alpine
+    # How the bundle delivers its two texts, which the bundle reads: as two
+    # compose configs, one per text, because this target delivers a config as
+    # one file at the path it is mounted at. The bundle takes "config_map" or
+    # "compose_configs" and stops the build on anything else.
+    request_guard_delivery: compose_configs
+    # The names of the bundle's two configs, which the workload's volumes source
+    # and the bundle checks these locals against, and the directory both files
+    # are mounted in. That directory is one of its own, beside the
+    # configuration's, and the configuration registers the guard by the full
+    # path of its file there. The proxy reads a registration's last dot as the
+    # one before the hook's name and every other dot as a directory separator,
+    # so this path carries no dot.
+    request_guard_module_config_name: "{{ .context.instance_id }}-request-guard-module"
+    request_guard_allowlist_config_name: "{{ .context.instance_id }}-request-guard-allowlist"
+    request_guard_dir: /etc/litellm-request-guard
+    # Whether the reverse proxy forwards the routes that create, read, update and
+    # delete an organization, as "true" or "false"; the bundle reads it. Off
+    # here: nothing this component offers reads a key's organization, so those
+    # routes are refused like the rest of the administrative routes.
+    forward_organization_routes: "false"
   # provides is evaluated before the workload and cannot read it, so the port has
   # one authored home in .infra.port that every reader dereferences — provides.port
-  # and provides.endpoint here, and below the proxy's own listen-port argument, the
-  # container port and the service entry; the literal is never repeated. The
-  # contract is key-for-key the one the helm realization publishes, so a consumer
-  # reads the same keys on either target.
+  # and provides.endpoint here, the path allowlist's listen port, which the
+  # bundle writes, and below its container port and the service entry, with the
+  # proxy's own loopback port derived from it in the locals; the literal is never
+  # repeated. The contract is key-for-key the one the helm realization publishes,
+  # so a consumer reads the same keys on either target.
   #
   # host is the name the compose provider gives the synthesized service, which is
   # the component instance's own name, so a consumer on the same compose network
-  # resolves it directly. host and endpoint spell it out twice on purpose: a
-  # provides entry cannot read another provides entry, so there is no home either
-  # could dereference instead — the repetition is forced, not a choice, and the
-  # two must be edited together.
+  # resolves it directly; the path allowlist's service shares that service's
+  # network namespace, so the name and infra.port reach the allowlist. host and
+  # endpoint spell it out twice on purpose: a provides entry cannot read another
+  # provides entry, so there is no home either could dereference instead — the
+  # repetition is forced, not a choice, and the two must be edited together.
   provides:
     host: "{{ .context.instance_id }}"
     port: "{{ .infra.port }}"
@@ -73,7 +178,54 @@ spec:
       {{- fail (printf "infra.external_base_url %q carries the path %q, but the proxy takes its public address as an origin only, so the links it composes would point where it is not served; set it to the scheme, host and port alone, for example https://llm.example.com" . $u.path) -}}
       {{- end -}}
       {{- end -}}
+  artifacts:
+    # The proxy's configuration body, as a compose config: the alias it
+    # publishes, the upstream target behind it, and, on every Release, the
+    # request guard's registration. The body is the one the helm realization
+    # carries in its ConfigMap, line for line.
+    #
+    # No credential value appears here. The upstream credential is named through
+    # the proxy's own environment indirection — the body carries the variable
+    # name and the runtime reads the value from the environment — and the
+    # administrative key is not named here at all, because the proxy reads its
+    # variable directly from the environment at startup.
+    #
+    # The config's name is spelled once, in config_name, which the volume below
+    # sources as well. The guard's module is not part of this body: the bundle
+    # imported below delivers it as a config of its own, mounted in
+    # request_guard_dir, so the registration names the module by the full path of
+    # its file there, and the proxy loads a module named by a full path from that
+    # path.
+    litellm-config.compose-fragment.yaml: |
+      configs:
+        {{ .locals.config_name }}:
+          content: |
+            model_list:
+              - model_name: {{ .values.model }}
+                litellm_params:
+                  model: {{ .values.upstream_model }}
+      {{- if hasKey (default dict .features) "provider_key" }}
+                  api_key: os.environ/{{ .values.provider_key_variable }}
+      {{- end }}
+            litellm_settings:
+              callbacks:
+                - {{ .locals.request_guard_dir }}/{{ .locals.request_filter_module }}.filter
+    # The request guard and the path allowlist, from the bundle every Recipe
+    # running this proxy imports, so the line they draw — which request fields a
+    # caller may send and which paths it may reach — has one text wherever the
+    # proxy runs. With request_guard_delivery set to compose_configs the bundle
+    # emits two compose configs, named by request_guard_module_config_name and
+    # request_guard_allowlist_config_name: the guard module, which holds the
+    # fields refused on every Release, and the reverse proxy's configuration,
+    # which lists the routes it forwards. The workload mounts each as a file in
+    # request_guard_dir. The bundle stops the build when a Release admits a
+    # refused field in infra.admitted_request_fields, and when a name, the
+    # address or the port it shares with this Recipe's locals above differs from
+    # its own. forward_organization_routes keeps the organization routes off.
+    request-guard:
+      $import: LiteLLMGuard#/artifacts/RequestGuard
   workload: |
+    {{- $configDir := "/etc/litellm" -}}
     {{- $masterKeyVar := "LITELLM_MASTER_KEY" -}}
     {{- $providerKeyVar := .values.provider_key_variable -}}
     apiVersion: aggrega.ai/v1alpha1
@@ -82,22 +234,26 @@ spec:
     containers:
       main:
         image: "ghcr.io/berriai/litellm:{{ .infra.engine_version }}"
+        # $configDir is the single authored home for the directory the
+        # configuration is mounted in: the path the proxy is pointed at and the
+        # mount that puts the file there both read the binding, so a future move
+        # cannot relocate one and leave the other behind. This target delivers a
+        # config as one file at its mount path, so the mount names the file.
         # The image entrypoint execs the proxy with the container args as its
         # command line, and supplying args replaces the image's own default
-        # arguments — so the listen port is passed here explicitly rather than
-        # inherited.
-        # The routing decision travels on this command line instead of in a
-        # configuration file. That is the deliberate near-duplicate of the helm
-        # realization's configuration body: the same authored values reach the
-        # proxy, by the only route this target has. An ArtifactLibrary bundle is
-        # the future single-source home for a body both targets can emit
-        # unchanged; it is not that today, so do not consolidate the two into a
-        # shape this target cannot express.
+        # arguments — so the configuration, the listen address and the port are
+        # passed here explicitly rather than inherited, each dereferencing its
+        # single authored home. The proxy listens on the loopback address only:
+        # callers reach it through the path allowlist below, which listens on
+        # infra.port, and nothing outside the shared network namespace can reach
+        # the proxy past it.
         args:
-          - "--model"
-          - "{{ .values.upstream_model }}"
+          - "--config"
+          - "{{ $configDir }}/{{ .locals.config_file }}"
+          - "--host"
+          - "{{ .locals.gateway_address }}"
           - "--port"
-          - "{{ .infra.port }}"
+          - "{{ .locals.gateway_port }}"
         # $masterKeyVar and $providerKeyVar are each bound once, so the variable
         # a value is rendered under and the inject-pipe entry it is read from
         # cannot drift apart. No credential value is authored here — each is
@@ -121,22 +277,21 @@ spec:
     {{- if hasKey (default dict .features) "provider_key" }}
           {{ $providerKeyVar }}: "{{ index .context.inject.env $providerKeyVar }}"
     {{- end }}
-        ports:
-          http: {{ .infra.port }}
         # A compose service carries one healthcheck, and it runs inside the
         # image, which ships Python but no HTTP client or socket tool. So the
         # check is the one the product's own Compose file runs — a request from
         # the image's Python — with that file's timing, sent to the documented
         # readiness endpoint rather than the liveness one that file names,
         # because the single check a service keeps is the one that reports it
-        # ready for traffic. Readiness makes no model call and fails while a
-        # configured bookkeeping database is unreachable.
+        # ready for traffic. It asks on the loopback address, where the proxy
+        # listens. Readiness makes no model call and fails while a configured
+        # bookkeeping database is unreachable.
         health:
           ready:
             exec:
               - python3
               - "-c"
-              - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:{{ .infra.port }}/health/readiness', timeout=10)"
+              - "import urllib.request; urllib.request.urlopen('http://{{ .locals.gateway_address }}:{{ .locals.gateway_port }}/health/readiness', timeout=10)"
             initialDelaySeconds: 40
             periodSeconds: 30
             timeoutSeconds: 10
@@ -148,6 +303,64 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+        # The configuration as the file the proxy is pointed at, and the guard's
+        # module as a file in a directory of its own beside it, where the
+        # configuration's registration finds it.
+        volumeMounts:
+          - name: config
+            path: "{{ $configDir }}/{{ .locals.config_file }}"
+          - name: request-guard-module
+            path: "{{ .locals.request_guard_dir }}/{{ .locals.request_filter_module }}.py"
+      # The path allowlist: the official nginx image, configured only by the
+      # file the bundle's second config carries, which it mounts and nothing
+      # else, run in the foreground in place of the image's own start-up
+      # scripts, which would edit a configuration this container does not use.
+      # This target runs it as a service of its own that shares the proxy's
+      # network namespace, so it reaches the proxy on the loopback address and a
+      # consumer reaching the component's service on infra.port reaches it. It
+      # forwards the routes the proxy serves; every other path is answered 403
+      # with nothing forwarded. Its health check asks the proxy's readiness route
+      # through it, with the curl the image carries and the product's own Compose
+      # file's timing, so it reports healthy only once the proxy and the
+      # allowlist both answer. The resources are sized for its one worker
+      # process relaying requests over the loopback address.
+      path-allowlist:
+        image: "nginx:{{ .locals.path_allowlist_image_tag }}"
+        command:
+          - nginx
+          - -c
+          - "{{ .locals.request_guard_dir }}/{{ .locals.path_allowlist_file }}"
+          - -g
+          - "daemon off;"
+        ports:
+          http: {{ .infra.port }}
+        health:
+          ready:
+            http: /health/readiness
+            initialDelaySeconds: 40
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: 250m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 128Mi
+        volumeMounts:
+          - name: request-guard-allowlist
+            path: "{{ .locals.request_guard_dir }}/{{ .locals.path_allowlist_file }}"
+    volumes:
+      config:
+        configmap:
+          source: "{{ .locals.config_name }}"
+      request-guard-module:
+        configmap:
+          source: "{{ .locals.request_guard_module_config_name }}"
+      request-guard-allowlist:
+        configmap:
+          source: "{{ .locals.request_guard_allowlist_config_name }}"
     # A ClusterIP service entry keeps the proxy internal to the compose network,
     # which is where its consumers sit: the agent wired to it resolves the service
     # name and the port straight from the edge. Nothing is published to the host,
