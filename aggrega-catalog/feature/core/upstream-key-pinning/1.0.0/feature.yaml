@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Feature
+metadata:
+  name: core/upstream-key-pinning
+  version: 1.0.0
+  description: >
+    Pins the public keys a gateway accepts from the services it forwards to.
+    For each upstream the Release names, the gateway accepts the connection
+    only when a certificate that upstream presents carries one of the keys
+    listed for it, and refuses the connection otherwise. It attaches to a
+    component standing in the request path that declares it can pin an
+    upstream by its public key (dataplane.aggrega.ai/upstream-pinning:
+    public-key). The gateway is the side that checks, and each entry names the
+    upstream it checks by the host the gateway dials.
+
+    Each key is a public key in PEM form, the key itself rather than a
+    certificate carrying it, so a certificate renewed over the same key still
+    matches and one issued over a new key is refused until that key is pinned.
+
+    A pin is a control, not an assurance: it narrows which key an upstream may
+    present and says nothing else about the connection. What a gateway does for
+    an upstream no entry names is the product's own, and each realization
+    states it; on some gateways, setting any pin stops certificate chains being
+    verified for every upstream.
+  annotations:
+    security.aggrega.ai/class: "trust"
+    security.aggrega.ai/trust_mechanism: "upstream_key_pinning"
+    routing.aggrega.ai/tier: "gateway"
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  # Selects on the capability's value, not on its presence. The pins this
+  # Feature carries are public keys, so a component able to pin only some
+  # other way, by a whole certificate's hash, offers no lower fidelity at which
+  # the attachment still does its job; it is refused before anything renders,
+  # by a selector violation naming this Feature and the selector.
+  appliesTo: "dataplane.aggrega.ai/upstream-pinning=public-key"
+  interoperability:
+    conflictsWith: []
+  # Rules of the Feature, whichever gateway carries it. An upstream given two
+  # entries leaves the attachment not saying which keys apply to it, and a key
+  # that is not one PEM public key is not the form every realization reads: a
+  # gateway handed other text may read it as something else entirely, a file
+  # path or a reference into a store of its own. Both halt here, naming the
+  # entry. Each realization adds what its own gateway cannot honour.
+  assertions:
+    one_entry_per_upstream: >-
+      {{- $seen := list -}}
+      {{- range $pin := .infra.pins -}}
+      {{- if has $pin.upstream $seen -}}
+      {{- fail (printf "core/upstream-key-pinning attachment %q on %q gives the upstream %q two entries in pins, so the attachment would not say which keys apply to it; merge them into one entry listing every key accepted from that upstream" $.metadata.feature_instance $.metadata.instance_id $pin.upstream) -}}
+      {{- end -}}
+      {{- $seen = append $seen $pin.upstream -}}
+      {{- end -}}
+    each_key_is_one_pem_public_key: >-
+      {{- range $pin := .infra.pins -}}
+      {{- range $key := $pin.public_keys -}}
+      {{- $k := trim $key -}}
+      {{- if not (and (hasPrefix "-----BEGIN PUBLIC KEY-----" $k) (hasSuffix "-----END PUBLIC KEY-----" $k) (eq (len (splitList "-----BEGIN " $k)) 2)) -}}
+      {{- fail (printf "core/upstream-key-pinning attachment %q on %q lists a key for the upstream %q that is not one public key in PEM form: each entry of public_keys is the text of a single block opening with -----BEGIN PUBLIC KEY----- and closing with -----END PUBLIC KEY-----, the key itself rather than a certificate, a fingerprint or a file path" $.metadata.feature_instance $.metadata.instance_id $pin.upstream) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+  schema:
+    values:
+      $ref: "BaseComponents#/schemas/BaseFeatureParameter"
+    infra:
+      # Which key an upstream presents differs per environment, a staging
+      # upstream presenting another certificate than a production one, and
+      # accepting it is the operator's trust decision, so the pins are filled in
+      # the Release. An entry names its upstream by the host the gateway dials
+      # rather than by an edge: the graph carries the edges into a gateway, and
+      # what the gateway forwards to onward is configured in the gateway itself.
+      # The list is required and carries at least one entry, because an
+      # attachment naming no pin would pin nothing.
+      pins:
+        type: array
+        min: 1
+        required: true
+        description: "The upstreams the gateway pins, each with the public keys it accepts from that upstream. At least one entry is required. Which upstreams a realization can name, and how many keys it can accept from one, are its gateway's, and a realization refuses an entry its gateway cannot honour rather than dropping it."
+        items:
+          type: object
+          properties:
+            upstream:
+              type: string
+              min: 1
+              description: "The upstream this entry pins, named by the host the gateway dials to reach it, with no scheme and no port. A realization whose gateway also takes a wildcard for every host under one suffix, or for every upstream, says so."
+            public_keys:
+              type: array
+              min: 1
+              description: "The public keys the gateway accepts from this upstream, each the PEM text of one key: a single block opening with -----BEGIN PUBLIC KEY-----. A certificate carrying any one of them is accepted. At least one is required; a second lets a replacement key be pinned before the upstream moves to it."
+              items:
+                type: string
+                min: 1
+          required: [upstream, public_keys]

@@ -242,6 +242,7 @@ The dimensions and their value sets:
 | `content-masking` | `entity-recognition` | The component can replace sensitive text in the chat and completion payload it is routing with a placeholder before the text travels further. `entity-recognition` names the fidelity: it replaces matches of patterns supplied in its configuration and also entity types that a recognizer service it calls detects. A component that could only replace pattern matches would carry a narrower value, added in the same act as the first component to carry it. |
 | `prompt-guard` | `pattern-list` | The component can inspect the chat and completion payload it is routing and refuse a request on its content. `pattern-list` names the fidelity: the match is against patterns supplied in its configuration. The dimension is deliberately narrower than content inspection in general — a component here reads the model payload it already parses to route, and not one of them inspects an arbitrary HTTP body. |
 | `upstream-tls` | `trust-anchor` | The component can require the service it forwards to present a certificate chaining to a trust anchor the Release supplies. |
+| `upstream-pinning` | `public-key` | The component can refuse a service it forwards to unless a certificate that service presents carries one of the public keys the Release supplies for it. `public-key` names what is pinned: the key itself, so a certificate renewed over the same key still matches. |
 
 Three rules bind the family, and each has already been got wrong once:
 
@@ -259,23 +260,22 @@ Three rules bind the family, and each has already been got wrong once:
   established against the product's own reference documentation.** A value
   nothing carries is worse than an absent one — a selector naming it parses,
   matches nothing, and reports nothing — so each is added in the same act as the
-  first component to carry it. One fidelity the field does implement stays
-  absent, and not for want of a product: an upstream certificate pinned by
-  key rather than verified against an anchor. 🔴 **One gateway in the catalog can
-  pin, and the ground for keeping it off this family is what a second value here
-  would assert, not scarcity — a pin says which key a certificate must BE, where
-  every value on this family says what one must SAY.** A certificate-name
-  assertion and a named trust anchor are neither of them pins. The one gateway
-  here able to pin carries it as a value on its own Component's surface.
+  first component to carry it. 🔴 **An upstream certificate pinned by key is a
+  dimension of its own, `upstream-pinning`, and never a value of `upstream-tls`:
+  a pin says which key a certificate must BE, where `trust-anchor` says what one
+  must SAY.** A certificate-name assertion and a named trust anchor are neither
+  of them pins, so a component able only to check a name or an anchor carries
+  no `upstream-pinning` value.
 
 Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 `upstream-tls: trust-anchor`), `core/gateway/contour` and
 `core/gateway/envoy-gateway` (each `request-mirroring: sampled`,
 `caller-identity: client-certificate`, `upstream-tls: trust-anchor`),
-`core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/litellm`
+`core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/tyk`
+(`upstream-pinning: public-key`), `core/gateway/litellm`
 (`caller-identity: injected-header`, `content-masking: entity-recognition`,
-`prompt-guard: pattern-list`, `upstream-tls: trust-anchor`). Four of the five carry no
-`gateway.aggrega.ai/intelligence` value and the fifth carries `semantic` — and
+`prompt-guard: pattern-list`, `upstream-tls: trust-anchor`). Five of the six carry no
+`gateway.aggrega.ai/intelligence` value and the sixth carries `semantic` — and
 that mixture is the separation working rather than an exception to it. The
 intelligence label names a **product tier** — whether the router parses the
 request body — while this family names **capabilities**, so the two answer
@@ -1187,21 +1187,6 @@ spec:
       # does not guarantee value-mapping compatibility with the new artifact.
       source_version: { type: string }
 ```
-
-### Pinning upstream keys is all-or-nothing per gateway
-
-Where a gateway Component exposes a knob for pinning the public keys it accepts
-from the upstreams it forwards to, a Release fills that knob for every upstream
-the gateway reaches or for none of them: each upstream carries an entry of its
-own, or one it inherits from a `*` entry. The first entry switches that gateway
-off chain verification for every upstream it reaches, so an upstream left out is
-reached with nothing verified at all rather than verified less strictly.
-
-Nothing checks this and a Release may leave an upstream out — the entries are
-text carried through to the gateway, so a half-filled surface renders as
-willingly as a complete one. What each entry means to the gateway belongs on the
-knob's own description; the convention is here because that description answers
-what one entry does and this is a property of the whole set.
 
 ## 5. Shared schema and mapping reuse
 
@@ -2396,6 +2381,22 @@ apart silently.
 State the behaviour on both the Feature's `infra` key and the FeatureRecipe's
 `metadata.description`: an operator reading either needs to know that supplying the
 key pins the name and omitting it derives one.
+
+### Pinning upstream keys is all-or-nothing on a gateway that stops verifying chains
+
+A gateway may stop verifying certificate chains for every upstream once any
+upstream is pinned; `core/gateway/tyk` does. On such a gateway, a Release
+attaching `core/upstream-key-pinning` names every upstream the gateway reaches
+or none of them: each upstream carries an entry of its own, or is covered by a
+`*` entry. An upstream left out is reached with nothing verified at all rather
+than verified less strictly.
+
+Nothing checks this and a Release may leave an upstream out — the entries are
+text carried through to the gateway, so a half-filled set renders as willingly
+as a complete one. What pinning does on a given gateway belongs on that
+gateway's realization of the Feature; the convention is here because a
+realization's description answers what its gateway does and this is a property
+of the whole set.
 
 ## 8. OCI Registry
 
