@@ -260,7 +260,7 @@ Three rules bind the family, and each has already been got wrong once:
   nothing carries is worse than an absent one — a selector naming it parses,
   matches nothing, and reports nothing — so each is added in the same act as the
   first component to carry it. One fidelity the field does implement stays
-  absent, and no longer for want of a product: an upstream certificate pinned by
+  absent, and not for want of a product: an upstream certificate pinned by
   key rather than verified against an anchor. 🔴 **One gateway in the catalog can
   pin, and the ground for keeping it off this family is what a second value here
   would assert, not scarcity — a pin says which key a certificate must BE, where
