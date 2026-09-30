@@ -1076,10 +1076,10 @@ Use `#` for comments throughout — every catalog file is YAML, and YAML's comme
 
 ### What a byte-level edit costs a consumer
 
-An entity's content digest is the SHA-256 of the file's **raw bytes**. Nothing is
-parsed, normalised or re-serialised first, which is what lets anything that can
-compute a SHA-256 verify a pin: `sha256sum component.yaml` prints the same hex the
-lockfile records, with no Aggrega-specific normalisation to agree on beforehand.
+An entity's content digest is taken over the **raw bytes** of its file and of each
+file it carries beside it, with nothing parsed, normalised or re-serialised first:
+it is the SHA-256 of a listing of one line per file, giving whether the file is
+executable, the SHA-256 of its bytes and its path, not the hex `sha256sum` prints.
 
 The consequence is that the digest tracks the bytes exactly — including across an
 edit YAML defines as producing the identical parsed value. Re-wrapping a folded
