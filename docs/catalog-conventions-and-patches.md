@@ -904,6 +904,35 @@ digest, with the consumer cost described under "What a byte-level edit costs a
 consumer" below. Carry a reorder along with a change the entity is being
 published for anyway.
 
+### Descriptions: a few short paragraphs, the detail in comments
+
+`metadata.description` is the prose a reader meets before choosing an entity: a
+publish stamps it onto the artifact as its searchable description (see
+"Searchable manifest annotations" below), and it is the text `aggrega search`
+matches a query against. This catalog writes it for that moment and keeps it
+short:
+
+- **A few short paragraphs, separated by blank lines** in a folded
+  `description: >` block — what the entity is; how a reader uses it; where it is
+  realized and what it does not do. `feature/core/random-password` is the shape.
+- **The detail is a YAML comment beside the field or block it explains**, written
+  in the reader's terms: why a default is what it is, how a setting behaves on one
+  provider, what a value means under each realization. A sentence cut from a
+  description moves into a comment; the fact it carried is never dropped.
+- **A limit a reader must meet before choosing the entity stays in the
+  description, briefly.** The disclosures other conventions on this page ask a
+  description to make — the input a fleet member leaves to the Release, which
+  realization to reach for — are this case.
+
+The length half of the convention is held by this catalog's own checks, which
+refuse every entity description in this catalog longer than a ceiling declared
+once in the check itself; the number lives there and nowhere else. The check measures length and nothing
+more, so the paragraph shape and the kept facts stay with the author and the
+reviewer. It is a convention of this catalog and never of the product: nothing in
+the product limits a description's length — the entity schemas declare none, and
+the compiler builds nothing from what a description says — so a catalog published
+by anyone else may write its descriptions at any length.
+
 ### Quoting follows the declared type
 
 The quoting rules below are one rule applied to several surfaces: **write each value
