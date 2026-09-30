@@ -28,8 +28,9 @@ metadata:
     management and the organization routes. Both come from the LiteLLMGuard
     bundle.
 
-    A core/context-propagation attachment, or a core/data-masking one listing
-    what to mask, adds the module its realization relies on; a masking
+    A core/context-propagation attachment, or a core/data-masking or
+    core/log-masking one listing what to mask, adds the module its realization
+    relies on; a masking
     attachment's refusals are a policy the request guard applies. DATABASE_URL,
     PROXY_BASE_URL and the two Presidio addresses are emitted only when
     infra.database_url, infra.external_base_url and the recognizer sockets are
@@ -70,6 +71,12 @@ spec:
     reply_masking_class: ReplyMasking
     buffered_reply_masking_class: BufferedReplyMasking
     field_pattern_masking_class: FieldPatternMasking
+    # The module the log-masking guardrail is loaded from, and the class in it:
+    # the configuration entry a core/log-masking attachment's realization
+    # writes names both from here, and the file below defines the class from
+    # here, so the entry cannot name one the file lacks.
+    log_masking_module: log_masking
+    log_masking_class: LogMasking
     # The request-guard module, delivered on every Release by the LiteLLMGuard
     # bundle imported below: the file it is carried as and the callback the
     # configuration registers first both read this name. The bundle holds the
@@ -126,6 +133,13 @@ spec:
     # and "true" when infra.database_url is set, empty when it is not.
     model_aliases: '{{ $aliases := list }}{{ range .values.models }}{{ $aliases = append $aliases .name }}{{ end }}{{ toJson $aliases }}'
     bookkeeping_database: '{{ if optional .infra "database_url" "" }}true{{ end }}'
+    # The entity types the Presidio analyzer that core/security/presidio-analyzer
+    # runs reports it recognizes in English, as a JSON list: the gateway hands
+    # each listed type to that analyzer, and a type outside the list is ignored
+    # when it is listed beside one it knows. Both masking realizations,
+    # core/data-masking's and core/log-masking's, check an attachment's entity
+    # types against this one list, so the two refuse the same types.
+    analyzer_entity_types: '["CREDIT_CARD", "CRYPTO", "DATE_TIME", "EMAIL_ADDRESS", "IBAN_CODE", "IP_ADDRESS", "LOCATION", "MAC_ADDRESS", "MEDICAL_LICENSE", "NRP", "PERSON", "PHONE_NUMBER", "UK_NHS", "URL", "US_BANK_NUMBER", "US_DRIVER_LICENSE", "US_ITIN", "US_PASSPORT", "US_SSN"]'
   # provides is evaluated before the workload and cannot read it, so the port has
   # one authored home in .infra.port that every reader dereferences — provides.port
   # and provides.endpoint here, the path allowlist's listen port, which the
@@ -226,10 +240,19 @@ spec:
     # output options its masking does not reach — is refused by the request
     # guard, from that policy, so the guard stays the one hook that refuses.
     #
+    # While a core/log-masking attachment lists entities or patterns, the
+    # ConfigMap carries the log-masking module, the one that attachment's
+    # guardrail entry is loaded from, decided from the attachment in the same
+    # way and failing closed in the same way. Its class runs only where the
+    # gateway hands a finished call to its logs, so nothing it does reaches a
+    # request or a reply; what it masks is stated on that realization. With no
+    # such attachment, the module is not emitted.
+    #
     # Each of those attachments is found by its type with any version it was
     # authored with set aside, so core/context-propagation and
     # core/context-propagation:1.0.0 are both read, as are core/data-masking
-    # and core/data-masking:1.0.0.
+    # and core/data-masking:1.0.0, and core/log-masking and
+    # core/log-masking:1.0.0.
     #
     # On every Release the body registers the request guard first, before any
     # hook that reads the request. Its module is not a file of this ConfigMap:
@@ -242,6 +265,7 @@ spec:
       {{- $identity := false }}
       {{- $listed := list }}
       {{- $masking := false }}
+      {{- $logMasking := false }}
       {{- range $name, $attachment := (default dict .features) }}
       {{- if eq (first (splitList ":" (toString $attachment.type))) "core/context-propagation" }}
       {{- $identity = true }}
@@ -252,6 +276,10 @@ spec:
       {{- if eq (first (splitList ":" (toString $attachment.type))) "core/data-masking" }}
       {{- $values := optional $attachment "values" dict }}
       {{- if or (optional $values "entities" list) (optional $values "patterns" list) }}{{ $masking = true }}{{ end }}
+      {{- end }}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/log-masking" }}
+      {{- $values := optional $attachment "values" dict }}
+      {{- if or (optional $values "entities" list) (optional $values "patterns" list) }}{{ $logMasking = true }}{{ end }}
       {{- end }}
       {{- end -}}
       apiVersion: v1
@@ -1241,6 +1269,223 @@ spec:
                       model=getattr(like, "model", None),
                       choices=[StreamingChoices(index=index, delta=Delta(**fields))],
                   )
+      {{- end }}
+      {{- if $logMasking }}
+        {{ .locals.log_masking_module }}.py: |
+          """Masking of what the gateway hands to its logs, by listed pattern and by entity type.
+
+          Delivered beside the gateway's configuration while core/log-masking lists patterns or entity types, and loaded by
+          the one guardrail entry that attachment's realization writes. {{ .locals.log_masking_class }} runs only where the gateway hands a finished
+          call to its logs, never before a request is forwarded and never on a reply before it is returned: it replaces each
+          copy of the call the logs are handed with a masked copy, and edits nothing the call itself holds. The copies are the
+          messages, prompt and input of the call; the standard logging payload's messages and reply; a streamed reply as the
+          gateway assembled it; the request as the provider was sent it and the reply as the provider returned it; the request
+          as the caller sent it, which the spend logs keep, with the reference it carries back to itself; and the reply handed
+          to each integration. In each, the text a caller or a model wrote is masked: every listed pattern at every match,
+          through the gateway's own content filter's masking of one text, then every listed entity type, through the gateway's
+          own Presidio integration's masking of one text; the words that say what a part is, the identifiers that tie parts
+          together, and parts that are not text, an image, a file or audio, pass as they are. When a text cannot be masked, a
+          recognizer that cannot be reached among the reasons, the call's record is not written at all rather than written
+          unmasked.
+          """
+          import asyncio
+          import copy
+          from concurrent.futures import ThreadPoolExecutor
+
+          from litellm.integrations.custom_guardrail import CustomGuardrail
+          from litellm.proxy.guardrails.guardrail_hooks.litellm_content_filter.content_filter import ContentFilterGuardrail
+          from litellm.proxy.guardrails.guardrail_hooks.presidio import _OPTIONAL_PresidioPIIMasking
+          from litellm.types.guardrails import GuardrailEventHooks
+
+          RECORD_DROPPED = (
+              "A call's log record was not written: masking it failed, and this gateway writes no record of a call it "
+              "cannot mask. The call itself was answered as usual."
+          )
+
+
+          class LogMaskingFailed(Exception):
+              pass
+
+
+          # The keys whose value is text a caller or a model wrote, in the request and reply shapes of the routes the gateway
+          # serves: a message's or a block's content, a part's text, a tool call's arguments, a completion's prompt, an
+          # embedding's or a responses request's input, a responses request's instructions and a responses reply's output, a
+          # messages-route system prompt, a completions suffix, reasoning and thinking, and a refusal.
+          _TEXT = frozenset([
+              "arguments", "content", "input", "instructions", "output", "output_text", "prompt", "reasoning_content",
+              "refusal", "suffix", "system", "text", "thinking",
+          ])
+
+          # Inside such text, the words that say what a part is and the identifiers that tie parts together.
+          _OWN = frozenset([
+              "cache_control", "call_id", "encrypted_content", "finish_reason", "id", "index", "media_type", "name", "role",
+              "signature", "status", "tool_call_id", "tool_use_id", "type",
+          ])
+
+          # The kinds of part that are not text: masking reads text, so these pass as they are.
+          _NOT_TEXT = frozenset([
+              "audio", "file", "image", "image_url", "input_audio", "input_file", "input_image", "video_url",
+          ])
+
+
+          def _field(holder, name):
+              return holder.get(name) if isinstance(holder, dict) else getattr(holder, name, None)
+
+
+          def _set_field(holder, name, value):
+              if isinstance(holder, dict):
+                  holder[name] = value
+              else:
+                  setattr(holder, name, value)
+
+
+          def _names(holder):
+              if isinstance(holder, dict):
+                  return list(holder)
+              dump = getattr(holder, "model_dump", None)
+              return list(dump()) if dump is not None else []
+
+
+          class {{ .locals.log_masking_class }}(CustomGuardrail):
+              def __init__(self, patterns=None, pii_entities_config=None, **kwargs):
+                  # A logging hook whatever mode the entry names, so the gateway calls it on no request before it is forwarded
+                  # and on no reply before it is returned; and no second entry is built for replies.
+                  kwargs["event_hook"] = GuardrailEventHooks.logging_only
+                  super().__init__(**kwargs)
+                  self._patterns = None
+                  if patterns:
+                      # The gateway's own content filter, never registered, used only for its masking of one text, so a
+                      # pattern masks here exactly what it masks under core/data-masking.
+                      self._patterns = ContentFilterGuardrail(
+                          guardrail_name=self.guardrail_name, patterns=patterns, event_hook=GuardrailEventHooks.pre_call
+                      )
+                  self._recognizer = None
+                  if pii_entities_config:
+                      # The gateway's own Presidio integration, never registered, used only for its masking of one text through
+                      # the analyzer and the anonymizer at the addresses the gateway's environment carries.
+                      self._recognizer = _OPTIONAL_PresidioPIIMasking(
+                          guardrail_name=self.guardrail_name,
+                          pii_entities_config=pii_entities_config,
+                          event_hook=GuardrailEventHooks.logging_only,
+                      )
+
+              async def _mask_text(self, text, done):
+                  # Each distinct text is masked once and every copy carrying it receives the result. A caller's request cannot
+                  # change what is masked: the recognizer is handed settings of its own, never the request's.
+                  if not text.strip():
+                      return text
+                  if text not in done:
+                      masked = text
+                      if self._patterns is not None:
+                          masked = self._patterns._filter_single_text(masked)
+                      if self._recognizer is not None:
+                          own = {"metadata": {}}
+                          masked = await self._recognizer.check_pii(
+                              text=masked,
+                              output_parse_pii=False,
+                              presidio_config=self._recognizer.get_presidio_settings_from_request_data(own),
+                              request_data=own,
+                          )
+                      done[text] = masked
+                  return done[text]
+
+              async def _masked_item(self, value, done, text, seen):
+                  if isinstance(value, str):
+                      return await self._mask_text(value, done) if text else value
+                  if isinstance(value, (dict, list)) or getattr(value, "model_dump", None) is not None:
+                      await self._mask_in_place(value, done, text, seen)
+                  return value
+
+              async def _mask_in_place(self, holder, done, text, seen):
+                  # Walks a copy: inside a key named in _TEXT every string is text, except under the keys _OWN names; outside
+                  # such a key only the walk goes on. A value met twice, as the request's reference back to itself is, is
+                  # masked once.
+                  if id(holder) in seen:
+                      return
+                  seen.add(id(holder))
+                  if isinstance(holder, list):
+                      for i, item in enumerate(holder):
+                          holder[i] = await self._masked_item(item, done, text, seen)
+                      return
+                  if text and _field(holder, "type") in _NOT_TEXT:
+                      return
+                  for name in _names(holder):
+                      if text and name in _OWN:
+                          continue
+                      value = _field(holder, name)
+                      if value is None:
+                          continue
+                      masked = await self._masked_item(value, done, text or name in _TEXT, seen)
+                      if masked is not value:
+                          _set_field(holder, name, masked)
+
+              async def _copy(self, value, done, text):
+                  if isinstance(value, str):
+                      return await self._mask_text(value, done) if text else value
+                  copied = copy.deepcopy(value)
+                  await self._mask_in_place(copied, done, text, set())
+                  return copied
+
+              async def _masked(self, kwargs, result):
+                  done = {}
+                  out = dict(kwargs)
+                  for key in ("messages", "prompt", "input"):
+                      if out.get(key) is not None:
+                          out[key] = await self._copy(out[key], done, True)
+                  payload = out.get("standard_logging_object")
+                  if isinstance(payload, dict):
+                      payload = dict(payload)
+                      if payload.get("messages") is not None:
+                          payload["messages"] = await self._copy(payload["messages"], done, True)
+                      if payload.get("response") is not None:
+                          payload["response"] = await self._copy(payload["response"], done, isinstance(payload["response"], str))
+                      out["standard_logging_object"] = payload
+                  for key in ("complete_streaming_response", "async_complete_streaming_response"):
+                      if out.get(key) is not None:
+                          out[key] = await self._copy(out[key], done, False)
+                  if isinstance(out.get("original_response"), str):
+                      out["original_response"] = await self._mask_text(out["original_response"], done)
+                  extra = out.get("additional_args")
+                  if isinstance(extra, dict) and extra.get("complete_input_dict") is not None:
+                      extra = dict(extra)
+                      extra["complete_input_dict"] = await self._copy(extra["complete_input_dict"], done, False)
+                      out["additional_args"] = extra
+                  params = out.get("litellm_params")
+                  arrived = params.get("proxy_server_request") if isinstance(params, dict) else None
+                  if isinstance(arrived, dict) and arrived.get("body") is not None:
+                      arrived = dict(arrived)
+                      arrived["body"] = await self._copy(arrived["body"], done, False)
+                      params = dict(params)
+                      params["proxy_server_request"] = arrived
+                      out["litellm_params"] = params
+                  if result is not None:
+                      result = await self._copy(result, done, isinstance(result, str))
+                  return out, result
+
+              async def async_logging_hook(self, kwargs, result, call_type):
+                  # Raised, the gateway hands this call to none of its logs: the handler for asynchronous integrations and the
+                  # spend logs stops at the hook, and the one for synchronous integrations logs the error and writes nothing.
+                  try:
+                      return await self._masked(kwargs, result)
+                  except Exception:
+                      raise LogMaskingFailed(RECORD_DROPPED) from None
+
+              def logging_hook(self, kwargs, result, call_type):
+                  # The gateway's handler for synchronous integrations calls this from a worker thread; the masking runs to its
+                  # end in an event loop of its own.
+                  def run():
+                      loop = asyncio.new_event_loop()
+                      try:
+                          return loop.run_until_complete(self.async_logging_hook(kwargs, result, call_type))
+                      finally:
+                          loop.close()
+
+                  try:
+                      asyncio.get_running_loop()
+                  except RuntimeError:
+                      return run()
+                  with ThreadPoolExecutor(max_workers=1) as pool:
+                      return pool.submit(run).result()
       {{- end }}
     # The request guard and the path allowlist, from the bundle every Recipe
     # running this proxy imports, so the line they draw — which request fields a

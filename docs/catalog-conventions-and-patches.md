@@ -243,6 +243,7 @@ The dimensions and their value sets:
 | `prompt-guard` | `pattern-list` | The component can inspect the chat and completion payload it is routing and refuse a request on its content. `pattern-list` names the fidelity: the match is against patterns supplied in its configuration. The dimension is deliberately narrower than content inspection in general — a component here reads the model payload it already parses to route, and not one of them inspects an arbitrary HTTP body. |
 | `upstream-tls` | `trust-anchor` | The component can require the service it forwards to present a certificate chaining to a trust anchor the Release supplies. |
 | `upstream-pinning` | `public-key` | The component can refuse a service it forwards to unless a certificate that service presents carries one of the public keys the Release supplies for it. `public-key` names what is pinned: the key itself, so a certificate renewed over the same key still matches. |
+| `log-masking` | `entity-recognition` | The component can replace sensitive text with a placeholder in the copy of a call it hands to its logs, while the request it forwards and the reply it returns stay as they were sent. `entity-recognition` names the fidelity: it replaces matches of patterns supplied in its configuration and also entity types that a recognizer service it calls detects. A component that could only replace pattern matches would carry a narrower value, added in the same act as the first component to carry it. |
 
 Three rules bind the family, and each has already been got wrong once:
 
@@ -273,7 +274,7 @@ Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 `caller-identity: client-certificate`, `upstream-tls: trust-anchor`),
 `core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/tyk`
 (`upstream-pinning: public-key`), `core/gateway/litellm`
-(`caller-identity: injected-header`, `content-masking: entity-recognition`,
+(`caller-identity: injected-header`, `content-masking: entity-recognition`, `log-masking: entity-recognition`,
 `prompt-guard: pattern-list`, `upstream-tls: trust-anchor`). Five of the six carry no
 `gateway.aggrega.ai/intelligence` value and the sixth carries `semantic` — and
 that mixture is the separation working rather than an exception to it. The

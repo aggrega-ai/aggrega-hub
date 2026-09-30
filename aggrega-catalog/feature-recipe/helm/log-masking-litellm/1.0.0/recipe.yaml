@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: log-masking-litellm
+  version: 1.0.0
+  description: >
+    Realizes core/log-masking on the AI gateway core/gateway/litellm; a
+    Release binds it in its Manifest. It writes one guardrail entry into the
+    configuration the gateway's own Recipe renders and emits no file; that
+    Recipe delivers the class the entry loads. Listed patterns are matched
+    inside the gateway; listed entity types are found and replaced by the
+    Presidio analyzer and anonymizer wired to its pii_analyzer and
+    pii_anonymizer sockets. The entry runs on every call, and a caller cannot
+    turn it off.
+
+    It masks each copy of a successful call the gateway hands to its logs:
+    the messages, the standard logging payload's messages and reply, a
+    streamed reply as assembled, the request and reply as the provider saw
+    them, the request the spend logs keep, and the reply each logging
+    integration receives. The gateway's Recipe configures no integration and
+    keeps no request text in its spend logs, so these are the copies one
+    configured beside it would receive.
+
+    Left unmasked: all the provider receives and the caller is answered; a
+    failed call's record, since the gateway masks nothing it logs for a failed
+    call; request metadata, tool definitions and headers; the gateway's debug
+    output; and text nothing matches. A call whose copies cannot be masked,
+    as when a recognizer cannot be reached, is left out of every log, its
+    spend row included.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/log-masking:1.0.0
+  # executionScope omitted -> component: the pipeline runs once per attached
+  # component and receives that component's rendered documents.
+  #
+  # core/gateway/litellm's realization renders the gateway's routing table as
+  # a configuration body, and the masking is a guardrail the running gateway
+  # reads out of that body. So this recipe emits no file: its one step writes
+  # a guardrail entry into the configuration the attached gateway already
+  # renders, and every other byte of that body is left as the gateway's own
+  # Recipe authored it. The class the entry loads is a module that Recipe
+  # delivers beside the configuration while this attachment lists something.
+  #
+  # The recipe halts when the attachment is carried by any component other
+  # than core/gateway/litellm, when the Recipe rendering it delivers no
+  # log-masking class, on an entity type the analyzer does not recognize in
+  # English, and on entities with the recognizer sockets unwired, each by an
+  # assertion below. No assertion can read the host component's labels, so
+  # the capability the gateway declares is stated in each message, and the
+  # guard at the top is what keeps that statement true.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/litellm and core/gateway/litellm:1.0.0 are the same host.
+    component_renders_the_body: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/litellm" -}}
+      {{- fail (printf "core/log-masking attachment %q on %q is bound to the LiteLLM realization, which writes its guardrail into the configuration body core/gateway/litellm renders; %s renders no such body. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The entry names a class the gateway's own Recipe delivers in a module
+    # beside the configuration and publishes the names of; a Recipe publishing
+    # none would leave the entry naming nothing the gateway can load, and the
+    # gateway would not start.
+    log_masking_class_is_delivered: >-
+      {{- if not (and (optional .locals "log_masking_module" "") (optional .locals "log_masking_class" "")) -}}
+      {{- fail (printf "core/log-masking attachment %q on %q is realized by a guardrail class core/gateway/litellm loads from a module its Recipe delivers beside the configuration, but the Recipe rendering %q delivers none; bind the component in the Manifest to a Recipe that does" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The entity types the Presidio analyzer that core/security/presidio-analyzer
+    # runs reports it recognizes in English, read from the one list the
+    # gateway's Recipe publishes for both masking realizations. A type outside
+    # the list is ignored by the analyzer when it is listed beside one it
+    # knows, so the logs would keep it and nothing would say so.
+    entity_types_the_analyzer_knows: >-
+      {{- $known := fromJson (optional .locals "analyzer_entity_types" "[]") -}}
+      {{- range $e := optional .values "entities" list -}}
+      {{- if not (has $e $known) -}}
+      {{- fail (printf "core/log-masking attachment %q on %q lists the entity type %q, which the Presidio analyzer core/gateway/litellm calls does not recognize in English; listed beside types it does recognize it would mask nothing in the logs and say nothing. List only types from: %s" $.metadata.feature_instance $.metadata.instance_id $e (join ", " $known)) -}}
+      {{- end -}}
+      {{- end -}}
+    # Listed entity types are found by the Presidio analyzer and replaced by
+    # the Presidio anonymizer that the gateway calls through its pii_analyzer
+    # and pii_anonymizer sockets: a person's name becomes <PERSON>. Both
+    # services receive the unmasked text, recognition runs in English, and it
+    # can miss an entity. Listed patterns need neither service.
+    entities_need_the_recognizer: >-
+      {{- if optional .values "entities" list -}}
+      {{- $analyzer := hasKey .uses "pii_analyzer" -}}
+      {{- $anonymizer := hasKey .uses "pii_anonymizer" -}}
+      {{- if not (and $analyzer $anonymizer) -}}
+      {{- $unwired := "neither its pii_analyzer socket nor its pii_anonymizer socket is wired" -}}
+      {{- if $analyzer }}{{ $unwired = "its pii_anonymizer socket is not wired" }}{{ end -}}
+      {{- if $anonymizer }}{{ $unwired = "its pii_analyzer socket is not wired" }}{{ end -}}
+      {{- fail (printf "core/log-masking attachment %q on %q lists entities, which core/gateway/litellm, declaring dataplane.aggrega.ai/log-masking: entity-recognition, finds and replaces in its logs through the Presidio analyzer and anonymizer it calls, but %s; wire a core/security/presidio-analyzer to pii_analyzer and a core/security/presidio-anonymizer to pii_anonymizer on %q, or list patterns instead of entities" .metadata.feature_instance .metadata.instance_id $unwired .metadata.instance_id) -}}
+      {{- end -}}
+      {{- end -}}
+  pipeline:
+    # One entry in the gateway's top-level guardrails list, found again by its
+    # name, so a second attachment adds an entry rather than replacing the
+    # first's. mode logging_only is the gateway's own mode for a guardrail that
+    # runs where a finished call is handed to its logs and nowhere else, and
+    # the class keeps to it whatever an entry names. default_on runs it on
+    # every call, where without it the entry runs only for a call that names
+    # it, so a caller cannot switch it off from the request, a request asking
+    # to disable the gateway's always-on guardrails included; an administrator
+    # can exempt a key or a team from the gateway's always-on guardrails in
+    # that key's or team's own settings. Each pattern is written as a JSON
+    # string, so its backslashes and quotes reach the gateway exactly as
+    # authored.
+    #
+    # What is masked. In each copy of a successful call the gateway hands to
+    # its logs, the class masks the text a caller or a model wrote: the text
+    # of messages, prompts and inputs and of their parts, tool-call arguments
+    # and tool results, a system prompt or instructions, reasoning and
+    # thinking, a refusal, and a reply's text and output. Patterns are matched
+    # by the gateway's content filter, with no other service, ignoring letter
+    # case, and every match is replaced for good by the pattern's name in
+    # capitals in brackets, [PROJECT_CODE_REDACTED] for a pattern named
+    # project_code; the gateway compiles each expression when it starts, and
+    # one that does not compile stops it starting. Entity types are then found
+    # and replaced by the recognizers. Tool-call arguments are masked as one
+    # text, so the names of their keys are masked as well, and a match
+    # spanning the JSON around a value can leave a logged copy no longer valid
+    # JSON. The words that say what a part is, the identifiers that tie parts
+    # together and parts that are not text, an image, a file or audio, pass
+    # as they are. Each copy is replaced by a masked copy: nothing the call
+    # holds is changed, so the request the provider receives and the reply the
+    # caller is answered with are exactly as they would be without the
+    # attachment.
+    #
+    # What is not masked. The gateway calls no logging guardrail for a call
+    # that fails, so what it hands its logs for one (the messages, the request
+    # as sent, the error the provider returned) is logged unmasked. The copies
+    # are masked where a finished call is handed to the logs, so the gateway's
+    # debug output and its printing of the logging payload, which its Recipe
+    # turns on neither of, are not masked. A request's metadata, its user
+    # field, tool definitions and headers are logged as sent. When a copy
+    # cannot be masked, because a recognizer cannot be reached or answers with
+    # an error among other reasons, the gateway writes no record of that call
+    # at all, to an integration or to the spend logs, and its own log records
+    # that a record was not written; such a call is not counted in the spend
+    # logs.
+    - id: write_log_masking_guardrail
+      plugin: pipeline-step/litellm-gateway-config:1.0.0
+      function: step
+      with: |
+        {{- $patterns := optional .values "patterns" list }}
+        {{- $entities := optional .values "entities" list }}
+        {{- $id := printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-") }}
+        section: guardrails
+        identifiedBy: guardrail_name
+        entries:
+          - guardrail_name: {{ $id }}-log-masking
+            litellm_params:
+              guardrail: {{ .locals.log_masking_module }}.{{ .locals.log_masking_class }}
+              default_on: true
+              mode: logging_only
+        {{- if $patterns }}
+              patterns:
+        {{- range $p := $patterns }}
+                - pattern_type: regex
+                  name: {{ $p.name | toJson }}
+                  pattern: {{ $p.regex | toJson }}
+                  action: MASK
+        {{- end }}
+        {{- end }}
+        {{- if $entities }}
+              pii_entities_config:
+        {{- range $e := $entities }}
+                {{ $e | toJson }}: MASK
+        {{- end }}
+        {{- end }}
