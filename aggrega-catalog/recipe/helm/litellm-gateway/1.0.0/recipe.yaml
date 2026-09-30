@@ -1285,21 +1285,33 @@ spec:
           through the gateway's own content filter's masking of one text, then every listed entity type, through the gateway's
           own Presidio integration's masking of one text; the words that say what a part is, the identifiers that tie parts
           together, and parts that are not text, an image, a file or audio, pass as they are. When a text cannot be masked, a
-          recognizer that cannot be reached among the reasons, the call's record is not written at all rather than written
-          unmasked.
+          recognizer that cannot be reached among the reasons, no copy is handed on masked in part: every copy is built again
+          with each such text replaced by one fixed placeholder, [TEXT_WITHHELD], so the call's record is still handed to the
+          logs and the call is still counted, and the gateway's own log says the text was withheld. Only if that fails too is
+          the record not written at all; it is never written unmasked.
           """
           import asyncio
           import copy
           from concurrent.futures import ThreadPoolExecutor
 
+          from litellm._logging import verbose_proxy_logger
           from litellm.integrations.custom_guardrail import CustomGuardrail
           from litellm.proxy.guardrails.guardrail_hooks.litellm_content_filter.content_filter import ContentFilterGuardrail
           from litellm.proxy.guardrails.guardrail_hooks.presidio import _OPTIONAL_PresidioPIIMasking
           from litellm.types.guardrails import GuardrailEventHooks
 
+          # What each text a caller or a model wrote becomes, in every copy of a call whose texts could not all be masked:
+          # one fixed word that carries no part of any text.
+          TEXT_WITHHELD = "[TEXT_WITHHELD]"
+
+          TEXT_WITHHELD_NOTE = (
+              "A call's log record was handed on with its text withheld: masking it failed (%s), so every text in every "
+              "copy of the call was replaced by " + TEXT_WITHHELD + ". The call itself was answered as usual."
+          )
+
           RECORD_DROPPED = (
-              "A call's log record was not written: masking it failed, and this gateway writes no record of a call it "
-              "cannot mask. The call itself was answered as usual."
+              "A call's log record was not written: masking its text failed, and withholding the text failed as well. The "
+              "call itself was answered as usual."
           )
 
 
@@ -1346,6 +1358,11 @@ spec:
               return list(dump()) if dump is not None else []
 
 
+          async def _withheld(text):
+              # Reads nothing of the text and calls no recognizer, so it cannot fail the way masking did.
+              return TEXT_WITHHELD
+
+
           class {{ .locals.log_masking_class }}(CustomGuardrail):
               def __init__(self, patterns=None, pii_entities_config=None, **kwargs):
                   # A logging hook whatever mode the entry names, so the gateway calls it on no request before it is forwarded
@@ -1389,23 +1406,23 @@ spec:
                       done[text] = masked
                   return done[text]
 
-              async def _masked_item(self, value, done, text, seen):
+              async def _replaced_item(self, value, replace, text, seen):
                   if isinstance(value, str):
-                      return await self._mask_text(value, done) if text else value
+                      return await replace(value) if text else value
                   if isinstance(value, (dict, list)) or getattr(value, "model_dump", None) is not None:
-                      await self._mask_in_place(value, done, text, seen)
+                      await self._replace_in_place(value, replace, text, seen)
                   return value
 
-              async def _mask_in_place(self, holder, done, text, seen):
+              async def _replace_in_place(self, holder, replace, text, seen):
                   # Walks a copy: inside a key named in _TEXT every string is text, except under the keys _OWN names; outside
                   # such a key only the walk goes on. A value met twice, as the request's reference back to itself is, is
-                  # masked once.
+                  # replaced once.
                   if id(holder) in seen:
                       return
                   seen.add(id(holder))
                   if isinstance(holder, list):
                       for i, item in enumerate(holder):
-                          holder[i] = await self._masked_item(item, done, text, seen)
+                          holder[i] = await self._replaced_item(item, replace, text, seen)
                       return
                   if text and _field(holder, "type") in _NOT_TEXT:
                       return
@@ -1415,64 +1432,82 @@ spec:
                       value = _field(holder, name)
                       if value is None:
                           continue
-                      masked = await self._masked_item(value, done, text or name in _TEXT, seen)
-                      if masked is not value:
-                          _set_field(holder, name, masked)
+                      replaced = await self._replaced_item(value, replace, text or name in _TEXT, seen)
+                      if replaced is not value:
+                          _set_field(holder, name, replaced)
 
-              async def _copy(self, value, done, text):
+              async def _copy(self, value, replace, text):
                   if isinstance(value, str):
-                      return await self._mask_text(value, done) if text else value
+                      return await replace(value) if text else value
                   copied = copy.deepcopy(value)
-                  await self._mask_in_place(copied, done, text, set())
+                  await self._replace_in_place(copied, replace, text, set())
                   return copied
 
-              async def _masked(self, kwargs, result):
-                  done = {}
+              async def _copies(self, kwargs, result, replace):
+                  # Every copy of the call the logs are handed, each built from what the call holds and never from another
+                  # copy, with each text in it replaced by what replace returns for that text. Nothing the call holds is
+                  # edited, so copies a failure leaves half built are dropped and never handed on.
                   out = dict(kwargs)
                   for key in ("messages", "prompt", "input"):
                       if out.get(key) is not None:
-                          out[key] = await self._copy(out[key], done, True)
+                          out[key] = await self._copy(out[key], replace, True)
                   payload = out.get("standard_logging_object")
                   if isinstance(payload, dict):
                       payload = dict(payload)
                       if payload.get("messages") is not None:
-                          payload["messages"] = await self._copy(payload["messages"], done, True)
+                          payload["messages"] = await self._copy(payload["messages"], replace, True)
                       if payload.get("response") is not None:
-                          payload["response"] = await self._copy(payload["response"], done, isinstance(payload["response"], str))
+                          payload["response"] = await self._copy(payload["response"], replace, isinstance(payload["response"], str))
                       out["standard_logging_object"] = payload
                   for key in ("complete_streaming_response", "async_complete_streaming_response"):
                       if out.get(key) is not None:
-                          out[key] = await self._copy(out[key], done, False)
+                          out[key] = await self._copy(out[key], replace, False)
                   if isinstance(out.get("original_response"), str):
-                      out["original_response"] = await self._mask_text(out["original_response"], done)
+                      out["original_response"] = await replace(out["original_response"])
                   extra = out.get("additional_args")
                   if isinstance(extra, dict) and extra.get("complete_input_dict") is not None:
                       extra = dict(extra)
-                      extra["complete_input_dict"] = await self._copy(extra["complete_input_dict"], done, False)
+                      extra["complete_input_dict"] = await self._copy(extra["complete_input_dict"], replace, False)
                       out["additional_args"] = extra
                   params = out.get("litellm_params")
                   arrived = params.get("proxy_server_request") if isinstance(params, dict) else None
                   if isinstance(arrived, dict) and arrived.get("body") is not None:
                       arrived = dict(arrived)
-                      arrived["body"] = await self._copy(arrived["body"], done, False)
+                      arrived["body"] = await self._copy(arrived["body"], replace, False)
                       params = dict(params)
                       params["proxy_server_request"] = arrived
                       out["litellm_params"] = params
                   if result is not None:
-                      result = await self._copy(result, done, isinstance(result, str))
+                      result = await self._copy(result, replace, isinstance(result, str))
                   return out, result
 
               async def async_logging_hook(self, kwargs, result, call_type):
-                  # Raised, the gateway hands this call to none of its logs: the handler for asynchronous integrations and the
-                  # spend logs stops at the hook, and the one for synchronous integrations logs the error and writes nothing.
+                  # What this returns is what the gateway hands on: to each integration, and to its spend logs and cost
+                  # tracking, which count the call from the copies' cost and key, never from their text.
+                  done = {}
+
+                  async def mask(text):
+                      return await self._mask_text(text, done)
+
                   try:
-                      return await self._masked(kwargs, result)
+                      return await self._copies(kwargs, result, mask)
+                  except Exception as failure:
+                      reason = type(failure).__name__
+                  # Masking failed, at the first text or part of the way through, so none of its copies is handed on: every
+                  # copy is built again from what the call holds, each text in it withheld.
+                  try:
+                      withheld = await self._copies(kwargs, result, _withheld)
                   except Exception:
+                      # Raised, the gateway hands this call to none of its logs: the handler for asynchronous integrations,
+                      # the spend logs and the cost tracking stops at the hook, and the one for synchronous integrations
+                      # logs the error and writes nothing.
                       raise LogMaskingFailed(RECORD_DROPPED) from None
+                  verbose_proxy_logger.error(TEXT_WITHHELD_NOTE, reason)
+                  return withheld
 
               def logging_hook(self, kwargs, result, call_type):
                   # The gateway's handler for synchronous integrations calls this from a worker thread; the masking runs to its
-                  # end in an event loop of its own.
+                  # end in an event loop of its own, and hands on, withholds or raises exactly as async_logging_hook does.
                   def run():
                       loop = asyncio.new_event_loop()
                       try:
