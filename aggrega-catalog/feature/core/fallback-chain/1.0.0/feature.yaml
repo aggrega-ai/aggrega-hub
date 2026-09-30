@@ -7,16 +7,21 @@ metadata:
   name: core/fallback-chain
   version: 1.0.0
   description: >
-    Bounds how far an AI gateway keeps trying after a target fails. Attached
-    to a gateway that routes on the model named in a request, it sets how many
-    further targets may be tried before the failure is returned to the caller,
-    so a request aimed at a provider having a bad minute can be answered by
-    the next target instead of failing outright. It bounds the walk rather
-    than defining it: which targets the chain visits comes from the routing
-    table the gateway serves, so a table publishing one alias once has nothing
-    to fall back to and this bound changes no answer. It brings no resource of
-    its own: the setting is written into the routing configuration the
-    gateway's Recipe already renders.
+    Sends a request whose model fails on to other models, in an order the
+    attachment names. Attached to an AI gateway that routes on the model named
+    in a request, it takes chains, whose entries each name a model the gateway
+    publishes and, in order, the models a failed request for it falls back to,
+    tried in turn until one answers; and max_hops, which bounds how far along
+    the chain a request is passed.
+
+    Every name in chains is a name the gateway publishes. The build halts on a
+    model listed among its own fallbacks and on a model given two entries, and
+    a realization halts on a name its gateway does not publish. A request falls
+    back once the gateway has given up on the model it asked for, after the
+    gateway's own retries of that model, whose count core/retry-policy sets.
+
+    It brings no resource of its own: the chain and its bound are written into
+    the routing configuration the gateway's Recipe already renders.
   annotations:
     routing.aggrega.ai/tier: "gateway"
     security.aggrega.ai/class: "routing_policy"
@@ -27,9 +32,59 @@ spec:
   appliesTo: "gateway.aggrega.ai/intelligence=semantic"
   interoperability:
     conflictsWith: []
+  # A value that cannot mean what it says is refused rather than handed to a
+  # gateway to interpret. A model listed among its own fallbacks is the model
+  # that failed, not another to send the request on to; and a request for a
+  # model follows one entry, so two entries for the same model leave the
+  # attachment not saying which list applies. Both halt here, naming the
+  # model, whichever gateway carries the attachment. That each name is one
+  # the gateway publishes is checked by each realization, which reads what
+  # its gateway publishes.
+  assertions:
+    no_model_falls_back_to_itself: >-
+      {{- range $entry := .values.chains -}}
+      {{- if has $entry.alias $entry.fallbacks -}}
+      {{- fail (printf "core/fallback-chain attachment %q on %q lists %q among its own fallbacks, but a fallback is another model a failed request is sent on to, not the model that failed; remove %q from the fallbacks of its entry" $.metadata.feature_instance $.metadata.instance_id $entry.alias $entry.alias) -}}
+      {{- end -}}
+      {{- end -}}
+    one_entry_per_model: >-
+      {{- $seen := list -}}
+      {{- range $entry := .values.chains -}}
+      {{- if has $entry.alias $seen -}}
+      {{- fail (printf "core/fallback-chain attachment %q on %q gives %q two entries in chains, but a request for it follows one entry, so the attachment would not say which list applies; merge them into one entry listing its fallbacks in the order to try them" $.metadata.feature_instance $.metadata.instance_id $entry.alias) -}}
+      {{- end -}}
+      {{- $seen = append $seen $entry.alias -}}
+      {{- end -}}
   schema:
     values:
       $ref: "BaseComponents#/schemas/BaseFeatureParameter"
       properties:
-        max_hops: { type: integer, min: 1 }
-      required: [max_hops]
+        # The chain itself. A bound alone changes no request's route, because
+        # it limits a walk that only a list of fallbacks gives the gateway, so
+        # the list is required and carries at least one entry: an attachment
+        # naming no chain is refused rather than built as a setting that does
+        # nothing. The entries are kept in the order written.
+        chains:
+          type: array
+          min: 1
+          description: "For each model that falls back, the models a failed request for it is sent on to. Each entry names one model and, in order, its fallbacks; a fallback that fails follows its own entry in turn, so a chain longer than one step is written as one entry per model along it."
+          items:
+            type: object
+            properties:
+              alias:
+                type: string
+                min: 1
+                description: "The model a request asks for, named as the gateway publishes it: an alias of the model map on an AI gateway. A request for it that fails is sent on to the models under fallbacks."
+              fallbacks:
+                type: array
+                min: 1
+                description: "The models a failed request for alias is sent on to, tried in the order written until one answers, each named as the gateway publishes it. alias itself is not one of them."
+                items:
+                  type: string
+                  min: 1
+            required: [alias, fallbacks]
+        max_hops:
+          type: integer
+          min: 1
+          description: "How far along the chain a request is passed. Once a request has fallen back this many times, a fallback that fails is not followed to its own entry: the request goes on to any model still left in the list it came from, and its failure is returned when none is. Each realization says how its gateway counts a fallback."
+      required: [chains, max_hops]

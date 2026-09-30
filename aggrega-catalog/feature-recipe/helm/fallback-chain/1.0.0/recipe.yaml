@@ -7,18 +7,21 @@ metadata:
   name: fallback-chain
   version: 1.0.0
   description: >
-    Component-scope FeatureRecipe for core/fallback-chain on an AI gateway whose
-    realization renders its routing table as a configuration body. The control it
-    turns on is a setting the running proxy reads out of that body rather than a
-    resource of its own, so this recipe emits no file: it writes the setting into
-    the configuration the attached gateway already renders, and every other byte
-    of that body is left as the gateway's own Recipe authored it. max_hops is
-    written as the gateway's bound on how many fallback targets it tries after
-    one fails. The bound limits a walk rather than defining one, and the
-    gateway's configuration names no fallback targets, so on this gateway it
-    changes no request's route: where one alias is published more than once, a
-    failed call moves to another of its entries as a retry, bounded by the
-    gateway's retry count, which core/retry-policy sets.
+    Realizes core/fallback-chain on the AI gateway core/gateway/litellm; a
+    Release binds it in its Manifest. It writes the chain and its bound into
+    the configuration the gateway's own Recipe renders, and emits no file.
+
+    Once the gateway gives up on the alias a request asked for, after its
+    retries within that alias, whose count core/retry-policy sets, it sends
+    the request to the aliases the alias's entry lists, in order, until one
+    answers, and a fallback that fails follows its own entry in turn. Each
+    alias tried after the first counts one fallback; a fallback's own entry is
+    followed only while fewer than max_hops have been counted, and every alias
+    one entry lists is tried whatever the count.
+
+    The build halts where chains names an alias the gateway's model map does
+    not publish, naming it and the aliases the map publishes, and when the
+    attachment is carried by any component other than core/gateway/litellm.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -27,11 +30,47 @@ spec:
   implements: core/fallback-chain:1.0.0
   # executionScope omitted -> component: the pipeline runs once per attached
   # component and receives that component's rendered documents.
+  #
+  # No assertion can read the host component's values, so the aliases the
+  # gateway's model map publishes are read from the local its Recipe publishes
+  # for exactly this, which an assertion here sees; the guard at the top keeps
+  # that local the one being read.
+  assertions:
+    component_renders_the_body: >-
+      {{- if ne .metadata.component "core/gateway/litellm" -}}
+      {{- fail (printf "core/fallback-chain attachment %q on %q is bound to the LiteLLM realization, which writes its chain into the configuration body core/gateway/litellm renders; %s renders no such body. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # An entry for an alias the map does not publish would never be read, since
+    # no request asks for it; a fallback the map does not publish would be
+    # tried and fail on every request that reaches it. Both halt, naming the
+    # name and what the map publishes.
+    chains_name_published_aliases: >-
+      {{- $published := fromJson (optional .locals "model_aliases" "[]") -}}
+      {{- range $entry := .values.chains -}}
+      {{- if not (has $entry.alias $published) -}}
+      {{- fail (printf "core/fallback-chain attachment %q on %q gives an entry to %q, but the model map of core/gateway/litellm publishes no such alias, so no request asks for it and the entry would never be read; give entries only to aliases the map publishes: %s" $.metadata.feature_instance $.metadata.instance_id $entry.alias (join ", " $published)) -}}
+      {{- end -}}
+      {{- range $fallback := $entry.fallbacks -}}
+      {{- if not (has $fallback $published) -}}
+      {{- fail (printf "core/fallback-chain attachment %q on %q lists %q as a fallback of %q, but the model map of core/gateway/litellm publishes no such alias, so every request falling back there would fail; list only aliases the map publishes: %s" $.metadata.feature_instance $.metadata.instance_id $fallback $entry.alias (join ", " $published)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
   pipeline:
-    - id: write_fallback_bound
+    # One step writes both settings into router_settings. fallbacks is the
+    # gateway's list of one-key maps, an alias to the aliases it falls back to,
+    # one per entry in the order written. max_fallbacks is max_hops: the gateway
+    # checks it on entering an alias's list of fallbacks and counts one fallback
+    # for each alias it tries from a list, so a list longer than the bound is
+    # still tried to its end, and it is a fallback's own entry that the bound
+    # stops the walk from following.
+    - id: write_fallback_chain
       plugin: pipeline-step/litellm-gateway-config:1.0.0
       function: step
       with: |
+        {{- $fallbacks := list }}
+        {{- range $entry := .values.chains }}{{ $fallbacks = append $fallbacks (dict $entry.alias $entry.fallbacks) }}{{ end }}
         section: router_settings
         settings:
+          fallbacks: {{ toJson $fallbacks }}
           max_fallbacks: {{ .values.max_hops }}
