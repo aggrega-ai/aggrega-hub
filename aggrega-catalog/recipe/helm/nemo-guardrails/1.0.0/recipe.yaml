@@ -1,0 +1,247 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: nemo-guardrails
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The NeMo Guardrails server as a guard in a model's path, on Kubernetes via
+    the helm provider's Workload synthesis, running the image in infra.image
+    directly: a stateless Deployment, a ClusterIP Service on the port the guard
+    answers on, and a ConfigMap carrying the guard's configuration as the
+    product's own two files. Synthesized rather than wrapping a chart because
+    the project publishes none. The ConfigMap's config.yaml names the Hugging
+    Face classifier rail on the guard's input, pointed at the endpoint and
+    model the detector wired on the detector socket publishes, with
+    values.threshold and values.blocked_labels, and passes each admitted
+    request through to the upstream unchanged; its rails.co carries the flow
+    that keeps a request body from switching that rail off. Each file is
+    mounted on its own at the path the image's start-up reads, so the guard
+    starts in the product's single-configuration mode and refuses a request
+    naming any other configuration. The upstream address is handed to the
+    guard through the MAIN_MODEL_BASE_URL variable it reads, from
+    infra.upstream_endpoint. When the optional upstream_key slot is attached,
+    config.yaml names the variable the credential is delivered under as an
+    env secretKeyRef, so its value never appears in the rendered manifest;
+    unattached, config.yaml names no credential and the guard presents none.
+    The guard answers its health route as soon as it serves, so readiness and
+    liveness both ask it there. provides.host is the bare, self-contained
+    in-cluster service name of the synthesized Service; a consumer in another
+    namespace qualifies it on its own side.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/security/nemo-guardrails:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Each entry below is the single authored home for a value the artifacts
+  # template and the workload template both have to agree on. They are separate
+  # templates, so a template variable bound in one is not visible in the other.
+  locals:
+    # The ConfigMap's name, which the artifact declares and the volume sources.
+    config_map_name: "{{ .context.instance_id }}-config"
+    # The image starts the server with its configuration root at /app/config
+    # and the configuration id in CONFIG_ID. A root holding config/config.yaml
+    # puts the server in its single-configuration mode, under the id "config",
+    # which is then also the id it serves by default; so the id is "config" and
+    # the files are mounted in /app/config/config.
+    config_id: config
+    config_dir: /app/config/config
+    # The variable the upstream credential is delivered under, which config.yaml
+    # names on the main model and the attachment below renders.
+    upstream_key_variable: UPSTREAM_API_KEY
+    # The name the classifier rail's configuration is declared under and the
+    # input flow refers to it by.
+    classifier_name: prompt_injection
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the PORT variable the image's start-up
+  # reads, the container port and the Service; the literal is never repeated.
+  #
+  # host and endpoint spell the Service name out twice on purpose. A provides
+  # entry cannot read another provides entry, and the name has to match the
+  # Service the helm provider derives from the service key below, so there is no
+  # home either could dereference instead — the repetition is forced, not a
+  # choice, and the two must be edited together.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}/v1"
+    protocol: "http"
+  artifacts:
+    # The guard's configuration, as the product's own two files.
+    #
+    # config.yaml: passthrough forwards each admitted request's messages and
+    # parameters to the upstream as the caller sent them. The one input rail is
+    # the Hugging Face classifier rail on the fms engine — the guardrails
+    # detector API — at the endpoint and model the wired detector publishes; the
+    # guard sends the latest user message and values.threshold there and refuses
+    # the request when a label in values.blocked_labels comes back at or above
+    # the threshold, and it refuses the request as well when the detector cannot
+    # be reached or answers with an error. The upstream itself is not named
+    # here: the guard takes its address from MAIN_MODEL_BASE_URL and forwards
+    # under the model name the caller asked for. A main model is declared only
+    # when the upstream_key slot is attached, and then only to name the variable
+    # the credential is delivered under — the model name it carries is replaced
+    # by the caller's on every request. Declaring one with that variable unset
+    # would refuse every request, so unattached nothing is declared. No
+    # credential value appears here.
+    #
+    # 🔴 rails.co redefines "process user input", a flow internal to the NeMo
+    # Guardrails library, copied from the library at the version the image
+    # carries with its one generation-options condition removed. The library's
+    # own flow runs the input rails only while a request's options leave them
+    # on, so a caller could switch the check off from the request body; with
+    # this definition the configuration's flow is the one that runs, and it runs
+    # the input rails on every request. It is the only thing that closes that
+    # switch: no setting of the server or of the configuration does. It is
+    # pinned to the build of the image its closure was proved on, which the
+    # Component names beside its infra.image setting; the catalog names no
+    # image, and its closure — every body toggle and a caller-named
+    # configuration refused, benign requests and streaming unchanged — is
+    # re-proved at every upgrade of the NeMo Guardrails component and for every
+    # other image a Release sets there. The compose Recipe carries the same
+    # flow, with each $ spelled as a compose file spells a literal one.
+    #
+    # The configuration names one detector address, so a second detector wired
+    # to the socket would leave one of them unused without saying which. The
+    # edges are counted here, where each carries its socket, and the build halts
+    # on a second one; a halting check elsewhere sees one edge per socket.
+    nemo-guardrails-config.configmap.yaml: |
+      {{- $detector := dict -}}
+      {{- $wired := 0 -}}
+      {{- range $alias, $edge := .context.uses -}}
+      {{- if eq $edge.socket "detector" -}}{{- $detector = $edge -}}{{- $wired = add1 $wired -}}{{- end -}}
+      {{- end -}}
+      {{- if gt $wired 1 -}}
+      {{- fail (printf "%d components are wired to the guard's detector socket, but its classifier rail calls one detector; wire a single core/security/trustyai-huggingface-detector to detector" $wired) -}}
+      {{- end -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .locals.config_map_name }}
+      data:
+        config.yaml: |
+      {{- if hasKey (default dict .features) "upstream_key" }}
+          models:
+            - type: main
+              engine: openai
+              model: named-by-each-request
+              api_key_env_var: {{ .locals.upstream_key_variable }}
+      {{- end }}
+          passthrough: true
+          rails:
+            config:
+              hf_classifier:
+                {{ .locals.classifier_name }}:
+                  engine: fms
+                  model: {{ $detector.provides.model | toJson }}
+                  base_url: {{ $detector.provides.endpoint | toJson }}
+                  threshold: {{ .values.threshold }}
+                  blocked_labels: {{ .values.blocked_labels | toJson }}
+            input:
+              flows:
+                - hf classifier check input $classifier={{ .locals.classifier_name }}
+        rails.co: |
+          # Redefines the library's "process user input" with its
+          # generation-options condition removed, so the input rails run on
+          # every request. Re-prove at every upgrade of the image.
+          define parallel flow process user input
+            """Run all the input rails on the user input."""
+            event UtteranceUserActionFinished(final_transcript="...")
+            $user_message = $event["final_transcript"]
+
+            # If we have input rails, we run them, otherwise we just create the user message event
+            if $config.rails.input.flows
+              # Create a marker event.
+              create event StartInputRails
+              event StartInputRails
+
+              # Run all the input rails
+              # This can potentially alter the $user_message
+              do run input rails
+
+              # Create a marker event.
+              create event InputRailsFinished
+              event InputRailsFinished
+
+            create event UserMessage(text=$user_message)
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        # The image's own start-up is kept: it checks that the configuration is
+        # in place and starts the server on it. It reads the configuration id and
+        # the port from these two variables. The server reads the upstream's
+        # address and API dialect from the other two.
+        variables:
+          CONFIG_ID: "{{ .locals.config_id }}"
+          PORT: "{{ .infra.port }}"
+          MAIN_MODEL_ENGINE: openai
+          MAIN_MODEL_BASE_URL: "{{ .infra.upstream_endpoint }}"
+    {{- if hasKey (default dict .features) "upstream_key" }}
+        attachments:
+          # The variable config.yaml names on the main model, read from the one
+          # home above so the two agree by construction. Delivered as an env
+          # secretKeyRef, so the credential's value never lands in the manifest.
+          {{ .locals.upstream_key_variable }}:
+            from: upstream_key
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The product documents GET /v1/health as its liveness check: it answers
+        # 200 while the server can serve a request, from the moment it listens,
+        # because the configuration is loaded on the first request. So readiness
+        # and liveness both ask it; the product states no timings, and the guard
+        # measured ready within seconds of starting.
+        health:
+          ready:
+            http: /v1/health
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          live:
+            http: /v1/health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        # Each file of the ConfigMap is mounted on its own, by subPath. Mounted
+        # as a directory, a ConfigMap also shows each file again under the links
+        # Kubernetes keeps beside it, and the guard, which reads every file in
+        # its configuration tree and follows links, would load them twice.
+        volumeMounts:
+          - name: config
+            path: "{{ .locals.config_dir }}/config.yaml"
+            subPath: config.yaml
+            readonly: true
+          - name: config
+            path: "{{ .locals.config_dir }}/rails.co"
+            subPath: rails.co
+            readonly: true
+    volumes:
+      config:
+        configmap:
+          source: "{{ .locals.config_map_name }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

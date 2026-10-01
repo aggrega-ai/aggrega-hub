@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: trustyai-huggingface-detector
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    TrustyAI's Hugging Face detector on Kubernetes via the helm provider's
+    Workload synthesis, running the image in infra.image directly: a stateless
+    Deployment plus a ClusterIP Service on the port the service answers on.
+    Synthesized rather than wrapping a chart because the project publishes
+    none. A weights-pull init container, running the same image and the
+    Hugging Face command-line tool it carries, fetches the model named in
+    values.model at values.model_revision into a pod-local volume before the
+    server starts, and the server loads it from there through the MODEL_DIR
+    variable it reads; the compiler never fetches weights. The volume lasts as
+    long as the pod, so each new pod fetches the weights again. When the
+    optional model_pull_token slot is attached the token reaches the pull step
+    alone as an env secretKeyRef, so it never appears in the rendered manifest;
+    unattached, weights are pulled anonymously, byte-identically to a Recipe
+    with no slot. The server loads the model before it answers anything, and
+    its health route answers only then, so readiness is asked there. The
+    listen port is handed to the server on its command line, from the same
+    infra.port the Service and the published address read. provides.host is
+    the bare, self-contained in-cluster service name of the synthesized
+    Service; a consumer in another namespace qualifies it on its own side.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/security/trustyai-huggingface-detector:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the server's --port argument, the
+  # container port and the Service; the literal is never repeated.
+  #
+  # host and endpoint spell the Service name out twice on purpose. A provides
+  # entry cannot read another provides entry, and the name has to match the
+  # Service the helm provider derives from the service key below, so there is no
+  # home either could dereference instead — the repetition is forced, not a
+  # choice, and the two must be edited together. endpoint carries no path: a
+  # caller appends the route it posts to.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}"
+    model: "{{ .values.model }}"
+    protocol: "http"
+  workload: |
+    {{- $modelDir := "/mnt/models" -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    # The weights are fetched here, where the service runs, and never by the
+    # compiler: .values.model and .values.model_revision are pointer strings the
+    # pull step resolves. The step runs the service's own image, which carries
+    # the Hugging Face command-line tool, and fetches the configuration,
+    # tokenizer and safetensors files of the model — the files the server loads
+    # — into the volume the server reads. $modelDir is the single authored home
+    # for that directory: the step writes there, both mounts put the volume
+    # there, and the server is pointed there, so none can move without the
+    # others.
+    initContainers:
+      - name: model-pull
+        image: "{{ .infra.image }}"
+        command: ["/usr/local/bin/hf"]
+        args:
+          - "download"
+          - "{{ .values.model }}"
+          - "--revision"
+          - "{{ .values.model_revision }}"
+          - "--local-dir"
+          - "{{ $modelDir }}"
+          - "--include"
+          - "*.json"
+          - "*.safetensors"
+          - "*.model"
+          - "*.txt"
+          - "--quiet"
+        variables:
+          HF_HOME: /tmp/huggingface
+          HF_HUB_DISABLE_TELEMETRY: "1"
+    {{- if hasKey (default dict .features) "model_pull_token" }}
+        attachments:
+          HF_TOKEN:
+            from: model_pull_token
+            as: env
+    {{- end }}
+        volumeMounts:
+          - name: model-cache
+            path: "{{ $modelDir }}"
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        # The image's own command line, with the port set from its single
+        # authored home: supplying args replaces the image's command, so each
+        # argument the image passes is passed here.
+        args:
+          - "uvicorn"
+          - "app:app"
+          - "--workers"
+          - "1"
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "{{ .infra.port }}"
+          - "--log-config"
+          - "/common/log_conf.yaml"
+        variables:
+          MODEL_DIR: "{{ $modelDir }}"
+        ports:
+          http: {{ .infra.port }}
+        # The server loads the model before it opens its port, and its health
+        # route answers "ok" from then on. Readiness is asked there. The product
+        # declares no liveness check, so none is declared; the load time follows
+        # the model named, so no start-up budget is guessed either.
+        health:
+          ready:
+            http: /health
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        volumeMounts:
+          - name: model-cache
+            path: "{{ $modelDir }}"
+            readonly: true
+    volumes:
+      model-cache:
+        ephemeral:
+          sizeLimit: "{{ .infra.model_cache.size }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

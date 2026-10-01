@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: trustyai-huggingface-detector
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    TrustyAI's Hugging Face detector for local development via Docker Compose.
+    Synthesized-mode Workload: the compose provider translates it into one
+    service running the image in infra.image, preceded by a weights-pull step.
+    The pull step is an init container, so it becomes a run-to-completion
+    service the detector waits on before it starts; it runs the same image and
+    the Hugging Face command-line tool the image carries, and fetches the model
+    named in values.model at values.model_revision into a named volume the
+    detector reads through the MODEL_DIR variable. The compiler never fetches
+    weights. The volume outlives the containers, so a restart re-runs the pull
+    step against weights already in place, and how the tool reconciles that is
+    its own behaviour. When the optional model_pull_token slot is attached its
+    value arrives on the inject pipe and is rendered as the HF_TOKEN
+    environment variable on the pull step alone, which is therefore also the
+    key the attached credential must publish under; unattached, no such
+    variable is emitted and weights are pulled anonymously. The detector's one
+    healthcheck asks its health route with the curl the image carries, which
+    answers only once the model is loaded. The service entry publishes no port
+    on the host: callers sit on the same compose network, and a service that
+    authenticates no caller is kept off the host's interfaces. provides.host is
+    the compose service name, and the published contract is key for key the
+    one the Kubernetes realization publishes.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/security/trustyai-huggingface-detector:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the server's --port argument, the
+  # container port and the service entry; the literal is never repeated.
+  #
+  # host is the name the compose provider gives the synthesized service, which is
+  # the component instance's own name. host and endpoint spell it out twice on
+  # purpose: a provides entry cannot read another provides entry, so there is no
+  # home either could dereference instead — the repetition is forced, not a
+  # choice, and the two must be edited together.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}"
+    model: "{{ .values.model }}"
+    protocol: "http"
+  workload: |
+    {{- $modelDir := "/mnt/models" -}}
+    {{- $tokenVar := "HF_TOKEN" -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    # The weights are fetched here, where the service runs, and never by the
+    # compiler: .values.model and .values.model_revision are pointer strings the
+    # pull step resolves. The step runs the service's own image, which carries
+    # the Hugging Face command-line tool, and fetches the configuration,
+    # tokenizer and safetensors files of the model into the volume the detector
+    # reads. $modelDir is the single authored home for that directory, and
+    # $tokenVar binds the variable the token is rendered under to the
+    # inject-pipe entry it is read from. No credential value is authored here.
+    initContainers:
+      - name: model-pull
+        image: "{{ .infra.image }}"
+        command: ["/usr/local/bin/hf"]
+        args:
+          - "download"
+          - "{{ .values.model }}"
+          - "--revision"
+          - "{{ .values.model_revision }}"
+          - "--local-dir"
+          - "{{ $modelDir }}"
+          - "--include"
+          - "*.json"
+          - "*.safetensors"
+          - "*.model"
+          - "*.txt"
+          - "--quiet"
+        variables:
+          HF_HOME: /tmp/huggingface
+          HF_HUB_DISABLE_TELEMETRY: "1"
+    {{- if hasKey (default dict .features) "model_pull_token" }}
+          {{ $tokenVar }}: "{{ index .context.inject.env $tokenVar }}"
+    {{- end }}
+        volumeMounts:
+          - name: model-cache
+            path: "{{ $modelDir }}"
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        # The image's own command line, with the port set from its single
+        # authored home: supplying args replaces the image's command, so each
+        # argument the image passes is passed here.
+        args:
+          - "uvicorn"
+          - "app:app"
+          - "--workers"
+          - "1"
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "{{ .infra.port }}"
+          - "--log-config"
+          - "/common/log_conf.yaml"
+        variables:
+          MODEL_DIR: "{{ $modelDir }}"
+        ports:
+          http: {{ .infra.port }}
+        # A compose service keeps one healthcheck and it runs inside the image,
+        # which carries curl and a shell. The server loads the model before it
+        # opens its port, so the check passes only once the model is loaded.
+        health:
+          ready:
+            http: /health
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        volumeMounts:
+          - name: model-cache
+            path: "{{ $modelDir }}"
+            readonly: true
+    volumes:
+      model-cache:
+        # A named volume shared by the pull step and the detector. The size is
+        # read from the operator's own sizing knob so one Release configures
+        # either target; this target creates the volume and honours no size.
+        persistent:
+          size: "{{ .infra.model_cache.size }}"
+    # A ClusterIP service entry keeps the detector internal to the compose
+    # network, where its callers sit. Nothing is published to the host.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
