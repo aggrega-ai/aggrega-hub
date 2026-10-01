@@ -32,10 +32,10 @@ metadata:
     core/log-masking one listing what to mask, adds the module its realization
     relies on; a masking
     attachment's refusals are a policy the request guard applies.
-    PROXY_BASE_URL and the two Presidio addresses are emitted only when
-    infra.external_base_url and the recognizer sockets are set; the build
-    halts on an address carrying a path and on one socket wired without the
-    other.
+    PROXY_BASE_URL and the Presidio and cache store addresses appear only when
+    infra.external_base_url and their sockets are set; the build halts on an
+    address carrying a path, on one recognizer socket wired alone, and on a
+    store other than core/datastore/redis.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -152,6 +152,22 @@ spec:
     # core/data-masking's and core/log-masking's, check an attachment's entity
     # types against this one list, so the two refuse the same types.
     analyzer_entity_types: '["CREDIT_CARD", "CRYPTO", "DATE_TIME", "EMAIL_ADDRESS", "IBAN_CODE", "IP_ADDRESS", "LOCATION", "MAC_ADDRESS", "MEDICAL_LICENSE", "NRP", "PERSON", "PHONE_NUMBER", "UK_NHS", "URL", "US_BANK_NUMBER", "US_DRIVER_LICENSE", "US_ITIN", "US_PASSPORT", "US_SSN"]'
+    # The variables the cache store's host and port are delivered under when
+    # the cache_store socket is wired: the workload writes them, and the
+    # semantic-caching realization's cache configuration names them through
+    # the proxy's environment indirection, so the two cannot name different
+    # variables. They are names of this Recipe's own and not the proxy's
+    # REDIS_HOST and REDIS_PORT, because the proxy reads those two as the
+    # address of a store to keep its own spend counters, rate limits and
+    # cross-pod bookkeeping in, which the cache's store is not wired here to
+    # be. The password goes under REDIS_PASSWORD, the variable the cache reads
+    # it from: the cache will not start without one, so with no credential
+    # attached the workload writes it empty, which connects without a
+    # password; on its own that variable names no store, and nothing else in
+    # the proxy reads it.
+    cache_store_host_variable: SEMANTIC_CACHE_STORE_HOST
+    cache_store_port_variable: SEMANTIC_CACHE_STORE_PORT
+    cache_store_password_variable: REDIS_PASSWORD
   # provides is evaluated before the workload and cannot read it, so the port has
   # one authored home in .infra.port that every reader dereferences — provides.port
   # and provides.endpoint here, the path allowlist's listen port, which the
@@ -205,6 +221,13 @@ spec:
       {{- end -}}
       {{- if and $anonymizer (not $analyzer) -}}
       {{- fail "the pii_anonymizer socket is wired and the pii_analyzer socket is not, but the gateway's Presidio integration replaces only the spans the analyzer reports and cannot use either service alone; wire a core/security/presidio-analyzer to pii_analyzer as well, or remove the pii_anonymizer edge" -}}
+      {{- end -}}
+    # The cache store's password is presented to the store wired to the
+    # cache_store socket, so a password attached with no store wired has
+    # nothing to reach. Halt on it here, naming the socket left empty.
+    cache_store_password_needs_a_store: >-
+      {{- if and (hasKey (optional . "features" dict) "cache_store_password") (not (hasKey .uses "cache_store")) -}}
+      {{- fail "the cache_store_password slot is attached, but nothing is wired to the cache_store socket, so the password has no store to be presented to; wire a core/datastore/redis to cache_store, or remove the cache_store_password attachment" -}}
       {{- end -}}
   artifacts:
     # The gateway's routing table. Every entry of the developer's model map
@@ -1609,12 +1632,18 @@ spec:
   # its Presidio integration reads wherever a guardrail names no address of its
   # own; this Recipe writes no guardrail entry, so nothing reads them until one
   # is configured, and the build halts when only one of the two is wired. With
-  # neither wired, neither variable is emitted. The pod is ready only once a
-  # request through the path allowlist would be served.
+  # neither wired, neither variable is emitted. With the cache_store socket
+  # wired, the store's published host and port reach the gateway under the
+  # two variables the locals above name, and its password as REDIS_PASSWORD:
+  # an env secretKeyRef when the cache_store_password slot is attached, an
+  # empty value when it is not. With nothing wired to cache_store, none of
+  # the three is emitted. The pod is ready only once a request through the
+  # path allowlist would be served.
   workload: |
     {{- $configDir := "/etc/litellm" -}}
     {{- $recognizer := false -}}
-    {{- range $alias, $edge := .context.uses }}{{ if or (eq $edge.socket "pii_analyzer") (eq $edge.socket "pii_anonymizer") }}{{ $recognizer = true }}{{ end }}{{ end -}}
+    {{- $cacheStore := false -}}
+    {{- range $alias, $edge := .context.uses }}{{ if or (eq $edge.socket "pii_analyzer") (eq $edge.socket "pii_anonymizer") }}{{ $recognizer = true }}{{ end }}{{ if eq $edge.socket "cache_store" }}{{ $cacheStore = true }}{{ end }}{{ end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     form: stateless
@@ -1653,7 +1682,12 @@ spec:
         # Each is written inside the loop over the edges, so a second service
         # wired to the same socket writes the variable twice and the build
         # refuses the duplicate rather than keeping one address silently.
-    {{- if or .infra.external_base_url $recognizer }}
+        # With the cache_store socket wired, the store's published host and
+        # port are written the same way, and the build halts when the store is
+        # not core/datastore/redis, its type compared with any version it was
+        # authored with set aside. With no password slot attached the password
+        # variable is written empty; attached, it is delivered below instead.
+    {{- if or .infra.external_base_url $recognizer $cacheStore }}
         variables:
     {{- end }}
     {{- with .infra.external_base_url }}
@@ -1666,8 +1700,19 @@ spec:
     {{- if eq $edge.socket "pii_anonymizer" }}
           PRESIDIO_ANONYMIZER_API_BASE: "{{ $edge.provides.endpoint }}"
     {{- end }}
+    {{- if eq $edge.socket "cache_store" }}
+    {{- $store := first (splitList ":" (toString $edge.component)) }}
+    {{- if ne $store "core/datastore/redis" }}
+    {{- fail (printf "the cache_store socket is wired to %q, a %s, but the gateway's semantic cache stores and searches its replies with the Redis query engine's vector search and JSON commands, which only core/datastore/redis is established to carry in this catalog; a store without them would cache nothing while every request still succeeds. Wire a core/datastore/redis to cache_store instead" $edge.target $store) }}
     {{- end }}
-    {{- if or (hasKey (default dict .features) "master_key") (hasKey (default dict .features) "provider_key") (hasKey (default dict .features) "database_url") }}
+          {{ $.locals.cache_store_host_variable }}: "{{ $edge.provides.host }}"
+          {{ $.locals.cache_store_port_variable }}: "{{ $edge.provides.port }}"
+    {{- if not (hasKey (default dict $.features) "cache_store_password") }}
+          {{ $.locals.cache_store_password_variable }}: ""
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if or (hasKey (default dict .features) "master_key") (hasKey (default dict .features) "provider_key") (hasKey (default dict .features) "database_url") (hasKey (default dict .features) "cache_store_password") }}
         attachments:
     {{- end }}
     {{- if hasKey (default dict .features) "master_key" }}
@@ -1692,6 +1737,15 @@ spec:
           # gateway's own resources.
           DATABASE_URL:
             from: database_url
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "cache_store_password" }}
+          # The variable the semantic cache reads the store's password from,
+          # read from the one home in the locals above. Delivered as an env
+          # secretKeyRef, so the password never lands in the manifest; the
+          # assertion above has halted the build if no store is wired.
+          {{ .locals.cache_store_password_variable }}:
+            from: cache_store_password
             as: env
     {{- end }}
         # The proxy documents /health/readiness and /health/liveliness as its

@@ -2326,7 +2326,8 @@ Feature in that product's own terms.
 
 The AI gateway controls `core/semantic-caching`, `core/period-budget` and
 `core/response-validation` show that answer gateway by gateway.
-`core/gateway/litellm` realizes the period budget. `core/gateway/kong` runs
+`core/gateway/litellm` realizes the period budget, and the semantic cache on a
+`core/datastore/redis` wired to its `cache_store` socket. `core/gateway/kong` runs
 Kong 3.9.3's open-source image, which carries neither a semantic cache nor a
 period budget, Kong offering both in its enterprise edition only, and
 `core/gateway/tyk` runs Tyk v5.14.0's gateway, which carries neither, the
