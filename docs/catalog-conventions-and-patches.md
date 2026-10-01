@@ -62,7 +62,7 @@ the label section below). The 15 categories:
 | `ai-tool` | Tools agents invoke | function, server, stateful-server, resource | populated |
 | `ai-pipeline` | Orchestrators that run a multi-step job | server | populated |
 | `datastore` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server, server | populated |
-| `gateway` | API and AI gateways | server | populated |
+| `gateway` | API and AI gateways | server, resource | populated |
 | `mesh` | Service meshes | server | created when the first entity lands |
 | `network` | Network primitives | server, resource | created when the first entity lands |
 | `messaging` | Event buses, queues, streams, the realtime media services that carry voice and video between participants, and the external carriers a message leaves the Release through | stateful-server, server, resource | populated |
@@ -284,8 +284,9 @@ request body — while this family names **capabilities**, so the two answer
 different questions and a component may honestly carry both. What a component's
 tier value never tells a reader is which of these capabilities it has: the AI
 gateway carries several of them, and no amount of reading its tier would say so.
-`core/gateway/litellm` carries `period-budget: cost` as well, the one component
-that does.
+`core/gateway/litellm` carries `period-budget: cost` as well, and so does
+`core/gateway/cloudflare-ai-gateway`, Cloudflare's hosted AI gateway, which
+carries no other value in this family and carries `semantic`.
 
 ### The `security.aggrega.ai/text-anonymization` label
 
@@ -703,6 +704,13 @@ mirrors, not the file:
 
 - `anthropic-agent/` in `ai-agent/` → `anthropic/` (name: `core/ai-agent/anthropic`)
 - `openai-model/` in `ai-model/` → `openai/` (name: `core/ai-model/openai`)
+
+What is stripped is a suffix that only repeats the category. Where the category
+word is part of the product's own name and stripping it would name another
+product, the segment keeps it: Cloudflare's AI Gateway is
+`core/gateway/cloudflare-ai-gateway`, because `cloudflare-ai` would read as the
+vendor's model service and `cloudflare` as Cloudflare Gateway, a different
+product of the same vendor.
 
 ### Naming a second realization of one component
 
@@ -2327,7 +2335,12 @@ Feature in that product's own terms.
 The AI gateway controls `core/semantic-caching`, `core/period-budget` and
 `core/response-validation` show that answer gateway by gateway.
 `core/gateway/litellm` realizes the period budget, and the semantic cache on a
-`core/datastore/redis` wired to its `cache_store` socket. `core/gateway/kong` runs
+`core/datastore/redis` wired to its `cache_store` socket.
+`core/gateway/cloudflare-ai-gateway`, Cloudflare's hosted gateway, realizes the
+period budget through its terraform Recipe, as a spend-limit rule on the
+gateway's own resource, and not the semantic cache: its cache answers only a
+request identical to an earlier one. Its helm and compose Recipes reference a
+gateway configured elsewhere and realize neither. `core/gateway/kong` runs
 Kong 3.9.3's open-source image, which carries neither a semantic cache nor a
 period budget, Kong offering both in its enterprise edition only, and
 `core/gateway/tyk` runs Tyk v5.14.0's gateway, which carries neither, the

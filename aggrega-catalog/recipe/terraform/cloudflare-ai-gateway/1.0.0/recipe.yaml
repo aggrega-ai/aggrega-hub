@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: cloudflare-ai-gateway
+  version: 1.0.0
+  description: >
+    Creates a Cloudflare AI Gateway in the account infra.account_id names,
+    rendered as Terraform for the Cloudflare provider, and publishes its
+    address. Reach for it where the Release is to create the gateway and set
+    its controls; reach for the helm or compose reference where the gateway
+    already exists and is configured outside the Release.
+
+    It writes the gateway's authentication and request-log settings from infra,
+    its cache off and its request-rate limit as zero, and what an attached
+    core/period-budget or core/retry-policy sets into the same resource.
+    Terraform authenticates to Cloudflare with the API token in the environment
+    it runs in, so the rendered configuration names no credential.
+
+    Applying it is outside any build: whether the gateway then behaves as
+    Cloudflare documents is not observed by the compiler.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/gateway/cloudflare-ai-gateway:1.0.0
+
+  # The address is composed from values the operator names, so it is a fixed
+  # string a consumer on any target can use, not a Terraform reference: the
+  # gateway takes the id it is given rather than generating one.
+  provides:
+    endpoint: "https://gateway.ai.cloudflare.com/v1/{{ .infra.account_id }}/{{ .infra.gateway_id }}/{{ .infra.provider_endpoint }}"
+    model: "{{ .values.model }}"
+
+  # The body renders into this component's own module directory.
+  #
+  # required_providers names the provider by its full source address and pins
+  # its version, so the engine installs the provider whose resource schema this
+  # body was written against. A module that leaves it out is assumed to need
+  # hashicorp/cloudflare, which HashiCorp's registry does not carry and
+  # OpenTofu's serves at whatever version is latest. No provider block is
+  # rendered: the provider reads its API token from the environment Terraform
+  # runs in.
+  #
+  # Five of the resource's attributes are required. cache_ttl 0 is the setting
+  # Cloudflare documents as caching off, so cache_invalidate_on_update has
+  # nothing to act on. The rate limit is written as a limit and an interval of
+  # 0, the values the provider's own example gives both; Cloudflare documents
+  # rate limiting as off on a gateway it creates itself, and states no meaning
+  # for 0, so that 0 leaves requests unlimited is read from that and not from a
+  # statement.
+  #
+  # An attached FeatureRecipe delivers its setting on the cloudflare_ai_gateway
+  # mechanism of this node's inject pipe, and this body places it:
+  #   retry_max_attempts       - the retry count core/retry-policy sets
+  #   spend_limit_rule.<name>  - one spend-limit rule per core/period-budget
+  #                              attachment, in the order of their names
+  # With nothing attached neither attribute is written.
+  artifacts:
+    main.tf: |
+      {{- $set := dict }}
+      {{- with .context.inject }}{{ with index . "cloudflare_ai_gateway" }}{{ $set = . }}{{ end }}{{ end }}
+      {{- $rules := list }}
+      {{- range $key, $rule := $set }}{{ if hasPrefix "spend_limit_rule." $key }}{{ $rules = append $rules $rule }}{{ end }}{{ end }}
+      terraform {
+        required_providers {
+          cloudflare = {
+            source  = "cloudflare/cloudflare"
+            version = "5.26.0"
+          }
+        }
+      }
+
+      resource "cloudflare_ai_gateway" "this" {
+        account_id = "{{ .infra.account_id }}"
+        id         = "{{ .infra.gateway_id }}"
+
+        authentication = {{ .infra.authentication }}
+        collect_logs   = {{ .infra.collect_logs }}
+
+        cache_ttl                  = 0
+        cache_invalidate_on_update = false
+        rate_limiting_limit        = 0
+        rate_limiting_interval     = 0
+      {{- with index $set "retry_max_attempts" }}
+
+        retry_max_attempts = {{ . }}
+      {{- end }}
+      {{- if $rules }}
+
+        spend_limits = {
+          enabled = true
+          rules = [
+      {{- range $rules }}
+            {{ . }},
+      {{- end }}
+          ]
+        }
+      {{- end }}
+      }

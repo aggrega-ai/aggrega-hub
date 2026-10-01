@@ -1,0 +1,109 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: period-budget-cloudflare-ai-gateway
+  version: 1.0.0
+  description: >
+    Realizes core/period-budget on core/gateway/cloudflare-ai-gateway's
+    terraform Recipe; a Release binds it in its Manifest. It writes one
+    spend-limit rule into the gateway's own resource and emits no file.
+
+    The gateway counts what its traffic cost in US dollars, priced from the
+    pricing it keeps per model, over a window that moves forward with time: the
+    last period, written as a number of seconds. Once the count reaches limit it
+    answers further model requests with HTTP 429 until the window has moved on.
+    It records a request's cost once the request completes, so concurrent
+    requests can take it past limit before the first refusal, and it counts
+    only models whose pricing it knows. So it honours unit usd, scope gateway
+    and a period of seconds, minutes, hours or days, and refuses tokens, a
+    budget per caller or per model, and calendar months by name.
+
+    It halts when the attachment is carried by any component other than
+    core/gateway/cloudflare-ai-gateway, and when a gateway carries more rules
+    than the 20 Cloudflare keeps. That the gateway reads the window in seconds,
+    and refuses as described, is Cloudflare's documented behaviour and no build
+    observes it.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: terraform
+  implements: core/period-budget:1.0.0
+  # executionScope omitted -> component: the checks and the delivery run once
+  # per attached component.
+
+  # The period as the number of seconds the window spans. The Feature's schema
+  # admits a whole number followed by s, m, h, d or mo; a calendar month has no
+  # fixed number of seconds, so it is refused below rather than converted here,
+  # and the entry stays empty for it.
+  locals:
+    window_seconds: >-
+      {{- $count := atoi (regexFind "^[0-9]+" .values.period) -}}
+      {{- $unit := regexFind "[a-z]+$" .values.period -}}
+      {{- $seconds := dict "s" 1 "m" 60 "h" 3600 "d" 86400 -}}
+      {{- if hasKey $seconds $unit -}}{{- mul $count (index $seconds $unit) -}}{{- end -}}
+
+  # How the gateway keeps the budget. Each spend-limit rule takes a limit in US
+  # dollars, limit_type cost, a window and a technique: sliding counts the
+  # window that ends now, fixed counts windows that start again when one ends.
+  # This realization writes sliding, which needs no claim about where a window
+  # starts. A rule with no dimension shares one count across all traffic; the
+  # gateway narrows a rule to models only by naming each one, and to callers
+  # only by a metadata value each request carries. Spend limits are counted for
+  # models whose pricing the gateway knows, on stored keys and on keys a caller
+  # sends alike.
+  #
+  # The rule's id is the attachment's name, so two attachments write two rules
+  # rather than both taking the provider's one default id.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside.
+    component_renders_the_body: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/cloudflare-ai-gateway" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q is bound to the Cloudflare AI Gateway realization, which writes a spend-limit rule into the gateway resource core/gateway/cloudflare-ai-gateway renders on terraform; %s renders no such resource. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The gateway's spend rule takes one limit type, cost, counted in US
+    # dollars.
+    unit_is_what_the_gateway_counts: >-
+      {{- if ne .values.unit "usd" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for unit %s, but core/gateway/cloudflare-ai-gateway counts a spend limit as what its traffic cost in US dollars, the one limit type its spend-limit rule takes, and counts no tokens against one; set unit to usd, or attach the Feature to a gateway that counts tokens" .metadata.feature_instance .metadata.instance_id .values.unit) -}}
+      {{- end -}}
+    # A rule partitioned by a metadata value tells callers apart only by a
+    # value the request itself carries: one the caller sends, which nothing
+    # verifies, or the Cloudflare Access user the gateway adds on a custom
+    # domain Access protects, which a service token does not carry. This
+    # realization configures neither, and a rule narrowed to models names each
+    # model it covers, which the attachment does not.
+    scope_is_the_whole_gateway: >-
+      {{- if eq .values.scope "caller" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for scope caller, but core/gateway/cloudflare-ai-gateway tells callers apart for a spend limit only by a metadata value each request carries — one the caller sends itself, or the Cloudflare Access user it adds on a custom domain Access protects — and this realization configures neither, so it writes no budget per caller; set scope to gateway" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- else if eq .values.scope "model" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for scope model, but core/gateway/cloudflare-ai-gateway narrows a spend-limit rule to models only by naming each model the rule covers, and the attachment names none, so this realization writes no budget per model; set scope to gateway" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+    # The window is a number of seconds. A whole number of seconds, minutes,
+    # hours or days converts exactly; a calendar month does not.
+    period_is_one_the_gateway_keeps: >-
+      {{- if hasSuffix "mo" .values.period -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of %s, but core/gateway/cloudflare-ai-gateway counts a spend limit over a window of a fixed number of seconds that moves forward with time, and a calendar month has no fixed length; set period to a number of days, as in 30d" .metadata.feature_instance .metadata.instance_id .values.period) -}}
+      {{- end -}}
+    # Cloudflare keeps at most 20 spend-limit rules on one gateway, and each
+    # attachment writes one.
+    rules_fit_the_gateway: >-
+      {{- $count := 0 -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" $attachment.type)) "core/period-budget" -}}{{- $count = add1 $count -}}{{- end -}}
+      {{- end -}}
+      {{- if gt $count 20 -}}
+      {{- fail (printf "core/period-budget attachment %q on %q is one of %d period budgets on this gateway, but core/gateway/cloudflare-ai-gateway keeps at most 20 spend-limit rules, one per attachment; attach at most 20" .metadata.feature_instance .metadata.instance_id $count) -}}
+      {{- end -}}
+
+  # Delivered on this node's inject pipe, on the cloudflare_ai_gateway
+  # mechanism the gateway's terraform Recipe reads, which writes it into the
+  # resource's spend_limits rules. The rule is written as the provider's own
+  # attribute syntax, from values the Feature's schema has typed.
+  injectMapping: |
+    cloudflare_ai_gateway:
+      spend_limit_rule.{{ .attachment_name }}: {{ printf "{ id = %q, limit = %v, limit_type = \"cost\", window = %s, technique = \"sliding\" }" .attachment_name .values.limit .locals.window_seconds | toJson }}
