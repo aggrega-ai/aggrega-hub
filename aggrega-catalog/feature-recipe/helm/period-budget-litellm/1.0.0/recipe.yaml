@@ -13,18 +13,21 @@ metadata:
     file.
 
     The gateway counts what its traffic cost in US dollars, priced from the
-    cost table it keeps per model, over the spend it logged since midnight
-    thirty days ago; once that exceeds limit it refuses every further model
-    request until older spend leaves the window. So it honours unit usd, scope
-    gateway and period 30d, and refuses any other unit, scope or period by
-    name.
+    cost table it keeps per model, and starts the count again at the start of
+    every period: a number of days from midnight UTC, 7d from a Monday, 1mo
+    from the first of the month. Once the count exceeds limit it refuses every
+    further model request until the next period starts, which it notices
+    within about ten minutes. It reads that count again at most once a
+    minute, so the traffic of that minute can take it past limit before the
+    first refusal. So it honours unit usd, scope gateway
+    and a period of whole days other than 30d, or 1mo, and refuses any other
+    unit, scope or period by name.
 
-    The gateway logs its spend in its bookkeeping database and checks a
+    The gateway keeps the count in its bookkeeping database and checks a
     budget only for callers it authenticates, so the build halts unless its
-    database_url and master_key credential slots are both attached, and
-    beside a core/audit-logging attachment that deletes that log in under
-    thirty days. It halts when the attachment is carried by any component
-    other than core/gateway/litellm.
+    database_url and master_key credential slots are both attached. It halts
+    when the attachment is carried by any component other than
+    core/gateway/litellm.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -36,24 +39,32 @@ spec:
   #
   # How the gateway keeps the budget. Its configuration takes a limit and a
   # reset period for the whole gateway. What it checks each request against is
-  # the sum of the spend it logged since midnight thirty days ago in its
-  # bookkeeping database's own clock, whatever reset period it is given; the
-  # reset period only restarts a running total it keeps beside that log, which
-  # no request is checked against. So a budget over any other length of time
-  # would be written and then counted over thirty days, and this recipe
-  # refuses it instead of shipping a budget that means something else. A
-  # call's spend reaches the log once the call has finished, and the gateway
-  # writes the log in batches a few seconds apart, so a request is checked
-  # against what was logged before it: the call that takes the total past the
-  # limit is still answered, and the ones after it are refused with HTTP 429
-  # and an error of type budget_exceeded naming the total and the limit. A
-  # model the cost table prices at nothing in both directions is not checked
-  # at all.
+  # a running total of what its calls cost, which it keeps for the whole
+  # gateway in its bookkeeping database and sets back to zero when a period
+  # ends. A period's end falls on the clock in UTC: a period of days ends at
+  # midnight, 7d on a Monday, 30d and 1mo on the first of the month, and any
+  # other number of days that many days after the midnight it began; a period
+  # of hours, minutes or seconds ends on a multiple of itself within the day,
+  # the hour or the minute. The gateway sets the total back to zero from a job
+  # it runs about every ten minutes, so a period runs until the first such run
+  # after its end, and it reads the total again at most once a minute, so a
+  # request is checked against a total up to a minute old: the requests of
+  # that minute are answered even once the total is past the limit, and the
+  # ones after it are refused with HTTP 429 and an error of type
+  # budget_exceeded naming the total and the limit. A period of whole days, or
+  # a month, is kept as written within those two delays; 30d would count a
+  # calendar month rather than thirty days, a period of hours, minutes or
+  # seconds that does not divide the day, the hour or the minute would be
+  # counted as another length, and one that does would run past its end by up
+  # to ten minutes, a large share of a short period, so this recipe refuses
+  # those instead of shipping a budget that means something else. A model the
+  # cost table prices at nothing in both
+  # directions is not checked at all.
   #
   # No assertion can read the host component's values, so what the gateway
   # was given is read from the attachments the host carries, its credential
-  # slots and any core/audit-logging among them, which an assertion here sees;
-  # the guard at the top keeps those the LiteLLM gateway's.
+  # slots among them, which an assertion here sees; the guard at the top keeps
+  # those the LiteLLM gateway's.
   assertions:
     # The host's type reaches this check as the Aggregate wrote it, so it is
     # compared with any version it was authored with set aside:
@@ -77,21 +88,32 @@ spec:
       {{- if ne .values.scope "gateway" -}}
       {{- fail (printf "core/period-budget attachment %q on %q asks for scope %s, but this realization writes the budget core/gateway/litellm keeps for everything it serves, and no budget per caller or per model; set scope to gateway" .metadata.feature_instance .metadata.instance_id .values.scope) -}}
       {{- end -}}
-    period_is_the_window_the_gateway_counts: >-
-      {{- if ne .values.period "30d" -}}
-      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of %s, but core/gateway/litellm checks its budget against the spend it logged since midnight thirty days ago, a window that moves forward a day at a time, whatever period it is given; set period to 30d" .metadata.feature_instance .metadata.instance_id .values.period) -}}
+    # The schema admits a whole number of seconds, minutes, hours, days or
+    # months; the gateway keeps a period of whole days as written, 30d aside,
+    # and a single month.
+    period_is_one_the_gateway_keeps: >-
+      {{- $period := .values.period -}}
+      {{- if hasSuffix "mo" $period -}}
+      {{- if ne $period "1mo" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of %s, but core/gateway/litellm starts its count again every month at most, on the first of the month; set period to 1mo, or to a number of days" .metadata.feature_instance .metadata.instance_id $period) -}}
       {{- end -}}
-    # The spend the budget is checked against is the gateway's own log of its
-    # calls, which it keeps only in its bookkeeping database; with none it
-    # counts nothing. And it checks a budget only for a caller it
-    # authenticates, which it does only once it has an administrative key;
-    # with none, every caller is let through unchecked. Without either the
-    # setting would be written and nothing ever refused, so this recipe halts
-    # naming whichever is missing.
+      {{- else if hasSuffix "d" $period -}}
+      {{- if eq $period "30d" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of 30d, but core/gateway/litellm starts a 30d count again on the first of every month, so it would count a calendar month of 28 to 31 days; set period to 1mo for a calendar month, or to another number of days" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+      {{- else -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of %s, but core/gateway/litellm counts a period of hours, minutes or seconds in steps of it within the day, the hour or the minute, which counts a length that does not divide them as another, and starts the count again only on a job it runs about every ten minutes, which overruns a short period by a large share of itself; set period to a number of days, or to 1mo" .metadata.feature_instance .metadata.instance_id $period) -}}
+      {{- end -}}
+    # The running total the budget is checked against is kept only in the
+    # gateway's bookkeeping database; with none it counts nothing. And it
+    # checks a budget only for a caller it authenticates, which it does only
+    # once it has an administrative key; with none, every caller is let
+    # through unchecked. Without either the setting would be written and
+    # nothing ever refused, so this recipe halts naming whichever is missing.
     gateway_keeps_the_count: >-
       {{- $missing := list -}}
       {{- if not (hasKey .features "database_url") -}}
-      {{- $missing = append $missing "its database_url credential slot is not attached, so it keeps no log of what it spent" -}}
+      {{- $missing = append $missing "its database_url credential slot is not attached, so it keeps no count of what it spent" -}}
       {{- end -}}
       {{- if not (hasKey .features "master_key") -}}
       {{- $missing = append $missing "its master_key credential slot is not attached, so it checks no caller against a budget" -}}
@@ -99,24 +121,13 @@ spec:
       {{- if $missing -}}
       {{- fail (printf "core/period-budget attachment %q on %q needs core/gateway/litellm to count what it spent and check each caller against the budget, but %s. Attach one holding the bookkeeping database's connection string to the database_url slot of %q, and a credential to its master_key slot" .metadata.feature_instance .metadata.instance_id (join ", and " $missing) .metadata.instance_id) -}}
       {{- end -}}
-    # core/audit-logging's retention deletes the same log the budget is
-    # checked against, so a retention under thirty days would shorten the
-    # window the budget counts. The attachments the host carries are read
-    # here with any version they were authored with set aside.
-    retention_keeps_the_window: >-
-      {{- range $name, $attachment := .features -}}
-      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/audit-logging" -}}
-      {{- $retention := optional (optional $attachment "values" dict) "retention_days" "" -}}
-      {{- if and (ne (toString $retention) "") (lt (int $retention) 30) -}}
-      {{- fail (printf "core/period-budget attachment %q on %q is checked against the spend core/gateway/litellm logged over the last thirty days, but core/audit-logging attachment %q deletes that log after %v days, so the budget would count only those; set its retention_days to 30 or more, or leave it unset" $.metadata.feature_instance $.metadata.instance_id $name $retention) -}}
-      {{- end -}}
-      {{- end -}}
-      {{- end -}}
   pipeline:
     # One step writes both settings into litellm_settings, the section the
-    # gateway reads them from. The gateway refuses to start with a limit and
-    # no reset period, so the period is written too, from the one value the
-    # assertion above admits.
+    # gateway reads them from: the limit, and the period as the attachment
+    # gives it, which the gateway takes as the length after which it starts
+    # the count again and which the assertion above admits only where the
+    # gateway keeps it as written. The gateway refuses to start with a limit
+    # and no reset period.
     - id: write_period_budget
       plugin: pipeline-step/litellm-gateway-config:1.0.0
       function: step
