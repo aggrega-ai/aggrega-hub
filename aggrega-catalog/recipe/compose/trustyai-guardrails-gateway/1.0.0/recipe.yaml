@@ -1,0 +1,148 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: trustyai-guardrails-gateway
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    TrustyAI's guardrails gateway in a model's path, for local development via
+    Docker Compose: one service running the image in infra.image, synthesized
+    from the Workload kind by the compose provider. A compose config carries
+    its configuration file, pointing the gateway at the orchestrator wired on
+    the orchestrator socket and declaring one route, values.route, that
+    applies the detector that orchestrator registered — by the detector_id it
+    publishes — with values.threshold and answers a detection with
+    values.fallback_message; it is mounted as one file, which the
+    GATEWAY_CONFIG variable names. The product serves no health route, so the
+    gateway's one healthcheck opens a connection to its port with the bash the
+    image carries. The service publishes no port on the host: callers sit on
+    the same compose network, and a gateway that authenticates no caller is
+    kept off the host's interfaces. provides.host is the compose service name,
+    and the published contract is key for key the one the Kubernetes
+    realization publishes.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/security/trustyai-guardrails-gateway:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Each entry below is the single authored home for a value the artifacts
+  # template and the workload template both have to agree on. They are separate
+  # templates, so a template variable bound in one is not visible in the other.
+  locals:
+    # The name the config is declared under, which the volume sources.
+    config_name: "{{ .context.instance_id }}-config"
+    # Where the configuration file is mounted and where GATEWAY_CONFIG points.
+    config_path: /etc/trustyai-guardrails-gateway/config.yaml
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the HTTP_PORT variable, the container
+  # port, the healthcheck and the service entry; the literal is never repeated.
+  # The route has its home in .values.route, which the endpoint and the
+  # configuration both read.
+  #
+  # host is the name the compose provider gives the synthesized service, which is
+  # the component instance's own name. host and endpoint spell it out twice on
+  # purpose: a provides entry cannot read another provides entry, so there is no
+  # home either could dereference instead — the repetition is forced, not a
+  # choice, and the two must be edited together.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}/{{ .values.route }}/v1"
+    protocol: "http"
+  artifacts:
+    # The gateway's configuration file, as a compose config: this target
+    # delivers a config as one file at the path it is mounted at. Its body is the
+    # one the Kubernetes realization carries in its ConfigMap, line for line,
+    # with every $ in the fallback message written $$, which is how a compose
+    # file spells a literal $ — Compose reads $ in the file it is given as the
+    # start of a variable of its own, so the gateway is handed the message as
+    # written. The detector entry always carries detector_params: the product
+    # leaves out of a route, without a word, any detector configured with none.
+    #
+    # The configuration names one orchestrator address, so a second orchestrator
+    # wired to the socket would leave one of them unused without saying which.
+    # The edges are counted here, where each carries its socket, and the build
+    # halts on a second one; a halting check elsewhere sees one edge per socket.
+    trustyai-guardrails-gateway-config.compose-fragment.yaml: |
+      {{- $orch := dict -}}
+      {{- $wired := 0 -}}
+      {{- range $alias, $edge := .context.uses -}}
+      {{- if eq $edge.socket "orchestrator" -}}{{- $orch = $edge -}}{{- $wired = add1 $wired -}}{{- end -}}
+      {{- end -}}
+      {{- if gt $wired 1 -}}
+      {{- fail (printf "%d components are wired to the gateway's orchestrator socket, but its configuration names one orchestrator; wire a single orchestrator to the orchestrator socket" $wired) -}}
+      {{- end -}}
+      configs:
+        {{ .locals.config_name }}:
+          content: |
+            orchestrator:
+              host: {{ $orch.provides.host | toJson }}
+              port: {{ $orch.provides.port }}
+            detectors:
+              - name: {{ $orch.provides.detector_id | toJson }}
+                input: true
+                output: {{ .values.check_output }}
+                detector_params:
+                  threshold: {{ .values.threshold }}
+            routes:
+              - name: {{ .values.route | toJson }}
+                detectors:
+                  - {{ $orch.provides.detector_id | toJson }}
+                fallback_message: {{ .values.fallback_message | replace "$" "$$" | toJson }}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        # The image's own command is kept. The gateway reads its port and its
+        # configuration file's path from these variables. It looks for a client
+        # certificate for the orchestrator under /etc/tls, finds none here, and
+        # calls the orchestrator over plain HTTP.
+        variables:
+          HTTP_PORT: "{{ .infra.port }}"
+          GATEWAY_CONFIG: "{{ .locals.config_path }}"
+        ports:
+          http: {{ .infra.port }}
+        # A compose service keeps one healthcheck and it runs inside the image,
+        # which carries bash but no socket tool, and the product serves no health
+        # route. So bash opening a connection to the port is the check: the
+        # gateway opens it once its configuration has loaded.
+        health:
+          ready:
+            exec:
+              - bash
+              - "-c"
+              - "exec 3<>/dev/tcp/127.0.0.1/{{ .infra.port }}"
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        volumeMounts:
+          - name: config
+            path: "{{ .locals.config_path }}"
+    volumes:
+      config:
+        configmap:
+          source: "{{ .locals.config_name }}"
+    # A ClusterIP service entry keeps the gateway internal to the compose
+    # network, where its callers sit. Nothing is published to the host.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

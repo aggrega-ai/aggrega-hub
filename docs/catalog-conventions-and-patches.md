@@ -277,7 +277,8 @@ Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 (`upstream-pinning: public-key`), `core/gateway/litellm`
 (`caller-identity: injected-header`, `content-masking: entity-recognition`, `log-masking: entity-recognition`,
 `prompt-guard: pattern-list`, `upstream-tls: trust-anchor`),
-`core/security/nemo-guardrails` (`prompt-guard: classifier`). Six of the seven carry no
+`core/security/nemo-guardrails` and `core/security/trustyai-guardrails-gateway` (each
+`prompt-guard: classifier`). Seven of the eight carry no
 `gateway.aggrega.ai/intelligence` value and `core/gateway/litellm` carries `semantic` — and
 that mixture is the separation working rather than an exception to it. The
 intelligence label names a **product tier** — whether the router parses the
@@ -308,6 +309,40 @@ The value names the role, not the interface. Components today:
 `core/security/presidio-anonymizer` (`anonymizer`), which speak the Presidio HTTP
 API; `core/gateway/litellm` selects them on its `pii_analyzer` and
 `pii_anonymizer` sockets. The compiler routes the address a selected component
+publishes and checks nothing about what answers there, so a component carrying a
+value here that speaks a different API is refused by nothing and fails when it
+is called; each socket's comment names the API its consumer speaks. As with the
+data-path family, a value is added in the same act as the first component to
+carry it.
+
+### The `security.aggrega.ai/text-detection` label
+
+`security.aggrega.ai/text-detection` records which role a service plays where a
+text is judged by a detector and the judgement is put to use by another service —
+one scores the texts it is sent and reports what it detects, the other runs such
+a detector around a call to a model — and it is what a consumer's socket selects
+on to be handed the right address:
+
+| Value | What the value asserts |
+| --- | --- |
+| `detector` | The component scores each text it is sent and reports what it detects in it — each label it scores at or above the threshold the caller names, or its own default, with the score — and changes and forwards nothing. |
+| `orchestrator` | The component runs the detectors a request names over its text — the latest message before the model is called, the reply after — asks the model for no reply when the input carries a detection, and reports the detections beside the reply. |
+
+It is a different label from `text-anonymization`, whose analyzer reports the
+sensitive spans of a text for an anonymizer to rewrite: a detector here gives a
+verdict on the whole text, and nothing is rewritten. Nor is an orchestrator a
+guard on its own — a request naming no detector passes through it unchecked — so
+the component that names the detectors for every request it routes carries the
+data-path family's `prompt-guard` instead.
+
+The value names the role, not the interface. Components today:
+`core/security/trustyai-huggingface-detector` (`detector`), which speaks the
+guardrails detector API, and `core/security/fms-guardrails-orchestrator`
+(`orchestrator`), which serves the orchestrator's own chat route.
+`core/security/nemo-guardrails` and `core/security/fms-guardrails-orchestrator`
+select `detector` on their `detector` sockets, and
+`core/security/trustyai-guardrails-gateway` selects `orchestrator` on its
+`orchestrator` socket. The compiler routes the address a selected component
 publishes and checks nothing about what answers there, so a component carrying a
 value here that speaks a different API is refused by nothing and fails when it
 is called; each socket's comment names the API its consumer speaks. As with the

@@ -1,0 +1,224 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/security/trustyai-guardrails-gateway
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    TrustyAI's guardrails gateway in a model's path: a service speaking the
+    OpenAI chat-completions API on one route, values.route, that sends every
+    request through the orchestrator wired on its orchestrator socket with a
+    fixed detector applied, overwriting any detectors a caller names. When the
+    detector reports the latest message at or above values.threshold, the
+    gateway answers with an ordinary completion carrying
+    values.fallback_message, and the model is not asked to reply, though its
+    server's /tokenize route still counts the refused text; with
+    values.check_output set, a flagged reply is replaced the same way.
+
+    It reads no system message, earlier turn or tool result, refuses a request
+    whose latest message is a list of content parts or a tool result, and
+    answers a refused streamed request with a stream carrying the detections
+    and no text. When the orchestrator or its detector cannot be reached, the
+    request is refused with an error. Its verdict is the detector's: a
+    probabilistic classifier misses some attacks, refuses some legitimate
+    requests and is known to be evadable.
+
+    It authenticates no caller and serves no model listing. The Release
+    supplies the image in infra.image and the catalog names none: TrustyAI's
+    build adds the compat-openssl11 package, whose declared licence includes
+    the OpenSSL licence, and is published only under a floating tag.
+
+    Realized on Kubernetes by its Helm Recipe and for local development by its
+    Compose Recipe, each running that image as a single stateless service.
+  labels:
+    component.aggrega.ai/type: server
+    component.aggrega.ai/category: security
+    # Every Recipe of this component runs the gateway as containers the Release
+    # itself operates, so a single posture is its identity.
+    component.aggrega.ai/hosting: self-hosted
+    # The gateway is published under the Apache-2.0 licence, which
+    # metadata.license names exactly; this label carries the class that licence
+    # falls into.
+    #
+    # The catalog names no image of the gateway: the Release supplies one in
+    # infra.image, where the comment beside the setting says what the published
+    # build carries and why the catalog names none.
+    component.aggrega.ai/upstream-licensing: osi-approved
+    # Prompt guard: the gateway stands in the traffic path, sends the chat
+    # payload it is routing to be checked and refuses a request on the verdict.
+    # classifier names the fidelity: the verdict is the detector's, reached
+    # through the orchestrator wired on its socket, against a threshold supplied
+    # in its configuration — a trained classifier's when the orchestrator's
+    # detector serves one, as core/security/trustyai-huggingface-detector does.
+    # The value names a capability, not the state of a Release: what the
+    # verdict is follows the detector the orchestrator calls.
+    dataplane.aggrega.ai/prompt-guard: classifier
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  usesSchema:
+    # The orchestrator every request is sent through. The selector admits only a
+    # component whose role in text detection is the orchestrator, so any other
+    # service wired here is refused by name. The selected component's published
+    # host, port and detector_id arrive on the edge and the Recipe writes them
+    # into the gateway's configuration; no inject block is authored on the edge,
+    # because the configuration is the Recipe's to write. The compiler routes the
+    # address without checking what answers there, and the wired service must
+    # speak the orchestrator's /api/v2/chat/completions-detection route, which
+    # the gateway calls. Required: the gateway has no check without it.
+    #
+    # The configuration its Recipes render carries one route, values.route, with
+    # one detector: the one the orchestrator registered, applied to the latest
+    # message, and to the model's reply when values.check_output is set, with
+    # values.threshold as its threshold. When the orchestrator reports a
+    # detection, the gateway replaces the choices of the answer with
+    # values.fallback_message; a streamed request it refuses is answered with a
+    # stream whose one chunk carries the detections and no choices, the
+    # fallback message not applied to it. When the orchestrator cannot be
+    # reached, or answers with an error — its detector unreachable among them —
+    # the gateway answers 500 with the error's text and nothing is forwarded.
+    orchestrator:
+      selector: "security.aggrega.ai/text-detection=orchestrator"
+      required: true
+  schema:
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate.
+      #
+      # The gateway puts its own detector selection into every request and drops
+      # any a caller sends, so a caller cannot switch the check off from the
+      # request body. The check reads the latest message only, and only a plain
+      # text message: a system message, an earlier turn and a tool result before
+      # it are forwarded unread, and a latest message that is a list of content
+      # parts or a tool result is refused with an error. The verdict is a
+      # probabilistic classifier's when the detector serves one, so it misses
+      # some attacks — reworded, encoded or respelled ones among them — refuses
+      # some legitimate requests, and is known to be evadable; it is one control
+      # beside others, not a guarantee.
+      route:
+        type: string
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+        default: guarded
+        description: >
+          Name of the gateway's one route: it serves chat completions at
+          /<route>/v1/chat/completions, and provides.endpoint ends in /<route>/v1,
+          the base URL a client library takes.
+      threshold:
+        type: number
+        min: 0
+        max: 1
+        default: 0.5
+        description: >
+          Score at or above which the detector's verdict refuses the request.
+          The orchestrator applies it, and core/security/trustyai-huggingface-detector
+          reports to the orchestrator only labels scored at or above its own 0.5,
+          so with that detector a value below 0.5 has no effect; above 0.5, a
+          higher value lets through a prompt the detector scores below it.
+      fallback_message:
+        type: string
+        min: 1
+        default: "I'm sorry, I can't respond to that."
+        description: >
+          Text of the assistant message the gateway answers a refused request
+          with, in an ordinary completion that also carries the detections. A
+          refused streamed request is answered with the detections and no text.
+      check_output:
+        type: boolean
+        default: false
+        description: >
+          Also checks the model's reply with the same detector and threshold, and
+          replaces a flagged reply with values.fallback_message. The model is
+          called before its reply is checked.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 8090
+        description: Port the gateway listens on and its Service accepts callers on. Most operators should omit this and let the Recipe assign the default (8090), the product's own.
+      # The Release supplies the image, and the catalog names none.
+      #
+      # The build of the gateway published for anyone to pull is TrustyAI's,
+      # quay.io/trustyai/guardrails-sidecar-gateway: the gateway under the
+      # Apache-2.0 licence, on Red Hat's Universal Base Image 9 minimal, whose own
+      # end-user licence agreement covers the base layer. Above the base, the
+      # image's own install step adds compat-openssl11 from the UBI repository,
+      # which declares the licence "OpenSSL and ASL 2.0".
+      #
+      # The publisher releases its newest build under the moving tag latest only,
+      # and that is the tag the TrustyAI service operator, as Open Data Hub ships
+      # it, deploys. Its versioned tags are
+      # older builds: v0.3.0, the newest of them, answers a streamed request with
+      # an error after the model has answered it. A digest is the only reference
+      # form that names one build, and a Release that must keep running one build
+      # mirrors the image into a registry it controls and sets this key to the
+      # copy. Open Data Hub publishes builds of the same gateway under release
+      # tags in quay.io/opendatahub/vllm-orchestrator-gateway; its odh-3.5 build
+      # ran these Recipes' configuration unchanged, and carries the same
+      # compat-openssl11 package.
+      #
+      # The gateway these Recipes describe — its route, a detection answered with
+      # the fallback message and the model not asked to reply, a caller's
+      # detectors dropped, streaming, the check on the reply, the refusal when the
+      # orchestrator or its detector cannot be reached — was proved running
+      # quay.io/trustyai/guardrails-sidecar-gateway@sha256:8fdab0bd8260fea1af06703b4efd03cfed2e8ffe5543c9e32321ceb6a43b3293
+      # in front of the orchestrator build named in that Component's own comment.
+      image:
+        type: string
+        required: true
+        description: >
+          Image the gateway runs, supplied by the Release; the catalog names
+          none. The Recipes run the published build's own binary at
+          /app/bin/vllm-orchestrator-gateway, so the image is TrustyAI's
+          guardrails gateway or a copy of it. That build adds the
+          compat-openssl11 package and is tagged only as latest, so a Release
+          that must keep one build mirrors it and names the copy here.
+      # The gateway runs on CPU and holds no model; it measured under 20 MB of
+      # resident memory while serving.
+      compute:
+        cpu:
+          type: string
+          default: 100m
+        memory:
+          type: string
+          default: 64Mi
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      # endpoint is the OpenAI-compatible base URL a consumer hands a client
+      # library, the route already in it; host, port and protocol expose the raw
+      # serving location.
+      #
+      # The gateway authenticates no caller: whatever reaches its address can call
+      # it. It passes a caller's Authorization header and any X-Forwarded header
+      # on to the orchestrator, which in turn passes none of them to the detector
+      # or the model.
+      host:
+        type: string
+        required: true
+        description: >
+          In-cluster DNS name of the Service fronting the gateway. Every caller
+          reaching this name can send requests through the gateway, so it is an
+          address for the component routing model traffic through it rather than
+          one to publish.
+      port:
+        type: integer
+        required: true
+        description: >
+          TCP port that Service accepts callers on. It follows the port an
+          operator set in the Release, so a consumer reads it rather than
+          assuming a default.
+      endpoint:
+        type: string
+        required: true
+        description: >
+          Base URL of the OpenAI-compatible API the gateway serves, with the host,
+          the port and the route already composed. A consumer hands it to a client
+          library as its base URL, and sends chat completions to it.
+      protocol:
+        type: string
+        description: URL scheme to reach `host` and `port` over, for a consumer composing its own address rather than reading `endpoint`.

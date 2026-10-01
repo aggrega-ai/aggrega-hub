@@ -1,0 +1,160 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: trustyai-guardrails-gateway
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    TrustyAI's guardrails gateway in a model's path, on Kubernetes via the helm
+    provider's Workload synthesis, running the image in infra.image directly: a
+    stateless Deployment, a ClusterIP Service on the port the gateway answers
+    on, and a ConfigMap carrying its configuration file. Synthesized rather
+    than wrapping a chart because the project publishes none. The
+    configuration points the gateway at the host and port the orchestrator
+    wired on the orchestrator socket publishes, and declares one route,
+    values.route, applying the detector that orchestrator registered — by the
+    detector_id it publishes — to the latest message, and to the reply when
+    values.check_output is set, with values.threshold, answering a detection
+    with values.fallback_message. The file is mounted on its own and the
+    GATEWAY_CONFIG variable points the gateway at it; the port reaches it
+    through the HTTP_PORT variable it reads. The product serves no health
+    route, so readiness and liveness are a TCP check on its port.
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service; a consumer in another namespace qualifies it on its
+    own side.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/security/trustyai-guardrails-gateway:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Each entry below is the single authored home for a value the artifacts
+  # template and the workload template both have to agree on. They are separate
+  # templates, so a template variable bound in one is not visible in the other.
+  locals:
+    # The ConfigMap's name, which the artifact declares and the volume sources.
+    config_map_name: "{{ .context.instance_id }}-config"
+    # Where the configuration file is mounted and where GATEWAY_CONFIG points.
+    config_path: /etc/trustyai-guardrails-gateway/config.yaml
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the HTTP_PORT variable, the container
+  # port, the probes and the Service; the literal is never repeated. The route
+  # has its home in .values.route, which the endpoint and the configuration both
+  # read.
+  #
+  # host and endpoint spell the Service name out twice on purpose. A provides
+  # entry cannot read another provides entry, and the name has to match the
+  # Service the helm provider derives from the service key below, so there is no
+  # home either could dereference instead — the repetition is forced, not a
+  # choice, and the two must be edited together.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}/{{ .values.route }}/v1"
+    protocol: "http"
+  artifacts:
+    # The gateway's configuration file.
+    #
+    # orchestrator is the wired orchestrator's published host and port. The one
+    # detector entry names the id that orchestrator published as detector_id, so
+    # the two agree by construction rather than by two authored strings; it is
+    # applied to the input always and to the reply as values.check_output says,
+    # and it always carries detector_params: the product leaves out of a route,
+    # without a word, any detector configured with none, and the route then
+    # checks nothing. The threshold travels there and the orchestrator applies
+    # it. The one route applies that detector and answers a detection with
+    # values.fallback_message.
+    #
+    # The configuration names one orchestrator address, so a second orchestrator
+    # wired to the socket would leave one of them unused without saying which.
+    # The edges are counted here, where each carries its socket, and the build
+    # halts on a second one; a halting check elsewhere sees one edge per socket.
+    trustyai-guardrails-gateway-config.configmap.yaml: |
+      {{- $orch := dict -}}
+      {{- $wired := 0 -}}
+      {{- range $alias, $edge := .context.uses -}}
+      {{- if eq $edge.socket "orchestrator" -}}{{- $orch = $edge -}}{{- $wired = add1 $wired -}}{{- end -}}
+      {{- end -}}
+      {{- if gt $wired 1 -}}
+      {{- fail (printf "%d components are wired to the gateway's orchestrator socket, but its configuration names one orchestrator; wire a single orchestrator to the orchestrator socket" $wired) -}}
+      {{- end -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .locals.config_map_name }}
+      data:
+        config.yaml: |
+          orchestrator:
+            host: {{ $orch.provides.host | toJson }}
+            port: {{ $orch.provides.port }}
+          detectors:
+            - name: {{ $orch.provides.detector_id | toJson }}
+              input: true
+              output: {{ .values.check_output }}
+              detector_params:
+                threshold: {{ .values.threshold }}
+          routes:
+            - name: {{ .values.route | toJson }}
+              detectors:
+                - {{ $orch.provides.detector_id | toJson }}
+              fallback_message: {{ .values.fallback_message | toJson }}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        # The image's own command is kept. The gateway reads its port and its
+        # configuration file's path from these variables. It looks for a client
+        # certificate for the orchestrator under /etc/tls, finds none here, and
+        # calls the orchestrator over plain HTTP.
+        variables:
+          HTTP_PORT: "{{ .infra.port }}"
+          GATEWAY_CONFIG: "{{ .locals.config_path }}"
+        ports:
+          http: {{ .infra.port }}
+        # The product serves only the configured route and declares no health
+        # check, so readiness and liveness are a TCP check on its port: it opens
+        # the port once its configuration has loaded, and a configuration it
+        # cannot read stops it before then.
+        health:
+          ready:
+            tcp: {{ .infra.port }}
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          live:
+            tcp: {{ .infra.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        volumeMounts:
+          - name: config
+            path: "{{ .locals.config_path }}"
+            subPath: config.yaml
+            readonly: true
+    volumes:
+      config:
+        configmap:
+          source: "{{ .locals.config_map_name }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

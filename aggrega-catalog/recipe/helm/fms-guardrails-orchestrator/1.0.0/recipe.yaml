@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: fms-guardrails-orchestrator
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The FMS Guardrails Orchestrator on Kubernetes via the helm provider's
+    Workload synthesis, running the image in infra.image directly: a stateless
+    Deployment, a ClusterIP Service on the port its API answers on, and a
+    ConfigMap carrying its configuration file. Synthesized rather than wrapping
+    a chart because the project publishes none. The configuration names the
+    upstream server in infra.upstream_host and infra.upstream_port as the one
+    chat requests are forwarded to, and registers the detector wired on the
+    detector socket, at the host and port it publishes, under
+    values.detector_id with values.default_threshold. The file is mounted on
+    its own, at a path the image does not use, and the ORCHESTRATOR_CONFIG
+    variable points the orchestrator at it; the ports reach it through the
+    HTTP_PORT and HEALTH_HTTP_PORT variables it reads. Its health route
+    answers as soon as it serves, on the health port, so readiness and
+    liveness both ask it there. provides.host is the bare, self-contained
+    in-cluster service name of the synthesized Service; a consumer in another
+    namespace qualifies it on its own side.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/security/fms-guardrails-orchestrator:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Each entry below is the single authored home for a value the artifacts
+  # template and the workload template both have to agree on. They are separate
+  # templates, so a template variable bound in one is not visible in the other.
+  locals:
+    # The ConfigMap's name, which the artifact declares and the volume sources.
+    config_map_name: "{{ .context.instance_id }}-config"
+    # Where the configuration file is mounted and where ORCHESTRATOR_CONFIG
+    # points. The published build's own /app/config/config.yaml is not used: in
+    # the build these Recipes were proved on it is a directory, not a file.
+    config_path: /etc/fms-guardrails-orchestrator/config.yaml
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the HTTP_PORT variable, the container
+  # port and the Service; the literal is never repeated.
+  #
+  # host and endpoint spell the Service name out twice on purpose. A provides
+  # entry cannot read another provides entry, and the name has to match the
+  # Service the helm provider derives from the service key below, so there is no
+  # home either could dereference instead — the repetition is forced, not a
+  # choice, and the two must be edited together.
+  provides:
+    host: "{{ .context.instance_id }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}-default:{{ .infra.port }}"
+    detector_id: "{{ .values.detector_id }}"
+    protocol: "http"
+  artifacts:
+    # The orchestrator's configuration file.
+    #
+    # openai names the upstream chat-completions server; with it present the
+    # orchestrator serves its chat route. detectors registers the one detector
+    # wired on the detector socket, at the host and port it publishes, under
+    # values.detector_id: the guardrails detector API's text-contents type,
+    # applied to the whole text with no chunker, filtered at
+    # values.default_threshold when a caller names no threshold. No
+    # passthrough_headers are listed, so none of a caller's headers reaches the
+    # detector or the upstream.
+    #
+    # The configuration registers one detector, so a second wired to the socket
+    # would leave one of them unregistered without saying which. The edges are
+    # counted here, where each carries its socket, and the build halts on a
+    # second one; a halting check elsewhere sees one edge per socket.
+    fms-guardrails-orchestrator-config.configmap.yaml: |
+      {{- $detector := dict -}}
+      {{- $wired := 0 -}}
+      {{- range $alias, $edge := .context.uses -}}
+      {{- if eq $edge.socket "detector" -}}{{- $detector = $edge -}}{{- $wired = add1 $wired -}}{{- end -}}
+      {{- end -}}
+      {{- if gt $wired 1 -}}
+      {{- fail (printf "%d components are wired to the orchestrator's detector socket, but its configuration registers one detector; wire a single detector to the detector socket" $wired) -}}
+      {{- end -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .locals.config_map_name }}
+      data:
+        config.yaml: |
+          openai:
+            service:
+              hostname: {{ .infra.upstream_host | toJson }}
+              port: {{ .infra.upstream_port }}
+          detectors:
+            {{ .values.detector_id }}:
+              type: text_contents
+              service:
+                hostname: {{ $detector.provides.host | toJson }}
+                port: {{ $detector.provides.port }}
+              chunker_id: whole_doc_chunker
+              default_threshold: {{ .values.default_threshold }}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        # The image's own command is kept. The orchestrator reads its two ports
+        # and its configuration file's path from these variables.
+        variables:
+          HTTP_PORT: "{{ .infra.port }}"
+          HEALTH_HTTP_PORT: "{{ .infra.health_port }}"
+          ORCHESTRATOR_CONFIG: "{{ .locals.config_path }}"
+        # health sorts before http, so an http probe asks the health port.
+        ports:
+          health: {{ .infra.health_port }}
+          http: {{ .infra.port }}
+        # The product's health route, GET /health on the health port, answers
+        # 200 with the orchestrator's name and version from the moment it
+        # serves, without asking its detector or the upstream. So readiness and
+        # liveness both ask it; the product states no timings, and the
+        # orchestrator measured ready within a second of starting.
+        health:
+          ready:
+            http: /health
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          live:
+            http: /health
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        volumeMounts:
+          - name: config
+            path: "{{ .locals.config_path }}"
+            subPath: config.yaml
+            readonly: true
+    volumes:
+      config:
+        configmap:
+          source: "{{ .locals.config_map_name }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

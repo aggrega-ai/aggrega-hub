@@ -1,0 +1,242 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/security/fms-guardrails-orchestrator
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The FMS Guardrails Orchestrator: a service that runs text detectors around
+    a model call. A caller posts an OpenAI chat-completions request naming the
+    detectors to apply; the orchestrator checks the latest message, answers a
+    detection with the detections and no reply, and otherwise forwards the
+    request to the upstream server in infra.upstream_host and
+    infra.upstream_port, adding any detection on the reply. It also answers
+    detection-only requests over a text.
+
+    It is not a guard on its own: a request naming no detectors is forwarded
+    unchecked, so it sits behind a component that names them, such as
+    core/security/trustyai-guardrails-gateway. Its Recipes register the one
+    detector wired on the detector socket under values.detector_id. Answering a
+    detection asks the upstream's /tokenize route, which vLLM serves, to count
+    the refused text, so that text reaches the upstream.
+
+    It authenticates no caller and forwards none of a caller's headers. The
+    Release supplies the image in infra.image and the catalog names none:
+    TrustyAI's build adds the compat-openssl11 package, whose declared licence
+    includes the OpenSSL licence, compiles in root-certificate data published
+    under a data licence, and is published only under a floating tag.
+
+    Realized on Kubernetes by its Helm Recipe and for local development by its
+    Compose Recipe, each running that image as a single stateless service.
+  labels:
+    component.aggrega.ai/type: server
+    component.aggrega.ai/category: security
+    # Every Recipe of this component runs the orchestrator as containers the
+    # Release itself operates, so a single posture is its identity.
+    component.aggrega.ai/hosting: self-hosted
+    # The orchestrator is published under the Apache-2.0 licence, which
+    # metadata.license names exactly; this label carries the class that licence
+    # falls into.
+    #
+    # The catalog names no image of the orchestrator: the Release supplies one
+    # in infra.image, where the comment beside the setting says what the
+    # published build carries and why the catalog names none.
+    component.aggrega.ai/upstream-licensing: osi-approved
+    # Text detection: the orchestrator runs the detectors a request names over
+    # its text — the latest message before the model is called, the reply after
+    # — and reports what they detect beside the reply, asking the model for no
+    # reply when the input carries a detection. The value names that role, and
+    # it is what a consumer's socket selects on to be handed this address. It is
+    # added with this component, the first to carry it: detector names a service
+    # that scores the texts it is sent and calls nothing, and this one calls a
+    # detector and a model.
+    security.aggrega.ai/text-detection: orchestrator
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  usesSchema:
+    # The detector the orchestrator runs. The selector admits only a component
+    # whose role in text detection is the detector, so any other service wired
+    # here is refused by name. The selected component's published host and port
+    # arrive on the edge and the Recipe writes them into the orchestrator's
+    # configuration, where the detector is registered under values.detector_id;
+    # no inject block is authored on the edge, because the configuration is the
+    # Recipe's to write. The compiler routes the address without checking what
+    # answers there, and the wired service must speak the guardrails detector
+    # API's content route, which the orchestrator calls with the detector's id
+    # in a detector-id header. Required: the orchestrator does not start with
+    # no detector configured.
+    #
+    # The product registers any number of detectors; these Recipes register one,
+    # the component wired here, and refuse the build when a second is wired.
+    detector:
+      selector: "security.aggrega.ai/text-detection=detector"
+      required: true
+  schema:
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate.
+      #
+      # A caller names the detectors to apply in each request, by the id they are
+      # registered under, separately for the input and for the model's reply. The
+      # input detectors read the latest message only, which has to be a user,
+      # assistant or system message: a request whose latest message is a tool
+      # result, or whose content is a list of parts, is refused with an error. A
+      # system message, an earlier turn and a tool result before the latest
+      # message are forwarded unread. A detection on the input is answered with
+      # no reply at all: the completion carries no choices, the detections and a
+      # warning that the input was unsuitable. A detection on the reply leaves the
+      # reply in place and adds the detections beside it, so a caller that wants
+      # a reply withheld acts on them itself.
+      detector_id:
+        type: string
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+        default: detector
+        description: >
+          Id the wired detector is registered under, which a caller names in a
+          request's detectors to have it applied. Published as
+          provides.detector_id, so a component calling the orchestrator reads it
+          from the edge rather than repeating it.
+      default_threshold:
+        type: number
+        min: 0
+        max: 1
+        default: 0.5
+        description: >
+          Score at or above which a detection is reported when the caller's
+          request names no threshold for the detector. The orchestrator applies
+          the threshold itself and sends the detector its other parameters, so
+          core/security/trustyai-huggingface-detector reports to it only labels
+          scored at or above its own 0.5, and with that detector a value below
+          0.5 has no effect.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 8033
+        description: Port the orchestrator serves its API on and its Service accepts callers on. Most operators should omit this and let the Recipe assign the default (8033), the product's own.
+      health_port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 8034
+        description: Port the orchestrator serves its health route on, which the Recipes' probes ask and no Service publishes. Most operators should omit this and let the Recipe assign the default (8034), the product's own.
+      # The orchestrator forwards a request with no detection on its input to the
+      # upstream server named here, at its /v1/chat/completions route, under the
+      # model name the caller asked for and with no credential: it holds none,
+      # and passes on none of the caller's headers. To answer a detection on the
+      # input it asks the same server's /tokenize route, vLLM's, to count the
+      # refused text; an upstream without that route turns the refusal into an
+      # error, and the request is refused all the same. The compiler pipes both
+      # values as strings and never contacts the server.
+      upstream_host:
+        type: string
+        required: true
+        description: Host name of the OpenAI-compatible model server the orchestrator forwards the requests it admits to, for example model-server. A deterministic pointer string the orchestrator resolves when it forwards; the compiler never contacts it.
+      upstream_port:
+        type: integer
+        min: 1
+        max: 65535
+        required: true
+        description: Port of that model server. The orchestrator reaches it over plain HTTP at /v1/chat/completions, and asks its /tokenize route to answer a detection on the input.
+      # The Release supplies the image, and the catalog names none.
+      #
+      # The build of the orchestrator published for anyone to pull is TrustyAI's,
+      # quay.io/trustyai/ta-guardrails-orchestrator: the orchestrator under the
+      # Apache-2.0 licence, on Red Hat's Universal Base Image 9 minimal, whose own
+      # end-user licence agreement covers the base layer. Above the base, the
+      # image's own install step adds compat-openssl11 from the UBI repository,
+      # which declares the licence "OpenSSL and ASL 2.0". The orchestrator binary
+      # compiles in the crate webpki-roots, Mozilla's root-certificate set, which
+      # declares the licence CDLA-Permissive-2.0, a data licence.
+      #
+      # The publisher releases its newest build under the moving tag latest only,
+      # and that is the tag the TrustyAI service operator, as Open Data Hub ships
+      # it, deploys. Its versioned tags are
+      # older builds: v1.38.0, the newest of them, carries orchestrator 0.10.0,
+      # which serves no chat route on these Recipes' configuration. Both builds
+      # keep a directory where the image's default configuration file should be,
+      # so these Recipes point the orchestrator at a configuration file of their
+      # own. A digest is the only reference form that names one build, and a
+      # Release that must keep running one build mirrors the image into a registry
+      # it controls and sets this key to the copy. Open Data Hub publishes builds
+      # of the same orchestrator in quay.io/opendatahub/ta-guardrails-orchestrator,
+      # under release and commit-named tags as well as odh-stable; its odh-stable
+      # build, orchestrator 0.16.0, ran these Recipes' configuration unchanged, and
+      # carries the same compat-openssl11 package and root-certificate data.
+      #
+      # The orchestrator these Recipes describe — its chat route and its
+      # detection-only route, a detection answered with no reply, a request
+      # naming no detector forwarded, the refusal when its detector cannot be
+      # reached — was proved running
+      # quay.io/trustyai/ta-guardrails-orchestrator@sha256:f3952b137e2a21cb4445073d0d2ec6a76843ab3a957ecb8215158aa908027e1c,
+      # whose health route reports orchestrator 0.16.0.
+      image:
+        type: string
+        required: true
+        description: >
+          Image the orchestrator runs, supplied by the Release; the catalog
+          names none. The Recipes run the published build's own binary at
+          /app/bin/fms-guardrails-orchestr8, so the image is TrustyAI's FMS
+          Guardrails Orchestrator or a copy of it. That build adds the
+          compat-openssl11 package, compiles in root-certificate data published
+          under a data licence, and is tagged only as latest, so a Release that
+          must keep one build mirrors it and names the copy here.
+      # The orchestrator runs on CPU and loads no model of its own; the detector
+      # and the model server do that work. It measured under 20 MB of resident
+      # memory while serving.
+      compute:
+        cpu:
+          type: string
+          default: 250m
+        memory:
+          type: string
+          default: 128Mi
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      # host, port and protocol are the shape every server component publishes;
+      # endpoint is the base URL of the orchestrator's API, published as its own
+      # key so a consumer reads it rather than assembling it; detector_id is the
+      # id a caller names to have the wired detector applied.
+      #
+      # Reachability is a deliberate part of the model. The orchestrator
+      # authenticates no caller: whatever reaches its address can submit text to
+      # its detector, have a request forwarded to the model with no detector
+      # applied, or both. It is published on an in-cluster address for the
+      # component that calls it, and is not meant to be exposed beyond the
+      # cluster.
+      host:
+        type: string
+        required: true
+        description: >
+          In-cluster DNS name of the Service fronting the orchestrator. Every
+          caller reaching this name can reach the model through it, with or
+          without a detector applied, so it is an address for the component
+          calling the orchestrator rather than one to publish.
+      port:
+        type: integer
+        required: true
+        description: >
+          TCP port that Service accepts callers on. It follows the port an
+          operator set in the Release, so a consumer reads it rather than
+          assuming a default.
+      endpoint:
+        type: string
+        required: true
+        description: >
+          Base URL of the orchestrator's API, with the host and the port already
+          composed and no path. A caller posts chat completions to
+          /api/v2/chat/completions-detection under it.
+      detector_id:
+        type: string
+        required: true
+        description: Id the wired detector is registered under, which a caller names in a request's detectors.
+      protocol:
+        type: string
+        description: URL scheme to reach `host` and `port` over, for a consumer composing its own address rather than reading `endpoint`.

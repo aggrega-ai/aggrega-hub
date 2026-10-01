@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: fms-guardrails-orchestrator
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The FMS Guardrails Orchestrator for local development via Docker Compose:
+    one service running the image in infra.image, synthesized from the
+    Workload kind by the compose provider. A compose config carries its
+    configuration file, naming the upstream server in infra.upstream_host and
+    infra.upstream_port as the one chat requests are forwarded to and
+    registering the detector wired on the detector socket under
+    values.detector_id with values.default_threshold; it is mounted as one
+    file, at a path the image does not use, which the ORCHESTRATOR_CONFIG
+    variable names. The orchestrator's one healthcheck asks its health route
+    with the curl the image carries. The service publishes no port on the
+    host: callers sit on the same compose network, and an orchestrator that
+    authenticates no caller is kept off the host's interfaces. provides.host is
+    the compose service name, and the published contract is key for key the
+    one the Kubernetes realization publishes.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/security/fms-guardrails-orchestrator:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # Each entry below is the single authored home for a value the artifacts
+  # template and the workload template both have to agree on. They are separate
+  # templates, so a template variable bound in one is not visible in the other.
+  locals:
+    # The name the config is declared under, which the volume sources.
+    config_name: "{{ .context.instance_id }}-config"
+    # Where the configuration file is mounted and where ORCHESTRATOR_CONFIG
+    # points. The published build's own /app/config/config.yaml is not used: in
+    # the build these Recipes were proved on it is a directory, not a file.
+    config_path: /etc/fms-guardrails-orchestrator/config.yaml
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides.port
+  # and provides.endpoint here, and below the HTTP_PORT variable, the container
+  # port and the service entry; the literal is never repeated.
+  #
+  # host is the name the compose provider gives the synthesized service, which is
+  # the component instance's own name. host and endpoint spell it out twice on
+  # purpose: a provides entry cannot read another provides entry, so there is no
+  # home either could dereference instead — the repetition is forced, not a
+  # choice, and the two must be edited together.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}"
+    detector_id: "{{ .values.detector_id }}"
+    protocol: "http"
+  artifacts:
+    # The orchestrator's configuration file, as a compose config: this target
+    # delivers a config as one file at the path it is mounted at. Its body is the
+    # one the Kubernetes realization carries in its ConfigMap, line for line; it
+    # holds no $, so nothing in it is read by Compose as a variable of its own.
+    #
+    # The configuration registers one detector, so a second wired to the socket
+    # would leave one of them unregistered without saying which. The edges are
+    # counted here, where each carries its socket, and the build halts on a
+    # second one; a halting check elsewhere sees one edge per socket.
+    fms-guardrails-orchestrator-config.compose-fragment.yaml: |
+      {{- $detector := dict -}}
+      {{- $wired := 0 -}}
+      {{- range $alias, $edge := .context.uses -}}
+      {{- if eq $edge.socket "detector" -}}{{- $detector = $edge -}}{{- $wired = add1 $wired -}}{{- end -}}
+      {{- end -}}
+      {{- if gt $wired 1 -}}
+      {{- fail (printf "%d components are wired to the orchestrator's detector socket, but its configuration registers one detector; wire a single detector to the detector socket" $wired) -}}
+      {{- end -}}
+      configs:
+        {{ .locals.config_name }}:
+          content: |
+            openai:
+              service:
+                hostname: {{ .infra.upstream_host | toJson }}
+                port: {{ .infra.upstream_port }}
+            detectors:
+              {{ .values.detector_id }}:
+                type: text_contents
+                service:
+                  hostname: {{ $detector.provides.host | toJson }}
+                  port: {{ $detector.provides.port }}
+                chunker_id: whole_doc_chunker
+                default_threshold: {{ .values.default_threshold }}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        # The image's own command is kept. The orchestrator reads its two ports
+        # and its configuration file's path from these variables.
+        variables:
+          HTTP_PORT: "{{ .infra.port }}"
+          HEALTH_HTTP_PORT: "{{ .infra.health_port }}"
+          ORCHESTRATOR_CONFIG: "{{ .locals.config_path }}"
+        # health sorts before http, so the http probe asks the health port.
+        ports:
+          health: {{ .infra.health_port }}
+          http: {{ .infra.port }}
+        # A compose service keeps one healthcheck and it runs inside the image,
+        # which carries curl and a shell. The product's health route answers 200
+        # from the moment the orchestrator serves.
+        health:
+          ready:
+            http: /health
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        volumeMounts:
+          - name: config
+            path: "{{ .locals.config_path }}"
+    volumes:
+      config:
+        configmap:
+          source: "{{ .locals.config_name }}"
+    # A ClusterIP service entry keeps the orchestrator internal to the compose
+    # network, where its callers sit. Nothing is published to the host.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
