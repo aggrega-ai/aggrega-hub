@@ -312,6 +312,61 @@ is called; each socket's comment names the API its consumer speaks. As with the
 data-path family, a value is added in the same act as the first component to
 carry it.
 
+### The `model.aggrega.ai/api` label
+
+`model.aggrega.ai/api` records which model API answers at the `endpoint` a
+component publishes, and it is what lets one socket take either a model or a
+gateway serving models. Two categories carry it — every `ai-model` Component,
+and a `gateway` Component that serves a model API — so the prefix names the
+concern the two share, serving a model, rather than either category. It sits
+beside `model.aggrega.ai/capability`, which says what kind of model answers, and
+does not overlap it.
+
+| Value | What the value asserts |
+| --- | --- |
+| `openai` | The OpenAI model API answers at the published endpoint — OpenAI's own, or a server's implementation of it — so a consumer speaks to it as it would to OpenAI. |
+| `native` | The product's own model API answers there, and it is not the OpenAI API, so a consumer speaks that product's API, through its client or its request shape. |
+
+Three rules bind it:
+
+- **A model socket selects the key, never a value.** The catalog's model
+  sockets — every agent's `model`, `core/ai-tool/model-invocation`'s
+  `target_model`, and `core/datastore/cognee`'s `extraction_model` and
+  `embedding_model` — select
+  `component.aggrega.ai/category in (ai-model, gateway), model.aggrega.ai/api`.
+  The category requirement admits the two categories and the key requirement
+  admits only the components among them carrying the label, so every model is
+  admitted whatever its value, a gateway serving a model API is admitted, and a
+  gateway serving none is refused by name. A selector's requirements all have to
+  hold and its alternatives live inside one key's set, so no selector can admit
+  an unlabelled model and a labelled gateway while refusing an unlabelled
+  gateway — which is why every `ai-model` Component carries the key. A socket
+  that needs one particular API names its value.
+- **A component carrying the key publishes what a model publishes:** `endpoint`
+  and `model` in its `provides`, the two keys a consumer's Recipe reads off a
+  model edge. One that published no `model` would hand its
+  consumers an empty model name, and no build would report it. A gateway
+  publishes one alias of its model map as its `model`, named by a value of its
+  own and checked against the map by an assertion on its Component, so the order
+  of the map never decides what a consumer asks for.
+- **A value is read off the product's own reference** — the routes the server
+  the Recipes pin registers, or the API its documentation names — and is added
+  in the same act as the first component to carry it, as with every label family
+  on this page. It names the product's API, never a configured state: a model
+  whose endpoint an operator may repoint keeps the value of the product it
+  describes.
+
+Components today: `core/gateway/litellm` carries `openai`, as do
+`core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
+`openai-embedding`, `nvidia-api` and `openai-compatible` — the broker, whose
+whole contract is to be pointed at a service speaking that API, and which stays
+the handle for an endpoint the catalog does not model. Every other
+`core/ai-model/*` Component carries `native`. Each label's comment says, in its
+product's terms, what answers at its endpoint. The compiler matches the string
+and checks nothing about what answers at the address, so a component carrying a
+value its endpoint does not speak is refused by nothing and fails when it is
+called.
+
 ### The `component.aggrega.ai/upstream-licensing` label
 
 `component.aggrega.ai/upstream-licensing` records the licensing class of the
@@ -2170,7 +2225,7 @@ is admitted by stating what it is *not*:
 - **Not an agent.** An application that serves an end user, or a framework an
   application is assembled from, belongs under `ai-agent` — including the
   workflow-automation platforms whose contract is an authored flow plus a model
-  socket. The tell is a required `ai-model` edge: an orchestrator is indifferent
+  socket. The tell is a required model edge: an orchestrator is indifferent
   to models, and usually has nothing to do with one.
 - **Not a model.** An orchestrator infers nothing. Every step it starts runs code
   or an image the author supplied.

@@ -20,7 +20,10 @@ metadata:
     published aliases, each pointing at a provider-qualified upstream target.
     The gateway holds the upstream credential and presents it on the caller's
     behalf, so the credential never reaches the calling application. Exports
-    its host, port, endpoint and protocol to consumers via the uses topology.
+    its host, port, endpoint, protocol and one alias as its model to consumers
+    via the uses topology, so an agent's model socket takes it in place of a
+    model: values.model names that alias, and may be omitted only when the map
+    publishes a single one.
 
     Because it holds that credential, it forwards only the request fields the
     proxy declares for the route, plus any the Release admits through
@@ -41,6 +44,14 @@ metadata:
     component.aggrega.ai/category: gateway
     component.aggrega.ai/hosting: self-hosted
     component.aggrega.ai/upstream-licensing: open-core
+    # Model API: the endpoint this gateway publishes answers the OpenAI API —
+    # the chat, completion and embedding routes the proxy serves, each request
+    # naming an alias of the model map — so a consumer drives it with an
+    # OpenAI client whichever provider answers behind it. It is what lets a
+    # model socket selecting this key admit the gateway beside the models
+    # themselves; the gateway publishes the endpoint and the model name such a
+    # socket's consumers read.
+    model.aggrega.ai/api: openai
     # The gateway capability dimension: this router reads the model name out of
     # the request body and routes on it, so a runtime control that has to parse
     # an LLM payload can attach here. The value is asserted by what the Recipe
@@ -192,6 +203,16 @@ spec:
             type: string
             required: true
             description: The provider-qualified upstream model this alias resolves to, in the proxy's own provider/model notation (for example openai/gpt-4o or anthropic/claude-sonnet-4). A deterministic pointer string the runtime resolves per request; the compiler never contacts the provider.
+      # The alias this gateway publishes as its model. A component wired to the
+      # gateway's address over a model socket — an agent, a tool, a memory store
+      # — reads one model name off the edge, the same key a model publishes, and
+      # sends it with every request; this value is that name. It names one alias
+      # rather than defaulting to the first entry, so the order of the map never
+      # decides what a consumer asks for. A caller that wants another alias the
+      # map publishes names it itself, in its own request or configuration.
+      model:
+        type: string
+        description: The alias of the model map published as this gateway's model, which a component wired to the gateway sends as the model name of its requests. It must be an alias some entry of the map publishes, and the build halts naming this value otherwise. It may be omitted only when every entry publishes the same alias, which is then the one published; with several distinct aliases and no value the build halts.
       routing_strategy:
         type: string
         enum: [simple-shuffle, least-busy, usage-based-routing, latency-based-routing]
@@ -270,7 +291,9 @@ spec:
       # every other gateway component publishes; endpoint is the
       # OpenAI-compatible base URL a caller wiring to the gateway reads.
       # Callers speak that one API to one address whichever provider answers
-      # behind it.
+      # behind it. endpoint and model together are the contract every model
+      # component publishes, which is what lets a model socket take this gateway
+      # in place of a model with its consumer's Recipe unchanged.
       host:
         type: string
         required: true
@@ -293,6 +316,36 @@ spec:
           the host, the port and the API path already composed. A caller hands
           it to a client library as its base URL and asks for an alias the
           model map publishes.
+      model:
+        type: string
+        required: true
+        description: >
+          The alias a consumer wired to the gateway sends as its model name:
+          values.model, or the one alias the map publishes when that is
+          omitted. Other aliases the map publishes are served at the same
+          endpoint to a caller that names them itself.
       protocol:
         type: string
         description: URL scheme to reach `host` and `port` over, for a consumer composing its own address rather than reading `endpoint`.
+
+  assertions:
+    # The model the gateway publishes must be one it serves, and must not be
+    # chosen by the order of the map. So values.model, where set, names an
+    # alias some entry publishes; where it is omitted, every entry publishes
+    # one alias, which is then the published one. A rule of this contract, so it
+    # holds whichever Recipe binds and halts before any renders.
+    published_model_is_a_mapped_alias: >-
+      {{- $aliases := list -}}
+      {{- range .values.models -}}
+      {{- $aliases = append $aliases .name -}}
+      {{- end -}}
+      {{- $aliases = uniq $aliases -}}
+      {{- with optional .values "model" "" -}}
+      {{- if not (has . $aliases) -}}
+      {{- fail (printf "values.model is %q, but no entry of values.models publishes that alias, so a component wired to this gateway would ask for a model it does not serve; set values.model to one of the aliases the map publishes: %s" . (join ", " $aliases)) -}}
+      {{- end -}}
+      {{- else -}}
+      {{- if gt (len $aliases) 1 -}}
+      {{- fail (printf "values.model is not set, but values.models publishes %d aliases (%s), so the gateway cannot tell which one a component wired to it asks for; set values.model to one of them" (len $aliases) (join ", " $aliases)) -}}
+      {{- end -}}
+      {{- end -}}
