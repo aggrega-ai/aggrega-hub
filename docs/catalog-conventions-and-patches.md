@@ -2269,6 +2269,20 @@ the build naming the type, which is the honest state for a control no
 FeatureRecipe realizes — and it may be realized on one component or on several. Each realization is a FeatureRecipe for one product that honours the
 Feature in that product's own terms.
 
+The AI gateway controls `core/semantic-caching`, `core/period-budget` and
+`core/response-validation` show that answer gateway by gateway.
+`core/gateway/litellm` realizes the period budget. `core/gateway/kong` runs
+Kong 3.9.3's open-source image, which carries neither a semantic cache nor a
+period budget, Kong offering both in its enterprise edition only, and
+`core/gateway/tyk` runs Tyk v5.14.0's gateway, which carries neither, the
+budget of Tyk's separate AI Studio being enforced in its enterprise edition
+only; so neither gateway realizes either Feature. APISIX at 3.18.0 carries a
+semantic cache and a budget counted in tokens, and the Envoy AI Gateway such a
+budget, in their open-source builds, but no Recipe here routes model traffic
+through either. Envoy Gateway on its own, Contour and NGINX offer none of the
+three. No gateway in this catalog checks a reply against a schema the operator
+sets, so `core/response-validation` is realized nowhere.
+
 **A capability that only one product in the field has is not a Feature.** It is a
 value on that product's own Component, where an operator sets it and reads it beside
 everything else that configures the product. A Recipe may declare `spec.pipeline`
