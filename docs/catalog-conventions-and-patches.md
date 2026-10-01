@@ -244,6 +244,7 @@ The dimensions and their value sets:
 | `upstream-tls` | `trust-anchor` | The component can require the service it forwards to present a certificate chaining to a trust anchor the Release supplies. |
 | `upstream-pinning` | `public-key` | The component can refuse a service it forwards to unless a certificate that service presents carries one of the public keys the Release supplies for it. `public-key` names what is pinned: the key itself, so a certificate renewed over the same key still matches. |
 | `log-masking` | `entity-recognition` | The component can replace sensitive text with a placeholder in the copy of a call it hands to its logs, while the request it forwards and the reply it returns stay as they were sent. `entity-recognition` names the fidelity: it replaces matches of patterns supplied in its configuration and also entity types that a recognizer service it calls detects. A component that could only replace pattern matches would carry a narrower value, added in the same act as the first component to carry it. |
+| `period-budget` | `cost` | The component can refuse model requests once what it has counted over a period exceeds a limit set in its configuration, and the value names what it counts. `cost`: what the traffic cost, priced from a table the component keeps per model. A component that counts tokens would carry a value of its own, added in the same act as the first component to carry it. |
 
 Three rules bind the family, and each has already been got wrong once:
 
@@ -283,6 +284,8 @@ request body — while this family names **capabilities**, so the two answer
 different questions and a component may honestly carry both. What a component's
 tier value never tells a reader is which of these capabilities it has: the AI
 gateway carries several of them, and no amount of reading its tier would say so.
+`core/gateway/litellm` carries `period-budget: cost` as well, the one component
+that does.
 
 ### The `security.aggrega.ai/text-anonymization` label
 

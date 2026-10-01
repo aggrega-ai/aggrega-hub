@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: period-budget-litellm
+  version: 1.0.0
+  description: >
+    Realizes core/period-budget on the AI gateway core/gateway/litellm; a
+    Release binds it in its Manifest. It writes the gateway's own budget
+    setting into the configuration the gateway's Recipe renders, and emits no
+    file.
+
+    The gateway counts what its traffic cost in US dollars, priced from the
+    cost table it keeps per model, over the spend it logged since midnight
+    thirty days ago; once that exceeds limit it refuses every further model
+    request until older spend leaves the window. So it honours unit usd, scope
+    gateway and period 30d, and refuses any other unit, scope or period by
+    name.
+
+    The gateway logs its spend in its bookkeeping database and checks a
+    budget only for callers it authenticates, so the build halts unless its
+    database_url and master_key credential slots are both attached, and
+    beside a core/audit-logging attachment that deletes that log in under
+    thirty days. It halts when the attachment is carried by any component
+    other than core/gateway/litellm.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/period-budget:1.0.0
+  # executionScope omitted -> component: the checks and the pipeline run once
+  # per attached component and receive that component's rendered documents.
+  #
+  # How the gateway keeps the budget. Its configuration takes a limit and a
+  # reset period for the whole gateway. What it checks each request against is
+  # the sum of the spend it logged since midnight thirty days ago in its
+  # bookkeeping database's own clock, whatever reset period it is given; the
+  # reset period only restarts a running total it keeps beside that log, which
+  # no request is checked against. So a budget over any other length of time
+  # would be written and then counted over thirty days, and this recipe
+  # refuses it instead of shipping a budget that means something else. A
+  # call's spend reaches the log once the call has finished, and the gateway
+  # writes the log in batches a few seconds apart, so a request is checked
+  # against what was logged before it: the call that takes the total past the
+  # limit is still answered, and the ones after it are refused with HTTP 429
+  # and an error of type budget_exceeded naming the total and the limit. A
+  # model the cost table prices at nothing in both directions is not checked
+  # at all.
+  #
+  # No assertion can read the host component's values, so what the gateway
+  # was given is read from the attachments the host carries, its credential
+  # slots and any core/audit-logging among them, which an assertion here sees;
+  # the guard at the top keeps those the LiteLLM gateway's.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/litellm and core/gateway/litellm:1.0.0 are the same host.
+    component_renders_the_body: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/litellm" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q is bound to the LiteLLM realization, which writes its budget into the configuration body core/gateway/litellm renders; %s renders no such body. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The gateway prices what a call cost from its cost table and counts that;
+    # tokens it counts only as a rate per minute on a key, which is not a
+    # budget over a period.
+    unit_is_what_the_gateway_counts: >-
+      {{- if ne .values.unit "usd" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for unit %s, but core/gateway/litellm counts a budget as what its traffic cost in US dollars, priced from the cost table it keeps per model, and counts no tokens against a budget; set unit to usd, or attach the Feature to a gateway that counts tokens" .metadata.feature_instance .metadata.instance_id .values.unit) -}}
+      {{- end -}}
+    # The budget the gateway takes from its configuration covers everything
+    # it serves. Budgets per caller are records its administrator sets on a
+    # key at run time, which a build does not create, and this realization
+    # writes no budget per model.
+    scope_is_the_whole_gateway: >-
+      {{- if ne .values.scope "gateway" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for scope %s, but this realization writes the budget core/gateway/litellm keeps for everything it serves, and no budget per caller or per model; set scope to gateway" .metadata.feature_instance .metadata.instance_id .values.scope) -}}
+      {{- end -}}
+    period_is_the_window_the_gateway_counts: >-
+      {{- if ne .values.period "30d" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of %s, but core/gateway/litellm checks its budget against the spend it logged since midnight thirty days ago, a window that moves forward a day at a time, whatever period it is given; set period to 30d" .metadata.feature_instance .metadata.instance_id .values.period) -}}
+      {{- end -}}
+    # The spend the budget is checked against is the gateway's own log of its
+    # calls, which it keeps only in its bookkeeping database; with none it
+    # counts nothing. And it checks a budget only for a caller it
+    # authenticates, which it does only once it has an administrative key;
+    # with none, every caller is let through unchecked. Without either the
+    # setting would be written and nothing ever refused, so this recipe halts
+    # naming whichever is missing.
+    gateway_keeps_the_count: >-
+      {{- $missing := list -}}
+      {{- if not (hasKey .features "database_url") -}}
+      {{- $missing = append $missing "its database_url credential slot is not attached, so it keeps no log of what it spent" -}}
+      {{- end -}}
+      {{- if not (hasKey .features "master_key") -}}
+      {{- $missing = append $missing "its master_key credential slot is not attached, so it checks no caller against a budget" -}}
+      {{- end -}}
+      {{- if $missing -}}
+      {{- fail (printf "core/period-budget attachment %q on %q needs core/gateway/litellm to count what it spent and check each caller against the budget, but %s. Attach one holding the bookkeeping database's connection string to the database_url slot of %q, and a credential to its master_key slot" .metadata.feature_instance .metadata.instance_id (join ", and " $missing) .metadata.instance_id) -}}
+      {{- end -}}
+    # core/audit-logging's retention deletes the same log the budget is
+    # checked against, so a retention under thirty days would shorten the
+    # window the budget counts. The attachments the host carries are read
+    # here with any version they were authored with set aside.
+    retention_keeps_the_window: >-
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/audit-logging" -}}
+      {{- $retention := optional (optional $attachment "values" dict) "retention_days" "" -}}
+      {{- if and (ne (toString $retention) "") (lt (int $retention) 30) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q is checked against the spend core/gateway/litellm logged over the last thirty days, but core/audit-logging attachment %q deletes that log after %v days, so the budget would count only those; set its retention_days to 30 or more, or leave it unset" $.metadata.feature_instance $.metadata.instance_id $name $retention) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+  pipeline:
+    # One step writes both settings into litellm_settings, the section the
+    # gateway reads them from. The gateway refuses to start with a limit and
+    # no reset period, so the period is written too, from the one value the
+    # assertion above admits.
+    - id: write_period_budget
+      plugin: pipeline-step/litellm-gateway-config:1.0.0
+      function: step
+      with: |
+        section: litellm_settings
+        settings:
+          max_budget: {{ .values.limit }}
+          budget_duration: "{{ .values.period }}"
