@@ -290,6 +290,16 @@ gateway carries several of them, and no amount of reading its tier would say so.
 `core/gateway/cloudflare-ai-gateway`, Cloudflare's hosted AI gateway, which
 carries no other value in this family and carries `semantic`.
 
+A component carrying `prompt-guard: classifier` is also something another
+component can send its traffic through: `core/gateway/litellm` and
+`core/gateway/nginx` each declare a `guard` socket selecting it, which
+`core/prompt-injection-shield` routes the gateway's model requests through.
+The selector admits both guards that carry the value, and each gateway's
+realization of the shield halts the build on any guard but
+`core/security/nemo-guardrails`, the one its two sensitivities are measured
+on — the same shape as `cache_store`, whose selector admits the key-value
+stores and whose Recipe halts on any store but `core/datastore/redis`.
+
 ### The `security.aggrega.ai/text-anonymization` label
 
 `security.aggrega.ai/text-anonymization` records which role a service plays in
@@ -2387,6 +2397,21 @@ budget, in their open-source builds, but no Recipe here routes model traffic
 through either. Envoy Gateway on its own, Contour and NGINX offer none of the
 three. No gateway in this catalog checks a reply against a schema the operator
 sets, so `core/response-validation` is realized nowhere.
+
+`core/prompt-injection-shield` is answered the same way, on the two gateways
+whose Recipes render the one route their model traffic takes.
+`core/gateway/litellm` and `core/gateway/nginx` realize it by sending that route
+through the guard wired to the gateway's `guard` socket, a
+`core/security/nemo-guardrails` that checks each chat request with a trained
+classifier and forwards what it admits to the model: on the AI gateway, every
+entry of the model map is addressed to the guard; on NGINX, its one location
+forwards to the guard in place of the upstream. Each realization halts the
+build unless the guard's threshold is the one the attachment's sensitivity
+names. The Feature selects `component.aggrega.ai/category=gateway`, because all
+it needs of a gateway is that it forwards to an address it is configured with.
+Every other gateway here renders no route a realization could send through a
+guard — it keeps its routes in a store of its own, takes them from the
+applications behind it, or is a hosted service — and realizes none.
 
 **A capability that only one product in the field has is not a Feature.** It is a
 value on that product's own Component, where an operator sets it and reads it beside

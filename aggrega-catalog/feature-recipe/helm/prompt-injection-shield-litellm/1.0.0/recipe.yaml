@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: prompt-injection-shield-litellm
+  version: 1.0.0
+  description: >
+    Component-scope FeatureRecipe for core/prompt-injection-shield on the AI
+    gateway core/gateway/litellm. It emits no file. The gateway's own Recipe,
+    reading the attachment, sends every entry of the model map to the guard
+    wired to the gateway's guard socket, which checks each chat request and
+    forwards what it admits to the model; this recipe writes a request policy
+    under which the gateway refuses every other kind of request with HTTP 400,
+    forwarding nothing, since the guard checks chat completions only.
+
+    The guard must be core/security/nemo-guardrails running the threshold the
+    sensitivity names, 0.5 for standard and 0.001 for strict, the values
+    measured for its detector's default classifier. The build halts otherwise,
+    with nothing on the guard socket, naming it, with more than one guard, on
+    a second attachment, on a map target not written openai/<model>, while
+    the provider_key slot or core/semantic-caching is attached, and on any
+    component other than core/gateway/litellm.
+
+    The guard reads only the latest user message, and judges no reply,
+    tool-call argument or image. A request it refuses is answered with an
+    ordinary completion, streamed when asked; when the guard or its detector
+    cannot be reached the request is refused and nothing reaches the model.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/prompt-injection-shield:1.0.0
+  # executionScope omitted -> component: the checks and the pipeline run once
+  # per attached component and receive that component's rendered documents.
+  #
+  # Where the route changes. The gateway's Recipe reads the attachment and
+  # writes the guard's published endpoint as the api_base of every entry of the
+  # model map, so the proxy sends each request for any alias to the guard over
+  # the OpenAI chat-completions API, under the model name the entry's target
+  # names. The guard checks the request and forwards what it admits to the one
+  # model API its own infra.upstream_endpoint names, presenting its own
+  # upstream_key; what it refuses it answers itself, an ordinary completion
+  # carrying "I'm sorry, I can't respond to that.", and nothing of the request
+  # reaches the model. This recipe changes no route itself: it checks what the
+  # route can only be right with — in its assertions, before anything renders,
+  # and in its pipeline step, where a failed check stops the build before any
+  # file is written — and writes the one setting the route needs beside it.
+  #
+  # What the guard checks, measured on core/security/nemo-guardrails in front of
+  # core/security/trustyai-huggingface-detector running its default classifier:
+  # the latest user message of each chat request, plain or streamed; a system
+  # message, an earlier turn and a tool result are forwarded unread, and the
+  # model's reply, tool-call arguments and images are not judged. Through this
+  # gateway, at its pinned release, attempts to override the model's
+  # instructions were refused and ordinary requests served with their messages
+  # unchanged, streamed or not. When the detector cannot be reached the guard
+  # refuses the request, a plain one with a completion reporting an internal
+  # error and a streamed one with a stream carrying no text; when the guard
+  # itself cannot be reached the gateway answers with an error. Neither reaches
+  # the model, and the gateway configures no fallback around the guard.
+  #
+  # The sensitivity, and the threshold it names. The guard refuses when its
+  # detector scores a label it blocks at or above values.threshold, which the
+  # guard publishes. 0.5 for standard and 0.001 for strict are the values
+  # measured for the detector's default model, whose scores sit close to 0 or
+  # close to 1: at 0.5 the guard refuses plain attempts to override a model's
+  # instructions; at 0.001 it also refuses one respelled in leetspeak, and some
+  # ordinary requests with it. The gateway reaches the guard and not the
+  # detector behind it, so this recipe checks the threshold the guard runs and
+  # cannot tell which model its detector loaded; under another model the two
+  # numbers are measured again, and the same two numbers carry a different
+  # meaning. The table is held by each realization of this Feature —
+  # prompt-injection-shield-nginx on helm and on compose state the same two
+  # numbers — because each renders against a different gateway and no surface
+  # is read by all three; change all of them together, and the guard's own
+  # description of its threshold with them.
+  #
+  # Neither assertion can read the host component's labels, so what the
+  # gateway is able to do is stated in the messages, and the check of the host's
+  # type above them is what keeps those statements true.
+  locals:
+    sensitivity_thresholds: '{"standard": 0.5, "strict": 0.001}'
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/litellm and core/gateway/litellm:1.0.0 are the same host.
+    component_sends_the_map_through_the_guard: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/litellm" -}}
+      {{- fail (printf "core/prompt-injection-shield attachment %q on %q is bound to the LiteLLM realization, which sends the model map core/gateway/litellm renders through a guard; %s renders no such map. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The compiler never brings a guard on its own: the requests are sent
+    # through the one wired to the guard socket, and with none the shield could
+    # only be ignored.
+    guard_is_wired: >-
+      {{- if not (hasKey .uses "guard") -}}
+      {{- fail (printf "core/prompt-injection-shield attachment %q on %q needs a guard to send the gateway's model requests through, but nothing is wired to its guard socket; wire a core/security/nemo-guardrails to the guard socket of %q" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The map goes through one guard at one threshold, so two attachments, at
+    # two sensitivities or at one, cannot each hold.
+    one_shield_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/prompt-injection-shield" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/prompt-injection-shield is attached to %q more than once (%s), but core/gateway/litellm sends its whole model map through one guard at one threshold, so the attachments cannot each hold; keep one attachment" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
+      {{- end -}}
+    # Every alias is sent to the guard over the OpenAI API, which the proxy
+    # speaks to an entry's address only for a target written openai/<model>;
+    # another provider's prefix would have it speak that provider's API to the
+    # guard, which answers none of them, so every request for the alias would
+    # fail.
+    targets_speak_the_guards_api: >-
+      {{- range $entry := fromJson (optional .locals "model_entries" "[]") -}}
+      {{- if not (hasPrefix "openai/" (toString $entry.target)) -}}
+      {{- fail (printf "core/prompt-injection-shield attachment %q on %q sends every alias of the model map to the guard, which speaks the OpenAI chat-completions API, but alias %q targets %q, which the gateway would address over another API; write that target openai/<model>, naming the model the guard's upstream serves" $.metadata.feature_instance $.metadata.instance_id (toString $entry.name) (toString $entry.target)) -}}
+      {{- end -}}
+      {{- end -}}
+    # The guard presents its own credential to the model; the gateway's would
+    # reach the guard and no model.
+    no_gateway_provider_credential: >-
+      {{- if hasKey .features "provider_key" -}}
+      {{- fail (printf "core/prompt-injection-shield attachment %q on %q sends every model request to the guard, which presents its own credential to the model, so the gateway's provider_key credential would be presented to no model; attach that credential to the upstream_key slot of the guard wired to %q, and remove the provider_key attachment" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The semantic cache embeds each prompt through an alias of the model map,
+    # inside the gateway, where no request policy applies; under the shield that
+    # alias is sent to the guard, which answers no embeddings request, and the
+    # cache, failing to embed, caches nothing while every request still succeeds.
+    no_semantic_cache: >-
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/semantic-caching" -}}
+      {{- fail (printf "core/prompt-injection-shield attachment %q on %q sends every alias of the model map to the guard, which answers no embeddings request, so the core/semantic-caching attachment %q could embed no prompt and would cache nothing while every request still succeeds; keep only one of the two attachments" $.metadata.feature_instance $.metadata.instance_id $name) -}}
+      {{- end -}}
+      {{- end -}}
+  pipeline:
+    # Before it writes, the step's input checks what only the render can show:
+    # the guard edge, with what the guard publishes, which an assertion cannot
+    # read. One guard; the NeMo Guardrails guard and no other, because the two
+    # sensitivities are measured on it, and core/security/trustyai-guardrails-gateway,
+    # the other guard the socket's selector admits, honours no threshold below
+    # its detector's own 0.5 and sends a refused request's text to the model
+    # server's tokenizer route; and the threshold the guard runs equal to the one
+    # the sensitivity names, compared as a number.
+    #
+    # Then it writes a request policy into the request guard's settings, under
+    # a member of this attachment's own: while the shield is attached the
+    # gateway serves chat completions and refuses every other request type with
+    # HTTP 400 saying why, forwarding nothing. The guard serves no completions,
+    # embeddings, responses or messages route, so such a request would fail at
+    # the guard, and the gateway, counting the failure against the alias, would
+    # refuse every request for that alias for a few seconds after it, chat
+    # included; refused here, it reaches neither.
+    - id: write_shield_policy
+      plugin: pipeline-step/litellm-gateway-config:1.0.0
+      function: step
+      with: |
+        {{- $id := printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-") }}
+        {{- $guards := list }}
+        {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "guard" }}{{ $guards = append $guards $edge }}{{ end }}{{ end }}
+        {{- if ne (len $guards) 1 }}{{ fail (printf "core/prompt-injection-shield attachment %q on %q needs exactly one guard, but %d components are wired to the gateway's guard socket; wire a single core/security/nemo-guardrails to it" .attachment_name .context.instance_id (len $guards)) }}{{ end }}
+        {{- $guard := first $guards }}
+        {{- $type := first (splitList ":" (toString $guard.component)) }}
+        {{- if ne $type "core/security/nemo-guardrails" }}{{ fail (printf "core/prompt-injection-shield attachment %q on %q is wired to the guard %q, a %s, but this realization sends the gateway's requests through core/security/nemo-guardrails alone, the one guard its two sensitivities are measured on and proved to refuse a request without the model's server receiving it; wire a core/security/nemo-guardrails to the guard socket instead" .attachment_name .context.instance_id $guard.target $type) }}{{ end }}
+        {{- $want := index (fromJson .locals.sensitivity_thresholds) (toString .values.sensitivity) }}
+        {{- $have := optional $guard.provides "threshold" "" }}
+        {{- if not $have }}{{ fail (printf "core/prompt-injection-shield attachment %q on %q is wired to the guard %q, which publishes no threshold, so the sensitivity it refuses at cannot be checked; bind %q in the Manifest to a Recipe that publishes one" .attachment_name .context.instance_id $guard.target $guard.target) }}{{ end }}
+        {{- if ne (float64 $have) (float64 $want) }}{{ fail (printf "core/prompt-injection-shield attachment %q on %q asks for sensitivity %s, which this realization runs as the guard's threshold %v, but the guard %q runs at %v; set values.threshold of %q to %v" .attachment_name .context.instance_id (toString .values.sensitivity) $want $guard.target $have $guard.target $want) }}{{ end }}
+        section: callback_settings
+        settings:
+          request_field_filter.{{ $id }}:
+            policies:
+              - reason: "sends every model request through a prompt-injection guard, which checks chat completions only"
+                served_request_types: [acompletion]

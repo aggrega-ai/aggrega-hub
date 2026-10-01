@@ -21,17 +21,17 @@ metadata:
     On every Release a second ConfigMap carries a request guard, which
     forwards only the request fields the proxy declares for the route, plus
     any the Release admits in infra.admitted_request_fields, and refuses the
-    rest naming the field, so a caller cannot send a request-body model list,
-    an upstream header, an unrecognised field or a provider key of its own. The
-    same ConfigMap configures a path allowlist, a container running the
-    official nginx image (BSD-2-Clause) on infra.port, which answers 403 to
-    every path but the model routes, the model listing, the health routes and
-    key management. Both come from the LiteLLMGuard bundle.
+    rest naming the field. The same ConfigMap configures a path allowlist, a
+    container running the official nginx image (BSD-2-Clause) on infra.port,
+    which answers 403 to every path but the model routes, the model listing,
+    the health routes and key management. Both come from the LiteLLMGuard
+    bundle.
 
     A core/context-propagation attachment, or a core/data-masking or
     core/log-masking one listing what to mask, adds the module its realization
-    relies on; a masking
-    attachment's refusals are a policy the request guard applies.
+    relies on; a masking attachment's refusals are a policy the request guard
+    applies. A core/prompt-injection-shield attachment sends every map entry
+    to the guard on the guard socket.
     PROXY_BASE_URL and the Presidio and cache store addresses appear only when
     infra.external_base_url and their sockets are set; the build halts on an
     address carrying a path, on one recognizer socket wired alone, and on a
@@ -58,6 +58,14 @@ spec:
     config_file: config.yaml
     config_map_name: "{{ .context.instance_id }}-config"
     provider_key_variable: LITELLM_PROVIDER_API_KEY
+    # The word every map entry presents as its credential while
+    # core/prompt-injection-shield sends it to the guard. The proxy calls an
+    # entry addressed this way only when the entry names a key, and the guard
+    # reads none from a request: it presents its own upstream_key to the model.
+    # So the entry names a fixed word that is no credential, and the gateway's
+    # own provider credential, which the shield's realization does not let be
+    # attached beside it, never leaves the gateway.
+    guard_api_key: the-guard-holds-the-upstream-credential
     # The module the caller-identity hook is delivered as: the ConfigMap's
     # second data key and the callback the configuration registers both read
     # it, so the file and its registration cannot name different modules.
@@ -138,6 +146,10 @@ spec:
     # whether the database_url credential slot is attached, which a
     # realization reads from the attachments themselves.
     model_aliases: '{{ $aliases := list }}{{ range .values.models }}{{ $aliases = append $aliases .name }}{{ end }}{{ toJson $aliases }}'
+    # Published the same way, and never emitted: every entry of the model map,
+    # its alias and its target, as a JSON list in map order, which the
+    # core/prompt-injection-shield realization checks each target in.
+    model_entries: '{{ toJson .values.models }}'
     # The alias published as the gateway's model, which provides.model below
     # hands to every component wired to it: values.model where it is set, and
     # otherwise the one alias the map publishes. The component's own assertion
@@ -287,11 +299,24 @@ spec:
     # request or a reply; what it masks is stated on that realization. With no
     # such attachment, the module is not emitted.
     #
+    # While a core/prompt-injection-shield attachment is present, every entry
+    # of the model map is sent to the guard wired to the guard socket: its
+    # api_base is the endpoint the guard publishes, and it presents the fixed
+    # word in guard_api_key as its credential, because the guard authenticates
+    # upstream with its own. The target stays as the developer wrote it, so the
+    # guard is asked for the model the target names. The guard checks each chat
+    # request and forwards what it admits to the model behind it; what it does
+    # not admit, it answers itself, and nothing of it reaches that model. The
+    # attachment's realization checks the guard and the map before any file is
+    # written; with the shield attached and nothing on the guard socket this
+    # body stops the build too, so the map is never written unguarded under an
+    # attached shield. With no such attachment, no entry carries an api_base.
+    #
     # Each of those attachments is found by its type with any version it was
     # authored with set aside, so core/context-propagation and
     # core/context-propagation:1.0.0 are both read, as are core/data-masking
-    # and core/data-masking:1.0.0, and core/log-masking and
-    # core/log-masking:1.0.0.
+    # and core/data-masking:1.0.0, core/log-masking and core/log-masking:1.0.0,
+    # and core/prompt-injection-shield and core/prompt-injection-shield:1.0.0.
     #
     # On every Release the body registers the request guard first, before any
     # hook that reads the request. Its module is not a file of this ConfigMap:
@@ -305,6 +330,7 @@ spec:
       {{- $listed := list }}
       {{- $masking := false }}
       {{- $logMasking := false }}
+      {{- $shield := false }}
       {{- range $name, $attachment := (default dict .features) }}
       {{- if eq (first (splitList ":" (toString $attachment.type))) "core/context-propagation" }}
       {{- $identity = true }}
@@ -320,6 +346,12 @@ spec:
       {{- $values := optional $attachment "values" dict }}
       {{- if or (optional $values "entities" list) (optional $values "patterns" list) }}{{ $logMasking = true }}{{ end }}
       {{- end }}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/prompt-injection-shield" }}{{ $shield = true }}{{ end }}
+      {{- end }}
+      {{- $guardBase := "" }}
+      {{- if $shield }}
+      {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "guard" }}{{ $guardBase = $edge.provides.endpoint }}{{ end }}{{ end }}
+      {{- if not $guardBase }}{{ fail "core/prompt-injection-shield is attached to the gateway, but nothing is wired to its guard socket, so its model map would be sent to no guard; wire a core/security/nemo-guardrails to the guard socket" }}{{ end }}
       {{- end -}}
       apiVersion: v1
       kind: ConfigMap
@@ -332,7 +364,10 @@ spec:
             - model_name: {{ .name }}
               litellm_params:
                 model: {{ .target }}
-      {{- if hasKey (default dict $.features) "provider_key" }}
+      {{- if $guardBase }}
+                api_base: {{ $guardBase | toJson }}
+                api_key: {{ $.locals.guard_api_key | toJson }}
+      {{- else if hasKey (default dict $.features) "provider_key" }}
                 api_key: os.environ/{{ $.locals.provider_key_variable }}
       {{- end }}
       {{- end }}
