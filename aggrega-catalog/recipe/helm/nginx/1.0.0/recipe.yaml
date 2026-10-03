@@ -12,26 +12,26 @@ metadata:
     synthesis, running the official upstream nginx image (no external Helm
     chart). NGINX holds no persistent state, so it renders a stateless
     Deployment plus a ClusterIP Service and declares no storage. The upstream
-    host and port resolved from the `upstream` uses-edge arrive on
-    .context.inject.env and are written into a minimal NGINX server
-    configuration whose proxy_pass forwards matching requests to that upstream;
-    the config is written at container start and nginx is then started in the
-    foreground. provides.host is the bare, self-contained in-cluster service
-    name of the synthesized Service — it carries no namespace, so the recipe is
-    independent of where it is deployed. A consumer in another namespace
-    qualifies the host with the target namespace on its own side (caller-side
-    routing). Each core/traffic-shadowing attachment on the component adds a
-    mirror to that location: an upstream group naming the Service the
-    attachment's infra names, and an internal location sending a copy of every
-    forwarded request there with its original URI, whose response NGINX
-    discards. NGINX copies every request it forwards and cannot copy a share
-    of them, so the FeatureRecipe realizing the attachment
-    (traffic-shadowing-nginx) halts on a share below 100. With no such
-    attachment the configuration carries no mirror. The two inject-pipe
-    variables the proxy_pass target is read from are named in the locals; a
-    core/prompt-injection-shield attachment's realization
-    (prompt-injection-shield-nginx) writes them with the address of the guard
-    wired to the guard socket.
+    host and port arrive on .context.inject.env under the two variables the
+    locals name, which the `upstream` edge's inject block names, and are
+    written into a minimal NGINX server configuration whose proxy_pass forwards
+    matching requests to that upstream; the config is written at container
+    start and nginx is then started in the foreground. With an edge wired on
+    any socket but guard and either variable missing from the pipe, the build
+    halts naming the edge and its socket; with neither on the pipe and no such
+    edge, the location answers 503. A core/prompt-injection-shield attachment's
+    realization (prompt-injection-shield-nginx) writes the two variables with
+    the address of the guard wired to the guard socket. provides.host is the
+    bare in-cluster service name of the synthesized Service and carries no
+    namespace; a consumer in another namespace qualifies it on its own side
+    (caller-side routing). Each core/traffic-shadowing attachment adds a mirror
+    to that location: an upstream group naming the Service the attachment's
+    infra names, and an internal location sending a copy of every forwarded
+    request there with its original URI, whose response NGINX discards. NGINX
+    copies every request it forwards and cannot copy a share of them, so the
+    FeatureRecipe realizing the attachment (traffic-shadowing-nginx) halts on a
+    share below 100, and this Recipe halts on an attachment to a gateway that
+    forwards nothing.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -42,7 +42,8 @@ spec:
   #
   # provides.host is the bare Service name "<instance_id>-default" — the helm
   # provider names the synthesized ClusterIP Service "<instance_id>-<service-key>"
-  # (here "<instance_id>-default"), with no namespace segment. A same-namespace
+  # (here "<instance_id>-default"), with no namespace segment, so the Recipe
+  # renders the same whatever namespace it is deployed into. A same-namespace
   # consumer reaches it under this name directly; a cross-namespace consumer
   # qualifies it with the target namespace caller-side.
   #
@@ -77,8 +78,45 @@ spec:
     {{- $mirrors := list -}}
     {{- range $name, $f := (default dict .features) -}}
     {{- if eq (first (splitList ":" $f.type)) "core/traffic-shadowing" -}}
-    {{- $mirrors = append $mirrors (dict "group" (printf "mirror_%s" $name) "location" (printf "/__mirror_%s" $name) "server" (printf "%s:%v" $f.infra.service_name $f.infra.service_port)) -}}
+    {{- $mirrors = append $mirrors (dict "name" $name "group" (printf "mirror_%s" $name) "location" (printf "/__mirror_%s" $name) "server" (printf "%s:%v" $f.infra.service_name $f.infra.service_port)) -}}
     {{- end -}}
+    {{- end -}}
+    {{- /*
+      The proxy_pass target: the host and port under the two variables the
+      locals name, read off the inject pipe as a map so that a variable nothing
+      delivered is told apart from one delivered empty. An edge wired on any
+      socket but guard is where they come from: the upstream socket, or one a
+      Component extending core/gateway/nginx adds. So an edge there delivering
+      only one of the two, or neither, halts the build naming the edge and its
+      socket, unless an attachment's realization has written both, as
+      core/prompt-injection-shield's does. The guard socket is the one set
+      aside, because that realization reads the guard's edge itself. With no
+      such edge, one variable without the other halts as well, since whatever
+      delivered one meant the gateway to forward. With neither and no such
+      edge there is nowhere to forward to: the location keeps its path and
+      answers 503, and a mirror, which copies a forwarded request, has nothing
+      to copy and halts the build.
+    */ -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $hostVar := .locals.upstream_host_variable -}}
+    {{- $portVar := .locals.upstream_port_variable -}}
+    {{- $missing := list -}}
+    {{- range (list $hostVar $portVar) }}{{ if not (hasKey $env .) }}{{ $missing = append $missing . }}{{ end }}{{ end -}}
+    {{- $edges := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ if ne $edge.socket "guard" }}{{ $edges = append $edges (printf "the edge %q on its %s socket" $alias $edge.socket) }}{{ end }}{{ end -}}
+    {{- if and $missing $edges -}}
+    {{- $verb := "delivers" }}{{ $which := "that edge" }}{{ if gt (len $edges) 1 }}{{ $verb = "deliver" }}{{ $which = "the edge it should forward through" }}{{ end -}}
+    {{- $halt := printf "core/gateway/nginx %q forwards each request to the host and port under %s and %s on its inject pipe, but %s %s no %s; give %s an inject block naming %s from the upstream's host and %s from its port — inject: { env: [ { in: %s, from: host }, { in: %s, from: port } ] }" .context.instance_id $hostVar $portVar (join " and " $edges) $verb (join " or " $missing) $which $hostVar $portVar $hostVar $portVar -}}
+    {{- fail $halt -}}
+    {{- end -}}
+    {{- if eq (len $missing) 1 -}}
+    {{- $halt := printf "core/gateway/nginx %q finds %s on its inject pipe but no %s, and forwards only to a host and port delivered together; whatever delivers one of the two delivers both — %s as the upstream's host and %s as its port" .context.instance_id (first (without (list $hostVar $portVar) (first $missing))) (first $missing) $hostVar $portVar -}}
+    {{- fail $halt -}}
+    {{- end -}}
+    {{- if and $missing $mirrors -}}
+    {{- $mirrorNames := list }}{{ range $mirrors }}{{ $mirrorNames = append $mirrorNames .name }}{{ end -}}
+    {{- $halt := printf "core/traffic-shadowing attachment %q on %q copies each request the gateway forwards, but %q forwards none: no edge delivers %s and %s on its inject pipe and no core/prompt-injection-shield attachment writes them, so its location answers 503 and there is no forwarded request to copy; wire an upstream whose edge names both, or remove the attachment" (join ", " $mirrorNames) .context.instance_id .context.instance_id $hostVar $portVar -}}
+    {{- fail $halt -}}
     {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
@@ -92,20 +130,22 @@ spec:
         # The upstream target resolved from the `upstream` uses-edge arrives on
         # the inject pipe (.context.inject.env). It is written into the NGINX
         # server config at container start and forwarded via proxy_pass; nginx
-        # is then started in the foreground so the container stays alive. Each
-        # mirror adds its upstream group ahead of the server block, a mirror
-        # directive in the forwarded location, and the internal location the
-        # copy is sent from.
+        # is then started in the foreground so the container stays alive. With
+        # no target on the pipe the location carries no proxy_pass and answers
+        # 503. Each mirror adds its upstream group ahead of the server block, a
+        # mirror directive in the forwarded location, and the internal location
+        # the copy is sent from.
         command:
           - /bin/sh
           - -c
-          - "echo '{{ range $mirrors }}upstream {{ .group }} { server {{ .server }}; } {{ end }}server { listen {{ .infra.port }}; location {{ .values.upstream_path }} { {{ range $mirrors }}mirror {{ .location }}; {{ end }}proxy_pass http://{{ index .context.inject.env .locals.upstream_host_variable }}:{{ index .context.inject.env .locals.upstream_port_variable }}; }{{ range $mirrors }} location = {{ .location }} { internal; proxy_pass http://{{ .group }}$request_uri; }{{ end }} }' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
+          - "echo '{{ range $mirrors }}upstream {{ .group }} { server {{ .server }}; } {{ end }}server { listen {{ .infra.port }}; location {{ .values.upstream_path }} { {{ range $mirrors }}mirror {{ .location }}; {{ end }}{{ if $missing }}return 503;{{ else }}proxy_pass http://{{ index $env $hostVar }}:{{ index $env $portVar }};{{ end }} }{{ range $mirrors }} location = {{ .location }} { internal; proxy_pass http://{{ .group }}$request_uri; }{{ end }} }' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
         ports:
           http: {{ .infra.port }}
         # NGINX documents no health endpoint, and the one location this server
-        # configures is forwarded to the upstream, so an HTTP check would report
-        # the upstream's health rather than the proxy's. Both probes open a TCP
-        # connection to the port the server listens on and the Service targets.
+        # configures forwards to the upstream, or answers 503 with none to
+        # forward to, so an HTTP check would report the upstream's health, or a
+        # refusal, rather than the proxy's. Both probes open a TCP connection to
+        # the port the server listens on and the Service targets.
         # No start-up time is documented; the liveness probe waits 10 s before
         # its first check.
         health:

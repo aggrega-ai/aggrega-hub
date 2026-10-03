@@ -11,9 +11,13 @@ metadata:
     Kong, a database-backed API gateway, for local development via Docker
     Compose, synthesized from the Workload kind by the compose provider. It
     holds no local state — the PostgreSQL backend wired on the `backend` edge is
-    the system of record — so it renders stateless with no volume. A
-    schema-provisioning step runs the same image with the same connection and
-    password before the gateway starts; the bootstrap is idempotent.
+    the system of record — so it renders stateless with no volume. The
+    connection's host, port, user and database arrive on the inject pipe under
+    the four KONG_PG_* variables the backend edge's inject block names; an edge
+    leaving any of them missing halts the build naming the edge and the
+    variables. A schema-provisioning step runs the same image with the same
+    connection and password before the gateway starts; the bootstrap is
+    idempotent.
 
     On a cold host the provisioning step may run before the backend accepts
     connections: the rendered gateway service waits on the provisioning step
@@ -75,6 +79,27 @@ spec:
   # primitive, so a plain environment variable is the delivery this target has.
   workload: |
     {{- $devPassword := "apppass" -}}
+    {{- /* The backend connection: four variables of the inject pipe, which the
+           backend edge's inject block names from the backend's provides. The
+           pipe is read as a map so that a variable nothing delivered is told
+           apart from one delivered empty, and the build halts naming the edge
+           and every variable it leaves missing, rather than rendering a
+           connection setting with an empty value. The socket is required, so a
+           build whose Aggregate leaves it empty is refused before this
+           template runs; the message for an empty socket is what validating
+           this Recipe on its own, with no connection, reports. */ -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $missing := list -}}
+    {{- range (list "KONG_PG_HOST" "KONG_PG_PORT" "KONG_PG_USER" "KONG_PG_DATABASE") }}{{ if not (hasKey $env .) }}{{ $missing = append $missing . }}{{ end }}{{ end -}}
+    {{- if $missing -}}
+    {{- $backendEdges := list }}{{ range $alias, $edge := .context.uses }}{{ if eq $edge.socket "backend" }}{{ $backendEdges = append $backendEdges $alias }}{{ end }}{{ end -}}
+    {{- $shape := "inject: { env: [ { in: KONG_PG_HOST, from: host }, { in: KONG_PG_PORT, from: port }, { in: KONG_PG_USER, from: user }, { in: KONG_PG_DATABASE, from: database } ] }" -}}
+    {{- $halt := printf "core/gateway/kong %q composes its PostgreSQL connection from KONG_PG_HOST, KONG_PG_PORT, KONG_PG_USER and KONG_PG_DATABASE on its inject pipe, but nothing is wired to its backend socket to deliver them; wire the backend and give its edge an inject block naming each from the backend's provides — %s" .context.instance_id $shape -}}
+    {{- if $backendEdges -}}
+    {{- $halt = printf "core/gateway/kong %q composes its PostgreSQL connection from KONG_PG_HOST, KONG_PG_PORT, KONG_PG_USER and KONG_PG_DATABASE on its inject pipe, but the edge %q on its backend socket delivers no %s; give that edge an inject block naming each from the backend's provides — %s" .context.instance_id (join ", " $backendEdges) (join ", " $missing) $shape -}}
+    {{- end -}}
+    {{- fail $halt -}}
+    {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # Kong holds no durable state — the PostgreSQL backend is the system of
@@ -123,10 +148,10 @@ spec:
         # database its own provisioning step created.
         variables:
           KONG_DATABASE: postgres
-          KONG_PG_HOST: "{{ .context.inject.env.KONG_PG_HOST }}"
-          KONG_PG_PORT: "{{ .context.inject.env.KONG_PG_PORT }}"
-          KONG_PG_USER: "{{ .context.inject.env.KONG_PG_USER }}"
-          KONG_PG_DATABASE: "{{ .context.inject.env.KONG_PG_DATABASE }}"
+          KONG_PG_HOST: "{{ $env.KONG_PG_HOST }}"
+          KONG_PG_PORT: "{{ $env.KONG_PG_PORT }}"
+          KONG_PG_USER: "{{ $env.KONG_PG_USER }}"
+          KONG_PG_DATABASE: "{{ $env.KONG_PG_DATABASE }}"
     {{- if hasKey (default dict .features) "password" }}
           KONG_PG_PASSWORD: "{{ .context.inject.env.KONG_PG_PASSWORD }}"
     {{- else }}
@@ -144,10 +169,10 @@ spec:
         # entry below publishes nothing to the host.
         variables:
           KONG_DATABASE: postgres
-          KONG_PG_HOST: "{{ .context.inject.env.KONG_PG_HOST }}"
-          KONG_PG_PORT: "{{ .context.inject.env.KONG_PG_PORT }}"
-          KONG_PG_USER: "{{ .context.inject.env.KONG_PG_USER }}"
-          KONG_PG_DATABASE: "{{ .context.inject.env.KONG_PG_DATABASE }}"
+          KONG_PG_HOST: "{{ $env.KONG_PG_HOST }}"
+          KONG_PG_PORT: "{{ $env.KONG_PG_PORT }}"
+          KONG_PG_USER: "{{ $env.KONG_PG_USER }}"
+          KONG_PG_DATABASE: "{{ $env.KONG_PG_DATABASE }}"
           KONG_PROXY_LISTEN: "0.0.0.0:{{ .infra.proxy_port }}, 0.0.0.0:8443 ssl"
           KONG_ADMIN_LISTEN: "0.0.0.0:{{ .infra.admin_port }}"
     {{- if hasKey (default dict .features) "password" }}
