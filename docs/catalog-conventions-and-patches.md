@@ -1905,6 +1905,19 @@ Per engine, the wiring the reference Recipe emits:
 - **compose** — environment variables carrying the endpoint and credentials into
   the consuming service. No service definition for the referenced resource.
 
+Where a reference realization names the address the Component declares as
+`infra.endpoint` with no default, so the Release supplies it, the Recipe carries a
+build-time `assertions` entry keyed `endpoint_supplied`, which halts when
+`infra.endpoint` is unset or empty with a sentence saying what the address is for
+that product and that the Release sets it. A build whose Release omits the
+address, and a check of the Recipe on its own, then stop on that sentence rather
+than on the Workload schema's refusal of a missing property. The key is the
+checked key with `_supplied` appended, the naming `image_supplied`,
+`subnet_group_supplied` and `external_base_url_supplied` follow for the image,
+the database subnet group and the external base URL a Release supplies. This is a
+catalog convention, not something the compiler checks: the compiler evaluates the
+assertion's template and knows nothing of what the key means.
+
 The credential slot is filled by a referenced credential — the
 `core/referenced-secret` Feature — rather than a provisioned one, and the
 realization the Manifest binds decides whether the secret material stays outside
