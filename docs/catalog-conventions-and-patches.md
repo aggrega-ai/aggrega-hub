@@ -2411,6 +2411,15 @@ through either. Envoy Gateway on its own, Contour and NGINX offer none of the
 three. No gateway in this catalog checks a reply against a schema the operator
 sets, so `core/response-validation` is realized nowhere.
 
+`core/concurrency-limit`, the AI gateway control declaring a cap on the
+requests a gateway carries at once across everything it serves, is realized
+nowhere either. The proxy `core/gateway/litellm` runs can cap the requests in
+flight for each entry of its model map, but holds no cap on their total, so
+that gateway carries no realization; and no Recipe of
+`core/gateway/cloudflare-ai-gateway` writes such a cap: the request limit its
+terraform Recipe writes into the gateway's resource is a rate, a number of
+requests over an interval.
+
 `core/prompt-injection-shield` is answered the same way, on the two gateways
 whose Recipes render the one route their model traffic takes.
 `core/gateway/litellm` and `core/gateway/nginx` realize it by sending that route
