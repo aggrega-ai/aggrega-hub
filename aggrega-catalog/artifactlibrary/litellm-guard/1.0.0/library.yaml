@@ -18,10 +18,14 @@ metadata:
     infra.admitted_request_fields, and refuses every other field with an error
     naming it; the fields that would re-target or re-key a call are refused even
     where the proxy declares them, and a Release admitting one stops the build.
-    An nginx configuration on infra.port forwards only the routes the module
-    checks, the model listing, the health routes, key management and, where the
-    importing Recipe turns them on, the organization routes, and answers every
-    other path 403.
+    It refuses as well a request naming user_api_key, the hash of the key the
+    proxy verified, in metadata the proxy keeps apart from its own, as on the
+    responses and messages routes; elsewhere the proxy overwrites the
+    caller's, and it removes its other identity fields wherever a caller
+    writes them. An nginx configuration on infra.port forwards only the routes
+    the module checks, the model listing, the health routes, key management
+    and, where the importing Recipe turns them on, the organization routes,
+    and answers every other path 403.
 
     The importing Recipe picks the delivery with the local
     request_guard_delivery — config_map, one ConfigMap for a Kubernetes target,
@@ -54,16 +58,29 @@ spec:
     # error naming it, forwarding nothing. The fields that would let a caller
     # re-target or re-key a call are refused even where the proxy declares them,
     # and a Release naming one of them in infra.admitted_request_fields stops
-    # the build, naming the field. The second text configures an nginx reverse
-    # proxy that listens on infra.port in front of the LiteLLM proxy: it
-    # forwards only the routes the module checks, the model listing, the health
-    # routes and key management, and, where the importing Recipe turns them on,
-    # the routes that create, read, update and delete an organization; every
-    # other path is answered 403 with nothing forwarded.
+    # the build, naming the field. A request naming one of the identity fields
+    # the proxy sets itself on every request — the hash of the key it verified,
+    # that key's team and organization, and the end user — in a metadata mapping
+    # the proxy did not fill is refused the same way, naming the field as the
+    # caller wrote it, such as metadata.user_api_key: the proxy fills one of a
+    # request's two metadata mappings by route and leaves the other to the
+    # caller, and the gateway's semantic cache keeps its replies apart by those
+    # fields, reading the caller's mapping first on the responses and messages
+    # routes. The proxy removes every one of them but the key's hash from both
+    # mappings before the module sees a request, so a request naming the team,
+    # the organization or the end user field is answered without it, and
+    # metadata.user_api_key is the field a caller is refused for in practice;
+    # the module checks all four, so a proxy that stopped removing them would
+    # see them refused rather than read. The second text configures an nginx
+    # reverse proxy that listens on infra.port in front of the LiteLLM proxy:
+    # it forwards only the routes the module checks, the model listing, the
+    # health routes and key management, and, where the importing Recipe turns
+    # them on, the routes that create, read, update and delete an organization;
+    # every other path is answered 403 with nothing forwarded.
     #
-    # The module reads each route's field list from the proxy when it loads, so
-    # a list that cannot be read stops the proxy from starting. The bundle is
-    # authored against LiteLLM v1.103.1.
+    # The module reads each route's field list, and the identity fields, from
+    # the proxy when it loads, so a list that cannot be read stops the proxy
+    # from starting. The bundle is authored against LiteLLM v1.103.1.
     #
     # How the two texts reach the workload. The importing Recipe chooses through
     # the local request_guard_delivery. With config_map the bundle emits one
@@ -296,11 +313,17 @@ spec:
             passed on, so a caller cannot send a provider key of its own. The fields the
             gateway refuses are read from the one deny set the bundle carrying it holds;
             further fields the Release names in infra.admitted_request_fields are admitted
-            on every route. The refusal is checked at the pre-call hook, where a caller's
-            field is visible as a caller's field, and again at the per-deployment hook that
-            sees fallbacks, as defence in depth. Every list this reads from LiteLLM is read
-            when the module loads, so a list that cannot be read stops the gateway from
-            starting rather than letting it serve with a narrower or a wider guard.
+            on every route. A request naming, in a metadata mapping the gateway did not
+            fill, one of the identity fields the gateway sets itself on every request — the
+            hash of the key it verified, that key's team and organization, and the end user
+            — is refused the same way, naming the field; the gateway itself removes every
+            one of them but the key's hash before this hook runs. So a caller cannot name
+            another key's identity where the gateway reads it. The refusal is checked at the
+            pre-call hook, where a caller's field is visible as a caller's field, and again
+            at the per-deployment hook that sees fallbacks, as defence in depth. Every list
+            this reads from LiteLLM is read when the module loads, so a list that cannot be
+            read stops the gateway from starting rather than letting it serve with a
+            narrower or a wider guard.
 
             A policy an attachment's realization writes into this module's settings refuses
             more, and never admits a field refused here: it can name the request types
@@ -314,7 +337,9 @@ spec:
 
             import litellm
             from fastapi import HTTPException
+            from litellm.caching.caching import Cache
             from litellm.integrations.custom_logger import CustomLogger
+            from litellm.proxy._types import UserAPIKeyAuth
             from litellm.types.llms.anthropic import ANTHROPIC_API_HEADERS, AnthropicMessagesRequest
             from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
 
@@ -327,6 +352,28 @@ spec:
             # infra.admitted_request_fields. Empty unless the Release sets it, and a field
             # in the deny set never reaches here — the bundle halts the build on one.
             ADMITTED = frozenset([{{ range $i, $f := $admitted }}{{ if $i }}, {{ end }}{{ $f | toJson | replace "$" $dollar }}{{ end }}])
+
+            # The identity fields the proxy sets on every request: the hash of the key the
+            # caller presented, that key's team and organization, and the end user it took
+            # from the request. The gateway's semantic cache keeps its replies apart by
+            # them, reading each from the request's metadata first and its
+            # litellm_metadata second, so a caller writing one of them into a mapping the
+            # proxy did not fill would be served the replies kept for whatever it named.
+            # Read from LiteLLM's cache when the module loads.
+            IDENTITY_FIELDS = frozenset(Cache._SEMANTIC_CACHE_TENANT_SCOPE_FIELDS) | frozenset(
+                [Cache._SEMANTIC_CACHE_END_USER_SCOPE_FIELD]
+            )
+
+            # Where the proxy writes those fields. It fills one of the request's two
+            # metadata mappings, metadata or litellm_metadata, the one its route uses, and
+            # strips every user_api_key_ field a caller sent from both, so the bare
+            # user_api_key a caller writes into the other mapping is what reaches this
+            # hook: on the responses and messages routes the proxy fills litellm_metadata
+            # and leaves the caller's metadata beside it, while on the others no second
+            # mapping remains. Beside the identity fields the proxy places the verified
+            # key's own record under this name, an object no request body can carry, so
+            # the mapping holding it is the proxy's and any other is the caller's.
+            KEY_RECORD = "user_api_key_auth"
 
             # One key the proxy adds on every route is a caller-injection vector under the
             # same name, so it is neither admitted nor refused by name:
@@ -709,6 +756,22 @@ spec:
                 return None
 
 
+            def _identity_fields_sent(data):
+                # The identity fields a request carries in a metadata mapping the proxy did
+                # not fill, each named as the caller wrote it, such as metadata.user_api_key.
+                # A mapping holding the verified key's record is the proxy's and passes. Were
+                # neither to hold it, both would be read as the caller's and every identity
+                # field in them refused, so a proxy that stopped placing the record would
+                # refuse requests rather than let a caller's field through.
+                named = []
+                for mapping_name in ("metadata", "litellm_metadata"):
+                    mapping = data.get(mapping_name)
+                    if not isinstance(mapping, dict) or isinstance(mapping.get(KEY_RECORD), UserAPIKeyAuth):
+                        continue
+                    named += [mapping_name + "." + field for field in IDENTITY_FIELDS if field in mapping]
+                return named
+
+
             def _refuse(fields):
                 named = ", ".join(sorted(set(fields)))
                 raise HTTPException(
@@ -736,6 +799,7 @@ spec:
                         elif key in allowed:
                             continue
                         refused.append(key)
+                    refused += _identity_fields_sent(data)
                     if refused:
                         _refuse(refused)
                     refusal = _policy_refusal(data, call_type)
