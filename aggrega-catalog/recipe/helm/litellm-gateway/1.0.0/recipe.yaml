@@ -85,6 +85,10 @@ spec:
     # here, so the entry cannot name one the file lacks.
     log_masking_module: log_masking
     log_masking_class: LogMasking
+    # The callback in that module that withholds a failed call's text: the
+    # configuration registers it and the file defines it from here, so the
+    # registration cannot name one the file lacks.
+    log_masking_failure_callback: withhold_failed_calls
     # The request-guard module, delivered on every Release by the LiteLLMGuard
     # bundle imported below: the file it is carried as and the callback the
     # configuration registers first both read this name. The bundle holds the
@@ -294,10 +298,19 @@ spec:
     # While a core/log-masking attachment lists entities or patterns, the
     # ConfigMap carries the log-masking module, the one that attachment's
     # guardrail entry is loaded from, decided from the attachment in the same
-    # way and failing closed in the same way. Its class runs only where the
-    # gateway hands a finished call to its logs, so nothing it does reaches a
-    # request or a reply; what it masks is stated on that realization. With no
-    # such attachment, the module is not emitted.
+    # way and failing closed in the same way, and the body registers the
+    # module's failure callback right after the request guard. Its guardrail
+    # class runs only where the gateway hands a finished call to its logs, so
+    # nothing it does reaches a request or a reply. Its failure callback is
+    # handed a failed call's record before every callback registered after
+    # it, and puts a copy with the text withheld in place of each entry that
+    # carries text, editing no object an entry held, so a retried attempt is
+    # sent as it would be without it. While the module is loaded, an error
+    # line the gateway's own loggers write at warning or above, carrying its
+    # exception or written for a failed call, keeps the kind of error and
+    # loses its text. What it masks and withholds is stated on that
+    # realization. With no such attachment, neither the module nor the
+    # registration is emitted.
     #
     # While a core/prompt-injection-shield attachment is present, every entry
     # of the model map is sent to the guard wired to the guard socket: its
@@ -376,6 +389,9 @@ spec:
           litellm_settings:
             callbacks:
               - {{ .locals.request_guard_dir }}/{{ .locals.request_filter_module }}.filter
+      {{- if $logMasking }}
+              - {{ .locals.log_masking_module }}.{{ .locals.log_masking_failure_callback }}
+      {{- end }}
       {{- if $identity }}
               - {{ .locals.caller_identity_module }}.hook
       {{- end }}
@@ -1347,10 +1363,11 @@ spec:
       {{- end }}
       {{- if $logMasking }}
         {{ .locals.log_masking_module }}.py: |
-          """Masking of what the gateway hands to its logs, by listed pattern and by entity type.
+          """Masking of what the gateway hands to its logs, by listed pattern and by entity type, and of a failed call's text.
 
           Delivered beside the gateway's configuration while core/log-masking lists patterns or entity types, and loaded by
-          the one guardrail entry that attachment's realization writes. {{ .locals.log_masking_class }} runs only where the gateway hands a finished
+          the one guardrail entry that attachment's realization writes and by the callback the configuration registers right
+          after the request guard. {{ .locals.log_masking_class }} runs only where the gateway hands a finished
           call to its logs, never before a request is forwarded and never on a reply before it is returned: it replaces each
           copy of the call the logs are handed with a masked copy, and edits nothing the call itself holds. The copies are the
           messages, prompt and input of the call; the standard logging payload's messages and reply; a streamed reply as the
@@ -1364,13 +1381,26 @@ spec:
           with each such text replaced by one fixed placeholder, [TEXT_WITHHELD], so the call's record is still handed to the
           logs and the call is still counted, and the gateway's own log says the text was withheld. Only if that fails too is
           the record not written at all; it is never written unmasked.
+
+          The gateway calls no logging guardrail for a call that fails, so a failed call's text is withheld instead.
+          {{ .locals.log_masking_failure_callback }} is handed a failed call's record before every callback registered after it: the call
+          record by the gateway's failure handlers, which can run before a failed attempt is retried, and the request by its
+          failure hook. In place of each entry that carries text it puts a copy in which every text a caller or a model wrote
+          is [TEXT_WITHHELD], matched or not, and the error the call failed with is [ERROR_TEXT_WITHHELD]; it edits no object
+          an entry held, so a retried attempt is sent exactly as it would be without it. The exception the call failed with is
+          left as the gateway raised it, because the caller's error reply is built from it, so a callback after this one can
+          still read a provider's own error message there. And while this module is loaded, an error the gateway's own
+          loggers write at warning or above, carrying its exception or written by the proxy for a failed call, keeps the kind
+          of error and loses its text.
           """
           import asyncio
           import copy
+          import logging
           from concurrent.futures import ThreadPoolExecutor
 
-          from litellm._logging import verbose_proxy_logger
+          from litellm._logging import verbose_logger, verbose_proxy_logger, verbose_router_logger
           from litellm.integrations.custom_guardrail import CustomGuardrail
+          from litellm.integrations.custom_logger import CustomLogger
           from litellm.proxy.guardrails.guardrail_hooks.litellm_content_filter.content_filter import ContentFilterGuardrail
           from litellm.proxy.guardrails.guardrail_hooks.presidio import _OPTIONAL_PresidioPIIMasking
           from litellm.types.guardrails import GuardrailEventHooks
@@ -1388,6 +1418,13 @@ spec:
               "A call's log record was not written: masking its text failed, and withholding the text failed as well. The "
               "call itself was answered as usual."
           )
+
+          # What the error a failed call ended with becomes, in what the logs are handed for that call: words that carry no
+          # part of it.
+          ERROR_WITHHELD = "[ERROR_TEXT_WITHHELD]"
+
+          # What the gateway's own log says in place of an error's text, followed by the kind of error.
+          ERROR_LINE_WITHHELD = "An error was logged with its text withheld, as log masking is attached: %s"
 
 
           class LogMaskingFailed(Exception):
@@ -1438,7 +1475,67 @@ spec:
               return TEXT_WITHHELD
 
 
-          class {{ .locals.log_masking_class }}(CustomGuardrail):
+          def _run_to_end(make):
+              # The gateway calls a synchronous hook from a worker thread, or from a thread running an event loop; either
+              # way the coroutine make returns runs to its end in an event loop of its own, and its result or its error is
+              # the hook's.
+              def run():
+                  loop = asyncio.new_event_loop()
+                  try:
+                      return loop.run_until_complete(make())
+                  finally:
+                      loop.close()
+
+              try:
+                  asyncio.get_running_loop()
+              except RuntimeError:
+                  return run()
+              with ThreadPoolExecutor(max_workers=1) as pool:
+                  return pool.submit(run).result()
+
+
+          class _TextCopies:
+              # Builds a copy of a value in which each text a caller or a model wrote is replaced by what replace returns for
+              # it; shared by the masking of a successful call and the withholding of a failed one, so the two read the same
+              # values as text.
+              async def _replaced_item(self, value, replace, text, seen):
+                  if isinstance(value, str):
+                      return await replace(value) if text else value
+                  if isinstance(value, (dict, list)) or getattr(value, "model_dump", None) is not None:
+                      await self._replace_in_place(value, replace, text, seen)
+                  return value
+
+              async def _replace_in_place(self, holder, replace, text, seen):
+                  # Walks a copy: inside a key named in _TEXT every string is text, except under the keys _OWN names; outside
+                  # such a key only the walk goes on. A value met twice is replaced once.
+                  if id(holder) in seen:
+                      return
+                  seen.add(id(holder))
+                  if isinstance(holder, list):
+                      for i, item in enumerate(holder):
+                          holder[i] = await self._replaced_item(item, replace, text, seen)
+                      return
+                  if text and _field(holder, "type") in _NOT_TEXT:
+                      return
+                  for name in _names(holder):
+                      if text and name in _OWN:
+                          continue
+                      value = _field(holder, name)
+                      if value is None:
+                          continue
+                      replaced = await self._replaced_item(value, replace, text or name in _TEXT, seen)
+                      if replaced is not value:
+                          _set_field(holder, name, replaced)
+
+              async def _copy(self, value, replace, text):
+                  if isinstance(value, str):
+                      return await replace(value) if text else value
+                  copied = copy.deepcopy(value)
+                  await self._replace_in_place(copied, replace, text, set())
+                  return copied
+
+
+          class {{ .locals.log_masking_class }}(_TextCopies, CustomGuardrail):
               def __init__(self, patterns=None, pii_entities_config=None, **kwargs):
                   # A logging hook whatever mode the entry names, so the gateway calls it on no request before it is forwarded
                   # and on no reply before it is returned; and no second entry is built for replies.
@@ -1480,42 +1577,6 @@ spec:
                           )
                       done[text] = masked
                   return done[text]
-
-              async def _replaced_item(self, value, replace, text, seen):
-                  if isinstance(value, str):
-                      return await replace(value) if text else value
-                  if isinstance(value, (dict, list)) or getattr(value, "model_dump", None) is not None:
-                      await self._replace_in_place(value, replace, text, seen)
-                  return value
-
-              async def _replace_in_place(self, holder, replace, text, seen):
-                  # Walks a copy: inside a key named in _TEXT every string is text, except under the keys _OWN names; outside
-                  # such a key only the walk goes on. A value met twice is replaced once.
-                  if id(holder) in seen:
-                      return
-                  seen.add(id(holder))
-                  if isinstance(holder, list):
-                      for i, item in enumerate(holder):
-                          holder[i] = await self._replaced_item(item, replace, text, seen)
-                      return
-                  if text and _field(holder, "type") in _NOT_TEXT:
-                      return
-                  for name in _names(holder):
-                      if text and name in _OWN:
-                          continue
-                      value = _field(holder, name)
-                      if value is None:
-                          continue
-                      replaced = await self._replaced_item(value, replace, text or name in _TEXT, seen)
-                      if replaced is not value:
-                          _set_field(holder, name, replaced)
-
-              async def _copy(self, value, replace, text):
-                  if isinstance(value, str):
-                      return await replace(value) if text else value
-                  copied = copy.deepcopy(value)
-                  await self._replace_in_place(copied, replace, text, set())
-                  return copied
 
               async def _copies(self, kwargs, result, replace):
                   # Every copy of the call the logs are handed, each built from what the call holds and never from another
@@ -1582,19 +1643,120 @@ spec:
               def logging_hook(self, kwargs, result, call_type):
                   # The gateway's handler for synchronous integrations calls this from a worker thread; the masking runs to its
                   # end in an event loop of its own, and hands on, withholds or raises exactly as async_logging_hook does.
-                  def run():
-                      loop = asyncio.new_event_loop()
-                      try:
-                          return loop.run_until_complete(self.async_logging_hook(kwargs, result, call_type))
-                      finally:
-                          loop.close()
+                  return _run_to_end(lambda: self.async_logging_hook(kwargs, result, call_type))
 
+
+          # Entries of a failed call's record as the gateway's failure handlers and its failure hook hand it on: those that
+          # are text a caller or a model wrote, withheld whole; those holding the call's settings and the request as the
+          # provider was sent it, walked for such text; and those holding the error's text. The standard logging payload and
+          # the request as the caller sent it are handled below; the exception is left as the gateway raised it.
+          _FAILED_CALL_TEXT = ("messages", "prompt", "input")
+          _FAILED_CALL_WALKED = ("optional_params", "additional_args")
+          _FAILED_CALL_ERROR = ("traceback_exception", "original_response")
+
+
+          class FailedCallWithholding(_TextCopies, CustomLogger):
+              async def _withheld_copy(self, value, text):
+                  # An entry that cannot be copied is handed on as the placeholder, whole, never as it came.
                   try:
-                      asyncio.get_running_loop()
-                  except RuntimeError:
-                      return run()
-                  with ThreadPoolExecutor(max_workers=1) as pool:
-                      return pool.submit(run).result()
+                      return await self._copy(value, _withheld, text)
+                  except Exception:
+                      return TEXT_WITHHELD
+
+              async def _withheld_entries(self, record):
+                  copies = {}
+                  for key in _FAILED_CALL_TEXT:
+                      if record.get(key) is not None:
+                          copies[key] = await self._withheld_copy(record[key], True)
+                  for key in _FAILED_CALL_WALKED:
+                      if isinstance(record.get(key), dict):
+                          copies[key] = await self._withheld_copy(record[key], False)
+                  for key in _FAILED_CALL_ERROR:
+                      if record.get(key):
+                          copies[key] = ERROR_WITHHELD
+                  payload = record.get("standard_logging_object")
+                  if isinstance(payload, dict):
+                      withheld = await self._withheld_copy(payload, False)
+                      if isinstance(withheld, dict):
+                          for key in ("messages", "response"):
+                              if payload.get(key) is not None:
+                                  withheld[key] = await self._withheld_copy(payload[key], True)
+                          if withheld.get("error_str"):
+                              withheld["error_str"] = ERROR_WITHHELD
+                          info = withheld.get("error_information")
+                          if isinstance(info, dict):
+                              for key in ("error_message", "traceback"):
+                                  if info.get(key):
+                                      info[key] = ERROR_WITHHELD
+                      copies["standard_logging_object"] = withheld
+                  # The request as the caller sent it: under litellm_params in the call record, at the top of the request.
+                  params = record.get("litellm_params")
+                  arrived = params.get("proxy_server_request") if isinstance(params, dict) else None
+                  if isinstance(arrived, dict) and arrived.get("body") is not None:
+                      body = await self._withheld_copy(arrived["body"], False)
+                      copies["litellm_params"] = dict(params, proxy_server_request=dict(arrived, body=body))
+                  arrived = record.get("proxy_server_request")
+                  if isinstance(arrived, dict) and arrived.get("body") is not None:
+                      body = await self._withheld_copy(arrived["body"], False)
+                      copies["proxy_server_request"] = dict(arrived, body=body)
+                  return copies
+
+              async def _withhold(self, record):
+                  # Every copy is built first and then put in place of its entry, so the callbacks after this one are handed
+                  # the copies; should building them fail, each entry that carries text is put in place as the placeholder.
+                  if not isinstance(record, dict):
+                      return
+                  try:
+                      copies = await self._withheld_entries(record)
+                  except Exception:
+                      copies = dict((key, TEXT_WITHHELD) for key in _FAILED_CALL_TEXT + _FAILED_CALL_WALKED if key in record)
+                      copies.update((key, ERROR_WITHHELD) for key in _FAILED_CALL_ERROR if key in record)
+                      for key in ("standard_logging_object", "litellm_params", "proxy_server_request"):
+                          if key in record:
+                              copies[key] = TEXT_WITHHELD
+                  record.update(copies)
+
+              def log_failure_event(self, kwargs, response_obj, start_time, end_time):
+                  _run_to_end(lambda: self._withhold(kwargs))
+
+              async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+                  await self._withhold(kwargs)
+
+              async def async_post_call_failure_hook(self, request_data, original_exception, user_api_key_dict, traceback_str=None):
+                  await self._withhold(request_data)
+                  return None
+
+
+          # The proxy's functions that log a failed call's error, by name: one of them writes a provider's error message
+          # without its exception attached.
+          _FAILED_CALL_LINES = frozenset(["log_llm_api_exception", "_handle_llm_api_exception"])
+
+
+          class _ErrorTextFilter(logging.Filter):
+              # The proxy runs this file anew for each name the configuration loads from it, the guardrail entry's class and
+              # the callback, so a filter already installed is found by this mark and each logger carries one.
+              withholds_error_text = True
+
+              def filter(self, record):
+                  if record.levelno >= logging.WARNING and (record.exc_info or record.funcName in _FAILED_CALL_LINES):
+                      if record.exc_info:
+                          error = record.exc_info[1]
+                      else:
+                          args = record.args if isinstance(record.args, tuple) else ()
+                          error = next((arg for arg in args if isinstance(arg, BaseException)), None)
+                      record.msg = ERROR_LINE_WITHHELD
+                      record.args = (type(error).__name__ if error is not None else "unknown",)
+                      record.exc_info = None
+                      record.exc_text = None
+                      record.stack_info = None
+                  return True
+
+
+          for _logger in (verbose_proxy_logger, verbose_router_logger, verbose_logger):
+              if not any(getattr(installed, "withholds_error_text", False) for installed in _logger.filters):
+                  _logger.addFilter(_ErrorTextFilter())
+
+          {{ .locals.log_masking_failure_callback }} = FailedCallWithholding()
       {{- end }}
     # The request guard and the path allowlist, from the bundle every Recipe
     # running this proxy imports, so the line they draw — which request fields a
