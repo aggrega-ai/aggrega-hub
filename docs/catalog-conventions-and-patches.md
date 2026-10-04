@@ -1791,6 +1791,54 @@ The two terraform and cloudformation realizations share the name
   renders nothing. `core/random-password` renders the request itself, for a
   workload whose Recipe expects to be handed a credential.
 
+### Who supplies a credential's locator: values or infra, exactly one
+
+A credential Feature that carries a caller's locator — the secret's name, the
+store entry to fetch, the value to deliver — takes it from either author. In
+this catalog that is `core/referenced-secret`, `core/referenced-secret-set`,
+`core/secret-value` and `core/secret-provided`: the developer writes the locator
+in the attachment's `values`, in the Aggregate, and the operator writes it in the
+attachment's `infra`, in the Release. `core/random-password` and
+`core/generated-secret` take no locator and are not shaped this way.
+
+**Why the operator's pillar.** A connection the Release wires has no entry in the
+Aggregate, and a Release writes `values` nowhere, so a credential that took its
+locator from `values` alone could never be named on such a connection, nor on any
+attachment the Release makes. The operator's form is `infra`, which leaves the
+Release's `values:` ban exactly as it is.
+
+**Why exactly one.** Two locators on one attachment do not say which secret it
+names, and none names no secret. Neither pillar's schema can state the rule,
+because each pillar is validated on its own and neither sees the other, so the
+Feature states it in its own `assertions` block, where both are in view: the
+build halts on an attachment carrying the locator in both pillars or in neither,
+naming the Feature, the attachment and the component. Presence decides, not
+content. The rule is the Feature's contract — the compiler evaluates the
+assertion as it evaluates any Feature's and holds no credential rule of its own.
+
+**How to author one.**
+
+- Declare the leaf in both pillars with **one name, one shape and one
+  `sensitive: true`**, `required` in neither; the assertion is what requires it.
+  Every other field keeps the single pillar it has: a data key stays in `values`,
+  so an attachment the Release alone makes reads its default.
+- Every realization reads the locator from whichever pillar carries it, with
+  `optional .values "<leaf>" (optional .infra "<leaf>" "")` — `(list)` in place of
+  `""` for a list. Read the `values` leaf only through `optional` in that
+  template: one that also reads it as a path finds the key present and empty and
+  never falls through to `infra`. The expression is repeated in each realization
+  because it sits inside a template the realization owns, and no catalog kind
+  holds a single expression for several entities to share; each says so in a
+  comment beside it.
+- State the two forms in the Feature's description, and any limit the operator's
+  form meets. `core/secret-provided` is the one shipped case: its value is
+  delivered by the attachment's own `inject:` block, which only the Aggregate
+  writes and a connection's attachment never carries, so on a connection, or on
+  an attachment the Release alone makes, no `inject:` block delivers it.
+- Declaring one leaf in both pillars is what the pillar-overlap advisory reports,
+  so every load reaching these Features prints it. The overlap is the contract
+  here, and the advisory changes no verdict and no rendered byte.
+
 ### The `workload:` authoring contract
 
 Three rules govern every synthesized Recipe. Each is enforced at load or render
