@@ -13,13 +13,16 @@ metadata:
     the official upstream image (no external Helm chart). APISIX holds no local
     state — the etcd store is the system of record — so it renders stateless.
     Its config.yaml, carrying the connection composed from the `etcd`
-    uses-edge, the static Admin API key and the Admin API port, is mounted from
-    a ConfigMap as a single file, so it masks none of the files APISIX writes
-    beside it at startup.
+    uses-edge and the Admin API port, is mounted from a ConfigMap as a single
+    file, so it masks none of the files APISIX writes beside it at startup.
 
     The Admin API is reachable only from inside the cluster — no Service
-    publishes its port — and is authenticated by the static `admin_key`, but
-    its client allowlist, `allow_admin` in that config.yaml, admits every
+    publishes its port — and is authenticated by the key the `admin_key`
+    credential slot names: config.yaml names an environment variable where the
+    key goes, and the Deployment delivers that variable from the Secret the
+    attached credential publishes, so none of the gateway's rendered files
+    carries the key. Its
+    client allowlist, `allow_admin` in that config.yaml, admits every
     address: what holds it in-cluster is the cluster boundary rather than the
     list, so narrow it wherever the admin port is routable from outside the
     cluster.
@@ -49,12 +52,18 @@ spec:
     host: "{{ .context.instance_id }}-default"
     port: "{{ .infra.http_port }}"
     protocol: "http"
+  # The single authored home for the environment variable the Admin API key
+  # travels in. config.yaml names it and the Workload delivers it, and they are
+  # separate templates, so a second spelling is how the file comes to name a
+  # variable nothing sets — which APISIX refuses at start-up.
+  locals:
+    admin_key_variable: APISIX_ADMIN_KEY
   # config.yaml carries APISIX's runtime configuration: the proxy listen port,
-  # the static Admin API key and listen port, and the etcd configuration-store
-  # host composed from the `etcd` uses-edge (.context.inject.env). It is emitted
-  # as a ConfigMap and mounted as a single file into the container's conf
-  # directory via subPath, so it does not mask the files APISIX writes alongside
-  # it at startup.
+  # the Admin API's listen port and the variable its key is read from, and the
+  # etcd configuration-store host composed from the `etcd` uses-edge
+  # (.context.inject.env). It is emitted as a ConfigMap and mounted as a single
+  # file into the container's conf directory via subPath, so it does not mask
+  # the files APISIX writes alongside it at startup.
   artifacts:
     config-configmap.yaml: |
       apiVersion: v1
@@ -72,7 +81,7 @@ spec:
             admin:
               {{- /* The Admin API's client allowlist, and 0.0.0.0/0 admits
                      every address. What stands in front of the API is the
-                     static key below and the cluster boundary: no Service
+                     key below and the cluster boundary: no Service
                      publishes the admin port, so a caller reaches the API only
                      from inside the cluster. That assumption is the one to
                      check — wherever the admin port is routable from outside
@@ -84,7 +93,15 @@ spec:
                 - 0.0.0.0/0
               admin_key:
                 - name: admin
-                  key: {{ .values.admin_key }}
+                  {{- /* No key is written here. APISIX reads a placeholder
+                         of the form dollar sign, two opening braces, a
+                         variable name and two closing braces as that
+                         environment variable's value when it loads this file,
+                         and the Workload delivers the variable from the Secret
+                         the admin_key credential publishes. The placeholder is
+                         printed from a string, because written bare its braces
+                         would be read as an action of this template. */}}
+                  key: {{ printf "${{%s}}" .locals.admin_key_variable }}
                   role: admin
               admin_listen:
                 ip: 0.0.0.0
@@ -109,6 +126,15 @@ spec:
         # config is mounted as a single file via subPath so APISIX's startup
         # writes into the same conf directory (for example nginx.conf) are not
         # masked.
+        #
+        # The variable config.yaml takes the Admin API key from, delivered from
+        # the Secret the attached admin_key credential publishes as an env
+        # secretKeyRef, so the key's value never lands in the manifest. The slot
+        # is required, so the delivery is unconditional.
+        attachments:
+          {{ .locals.admin_key_variable }}:
+            from: admin_key
+            as: env
         ports:
           http: {{ .infra.http_port }}
           admin: {{ .infra.admin_port }}

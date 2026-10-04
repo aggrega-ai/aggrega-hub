@@ -628,7 +628,11 @@ importer's Manifest binds: the credential itself under
 meets what the product requires of the credential — a length, the characters it
 refuses — and the parameter's description says what the value is under each.
 Every Manifest whose Aggregate imports the module maps `core/referenced-secret`,
-or the build halts, and the module's description says so. The shape stops where
+or the build halts, and the module's description says so. `core/apisix` declares
+its parameter required and with no default, because the key it carries guards
+the API that writes the gateway's routes and a pinned one would be a key every
+reader of the catalog holds: an importer passes one down and its Release
+fulfills it, or the build halts. The shape stops where
 the Feature cannot follow. A
 module that also builds on `compose` attaches nothing, because that target has no
 realization of a Feature holding a credential by reference; its description says
@@ -641,8 +645,8 @@ does a credential that is a slot on some consumers and a plain value on another,
 because one parameter would then be a Secret's name on one side and the literal
 credential on the other — the object store's access key in `core/agenta`, a slot
 on both API tiers and the store's own `root_user`. `core/keycloak`, `core/harbor`,
-`core/thanos`, `core/livekit`, `core/agenta` and `core/dify` are the shipped
-shape, the last two leaving credentials unattached for those reasons;
+`core/thanos`, `core/apisix`, `core/livekit`, `core/agenta` and `core/dify` are
+the shipped shape, the last two leaving credentials unattached for those reasons;
 `core/kong` and `core/ferretdb` show the `compose` limit.
 
 ### Recipe/FeatureRecipe Provider Segment
