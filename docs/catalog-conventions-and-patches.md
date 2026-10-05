@@ -1430,15 +1430,38 @@ grows:
   default makes the render irreproducible across pulls, which is the whole point
   of pinning the chart. Set each tag explicitly in the value mapping and offer an
   `infra.overrides.<name>_image` escape that replaces the block.
-- **Pin the generated resource names.** Bind the chart's `fullnameOverride` to
-  `.context.instance_id` so a Service the Component publishes through `provides`
-  is named something the render actually emits. A `provides.host` that names no
-  emitted Service is a broken contract, and a build reports nothing either way,
-  because both sides render successfully. This catalog's own checks refuse a
-  sourced Helm Recipe that publishes a host while pinning no name. That catches
-  the structural omission which causes the defect rather than the defect itself:
-  the check reads authored YAML and renders nothing, so confirming the published
-  address against a Service the chart really emits stays the author's to do.
+- **Pin the generated resource names to the rendered name.** Bind the chart's
+  `fullnameOverride` to `.context.rendered_name` — the name the helm provider
+  gives the chart, which is the chart's release name — and build every
+  `provides` value that names an emitted resource from the same key, keeping
+  whatever prefix or suffix the chart adds to it:
+
+  ```yaml
+  provides:
+    host: "{{ .context.rendered_name }}-proxy"
+  valuesMapping: |
+    fullnameOverride: "{{ .context.rendered_name }}"
+  ```
+
+  The pin is what makes a Service the Component publishes through `provides` one
+  the render actually emits. A `provides.host` that names no emitted Service is
+  a broken contract, and a build reports nothing either way, because both sides
+  render successfully. The key the pin is bound to is what makes the name one
+  the cluster accepts. Never bind it to `.context.instance_id`: that is the
+  Component's identity as written, and a Component's name may carry characters
+  a Kubernetes resource name refuses — an underscore, a capital — so the chart
+  would mint names the cluster refuses when the Release is applied, which no
+  build catches: the render succeeds either way. The rendered name writes those
+  characters out and spells the name in the alphabet a Kubernetes name allows.
+  A name the Recipe writes itself for an object it emits beside the chart — an
+  `artifacts:` entry, or a second Service-name knob the chart offers — is bound
+  to the same key, so it agrees with the chart's own names.
+  This catalog's own checks refuse a sourced Helm Recipe that publishes a host
+  while pinning no name, or while binding the pin to anything but
+  `.context.rendered_name`. That catches the structural omission which causes
+  the defect rather than the defect itself: the check reads authored YAML and
+  renders nothing, so confirming the published address against a Service the
+  chart really emits stays the author's to do.
   🔴 **And the name the chart honours is not always the top-level one.** Some
   charts derive a component's resource names from a knob of their own —
   `server.fullnameOverride` rather than `fullnameOverride`, say — and the
@@ -1882,9 +1905,11 @@ file.
 
 **3. `provides` cannot read the workload.** `provides` is self-contained: it
 evaluates before any caller is resolved, and its template context offers only
-`.context.instance_id`, `.values`, `.infra`, `.locals`, and static text. There is
-no `.workload` in scope, so `provides.endpoint` cannot derive itself from the
-workload's endpoint. Where a Recipe needs to publish an endpoint, declare it as a
+`.context.instance_id`, `.values`, `.infra`, `.locals`, and static text — and, on
+a Recipe that also names a chart in `source:`, `.context.rendered_name`, the name
+that chart's resources are rendered against. There is no `.workload` in scope, so
+`provides.endpoint` cannot derive itself from the workload's endpoint. Where a
+Recipe needs to publish an endpoint, declare it as a
 static value or as an `.infra` / `.values` reference, and treat the workload's own
 endpoint as a separate declaration. When both express the same address, that
 duplication is a single-sourcing hazard — put the address in one `infra` or
