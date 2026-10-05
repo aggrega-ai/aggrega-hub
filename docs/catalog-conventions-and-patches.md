@@ -1866,6 +1866,121 @@ assertion as it evaluates any Feature's and holds no credential rule of its own.
   so every load reaching these Features prints it. The overlap is the contract
   here, and the advisory changes no verdict and no rendered byte.
 
+### A key both ends of a connection hold
+
+A server that checks a key and a caller that presents it each hold that key, each
+on its own side. This is a **convention** catalog authors uphold, and the
+compiler enforces none of it: it evaluates the slots and attachments it is given
+and pipes their strings through, and it never compares what one component holds
+with what another holds.
+
+- **The caller's key is the caller's.** A caller holds the key it presents on the
+  connection it presents it on, in a slot its socket declares under
+  `usesSchema.<socket>.featuresSchema`, so a caller reaching several servers
+  holds one key for each. A caller whose Component declares the key in a slot of
+  its own instead — `core/ai-agent/crewai`'s `model_api_key` — holds one key for
+  every connection it makes.
+- **The server's key is its own slot.** A server holds the key it verifies in a
+  slot of its own Component, and every Recipe for it delivers that key as the
+  variable the server reads. Neither end sees the other's attachments: an
+  attachment on a connection lands on the caller alone, and a server's rendered
+  output is the same whatever the connections reaching it carry. Filling one
+  end's slot fills nothing on the other, so declaring the key on both ends is the
+  minimum rather than a duplicate.
+- **Both ends read one parameter.** The Aggregate declares one parameter and
+  both attachments read it, so the key the caller presents and the key the server
+  verifies cannot be written apart. What the parameter carries is the locator the
+  bound realization reads `origin` as — a secret's name for `k8s-existing-secret`,
+  the key of a store entry for `k8s-external-secret`, the value itself for
+  `k8s-secret-from-parameter` and `dotenv-secret` — so the two ends' realizations
+  read it in the same sense.
+
+**One secret where the two ends share a secret scope, one each where they do
+not.** A secret scope is the boundary within which a provider resolves a secret
+by reference. Where both ends sit in one scope, both reference one secret
+resource. Where they sit in different scopes, each end holds a secret resource
+of its own, realized from the same store entry. The Manifest chooses each end's
+realization: by Feature type for every attachment of that type, or for one
+attachment by its name in the `features.name` tier, where a connection's
+attachment is keyed `<alias>.<slot>`. Each provider draws the scope in its own
+terms:
+
+- `helm` — the Kubernetes namespace, read from the `aggrega.ai/namespace`
+  annotation cascading from the boundary; a workload references a Secret only in
+  its own namespace. In one namespace, bind both ends to `k8s-existing-secret`
+  with one `origin`, and both reference that Secret by name. In two, bind each
+  end to a realization that renders its own resource beside it, such as
+  `k8s-external-secret` fetching the one store entry into each namespace.
+  `k8s-secret-from-parameter`, which writes the value itself into a Secret for
+  evaluation, derives one Secret per end even within one namespace, each
+  carrying the same value.
+- `compose` — the Compose project, one `docker-compose.yaml`, whose `${VAR}`
+  references Docker Compose substitutes from the environment the project is
+  started with: the shell, a file named with `--env-file`, or the `.env` file in
+  the project directory. In one project, both ends' `dotenv-secret` attachments
+  carry the same reference. Boundaries rendering to different files are
+  different projects, each started with an environment of its own holding the
+  entry.
+- `terraform` — the boundary's root configuration, the one configuration a plan
+  sees; a reference resolves only against what that configuration declares, so
+  two root configurations each hold their own copy.
+- `cloudformation` — the stack, in the AWS account and region it deploys into. A
+  Secrets Manager secret a realization renders is published as a `Ref`, which
+  resolves inside its own stack, so a component in another stack holds a secret
+  of its own.
+
+The standard library ships the key-checking model servers on `helm` and
+`compose`, which are therefore the two capabilities where both cases are
+realized end to end.
+
+**A server holding one key cannot tell its callers apart.** `core/ai-model/vllm`,
+`tei` and `tgi` each check one key, so every caller presents the same key, a
+caller presenting any other is refused, and withdrawing one caller's access means
+changing the key every caller presents. However many keys the callers'
+connections hold, the server's slot holds one. That is the servers' own limit,
+not the catalog's. Two targets add a difference of their own:
+
+- **Text Generation Inference matches the key without regard to letter case.**
+  At the release the catalog pins, the server folds both the `Authorization`
+  header and the key it holds to lower case before comparing them, so two keys
+  differing only in case are one key to it, and a key's strength is judged on its
+  case-folded form. That is the server's behaviour, and no Recipe changes it.
+- **LiteLLM also accepts the keys it issues.** The LiteLLM model and the LiteLLM
+  gateway accept, beside the key their `api_key` slot holds — LiteLLM's master
+  key — the keys they issue through their key-management API, and only while
+  their bookkeeping database is attached through `database_url`; with none, they
+  accept their own key alone.
+
+**The caller key's name on the model-serving targets is `api_key`.** On
+`core/ai-model/vllm`, `tei`, `tgi` and `litellm`, and on `core/gateway/litellm`,
+the key a target requires of its callers is the optional slot `api_key`, with
+`selector: "feature.aggrega.ai/kind=secret"`, `sensitive: true` and
+`inject: [env]`, and a description saying every caller must present it and
+naming the product's own term for it where it has one. The variable the server
+reads is each Recipe's translation, as for any target-expected name. The name is
+scoped to those targets: a datastore's password, a broker's credential and a key
+that is one half of a pair keep the names their products give them. Because the
+name is fixed, a lint plugin comparing what the two ends of a connection
+reference can find the target's end by this slot name alone, a catalog
+convention no schema keyword marks; the publishing linter that `aggrega lint`
+runs carries no such rule.
+
+**Two realizations constrain the secret the two ends share.**
+
+- **KubeAI** (`helm/vllm-kubeai`). The KubeAI `Model` imports the credential's
+  secret through `envFrom`, which names each variable after one of the secret's
+  data keys, so a shared secret carries the key under the data key
+  `VLLM_API_KEY`, the Recipe halts the build naming any other, and the caller's
+  attachment names that same data key. Every key the secret holds becomes a
+  variable of the server's container, so the secret holds that key alone.
+- **KServe** (`helm/vllm-kserve`). The `InferenceService` passes `VLLM_API_KEY`
+  to the container of the serving runtime the cluster registered for the
+  model's format, so the key takes effect only where that runtime runs vLLM's own
+  server.
+
+The [credential chapter](https://github.com/aggrega-ai/aggrega-docs/blob/main/architecture/08-credential-model.md#a-key-both-ends-of-a-connection-hold)
+works the shape through in one Aggregate.
+
 ### The `workload:` authoring contract
 
 Three rules govern every synthesized Recipe. Each is enforced at load or render
