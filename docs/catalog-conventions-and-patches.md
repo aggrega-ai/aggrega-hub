@@ -2075,15 +2075,48 @@ file.
 
 **3. `provides` cannot read the workload.** `provides` is self-contained: it
 evaluates before any caller is resolved, and its template context offers only
-`.context.instance_id`, `.values`, `.infra`, `.locals`, and static text — and, on
-a Recipe that also names a chart in `source:`, `.context.rendered_name`, the name
-that chart's resources are rendered against. There is no `.workload` in scope, so
+`.context.instance_id`, `.values`, `.infra`, `.locals`, and static text — and,
+where the node's provider reports one, `.context.rendered_name`, the name the
+node's resources are rendered under: on a `helm` Recipe, one that declares a
+`workload:` or names a chart in `source:`. There is no `.workload` in scope, so
 `provides.endpoint` cannot derive itself from the workload's endpoint. Where a
 Recipe needs to publish an endpoint, declare it as a
 static value or as an `.infra` / `.values` reference, and treat the workload's own
 endpoint as a separate declaration. When both express the same address, that
 duplication is a single-sourcing hazard — put the address in one `infra` or
 `values` key and have both read it, rather than repeating the literal twice.
+
+**On the `helm` target, build every published name from the rendered name.**
+Unlike the three rules above, no build enforces this one. The helm provider names
+everything it synthesizes for a node — the Deployment or StatefulSet, every
+Service, every claim — from `.context.rendered_name`, the node's release name, so
+a Service is `<rendered name>-<service key>`. Build every `provides` value that
+names one of those resources — a `host`, an `endpoint`, a Service name — from the
+same key, keeping the service-key suffix:
+
+```yaml
+provides:
+  host: "{{ .context.rendered_name }}-default"
+  endpoint: "http://{{ .context.rendered_name }}-default:{{ .infra.port }}"
+```
+
+Never build such a value from `.context.instance_id`: that is the Component's
+identity as written, and a Component's name may carry characters a Kubernetes
+resource name refuses — an underscore, a capital — which the rendered name writes
+out. A value built from the identity then names a Service that does not exist, and
+no build catches it: the render succeeds either way. A name the Recipe writes
+itself for an object it emits — an `artifacts:` entry's ConfigMap, say — is built
+from the same key, and so is every reference to it, such as the volume that mounts
+it, so the object and its references agree and the cluster accepts both. A
+`locals:` entry cannot read `.context.rendered_name`, so each of those values is
+built where it is used — a published value in `provides` itself, an artifact's
+name in the artifact and in the volume — even where that spells the name twice.
+This catalog's own checks refuse a synthesized `helm` Recipe whose `provides`
+reads `.context.instance_id`, directly or through a `locals:` entry. They judge
+`provides` alone, and they read authored YAML and render nothing, so they cannot
+see an artifact's name or a wrong service-key suffix: keeping those on the key,
+and confirming the published address against a Service the render really emits,
+stays the author's to do.
 
 ### Presence parametrization — expose an enable-parameter per component
 
