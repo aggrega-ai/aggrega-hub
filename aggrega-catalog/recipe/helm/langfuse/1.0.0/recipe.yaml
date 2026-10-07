@@ -19,9 +19,10 @@ metadata:
     edges; the columnar analytics store is supplied as operator-set pointer
     strings, and the build halts until both of its addresses are set.
     infra.external_base_url reaches the console as NEXTAUTH_URL. An attached
-    credential reaches the containers as an env secretKeyRef, so its value never
-    appears in the rendered manifest; an unattached slot renders a development
-    literal, as the Component's slot descriptions say, except the cache and
+    credential, on a connection or in one of the Component's own slots,
+    reaches the containers as an env secretKeyRef, so its value never appears
+    in the rendered manifest; an unattached one renders a development literal,
+    as each credential's description says, except the cache and
     analytics-store passwords, which then render nothing.
 
     Reach for this realization where the build must complete with nothing
@@ -59,7 +60,7 @@ spec:
   #
   # The columnar analytics store is where every trace, observation and score
   # this platform serves actually lives, and its two addresses have no sensible
-  # default: a deployment reaches whichever store it runs or contracts for. A
+  # default: a Release reaches whichever store it runs or contracts for. A
   # build that has not supplied them halts here rather than rendering a console
   # with an address-less variable, which starts and then stays empty.
   assertions:
@@ -110,23 +111,41 @@ spec:
   # are read from that edge's own values, so wiring a different store is a
   # change of target and edge values rather than a change of component.
   #
-  # Every credential slot is optional. When one is attached its value reaches
-  # the container as an env secretKeyRef and never appears in the rendered
-  # manifest; when it is not, the Recipe emits the deterministic development
-  # literal the Component's own slot description announces, so a bare render
-  # runs. The cache and analytics-store passwords are the two exceptions: with
-  # nothing attached they emit no variable at all, because presenting a
-  # password to a service that wants none fails the connection rather than
-  # defaulting.
+  # Every credential is optional. Three are held on the connection they are
+  # presented on — the backend's password, the cache's password and the secret
+  # half of the object store's access key — and the rest are slots of the
+  # Component. When one is attached its value reaches the container as an env
+  # secretKeyRef and never appears in the rendered manifest; when it is not,
+  # the Recipe emits the deterministic development literal the credential's own
+  # description announces, so a bare render runs. The cache and analytics-store
+  # passwords are the two exceptions: with nothing attached they emit no
+  # variable at all, because presenting a password to a service that wants none
+  # fails the connection rather than defaulting.
   workload: |
     {{- /*
       The console's externally reachable base URL. The operator's value wins when
       one was supplied; with none, the in-cluster Service address stands in, which
-      is correct for a deployment nobody reaches from a browser outside the
+      is correct for an installation nobody reaches from a browser outside the
       cluster. Bound once here because both containers read it and the fallback
       must not be spelled twice.
     */ -}}
     {{- $externalURL := .infra.external_base_url | default (printf "http://%s-default:%v" .context.instance_id .infra.port) -}}
+    {{- /*
+      The alias of each connection carrying a credential, or empty: the
+      relational backend's password, the cache's password, and the secret half
+      of the object store's access key. Resolved once here because both
+      containers deliver each of them.
+    */ -}}
+    {{- $backendCredential := "" -}}
+    {{- $cacheCredential := "" -}}
+    {{- $eventStoreCredential := "" -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- if hasKey (default dict $edge.features) "credential" -}}
+    {{- if eq $edge.socket "backend" -}}{{- $backendCredential = $alias -}}{{- end -}}
+    {{- if eq $edge.socket "cache" -}}{{- $cacheCredential = $alias -}}{{- end -}}
+    {{- if eq $edge.socket "event_store" -}}{{- $eventStoreCredential = $alias -}}{{- end -}}
+    {{- end -}}
+    {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # Neither container holds durable state — the relational backend, the cache,
@@ -198,10 +217,10 @@ spec:
           CLICKHOUSE_USER: "{{ .infra.analytics_store_user }}"
           CLICKHOUSE_DB: "{{ .infra.analytics_store_database }}"
           CLICKHOUSE_CLUSTER_ENABLED: "{{ .infra.analytics_store_cluster }}"
-    {{- if not (hasKey (default dict .features) "backend_password") }}
+    {{- if not $backendCredential }}
           DATABASE_PASSWORD: postgres
     {{- end }}
-    {{- if not (hasKey (default dict .features) "event_store_secret_key") }}
+    {{- if not $eventStoreCredential }}
           LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: minioadmin
           LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: minioadmin
     {{- end }}
@@ -214,25 +233,29 @@ spec:
     {{- if not (hasKey (default dict .features) "salt") }}
           SALT: langfuse-development-salt-evaluation-only
     {{- end }}
-    {{- if or (hasKey (default dict .features) "backend_password") (hasKey (default dict .features) "cache_password") (hasKey (default dict .features) "event_store_secret_key") (hasKey (default dict .features) "analytics_store_password") (hasKey (default dict .features) "session_secret") (hasKey (default dict .features) "encryption_key") (hasKey (default dict .features) "salt") }}
+    {{- if or $backendCredential $cacheCredential $eventStoreCredential (hasKey (default dict .features) "analytics_store_password") (hasKey (default dict .features) "session_secret") (hasKey (default dict .features) "encryption_key") (hasKey (default dict .features) "salt") }}
         attachments:
     {{- end }}
-    {{- if hasKey (default dict .features) "backend_password" }}
+    {{- with $backendCredential }}
           DATABASE_PASSWORD:
-            from: backend_password
+            connection: "{{ . }}"
+            from: credential
             as: env
     {{- end }}
-    {{- if hasKey (default dict .features) "cache_password" }}
+    {{- with $cacheCredential }}
           REDIS_AUTH:
-            from: cache_password
+            connection: "{{ . }}"
+            from: credential
             as: env
     {{- end }}
-    {{- if hasKey (default dict .features) "event_store_secret_key" }}
+    {{- with $eventStoreCredential }}
           LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:
-            from: event_store_secret_key
+            connection: "{{ . }}"
+            from: credential
             as: env
           LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:
-            from: event_store_secret_key
+            connection: "{{ . }}"
+            from: credential
             as: env
     {{- end }}
     {{- if hasKey (default dict .features) "analytics_store_password" }}
@@ -324,10 +347,10 @@ spec:
           CLICKHOUSE_USER: "{{ .infra.analytics_store_user }}"
           CLICKHOUSE_DB: "{{ .infra.analytics_store_database }}"
           CLICKHOUSE_CLUSTER_ENABLED: "{{ .infra.analytics_store_cluster }}"
-    {{- if not (hasKey (default dict .features) "backend_password") }}
+    {{- if not $backendCredential }}
           DATABASE_PASSWORD: postgres
     {{- end }}
-    {{- if not (hasKey (default dict .features) "event_store_secret_key") }}
+    {{- if not $eventStoreCredential }}
           LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: minioadmin
           LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: minioadmin
     {{- end }}
@@ -337,25 +360,29 @@ spec:
     {{- if not (hasKey (default dict .features) "salt") }}
           SALT: langfuse-development-salt-evaluation-only
     {{- end }}
-    {{- if or (hasKey (default dict .features) "backend_password") (hasKey (default dict .features) "cache_password") (hasKey (default dict .features) "event_store_secret_key") (hasKey (default dict .features) "analytics_store_password") (hasKey (default dict .features) "encryption_key") (hasKey (default dict .features) "salt") }}
+    {{- if or $backendCredential $cacheCredential $eventStoreCredential (hasKey (default dict .features) "analytics_store_password") (hasKey (default dict .features) "encryption_key") (hasKey (default dict .features) "salt") }}
         attachments:
     {{- end }}
-    {{- if hasKey (default dict .features) "backend_password" }}
+    {{- with $backendCredential }}
           DATABASE_PASSWORD:
-            from: backend_password
+            connection: "{{ . }}"
+            from: credential
             as: env
     {{- end }}
-    {{- if hasKey (default dict .features) "cache_password" }}
+    {{- with $cacheCredential }}
           REDIS_AUTH:
-            from: cache_password
+            connection: "{{ . }}"
+            from: credential
             as: env
     {{- end }}
-    {{- if hasKey (default dict .features) "event_store_secret_key" }}
+    {{- with $eventStoreCredential }}
           LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:
-            from: event_store_secret_key
+            connection: "{{ . }}"
+            from: credential
             as: env
           LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:
-            from: event_store_secret_key
+            connection: "{{ . }}"
+            from: credential
             as: env
     {{- end }}
     {{- if hasKey (default dict .features) "analytics_store_password" }}

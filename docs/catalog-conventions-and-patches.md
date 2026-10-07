@@ -617,12 +617,14 @@ Aggregate importing a module hands it `type`, `active` and `parameters` and
 nothing else, so an attachment the module does not make itself never reaches a
 component inside it. The module declares one parameter per distinct credential,
 with a pinned development default its description says is for evaluation, and
-attaches `core/referenced-secret` on every slot that shares it — `origin` read
-from the parameter, `key` a literal — so the one credential is authored once and
-cannot drift between the components that must agree on it; an importer supplying
-its own declares a parameter of its own and passes it down through its
-`aggregates` entry. What the parameter means follows the realization the
-importer's Manifest binds: the credential itself under
+attaches `core/referenced-secret` on every slot that shares it — on a
+component's own slot where the component verifies the credential or uses it
+itself, and as the `credential` of the connection where a component presents it
+to another — with `origin` read from the parameter and `key` a literal, so the
+one credential is authored once and cannot drift between the components that
+must agree on it; an importer supplying its own declares a parameter of its own
+and passes it down through its `aggregates` entry. What the parameter means
+follows the realization the importer's Manifest binds: the credential itself under
 `k8s-secret-from-parameter`, the name of a Secret that already exists under
 `k8s-existing-secret`. So the default is a valid Kubernetes object name that also
 meets what the product requires of the credential — a length, the characters it
@@ -643,9 +645,10 @@ clients with no way to authenticate — the store's password in `core/livekit`,
 which neither the media server nor the bridge declares a slot to present. So
 does a credential that is a slot on some consumers and a plain value on another,
 because one parameter would then be a Secret's name on one side and the literal
-credential on the other — the object store's access key in `core/agenta`, a slot
-on both API tiers and the store's own `root_user`. `core/keycloak`, `core/harbor`,
-`core/thanos`, `core/apisix`, `core/livekit`, `core/agenta` and `core/dify` are
+credential on the other — the object store's access key in `core/agenta`, the
+`credential_id` of both API tiers' store connections and the store's own
+`root_user`. `core/keycloak`, `core/harbor`, `core/thanos`, `core/apisix`,
+`core/livekit`, `core/agenta` and `core/dify` are
 the shipped shape, the last two leaving credentials unattached for those reasons;
 `core/kong` and `core/ferretdb` show the `compose` limit.
 
@@ -1877,9 +1880,9 @@ with what another holds.
 - **The caller's key is the caller's.** A caller holds the key it presents on the
   connection it presents it on, in a slot its socket declares under
   `usesSchema.<socket>.featuresSchema`, so a caller reaching several servers
-  holds one key for each. A caller whose Component declares the key in a slot of
-  its own instead — `core/ai-agent/crewai`'s `model_api_key` — holds one key for
-  every connection it makes.
+  holds one key for each — `core/ai-agent/crewai`'s `model` socket declares it as
+  `credential`. A caller whose Component declares the key in a slot of its own
+  instead holds one key for every connection it makes.
 - **The server's key is its own slot.** A server holds the key it verifies in a
   slot of its own Component, and every Recipe for it delivers that key as the
   variable the server reads. Neither end sees the other's attachments: an
@@ -1964,6 +1967,58 @@ name is fixed, a lint plugin comparing what the two ends of a connection
 reference can find the target's end by this slot name alone, a catalog
 convention no schema keyword marks; the publishing linter that `aggrega lint`
 runs carries no such rule.
+
+**The caller key's name on a socket is `credential`.** A credential a caller
+presents to the target of one of its own sockets is declared on that socket,
+under `usesSchema.<socket>.featuresSchema`, as the slot `credential`, with
+`selector: "feature.aggrega.ai/kind=secret"`, `sensitive: true`, the `inject`
+mechanisms its Recipes deliver it through, `required: true` where the caller
+cannot run without it, and a description naming what the caller presents it to
+and the variable it is delivered as. The `core/ai-agent` Components that reach
+a model declare it on their `model` socket, and their Recipes deliver it as
+`OPENAI_API_KEY`; a platform presenting a password to the datastore on its
+`backend` socket declares it there — `core/gateway/kong`, whose Recipes deliver
+it as `KONG_PG_PASSWORD` — as do the cache and object-store sockets of
+`core/observability/langfuse`, the sandbox and plugin-runtime sockets of
+`core/ai-agent/dify`, and the media-server socket of
+`core/messaging/livekit-sip`, where the slot is `required`. The name holds one
+credential; it is a key a developer writes on the connection
+(`uses.<socket>.<alias>.features.credential`) and an operator writes on a
+connection the Release wires, so it is the same word on every socket.
+
+- **Every Recipe reads it per connection.** It sits under the connection, at
+  `.context.uses.<alias>.features.credential`, never among the Component's own
+  `.features`. A synthesized Workload delivers it with `connection: <alias>`
+  beside `from: credential`; a compose Recipe reads the value its credential
+  writes on the inject pipe; a chart Recipe reads the locator it publishes, at
+  `.context.uses.<alias>.features.credential.provides`, into the chart's
+  existing-secret setting. Each guards the delivery on the connection carrying
+  one — `hasKey (default dict $edge.features) "credential"` — because an entry
+  naming a connection with nothing in the slot is refused, and a connection
+  carrying no credential renders exactly what it renders with no slot at all.
+- **The socket says when none is intended.** Each such socket also declares
+  `unauthenticated` (`type: boolean`, `default: false`) in its `valueSchema`: the
+  connection's own statement that its target takes no credential. It changes
+  nothing a Component renders.
+- **Several consumers share one credential by authoring.** Nothing cascades into
+  a connection, so a shared key is one parameter every connection's credential
+  reads — under `k8s-existing-secret`, the name of one Secret each connection
+  references; under `k8s-secret-from-parameter`, the key itself, rendered once per
+  connection. The worked example is
+  [`language-reference/examples/model-api-key-sharing/`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/examples/model-api-key-sharing/).
+
+**A pair presented on one connection adds `credential_id`.** Where a caller
+presents an identifier and its secret together on one connection — an object
+store's access-key identifier and secret key — the secret half is `credential`,
+as on every other socket, and the identifier half is `credential_id`, declared
+beside it with the same keys and read and delivered the same way.
+`core/ai-agent/agenta-api` and `core/ai-agent/agenta-services` declare the pair
+on their `store` socket and deliver `credential_id` as `AGENTA_STORE_ACCESS_KEY`
+and `credential` as `AGENTA_STORE_SECRET_KEY`. An identifier that is a plain
+value rather than a credential stays a value on the connection:
+`core/observability/langfuse` names its object store's access-key identifier in
+the `event_store` connection's `access_key_id` value, and only the secret half
+is its `credential`.
 
 **Two realizations constrain the secret the two ends share.**
 

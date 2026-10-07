@@ -21,7 +21,9 @@ metadata:
     internal API. The backend password and the two keys it shares with the API
     server and the worker each come from a credential when one is attached and
     otherwise from a pinned development literal, for evaluation and local
-    development; the two keys are attached on all three or on none.
+    development; the two it presents, to the backend and to the API server, are
+    held on those connections, and the two keys are attached on all three or on
+    none.
 
     provides.host is the bare in-cluster Service name, with no namespace; a
     consumer in another namespace qualifies it on its own side.
@@ -55,15 +57,28 @@ spec:
   # translated into DIFY_INNER_API_URL, the internal endpoint the runtime calls
   # to resolve workspace and credential context.
   #
-  # The backend password comes from a credential when one is attached and from
-  # an inline development default otherwise. The same holds for the runtime's
-  # own server key and for the key it presents on the internal API: each has
-  # its own credential slot and falls back to a pinned development literal
-  # matching the one the API-server and worker Recipes emit, so the three agree
-  # with no external secret. Those two keys are read by the runtime, the API
-  # server and the worker alike, so a credential for either is attached to the
-  # matching slot on all three or on none of them.
+  # The backend password comes from a credential when the backend connection
+  # carries one and from an inline development default otherwise. The same
+  # holds for the runtime's own server key, a slot of its own, and for the key
+  # it presents on the internal API, held on its api connection: each falls
+  # back to a pinned development literal matching the one the API-server and
+  # worker Recipes emit, so the three agree with no external secret. Those two
+  # keys are read by the runtime, the API server and the worker alike, so a
+  # credential for either is attached on all three or on none of them.
   workload: |
+    {{- /*
+      The alias of each connection carrying a credential, or empty: the
+      backend's password and the key presented on the API server's internal
+      API.
+    */ -}}
+    {{- $backendCredential := "" -}}
+    {{- $apiCredential := "" -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- if hasKey (default dict $edge.features) "credential" -}}
+    {{- if eq $edge.socket "backend" -}}{{- $backendCredential = $alias -}}{{- end -}}
+    {{- if eq $edge.socket "api" -}}{{- $apiCredential = $alias -}}{{- end -}}
+    {{- end -}}
+    {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # form: stateful selects a StatefulSet on the helm provider; the
@@ -97,23 +112,24 @@ spec:
           # The API-server edge is translated into the internal endpoint the
           # runtime calls back on.
           DIFY_INNER_API_URL: "http://{{ .context.inject.env.API_HOST }}:{{ .context.inject.env.API_PORT }}"
-          # The two keys this runtime and the API server present to each other,
-          # each behind its own credential slot. SERVER_KEY is the key a caller
-          # must present to this runtime; DIFY_INNER_API_KEY is the key this
-          # runtime presents back to the API server. Unattached, the Recipe
-          # emits the pinned development literal below — the same literal the
-          # API-server and worker Recipes emit — so the stack runs self-contained
-          # with no external secret. Attached, the literal is not emitted and the
-          # credential subsystem delivers the value on the same variable through
-          # the attachments block further down. This runtime, the API server and
-          # the worker all read these two keys, so a credential is attached to
-          # the matching slot on all three or on none of them: attaching it to
-          # some of them leaves the rest carrying a different value, which
-          # renders cleanly and is refused when the call between them is made.
+          # The two keys this runtime and the API server present to each other.
+          # SERVER_KEY is the key a caller must present to this runtime, behind
+          # its own credential slot; DIFY_INNER_API_KEY is the key this runtime
+          # presents back to the API server, held on its api connection.
+          # Unattached, the Recipe emits the pinned development literal below —
+          # the same literal the API-server and worker Recipes emit — so the
+          # stack runs self-contained with no external secret. Attached, the
+          # literal is not emitted and the credential subsystem delivers the
+          # value on the same variable through the attachments block further
+          # down. This runtime, the API server and the worker all read these two
+          # keys, so a credential is attached on all three or on none of them:
+          # attaching it to some of them leaves the rest carrying a different
+          # value, which renders cleanly and is refused when the call between
+          # them is made.
     {{- if not (hasKey (default dict .features) "plugin_daemon_key") }}
           SERVER_KEY: dify-plugin-daemon-server-key
     {{- end }}
-    {{- if not (hasKey (default dict .features) "inner_api_key") }}
+    {{- if not $apiCredential }}
           DIFY_INNER_API_KEY: dify-plugin-inner-api-key
     {{- end }}
           FORCE_VERIFYING_SIGNATURE: "{{ .values.verify_signature }}"
@@ -127,14 +143,15 @@ spec:
           PLUGIN_INSTALLED_PATH: plugin
           PLUGIN_PACKAGE_CACHE_PATH: plugin_packages
           PLUGIN_MEDIA_CACHE_PATH: assets
-    {{- if not (hasKey (default dict .features) "password") }}
+    {{- if not $backendCredential }}
           DB_PASSWORD: apppass
     {{- end }}
-    {{- if or (hasKey (default dict .features) "password") (hasKey (default dict .features) "plugin_daemon_key") (hasKey (default dict .features) "inner_api_key") }}
+    {{- if or $backendCredential (hasKey (default dict .features) "plugin_daemon_key") $apiCredential }}
         attachments:
-    {{- if hasKey (default dict .features) "password" }}
+    {{- with $backendCredential }}
           DB_PASSWORD:
-            from: password
+            connection: "{{ . }}"
+            from: credential
             as: env
     {{- end }}
     {{- if hasKey (default dict .features) "plugin_daemon_key" }}
@@ -142,9 +159,10 @@ spec:
             from: plugin_daemon_key
             as: env
     {{- end }}
-    {{- if hasKey (default dict .features) "inner_api_key" }}
+    {{- with $apiCredential }}
           DIFY_INNER_API_KEY:
-            from: inner_api_key
+            connection: "{{ . }}"
+            from: credential
             as: env
     {{- end }}
     {{- end }}
