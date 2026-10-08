@@ -2003,7 +2003,24 @@ connection the Release wires, so it is the same word on every socket.
 - **The socket says when none is intended.** Each such socket also declares
   `unauthenticated` (`type: boolean`, `default: false`) in its `valueSchema`: the
   connection's own statement that its target takes no credential. It changes
-  nothing a Component renders.
+  nothing a Component renders. A socket whose `credential` is `required` declares
+  no `unauthenticated`, because a connection carrying no credential there halts
+  whatever the connection says.
+- **A managed target reached with neither is refused.** Every Component
+  declaring such a socket carries the assertion
+  `managed_target_needs_a_credential`. It ranges a list naming every socket of
+  the Component that declares `unauthenticated`, and halts the build on a
+  connection whose target is labelled `component.aggrega.ai/hosting: managed`
+  and which carries neither a `credential` nor `unauthenticated: true`, naming
+  the component instance, the socket, the connection and its target. A target
+  labelled `self-hosted`, `external` or `mixed`, or carrying no hosting label,
+  draws nothing — a `mixed` target's posture follows the Recipe the Manifest
+  selects, which a Component assertion runs before. It is a Component assertion
+  so that it holds whichever Recipe binds, and what the label means is this
+  catalog's convention: the build carries the label's string, and the assertion
+  decides what it means. A Component's assertions are written in the Component
+  itself, so each carries its own copy, and the copies differ only in that list
+  of sockets.
 - **Several consumers share one credential by authoring.** Nothing cascades into
   a connection, so a shared key is one parameter every connection's credential
   reads — under `k8s-existing-secret`, the name of one Secret each connection
