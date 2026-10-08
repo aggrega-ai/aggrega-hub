@@ -1458,7 +1458,11 @@ grows:
   characters out and spells the name in the alphabet a Kubernetes name allows.
   A name the Recipe writes itself for an object it emits beside the chart — an
   `artifacts:` entry, or a second Service-name knob the chart offers — is bound
-  to the same key, so it agrees with the chart's own names.
+  to the same key, so it agrees with the chart's own names. The rule binds a
+  FeatureRecipe attached to a helm component in the same terms: there the key is
+  the host component's name, and a name the attachment composes from its host,
+  in a chart value or anywhere else, is built from it ("Name an emitted resource
+  for the scope that carries it").
   This catalog's own checks refuse a sourced Helm Recipe that publishes a host
   while pinning no name, or while binding the pin to anything but
   `.context.rendered_name`. That catches the structural omission which causes
@@ -2117,6 +2121,15 @@ reads `.context.instance_id`, directly or through a `locals:` entry. They judge
 see an artifact's name or a wrong service-key suffix: keeping those on the key,
 and confirming the published address against a Service the render really emits,
 stays the author's to do.
+
+**The rule binds a FeatureRecipe's composed names too.** On a FeatureRecipe
+attached to a component, `.context.rendered_name` is the host component's name
+as the host's own provider reports it — the value the host's Recipe reads — so
+every name the attachment composes from its host is built from that key, never
+from `.context.instance_id`: a resource the attachment emits, every value it
+publishes naming one, and a resource of the host it points at, such as the
+`<rendered name>-<service key>` Service a route forwards to. "Name an emitted
+resource for the scope that carries it" below sets out how.
 
 ### Presence parametrization — expose an enable-parameter per component
 
@@ -2806,14 +2819,46 @@ and the name the attachment is carried under; at boundary scope it is the
 boundary's own name. The catalog's component-scope FeatureRecipes compose both:
 
 ```yaml
-# The attachment name may be authored with underscores, which a Kubernetes
-# resource name cannot carry, so it is folded to hyphens.
-name: '{{ .context.instance_id }}-{{ .attachment_name | replace "_" "-" }}'
+# The host part is the host's rendered name, which the helm provider spells in
+# the characters a Kubernetes name allows. The attachment name may be authored
+# with underscores, which a Kubernetes resource name cannot carry, so it is
+# folded to hyphens.
+name: '{{ .context.rendered_name }}-{{ .attachment_name | replace "_" "-" }}'
 ```
 
 Composing the host alone is enough where the chart already suffixes the resource
 per kind. Composing the *attachment* name as well is what keeps one Feature
 attached twice to a single component, under two names, from colliding with itself.
+
+**On the `helm` target the host part is `.context.rendered_name`, never
+`.context.instance_id`.** This is "build every published name from the rendered
+name", the rule a Recipe follows, applied to an attachment: on a FeatureRecipe
+attached to a component, `.context.rendered_name` is the host component's name as
+the host's own provider reports it, the value the host's Recipe reads. A
+component's name may carry an underscore or a capital, which a Kubernetes resource
+name refuses and the rendered name writes out; a name built from the identity
+renders without complaint and is refused only when the Release is applied, so no
+build catches it. The rule reaches every name an attachment composes from its
+host:
+
+- a resource the attachment emits — a Secret, a ServiceAccount, a route, a policy,
+  a ServiceMonitor;
+- every value the attachment publishes naming such a resource, so the name a
+  consumer reads and the name the render emits are one string;
+- a resource of the host the attachment points at — the Service a route forwards
+  to, `<rendered name>-<service key>` for a workload the helm provider synthesizes,
+  or a gateway the host's Recipe names from its rendered name.
+
+A label value is not a resource name. A selector that matches a label on the
+host's resources reads what that label carries, and on a Service the helm
+provider synthesizes, `app.kubernetes.io/name` carries the component's identity,
+so such a selector keeps reading `.context.instance_id`. Unlike a Recipe's, an
+attachment's `locals:` entries read the host's rendered name, so a name the
+attachment both emits and publishes is derived once there. Where the host's
+provider reports no name — a helm Recipe that places an artifact set alone — the
+key is empty, and reading it from the attachment's inline templates, other than
+its `injectMapping`, halts the build; an attachment carried by such a host names
+its resources from the identity.
 
 **This is a convention authors uphold, not a rule the compiler applies.** Nothing
 in the compiler inspects a name template, infers that a value is a resource name,
@@ -2844,7 +2889,7 @@ written when supplied, and derive the scope-composed name only when it is absent
 
 ```yaml
 locals:
-  sa_name: '{{ default (printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-")) .infra.service_account_name }}'
+  sa_name: '{{ default (printf "%s-%s" .context.rendered_name (.attachment_name | replace "_" "-")) .infra.service_account_name }}'
 ```
 
 Two things make this shape work. An omitted optional key arrives empty, so
