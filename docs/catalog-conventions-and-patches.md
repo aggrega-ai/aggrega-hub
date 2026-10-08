@@ -1969,8 +1969,31 @@ scoped to those targets: a datastore's password, a broker's credential and a key
 that is one half of a pair keep the names their products give them. Because the
 name is fixed, a lint plugin comparing what the two ends of a connection
 reference can find the target's end by this slot name alone, a catalog
-convention no schema keyword marks; the publishing linter that `aggrega lint`
-runs carries no such rule.
+convention no schema keyword marks. The publishing linter that `aggrega lint`
+runs carries that comparison as the rule
+`connection-credential-matches-target-key`, which `aggrega lint --release`
+runs over the Release it names. For each connection whose target declares
+`api_key` and is not a managed target (below), it reports a `credential` on
+the connection with the target's
+`api_key` unfilled, a filled `api_key` with no `credential` on the connection,
+and two ends whose `origin` is written differently, and it never quotes
+either. It reads `api_key` and `credential` and no other slot, so a target's
+other secrets — `core/ai-model/vllm`'s `model_pull_token` — are never
+compared, and a key slot named any other way draws no advice. The finding is
+advisory, and a workspace whose two ends deliberately differ opts out with
+`allow_connection_credential_mismatches`.
+
+**A managed target's `api_key` is the vendor's key, and the rule does not
+judge it.** A Component labelled `component.aggrega.ai/hosting: managed`
+stands for a service its vendor runs, so nothing the Release runs checks a key
+on it. Where such a Component declares `api_key` — `core/ai-model/openai`,
+`core/ai-agent/bland`, `letta`, `retell` and `vapi`, and
+`core/messaging/telnyx` and `vonage` — the slot holds the key the Release
+presents to that vendor, named as the vendor's product names it, like the
+other product-named keys above, and never a key its callers present. The rule
+therefore passes over every connection whose target carries that label. A
+target labelled `self-hosted`, `external` or `mixed`, or carrying no hosting
+label, is judged.
 
 **The caller key's name on a socket is `credential`.** A credential a caller
 presents to the target of one of its own sockets is declared on that socket,
