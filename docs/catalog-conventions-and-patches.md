@@ -2000,6 +2000,16 @@ connection the Release wires, so it is the same word on every socket.
   one — `hasKey (default dict $edge.features) "credential"` — because an entry
   naming a connection with nothing in the slot is refused, and a connection
   carrying no credential renders exactly what it renders with no slot at all.
+- **An optional socket whose unwired side reaches a provider keeps a Component
+  slot for that side.** `core/datastore/cognee`'s `extraction_model` and
+  `embedding_model` sockets are optional, and a socket left unwired reaches the
+  provider the Component's `values` name, at that provider's own address, which
+  no connection reaches. Each socket declares `credential`, and the Component
+  keeps `model_api_key`, which its Recipe reads only for a socket left unwired:
+  a wired socket's key is its connection's `credential`, never the Component's
+  slot. Each side's key is delivered under its own variable, `LLM_API_KEY` for
+  extraction and `EMBEDDING_API_KEY` for embedding, because the server, given no
+  embedding key, may present the extraction key to the embedding provider.
 - **The socket says when none is intended.** Each such socket also declares
   `unauthenticated` (`type: boolean`, `default: false`) in its `valueSchema`: the
   connection's own statement that its target takes no credential. It changes

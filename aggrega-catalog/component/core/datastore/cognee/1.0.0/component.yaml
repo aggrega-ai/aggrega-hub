@@ -63,29 +63,65 @@ spec:
     # its own: with neither socket wired it still renders and starts,
     # reaching the provider named in `values` at that provider's own address. A
     # wired socket replaces that with the address and model name the wired
-    # component publishes, which is what lets a deployment point extraction at a
-    # model it runs itself. Each address is a deterministic pointer string the
-    # running server resolves; the compiler never contacts a model.
+    # component publishes, and the key with the credential its own connection
+    # carries, which is what lets extraction point at a model the same Release
+    # runs. Each address is a deterministic pointer string the running server
+    # resolves; the compiler never contacts a model.
     #
     # Wired to a gateway, the address is the gateway's and the model name is
     # the one alias the gateway publishes. The provider family in `values`
     # still selects the client the server constructs, so it names one that
     # speaks the API the gateway's model.aggrega.ai/api value names.
     #
+    # Each socket declares the two per-connection facts an agent's model
+    # socket declares: unauthenticated, a statement about the connection's
+    # target, authored on the connection, that the model it reaches takes no
+    # credential, which changes nothing this component renders; and the
+    # credential the server presents to that model. The credential is optional
+    # (a model that checks no key); transparent (inject: [env]) so a
+    # synthesized Workload may reference it as an env secret;
+    # secret-kind-pinned but family-agnostic.
+    #
     # extraction_model reads the ingested material and names the entities and
     # relations written into the graph; its unwired fallback is
     # values.extraction_provider.
     extraction_model:
       selector: "component.aggrega.ai/category in (ai-model, gateway), model.aggrega.ai/api"
+      valueSchema:
+        unauthenticated:
+          type: boolean
+          default: false
+          description: Declares that the model this connection reaches takes no credential, so a connection carrying none is intended rather than an omission. It changes nothing this component renders.
+      featuresSchema:
+        credential:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [env]
+          description: "Optional credential the server presents to the model this connection reaches, the one it reads ingested material with. When attached, the Recipe delivers it as LLM_API_KEY (a Kubernetes secretKeyRef on helm), so its value never appears in the rendered manifest, and the component's model_api_key is not read for this side; unattached, no key is delivered for it."
     # embedding_model encodes the same material, so it is retrievable by
     # similarity alongside the graph; its unwired fallback is
     # values.embedding_provider.
     embedding_model:
       selector: "component.aggrega.ai/category in (ai-model, gateway), model.aggrega.ai/api"
+      valueSchema:
+        unauthenticated:
+          type: boolean
+          default: false
+          description: Declares that the model this connection reaches takes no credential, so a connection carrying none is intended rather than an omission. It changes nothing this component renders.
+      featuresSchema:
+        credential:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [env]
+          description: "Optional credential the server presents to the model this connection reaches, the one it encodes ingested material with. When attached, the Recipe delivers it as EMBEDDING_API_KEY (a Kubernetes secretKeyRef on helm), so its value never appears in the rendered manifest, and the component's model_api_key is not read for this side; unattached, no key is delivered for it, and the server may then present the extraction side's key, where one is delivered, to this model instead."
 
   featuresSchema:
-    # One optional, transparent credential slot. `required` omitted → optional,
-    # so a bare deployment still loads, and with nothing attached the render is
+    # The key for a model socket left UNWIRED, and only for that. An unwired
+    # socket reaches the provider named in `values` at its own address, which
+    # no connection reaches, so its key cannot sit on a connection; a wired
+    # socket carries its key on its own connection, under credential, and
+    # never reads this slot. `required` omitted → optional, so a bare
+    # instance still loads, and with nothing attached the render is
     # byte-identical to a Recipe carrying no slot at all. Transparent
     # (inject: [env]) so the injected value reaches the Recipe on the env pipe;
     # the selector is secret-kind-pinned but family-agnostic, so either a
@@ -94,7 +130,7 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [env]
-      description: "Optional credential the server presents to the model provider it reads ingested material with. When attached, the Recipe delivers it as an environment variable, so the plaintext never appears in the rendered manifest; unattached, the server starts and serves but holds no model credential, so an ingestion request fails at the provider. Attach one for any deployment that must actually build a graph. A deployment whose embedding provider requires a second, distinct credential carries that one through its own secret machinery, which this single slot does not express."
+      description: "Optional credential the server presents to a model provider it reaches without a connection. It serves only a model socket left unwired, where the server reaches the provider its values name at that provider's own address: for extraction it is delivered as LLM_API_KEY, for embedding as EMBEDDING_API_KEY, so with both unwired each side presents this key. A wired socket carries its key on its own connection, under credential, and never reads this slot. Delivered as an environment variable, so the plaintext never appears in the rendered manifest; unattached, no key is delivered for an unwired side."
 
   schema:
     values:
@@ -190,3 +226,22 @@ spec:
       protocol:
         type: string
         description: How the published address is spoken to — `http`, so a consumer reaches the API with an HTTP client.
+
+  # A connection to a target its catalog labels a managed service
+  # (component.aggrega.ai/hosting: managed) carries a credential, or says on the
+  # connection that its target takes none. The rule reads the target's labels,
+  # the connection's unauthenticated value and its credential slot, all known
+  # before a Recipe binds, so it holds whichever Recipe renders this component;
+  # a self-hosted target draws nothing. The list names every socket of this
+  # component that declares unauthenticated.
+  assertions:
+    managed_target_needs_a_credential: >-
+      {{- range $socket := list "extraction_model" "embedding_model" -}}
+      {{- range $alias, $connection := (optional $.uses $socket dict) -}}
+      {{- $managed := eq (optional $connection.labels "component.aggrega.ai/hosting" "") "managed" -}}
+      {{- $optedOut := optional $connection.values "unauthenticated" false -}}
+      {{- if and $managed (not (hasKey $connection.features "credential")) (not $optedOut) -}}
+      {{- fail (printf "the %s connection %s of %q reaches %q, whose component.aggrega.ai/hosting label is managed, with no credential: attach one under credential on that connection, or set unauthenticated: true in its values" $socket $alias $.metadata.instance_id $connection.target) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
