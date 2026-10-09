@@ -269,7 +269,7 @@ while :; do
   fi
 
   COMMIT="$(git commit-tree "$TREE" ${BASE:+-p "$BASE"} -m "$MESSAGE")" || {
-    echo "record-published: git could not make the commit (is a committer identity set?)" >&2
+    echo "record-published: git could not create the commit (is a committer identity set?)" >&2
     exit 1
   }
   if git push -q "$REMOTE" "$COMMIT:refs/heads/$PUBLISHED_BRANCH" 2>"$TMP/push.err"; then
