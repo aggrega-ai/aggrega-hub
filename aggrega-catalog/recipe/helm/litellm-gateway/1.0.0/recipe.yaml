@@ -11,12 +11,11 @@ metadata:
     An AI gateway on Kubernetes via the helm provider's Workload synthesis,
     running the official upstream proxy image directly (no external Helm chart).
     Renders a Deployment, a ClusterIP Service and a ConfigMap carrying the
-    routing table — every published alias, its upstream target and the routing
-    strategy — so the rendered artifact shows which models the gateway serves.
-    An attached api_key, provider_key or database_url reaches the gateway
-    as an env secretKeyRef, so no credential value appears in the gateway's
-    own resources. The configuration contract is authored against LiteLLM
-    v1.103.1.
+    routing table — each alias of values.models and of a models connection,
+    its upstream and the routing strategy — so the rendered artifact shows
+    which models the gateway serves. Every credential reaches the gateway as
+    an env secretKeyRef, so no credential value appears in its own resources.
+    The configuration contract is authored against LiteLLM v1.103.1.
 
     On every Release a second ConfigMap carries a request guard, which
     forwards only the request fields the proxy declares for the route, plus
@@ -34,8 +33,9 @@ metadata:
     to the guard on the guard socket.
     PROXY_BASE_URL and the Presidio and cache store addresses appear only when
     infra.external_base_url and their sockets are set; the build halts on an
-    address carrying a path, on one recognizer socket wired alone, and on a
-    store other than core/datastore/redis.
+    address carrying a path, on one recognizer socket wired alone, on a store
+    other than core/datastore/redis, and on two models aliases naming one
+    variable.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -50,15 +50,30 @@ spec:
   # entries are what keeps the emitted ConfigMap and the container that reads it
   # from drifting apart: config_file is the ConfigMap's data key and the filename
   # the proxy is pointed at, and provider_key_variable is the variable the
-  # routing table names for its upstream credential and the variable the
-  # attached credential is delivered under. A second home for that last one is
-  # exactly how a routing table comes to name a variable nothing sets. The
-  # ConfigMap's own name, "<rendered_name>-config", has no entry here: the
-  # artifact declares it and the volume sources it, both reading
-  # .context.rendered_name, which a locals entry cannot read.
+  # routing table's hand-typed entries name for their upstream credential and
+  # the variable the attached provider_key is delivered under. A second home
+  # for that last one is exactly how a routing table comes to name a variable
+  # nothing sets. The ConfigMap's own name, "<rendered_name>-config", has no
+  # entry here: the artifact declares it and the volume sources it, both
+  # reading .context.rendered_name, which a locals entry cannot read.
   locals:
     config_file: config.yaml
     provider_key_variable: LITELLM_PROVIDER_API_KEY
+    # The variable a models connection's credential is delivered under, which
+    # that connection's entry in the routing table names: these two fixed parts
+    # around the connection's alias, written in capitals with every character
+    # other than a letter or a digit as an underscore, so the connection fast
+    # is delivered as LITELLM_MODEL_FAST_API_KEY. The rule is applied in the
+    # artifacts template and in the workload template, because a variable bound
+    # in one is not visible in the other and a locals entry cannot read a
+    # connection; its fixed parts are held here once, so the two cannot name
+    # different variables. Two aliases the rule maps to one variable halt the
+    # build in the workload, naming both. The fixed prefix keeps every such
+    # variable apart from the provider variables the proxy reads on its own,
+    # so a connection named after a provider is never read as that
+    # provider's default key.
+    connection_key_variable_prefix: LITELLM_MODEL_
+    connection_key_variable_suffix: _API_KEY
     # The word every map entry presents as its credential while
     # core/prompt-injection-shield sends it to the guard. The proxy calls an
     # entry addressed this way only when the entry names a key, and the guard
@@ -146,22 +161,28 @@ spec:
     # Published for an attachment's realization to check against, and never
     # emitted. A FeatureRecipe reads this Recipe's locals and not the
     # component's values, so the fact it checks an attachment against is
-    # stated here once: every alias the model map publishes, as a JSON list.
-    # Whether the gateway has a bookkeeping database is not stated here: it is
-    # whether the database_url credential slot is attached, which a
-    # realization reads from the attachments themselves.
-    model_aliases: '{{ $aliases := list }}{{ range .values.models }}{{ $aliases = append $aliases .name }}{{ end }}{{ toJson $aliases }}'
-    # Published the same way, and never emitted: every entry of the model map,
-    # its alias and its target, as a JSON list in map order, which the
-    # core/prompt-injection-shield realization checks each target in.
-    model_entries: '{{ toJson .values.models }}'
+    # stated here once: every alias the hand-typed entries of values.models
+    # publish, as a JSON list. It carries those entries only, because a locals
+    # entry cannot read a connection: the aliases of the models wired to the
+    # models socket are the keys of the host's .uses.models, which a
+    # realization's assertion reads beside this list. Whether the gateway has a
+    # bookkeeping database is not stated here: it is whether the database_url
+    # credential slot is attached, which a realization reads from the
+    # attachments themselves.
+    model_aliases: '{{ $aliases := list }}{{ range (optional .values "models" list) }}{{ $aliases = append $aliases .name }}{{ end }}{{ toJson $aliases }}'
+    # Published the same way, and never emitted: every hand-typed entry of
+    # values.models, its alias and its target, as a JSON list in map order,
+    # which the core/prompt-injection-shield realization checks each target
+    # in. The wired entries are not among them, for the same reason.
+    model_entries: '{{ toJson (optional .values "models" list) }}'
     # The alias published as the gateway's model, which provides.model below
     # hands to every component wired to it: values.model where it is set, and
-    # otherwise the one alias the map publishes. The component's own assertion
-    # has already halted the build where values.model names an alias the map
-    # does not publish, or is omitted while the map publishes several, so the
-    # first entry's alias read here is the only alias there is.
-    published_model: '{{ with optional .values "model" "" }}{{ . }}{{ else }}{{ (index .values.models 0).name }}{{ end }}'
+    # otherwise the one alias values.models publishes. The component's own
+    # assertion has already halted the build where values.model names an alias
+    # the gateway does not serve, or is omitted while the gateway serves
+    # several aliases or values.models has no entry, so the first entry's alias
+    # read here is the only alias there is.
+    published_model: '{{ with optional .values "model" "" }}{{ . }}{{ else }}{{ with optional .values "models" list }}{{ (index . 0).name }}{{ end }}{{ end }}'
     # The entity types the Presidio analyzer that core/security/presidio-analyzer
     # runs reports it recognizes in English, as a JSON list: the gateway hands
     # each listed type to that analyzer, and a type outside the list is ignored
@@ -178,8 +199,9 @@ spec:
     # address of a store to keep its own spend counters, rate limits and
     # cross-pod bookkeeping in, which the cache's store is not wired here to
     # be. The password goes under REDIS_PASSWORD, the variable the cache reads
-    # it from: the cache will not start without one, so with no credential
-    # attached the workload writes it empty, which connects without a
+    # it from, delivered from the credential the cache_store connection
+    # carries: the cache will not start without one, so with no credential on
+    # that connection the workload writes it empty, which connects without a
     # password; on its own that variable names no store, and nothing else in
     # the proxy reads it.
     cache_store_host_variable: SEMANTIC_CACHE_STORE_HOST
@@ -239,20 +261,34 @@ spec:
       {{- if and $anonymizer (not $analyzer) -}}
       {{- fail "the pii_anonymizer socket is wired and the pii_analyzer socket is not, but the gateway's Presidio integration replaces only the spans the analyzer reports and cannot use either service alone; wire a core/security/presidio-analyzer to pii_analyzer as well, or remove the pii_anonymizer edge" -}}
       {{- end -}}
-    # The cache store's password is presented to the store wired to the
-    # cache_store socket, so a password attached with no store wired has
-    # nothing to reach. Halt on it here, naming the socket left empty.
-    cache_store_password_needs_a_store: >-
-      {{- if and (hasKey (optional . "features" dict) "cache_store_password") (not (hasKey .uses "cache_store")) -}}
-      {{- fail "the cache_store_password slot is attached, but nothing is wired to the cache_store socket, so the password has no store to be presented to; wire a core/datastore/redis to cache_store, or remove the cache_store_password attachment" -}}
-      {{- end -}}
   artifacts:
-    # The gateway's routing table. Every entry of the developer's model map
-    # becomes one published alias and the upstream target it resolves to, and the
-    # strategy entry below states how the gateway picks between entries that
-    # publish the same alias. This body is the reason the component's capability
-    # label is true of what is rendered rather than only of what is authored: a
-    # reader of this artifact can see the models the gateway serves.
+    # The gateway's routing table. Every hand-typed entry of values.models
+    # becomes one published alias and the upstream target it resolves to; then
+    # every connection on the models socket becomes one more, published under
+    # the connection's alias, in alias order. The strategy entry below states
+    # how the gateway picks between entries that publish the same alias. This
+    # body is the reason the component's capability label is true of what is
+    # rendered rather than only of what is authored: a reader of this artifact
+    # can see the models the gateway serves.
+    #
+    # A wired entry is written from what its model publishes: the model name,
+    # as the entry's model, and the endpoint, as its api_base — strings piped
+    # through, never resolved. Its notation follows its credential. With a
+    # credential on the connection, the entry is written openai/<model> and
+    # names the variable the workload delivers that credential under, so the
+    # proxy presents it to the model; with none, it is written
+    # hosted_vllm/<model>, the proxy's notation for an OpenAI-API server it
+    # reaches presenting no credential, because an openai/ entry with no key is
+    # refused by the proxy on every request. A wired entry never names
+    # provider_key's variable. The component's own assertions have already
+    # halted the build on a wired model that does not speak the OpenAI API, on
+    # an alias a connection and values.models both publish, and on a managed
+    # model reached with no credential and no unauthenticated: true. With no
+    # entry in values.models and nothing on the models socket, this body halts
+    # the build, naming the gateway, since its table would hold no model; that
+    # check is here rather than among the component's assertions because
+    # validating this Recipe on its own places the component in a build that
+    # wires no connection and gives it no values.
     #
     # The body is rendered as a ConfigMap beside the Deployment, and that
     # ConfigMap is where this realization earns the gateway's capability: the
@@ -260,13 +296,14 @@ spec:
     # leaving it to the running process to reveal. The proxy container reads
     # that file through the --config flag.
     #
-    # No credential value appears here. The upstream credential is named through
-    # the proxy's own environment indirection — each entry carries the variable
-    # name and the runtime reads the value from the environment — and the
-    # administrative key is not named here at all, because the proxy reads its
-    # variable directly from the environment at startup. Every map entry names
-    # that variable rather than carrying the credential, which is what keeps the
-    # credential inside the gateway and out of the calling application.
+    # No credential value appears here. Each upstream credential is named
+    # through the proxy's own environment indirection — an entry carries the
+    # variable name and the runtime reads the value from the environment — and
+    # the administrative key is not named here at all, because the proxy reads
+    # its variable directly from the environment at startup. A hand-typed entry
+    # names provider_key's variable and a wired entry its own connection's,
+    # rather than carrying the credential, which is what keeps every credential
+    # inside the gateway and out of the calling application.
     #
     # While a core/context-propagation attachment is present, the same ConfigMap
     # also carries the caller-identity hook as a second data key, and the body
@@ -324,7 +361,10 @@ spec:
     # attachment's realization checks the guard and the map before any file is
     # written; with the shield attached and nothing on the guard socket this
     # body stops the build too, so the map is never written unguarded under an
-    # attached shield. With no such attachment, no entry carries an api_base.
+    # attached shield. It stops the build as well, naming them, while the
+    # shield is attached and the models socket holds a connection, because a
+    # wired entry is sent to its own model's endpoint and would pass the guard
+    # by. With no such attachment, no hand-typed entry carries an api_base.
     #
     # Each of those attachments is found by its type with any version it was
     # authored with set aside, so core/context-propagation and
@@ -363,9 +403,13 @@ spec:
       {{- if eq (first (splitList ":" (toString $attachment.type))) "core/prompt-injection-shield" }}{{ $shield = true }}{{ end }}
       {{- end }}
       {{- $guardBase := "" }}
+      {{- $wired := list }}
+      {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "models" }}{{ $wired = append $wired $alias }}{{ end }}{{ end }}
+      {{- if not (or (optional .values "models" list) $wired) }}{{ fail (printf "%q serves no model: values.models has no entry and nothing is wired to its models socket, so its routing table would be empty; wire a model to the models socket, or add an entry to values.models" .context.instance_id) }}{{ end }}
       {{- if $shield }}
       {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "guard" }}{{ $guardBase = $edge.provides.endpoint }}{{ end }}{{ end }}
       {{- if not $guardBase }}{{ fail "core/prompt-injection-shield is attached to the gateway, but nothing is wired to its guard socket, so its model map would be sent to no guard; wire a core/security/nemo-guardrails to the guard socket" }}{{ end }}
+      {{- if $wired }}{{ fail (printf "core/prompt-injection-shield is attached to the gateway, which sends its model map to the guard, but its models socket holds %s, whose entries would be sent to each model's own endpoint past the guard; remove those connections, or the shield attachment" (join ", " $wired)) }}{{ end }}
       {{- end -}}
       apiVersion: v1
       kind: ConfigMap
@@ -374,7 +418,7 @@ spec:
       data:
         {{ .locals.config_file }}: |
           model_list:
-      {{- range .values.models }}
+      {{- range (optional .values "models" list) }}
             - model_name: {{ .name }}
               litellm_params:
                 model: {{ .target }}
@@ -383,6 +427,20 @@ spec:
                 api_key: {{ $.locals.guard_api_key | toJson }}
       {{- else if hasKey (default dict $.features) "provider_key" }}
                 api_key: os.environ/{{ $.locals.provider_key_variable }}
+      {{- end }}
+      {{- end }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "models" }}
+            - model_name: {{ $alias | toJson }}
+              litellm_params:
+      {{- if hasKey (default dict $edge.features) "credential" }}
+                model: {{ printf "openai/%s" $edge.provides.model | toJson }}
+                api_base: {{ $edge.provides.endpoint | toJson }}
+                api_key: os.environ/{{ $.locals.connection_key_variable_prefix }}{{ regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}{{ $.locals.connection_key_variable_suffix }}
+      {{- else }}
+                model: {{ printf "hosted_vllm/%s" $edge.provides.model | toJson }}
+                api_base: {{ $edge.provides.endpoint | toJson }}
+      {{- end }}
       {{- end }}
       {{- end }}
           router_settings:
@@ -1845,15 +1903,28 @@ spec:
   # neither wired, neither variable is emitted. With the cache_store socket
   # wired, the store's published host and port reach the gateway under the
   # two variables the locals above name, and its password as REDIS_PASSWORD:
-  # an env secretKeyRef when the cache_store_password slot is attached, an
-  # empty value when it is not. With nothing wired to cache_store, none of
-  # the three is emitted. The pod is ready only once a request through the
-  # path allowlist would be served.
+  # an env secretKeyRef when the cache_store connection carries a credential,
+  # an empty value when it does not. With nothing wired to cache_store, none
+  # of the three is emitted. Each models connection carrying a credential
+  # delivers it as an env secretKeyRef under the variable its routing-table
+  # entry names, derived from its alias by the rule the locals above state;
+  # two aliases the rule maps to one variable halt the build here, naming
+  # both. The pod is ready only once a request through the path allowlist
+  # would be served.
   workload: |
     {{- $configDir := "/etc/litellm" -}}
     {{- $recognizer := false -}}
     {{- $cacheStore := false -}}
-    {{- range $alias, $edge := .context.uses }}{{ if or (eq $edge.socket "pii_analyzer") (eq $edge.socket "pii_anonymizer") }}{{ $recognizer = true }}{{ end }}{{ if eq $edge.socket "cache_store" }}{{ $cacheStore = true }}{{ end }}{{ end -}}
+    {{- $storeCredential := "" -}}
+    {{- $modelKeys := dict -}}
+    {{- range $alias, $edge := .context.uses }}{{ if or (eq $edge.socket "pii_analyzer") (eq $edge.socket "pii_anonymizer") }}{{ $recognizer = true }}{{ end }}{{ if eq $edge.socket "cache_store" }}{{ $cacheStore = true }}{{ if hasKey (default dict $edge.features) "credential" }}{{ $storeCredential = $alias }}{{ end }}{{ end }}{{ end -}}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if and (eq $edge.socket "models") (hasKey (default dict $edge.features) "credential") }}
+    {{- $variable := printf "%s%s%s" $.locals.connection_key_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_") $.locals.connection_key_variable_suffix }}
+    {{- with get $modelKeys $variable }}{{ fail (printf "the models connections %s and %s of %q would each deliver their credential as %s, because the gateway names a connection's variable after its alias in capitals, with every character other than a letter or a digit as an underscore; rename one of the two connections" . $alias $.context.instance_id $variable) }}{{ end }}
+    {{- $_ := set $modelKeys $variable $alias }}
+    {{- end }}
+    {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     form: stateless
@@ -1895,8 +1966,9 @@ spec:
         # With the cache_store socket wired, the store's published host and
         # port are written the same way, and the build halts when the store is
         # not core/datastore/redis, its type compared with any version it was
-        # authored with set aside. With no password slot attached the password
-        # variable is written empty; attached, it is delivered below instead.
+        # authored with set aside. With no credential on the cache_store
+        # connection the password variable is written empty; with one, it is
+        # delivered below instead.
     {{- if or .infra.external_base_url $recognizer $cacheStore }}
         variables:
     {{- end }}
@@ -1917,12 +1989,12 @@ spec:
     {{- end }}
           {{ $.locals.cache_store_host_variable }}: "{{ $edge.provides.host }}"
           {{ $.locals.cache_store_port_variable }}: "{{ $edge.provides.port }}"
-    {{- if not (hasKey (default dict $.features) "cache_store_password") }}
+    {{- if not (hasKey (default dict $edge.features) "credential") }}
           {{ $.locals.cache_store_password_variable }}: ""
     {{- end }}
     {{- end }}
     {{- end }}
-    {{- if or (hasKey (default dict .features) "api_key") (hasKey (default dict .features) "provider_key") (hasKey (default dict .features) "database_url") (hasKey (default dict .features) "cache_store_password") }}
+    {{- if or (hasKey (default dict .features) "api_key") (hasKey (default dict .features) "provider_key") (hasKey (default dict .features) "database_url") $storeCredential $modelKeys }}
         attachments:
     {{- end }}
     {{- if hasKey (default dict .features) "api_key" }}
@@ -1934,9 +2006,9 @@ spec:
             as: env
     {{- end }}
     {{- if hasKey (default dict .features) "provider_key" }}
-          # The same variable every routing-table entry names through the proxy's
-          # environment indirection, read from the one home above so the table
-          # and the delivery agree by construction.
+          # The same variable every hand-typed routing-table entry names
+          # through the proxy's environment indirection, read from the one home
+          # above so the table and the delivery agree by construction.
           {{ .locals.provider_key_variable }}:
             from: provider_key
             as: env
@@ -1950,13 +2022,23 @@ spec:
             from: database_url
             as: env
     {{- end }}
-    {{- if hasKey (default dict .features) "cache_store_password" }}
+    {{- with $storeCredential }}
           # The variable the semantic cache reads the store's password from,
-          # read from the one home in the locals above. Delivered as an env
-          # secretKeyRef, so the password never lands in the manifest; the
-          # assertion above has halted the build if no store is wired.
-          {{ .locals.cache_store_password_variable }}:
-            from: cache_store_password
+          # read from the one home in the locals above, delivered from the
+          # credential the cache_store connection carries as an env
+          # secretKeyRef, so the password never lands in the manifest.
+          {{ $.locals.cache_store_password_variable }}:
+            connection: "{{ . }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- range $variable, $alias := $modelKeys }}
+          # A models connection's credential, under the variable its
+          # routing-table entry names, so the proxy presents it to that model
+          # alone; delivered as an env secretKeyRef, never the value.
+          {{ $variable }}:
+            connection: "{{ $alias }}"
+            from: credential
             as: env
     {{- end }}
         # The proxy documents /health/readiness and /health/liveliness as its
