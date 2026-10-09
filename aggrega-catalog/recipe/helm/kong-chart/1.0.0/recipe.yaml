@@ -30,6 +30,13 @@ metadata:
     infra.source_version) are pinned. provides.host is the proxy data-plane
     Service name, with no namespace; a consumer in another namespace qualifies
     it on its own side.
+
+    Each model wired to the models socket gets a chat and a completion route
+    through Kong's AI proxy, in a ConfigMap beside the chart that an init
+    container imports into the database, retried on a first install until the
+    bootstrap Job has provisioned the schema. A connection's credential arrives
+    as an env secretKeyRef the routes name through Kong's environment vault, so
+    no credential value is in the rendered output.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -60,10 +67,64 @@ spec:
   # The name carries no namespace, so the recipe is independent of where it is
   # deployed; a consumer in another namespace qualifies the host with the target
   # namespace on its own side (caller-side routing).
+  #
+  # endpoint is the route the gateway serves for the model values.model names,
+  # under that alias in the path, on the proxy Service name and port; model is
+  # that alias. The Service name is spelled out again on purpose: a provides
+  # entry cannot read another provides entry, so the repetition is forced, and
+  # the entries are edited together. With nothing wired to the models socket
+  # values.model is omitted — the component's assertion halts on any other
+  # combination — and both are empty.
   provides:
     host: "{{ .context.rendered_name }}-proxy"
     port: "{{ .infra.proxy_port }}"
     protocol: "http"
+    endpoint: '{{ with optional .values "model" "" }}http://{{ $.context.rendered_name }}-proxy:{{ $.infra.proxy_port }}/{{ . }}/v1{{ end }}'
+    model: '{{ optional .values "model" "" }}'
+
+  # The entries below are the values the value mapping shares with the
+  # KongModelRoutes bundle imported for the gateway's model routes. Each has
+  # its home in the bundle, which stops the build naming the local when one is
+  # missing or differs from its own; the value mapping reads them here,
+  # because a value mapping cannot read the bundle. model_routes_delivery has
+  # the bundle emit one ConfigMap. model_routes_file is the file that
+  # ConfigMap carries the routes as and the file the import step reads. The
+  # ConfigMap is named after the rendered name followed by
+  # model_routes_config_map_suffix; a locals entry cannot read the rendered
+  # name, so the volume composes the two. A models connection's credential
+  # reaches the gateway under two variables, both named after the connection's
+  # alias in capitals with every character other than a letter or a digit as
+  # an underscore, between the fixed parts here: the connection fast carrying
+  # a credential gives AI_PROXY_FAST_API_KEY, which holds the credential, and
+  # AI_PROXY_FAST_AUTHORIZATION, the bearer token composed from it, which the
+  # connection's routes name through Kong's environment vault. A locals entry
+  # cannot read a connection, so the value mapping applies the alias rule
+  # itself, once.
+  locals:
+    model_routes_delivery: config_map
+    model_routes_file: model-routes.yaml
+    model_routes_config_map_suffix: "-model-routes"
+    connection_variable_prefix: AI_PROXY_
+    credential_variable_suffix: _API_KEY
+    header_variable_suffix: _AUTHORIZATION
+
+  # The models the gateway serves, as Kong's own declarative configuration,
+  # from the KongModelRoutes bundle every Recipe running this gateway imports,
+  # so the routes and the rules they are written by have one text wherever the
+  # gateway runs. It is emitted beside the chart's resources and loaded into
+  # the backend database by the import step the value mapping below adds. Each
+  # connection on the models socket gets a chat and a completion route under
+  # its alias, through Kong's AI proxy to the endpoint and the model name the
+  # model publishes, and one carrying a credential has its routes name
+  # AI_PROXY_<ALIAS>_AUTHORIZATION through Kong's environment vault, never the
+  # value. With model_routes_delivery set to config_map the bundle emits one
+  # ConfigMap, "<rendered_name>-model-routes", carrying the routes as
+  # model_routes_file; with nothing wired to the models socket it emits
+  # nothing. The bundle stops the build when a local above differs from its
+  # own side.
+  artifacts:
+    model-routes:
+      $import: KongModelRoutes#/artifacts/ModelRoutes
 
   # This Recipe reads from infra.overrides:
   #   image        - map[string]string (image.* fields; overrides the tag pin)
@@ -98,6 +159,35 @@ spec:
         {{- $backend = $edge }}
       {{- end }}
     {{- end }}
+    {{- /* The models connections, in alias order, and those of them carrying a
+           credential. The directory the routes file is mounted at is the
+           single authored home for the mount and the path the import step
+           reads. */}}
+    {{- $routesDir := "/etc/kong/model-routes" }}
+    {{- $wired := list }}
+    {{- $credentialed := list }}
+    {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "models" }}
+        {{- $wired = append $wired $alias }}
+        {{- if hasKey (default dict $edge.features) "credential" }}
+          {{- $credentialed = append $credentialed $alias }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- /* The inline development password, the single authored home for the
+           gateway's and the import step's connection when the backend
+           connection carries no credential. */}}
+    {{- $devPassword := "apppass" }}
+    {{- /* The gateway image pin, the single authored home for the chart's image
+           values below and for the image the import step runs: the step
+           writes into the database the gateway reads, so the two run one
+           release, an image override included. */}}
+    {{- $repository := "kong" }}
+    {{- $tag := "3.9.3" }}
+    {{- $image := printf "%s:%s" $repository $tag }}
+    {{- with .infra.overrides }}{{ with .image }}
+      {{- if .unifiedRepoTag }}{{ $image = .unifiedRepoTag }}{{ else if and .repository .tag }}{{ $image = printf "%s:%s" .repository .tag }}{{ end }}
+    {{- end }}{{ end }}
 
     ## ── Pin the chart's resource names to the rendered name ────
     ## Names the proxy Service "<rendered_name>-proxy", matching provides.host,
@@ -114,8 +204,8 @@ spec:
       {{ $k }}: "{{ $v }}"
       {{- end }}
       {{- else }}
-      repository: kong
-      tag: "3.9.3"
+      repository: {{ $repository }}
+      tag: "{{ $tag }}"
       {{- end }}
 
     ## ── Chart extras this Component does not describe ──────────
@@ -151,8 +241,79 @@ spec:
             name: "{{ $backend.features.credential.provides.name }}"
             key: "{{ $backend.features.credential.provides.key }}"
       {{- else }}
-      pg_password: "apppass"
+      pg_password: "{{ $devPassword }}"
       {{- end }}
+
+    ## ── The models the gateway serves ──────────────────────────
+    ## While the models socket holds a connection, an init container of the
+    ## gateway's pod imports the routes ConfigMap the artifact above emits into
+    ## the backend database, with the gateway's image and the same backend
+    ## connection and password. The chart places such a container ahead of its
+    ## own wait for the database, so on a first install it fails until the
+    ## bootstrap migration Job has provisioned the schema and the cluster
+    ## retries it; once the schema is there it succeeds and the gateway starts.
+    ## The import adds and updates each service, route and plugin under an id
+    ## Kong derives from its name, so a re-run writes the same rows again; it
+    ## removes nothing, so a route whose connection is removed stays in the
+    ## database until it is deleted through the Admin API. The step reads no
+    ## model credential: the routes hold a reference to one, which only the
+    ## gateway resolves.
+    {{- if $wired }}
+    deployment:
+      initContainers:
+        - name: model-routes
+          image: "{{ $image }}"
+          args: [kong, config, db_import, "{{ $routesDir }}/{{ .locals.model_routes_file }}"]
+          env:
+            - name: KONG_DATABASE
+              value: postgres
+            - name: KONG_PG_HOST
+              value: "{{ $backend.provides.host }}"
+            - name: KONG_PG_PORT
+              value: "{{ $backend.provides.port }}"
+            - name: KONG_PG_USER
+              value: "{{ $backend.provides.user }}"
+            - name: KONG_PG_DATABASE
+              value: "{{ $backend.provides.database }}"
+            - name: KONG_PG_PASSWORD
+              {{- if hasKey (default dict $backend.features) "credential" }}
+              valueFrom:
+                secretKeyRef:
+                  name: "{{ $backend.features.credential.provides.name }}"
+                  key: "{{ $backend.features.credential.provides.key }}"
+              {{- else }}
+              value: "{{ $devPassword }}"
+              {{- end }}
+          volumeMounts:
+            - name: model-routes
+              mountPath: "{{ $routesDir }}"
+              readOnly: true
+      userDefinedVolumes:
+        - name: model-routes
+          configMap:
+            name: "{{ .context.rendered_name }}{{ .locals.model_routes_config_map_suffix }}"
+    {{- end }}
+
+    ## Each models connection carrying a credential delivers it as
+    ## AI_PROXY_<ALIAS>_API_KEY, bound by NAME to the secret its attachment
+    ## publishes, and composes AI_PROXY_<ALIAS>_AUTHORIZATION from it, the
+    ## bearer token the connection's routes read through Kong's environment
+    ## vault. The chart writes its environment in name order, so the credential
+    ## variable comes before the token, and the cluster composes the token from
+    ## it; neither carries the value in the rendered artifact.
+    {{- with $credentialed }}
+    customEnv:
+      {{- range $alias := . }}
+      {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+      {{- $credential := (get $.context.uses $alias).features.credential }}
+      {{ $.locals.connection_variable_prefix }}{{ $name }}{{ $.locals.credential_variable_suffix }}:
+        valueFrom:
+          secretKeyRef:
+            name: "{{ $credential.provides.name }}"
+            key: "{{ $credential.provides.key }}"
+      {{ $.locals.connection_variable_prefix }}{{ $name }}{{ $.locals.header_variable_suffix }}: "Bearer $({{ $.locals.connection_variable_prefix }}{{ $name }}{{ $.locals.credential_variable_suffix }})"
+      {{- end }}
+    {{- end }}
 
     ## ── Schema migrations ──────────────────────────────────────
     ## The three steps the product's own maintainers sequence around a release.

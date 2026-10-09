@@ -10,27 +10,27 @@ metadata:
   description: >
     Kong, a database-backed API gateway, on Kubernetes via the helm provider's
     Workload synthesis (a stateless Deployment plus a ClusterIP Service on the
-    proxy port). Kong holds no local state — the PostgreSQL backend is the
-    system of record — so it renders stateless. The backend identity (host,
-    port, user, database) arrives on .context.inject.env under the four
-    KONG_PG_* variables the `backend` edge's inject block names, and composes
-    Kong's connection; an edge leaving any of them missing halts the build
-    naming the edge and the variables. A migrations step runs to completion
-    before the gateway serves, provisioning the database schema against the
-    same backend and credentials. The connection is rendered password-free
-    where possible: with no credential on the backend connection the Recipe
-    uses an inline development default, and with one attached the password is
-    supplied on KONG_PG_PASSWORD via the credential subsystem. provides.host is
-    the bare, self-contained in-cluster service name of the synthesized Service
-    — it carries no namespace, so the recipe is independent of where it is
-    deployed. A consumer in another namespace qualifies the host with the
-    target namespace on its own side (caller-side routing). Reach for this
-    realization where the build must complete with nothing fetched, or where no
-    chart repository is reachable from it; reach for `kong-chart`, which renders
-    the official Kong chart, where the gateway will be upgraded in place — that
-    realization sequences an up-migration before an upgrade and a finishing
-    migration after it, neither of which a workload with a bootstrap step ahead
-    of it can express.
+    proxy port). The PostgreSQL backend is the system of record, so the gateway
+    renders stateless. Its host,
+    port, user and database arrive on .context.inject.env under the four
+    KONG_PG_* variables the `backend` edge's inject block names; an edge leaving
+    any missing halts the build naming the edge and the variables. A migrations
+    step runs to completion before the gateway serves. With no credential on
+    the backend connection the Recipe uses an inline development default; with
+    one, KONG_PG_PASSWORD comes from the credential subsystem.
+
+    Each model wired to the models socket gets a chat and a completion route
+    through Kong's AI proxy, written as Kong's declarative configuration in a
+    ConfigMap that a second step imports into the database before the gateway
+    starts. A connection's credential arrives as an env secretKeyRef and the
+    routes name it through Kong's environment vault, so no credential value is
+    in the rendered output.
+
+    provides.host is the bare in-cluster Service name, with no namespace; a
+    consumer in another namespace qualifies it on its own side. Reach for this
+    realization where the build must complete with nothing fetched; reach for
+    `kong-chart` where the gateway will be upgraded in place, since it migrates
+    the schema on either side of an upgrade.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -39,15 +39,66 @@ spec:
   implements: core/gateway/kong:1.0.0
   # This Recipe reads no infra.overrides keys.
   #
+  # The entries below are the values the workload shares with the
+  # KongModelRoutes bundle imported for the gateway's model routes. Each has
+  # its home in the bundle, which stops the build naming the local when one is
+  # missing or differs from its own; the workload reads them here, because a
+  # workload cannot read the bundle. model_routes_delivery has the bundle emit
+  # one ConfigMap. model_routes_file is the file that ConfigMap carries the
+  # routes as and the file the import step reads. The ConfigMap is named after
+  # the rendered name followed by model_routes_config_map_suffix; a locals
+  # entry cannot read the rendered name, so the volume composes the two. A
+  # models connection's credential reaches the gateway under two variables,
+  # both named after the connection's alias in capitals with every character
+  # other than a letter or a digit as an underscore, between the fixed parts
+  # here: the connection fast carrying a credential gives
+  # AI_PROXY_FAST_API_KEY, which holds the credential, and
+  # AI_PROXY_FAST_AUTHORIZATION, which the workload composes from it as the
+  # bearer token and the connection's routes name through Kong's environment
+  # vault. A locals entry cannot read a connection, so the workload applies
+  # the alias rule itself, once.
+  locals:
+    model_routes_delivery: config_map
+    model_routes_file: model-routes.yaml
+    model_routes_config_map_suffix: "-model-routes"
+    connection_variable_prefix: AI_PROXY_
+    credential_variable_suffix: _API_KEY
+    header_variable_suffix: _AUTHORIZATION
   # provides.host is the bare Service name "<rendered_name>-default" — the helm
   # provider names the synthesized ClusterIP Service "<rendered_name>-<service-key>"
   # (here "<rendered_name>-default"), with no namespace segment. A same-namespace
   # consumer reaches it under this name directly; a cross-namespace consumer
   # qualifies it with the target namespace caller-side.
+  #
+  # endpoint is the route the gateway serves for the model values.model names,
+  # under that alias in the path, on the same Service name and port as host and
+  # port; model is that alias. The two spell the Service name out again on
+  # purpose: a provides entry cannot read another provides entry, so the
+  # repetition is forced, and the entries are edited together. With nothing
+  # wired to the models socket values.model is omitted — the component's
+  # assertion halts on any other combination — and both are empty.
   provides:
     host: "{{ .context.rendered_name }}-default"
     port: "{{ .infra.proxy_port }}"
     protocol: "http"
+    endpoint: '{{ with optional .values "model" "" }}http://{{ $.context.rendered_name }}-default:{{ $.infra.proxy_port }}/{{ . }}/v1{{ end }}'
+    model: '{{ optional .values "model" "" }}'
+  # The models the gateway serves, as Kong's own declarative configuration,
+  # from the KongModelRoutes bundle every Recipe running this gateway imports,
+  # so the routes and the rules they are written by have one text wherever the
+  # gateway runs; the import step below loads them into the backend database.
+  # Each connection on the models socket gets a chat and a completion route
+  # under its alias, through Kong's AI proxy to the endpoint and the model name
+  # the model publishes, and one carrying a credential has its routes name
+  # AI_PROXY_<ALIAS>_AUTHORIZATION through Kong's environment vault, never the
+  # value. With model_routes_delivery set to config_map the bundle emits one
+  # ConfigMap, "<rendered_name>-model-routes", carrying the routes as
+  # model_routes_file; with nothing wired to the models socket it emits
+  # nothing. The bundle stops the build when a local above differs from its
+  # own side.
+  artifacts:
+    model-routes:
+      $import: KongModelRoutes#/artifacts/ModelRoutes
   workload: |
     {{- /* Kong's Status API port: the product's own default. It is the single
            authored home for the listen address below, the container port and
@@ -81,6 +132,18 @@ spec:
     {{- $backendCredential = $alias -}}
     {{- end -}}
     {{- end -}}
+    {{- /* The models connections, in alias order, and those of them carrying a
+           credential, each with the two variables its credential reaches the
+           gateway under: the alias in capitals with every character other
+           than a letter or a digit as an underscore, between the fixed parts
+           the locals hold. The rule is applied here once, and every variable
+           below reads it. The import step below runs only while a connection
+           is wired; the directory the routes file is mounted at is the single
+           authored home for the mount and the path the step reads. */ -}}
+    {{- $wired := list -}}
+    {{- $credentialed := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "models" }}{{ $wired = append $wired $alias }}{{ if hasKey (default dict $edge.features) "credential" }}{{ $name := printf "%s%s" $.locals.connection_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_") }}{{ $credentialed = append $credentialed (dict "alias" $alias "credential" (printf "%s%s" $name $.locals.credential_variable_suffix) "header" (printf "%s%s" $name $.locals.header_variable_suffix)) }}{{ end }}{{ end }}{{ end -}}
+    {{- $routesDir := "/etc/kong/model-routes" -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # Kong holds no durable state — the PostgreSQL backend is the system of
@@ -94,6 +157,17 @@ spec:
     # differ (the image default entrypoint with `migrations bootstrap`). The
     # bootstrap is idempotent, so a re-run against an already-provisioned
     # database is a no-op.
+    #
+    # While the models socket holds a connection, a second step runs after the
+    # bootstrap and before the gateway: it imports the routes ConfigMap the
+    # artifact above emits into the same database, with the same image, backend
+    # connection and password. Init containers run one after the other, in this
+    # order, so the import meets a provisioned schema. The import adds and
+    # updates each service, route and plugin under an id Kong derives from its
+    # name, so a re-run writes the same rows again; it removes nothing, so a
+    # route whose connection is removed stays in the database until it is
+    # deleted through the Admin API. The step reads no model credential: the
+    # routes hold a reference to one, which only the gateway resolves.
     initContainers:
       - image: "kong:{{ .infra.engine_version }}"
         args: [kong, migrations, bootstrap]
@@ -113,20 +187,61 @@ spec:
             from: credential
             as: env
     {{- end }}
+    {{- if $wired }}
+      - image: "kong:{{ .infra.engine_version }}"
+        args: [kong, config, db_import, "{{ $routesDir }}/{{ .locals.model_routes_file }}"]
+        variables:
+          KONG_DATABASE: postgres
+          KONG_PG_HOST: "{{ $env.KONG_PG_HOST }}"
+          KONG_PG_PORT: "{{ $env.KONG_PG_PORT }}"
+          KONG_PG_USER: "{{ $env.KONG_PG_USER }}"
+          KONG_PG_DATABASE: "{{ $env.KONG_PG_DATABASE }}"
+    {{- if not $backendCredential }}
+          KONG_PG_PASSWORD: apppass
+    {{- end }}
+    {{- with $backendCredential }}
+        attachments:
+          KONG_PG_PASSWORD:
+            connection: "{{ . }}"
+            from: credential
+            as: env
+    {{- end }}
+        volumeMounts:
+          - name: model-routes
+            path: "{{ $routesDir }}"
+            readonly: true
+    {{- end }}
     containers:
       main:
         image: "kong:{{ .infra.engine_version }}"
-        # No command/args override — the image default entrypoint runs
-        # `kong docker-start`. The backend identity resolved from the `backend`
-        # uses-edge arrives on the inject pipe (.context.inject.env), read above
-        # as $env, and composes the KONG_PG_* connection. KONG_PG_PASSWORD is
-        # delivered via the optional credential on the `backend` connection
-        # (env secret when attached) or an inline development default when
-        # unattached.
+        # The image default entrypoint runs `kong docker-start`. The backend
+        # identity resolved from the `backend` uses-edge arrives on the inject
+        # pipe (.context.inject.env), read above as $env, and composes the
+        # KONG_PG_* connection. KONG_PG_PASSWORD is delivered via the optional
+        # credential on the `backend` connection (env secret when attached) or
+        # an inline development default when unattached.
         # The admin API listens in-cluster only — the synthesized Service is a
         # ClusterIP. The read-only Status API listens on loopback by default;
         # it is bound on every address so the kubelet can reach it, and no
         # Service publishes it.
+        #
+        # Each models connection carrying a credential delivers it below as
+        # AI_PROXY_<ALIAS>_API_KEY, an env secretKeyRef, and its routes read
+        # AI_PROXY_<ALIAS>_AUTHORIZATION, the bearer token Kong presents, which
+        # has to hold the whole header value. The cluster composes one variable
+        # from another only when the other is declared before it, and a
+        # workload's variables are declared before the credentials it delivers,
+        # so the token is composed as the container starts: a shell exports it
+        # from the delivered variable and hands over to the image's own
+        # entrypoint and command. The arguments name the variables and never a
+        # value. With no credential on a models connection the image's own
+        # command runs unchanged.
+    {{- with $credentialed }}
+        args:
+          - /bin/sh
+          - -c
+          - '{{ range . }}export {{ .header }}="Bearer ${{ .credential }}" && {{ end }}exec /docker-entrypoint.sh kong docker-start'
+    {{- end }}
         variables:
           KONG_DATABASE: postgres
           KONG_PG_HOST: "{{ $env.KONG_PG_HOST }}"
@@ -139,10 +254,18 @@ spec:
     {{- if not $backendCredential }}
           KONG_PG_PASSWORD: apppass
     {{- end }}
-    {{- with $backendCredential }}
+    {{- if or $backendCredential $credentialed }}
         attachments:
+    {{- end }}
+    {{- with $backendCredential }}
           KONG_PG_PASSWORD:
             connection: "{{ . }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- range $credentialed }}
+          {{ .credential }}:
+            connection: "{{ .alias }}"
             from: credential
             as: env
     {{- end }}
@@ -175,6 +298,12 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+    {{- if $wired }}
+    volumes:
+      model-routes:
+        configmap:
+          source: "{{ .context.rendered_name }}{{ .locals.model_routes_config_map_suffix }}"
+    {{- end }}
     services:
       default:
         type: ClusterIP

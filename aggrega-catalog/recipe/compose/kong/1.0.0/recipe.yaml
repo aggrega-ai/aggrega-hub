@@ -9,28 +9,30 @@ metadata:
   license: Apache-2.0
   description: >
     Kong, a database-backed API gateway, for local development via Docker
-    Compose, synthesized from the Workload kind by the compose provider. It
-    holds no local state — the PostgreSQL backend wired on the `backend` edge is
-    the system of record — so it renders stateless with no volume. The
-    connection's host, port, user and database arrive on the inject pipe under
-    the four KONG_PG_* variables the backend edge's inject block names; an edge
-    leaving any of them missing halts the build naming the edge and the
-    variables. A schema-provisioning step runs the same image with the same
-    connection and password before the gateway starts; the bootstrap is
-    idempotent.
+    Compose, synthesized from the Workload kind by the compose provider. The
+    PostgreSQL backend on the `backend` edge is the system of record, so it
+    renders stateless with no volume. The connection's host, port, user and
+    database arrive on the inject pipe under the four KONG_PG_* variables the
+    edge's inject block names; an edge leaving any missing halts the build
+    naming the edge and the variables. A schema-provisioning step runs the same
+    image and connection before the gateway starts. On a cold host it may run
+    before the backend accepts connections: no service is ordered after the
+    backend, and no readiness wait is hidden in a command line.
 
-    On a cold host the provisioning step may run before the backend accepts
-    connections: the rendered gateway service waits on the provisioning step
-    having completed, and neither service is ordered after the backend, and no
-    readiness wait is hidden in a command line to compensate.
+    With no credential on the backend connection, the steps and the gateway
+    share the inline development default the PostgreSQL Recipe for this target
+    also falls back to; an attached one is rendered as KONG_PG_PASSWORD, the key
+    it must publish under. Nothing is published to the host; the replica count
+    is reported as an unsupported-field warning. provides.host is the compose
+    service name.
 
-    With no credential on the backend connection, the step and the gateway
-    share an inline development default the PostgreSQL Recipe for this target
-    also falls back to; an attached one is rendered as the plain
-    KONG_PG_PASSWORD environment variable on both, the key it must publish
-    under. Nothing is published to the host, and the replica count is reported
-    as an unsupported-field warning. provides.host is the compose service name,
-    which a consumer on the same compose network resolves directly.
+    Each model wired to the models socket gets a chat and a completion route
+    through Kong's AI proxy, in Kong's declarative configuration that a second
+    step imports into the database before the gateway starts. A connection's
+    credential is the value it publishes as AI_PROXY_<ALIAS>_API_KEY, written
+    into the bearer token the routes name through Kong's environment vault: a
+    Compose variable reference such as ${OPENAI_API_KEY} lands as that
+    reference, a literal as itself.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -51,10 +53,56 @@ spec:
   # service, which is the component instance's own name, where the Kubernetes
   # realization names its Service after the instance and the service key. A
   # consumer on the same compose network resolves it directly.
+  #
+  # endpoint is the route the gateway serves for the model values.model names,
+  # under that alias in the path, on the same service name and port; model is
+  # that alias. With nothing wired to the models socket values.model is
+  # omitted — the component's assertion halts on any other combination — and
+  # both are empty.
   provides:
     host: "{{ .context.instance_id }}"
     port: "{{ .infra.proxy_port }}"
     protocol: "http"
+    endpoint: '{{ with optional .values "model" "" }}http://{{ $.context.instance_id }}:{{ $.infra.proxy_port }}/{{ . }}/v1{{ end }}'
+    model: '{{ optional .values "model" "" }}'
+  # The entries below are the values the workload shares with the
+  # KongModelRoutes bundle imported for the gateway's model routes. Each that
+  # the bundle reads has its home in the bundle, which stops the build naming
+  # the local when one is missing or differs from its own; the workload reads
+  # them here, because a workload cannot read the bundle.
+  # model_routes_delivery has the bundle emit one compose config, named
+  # model_routes_config_name, which the volume sources; model_routes_path, the
+  # file it is mounted as and the import step reads, is this Recipe's own,
+  # since a compose config carries no file name. A models connection's
+  # credential reaches the gateway as AI_PROXY_<ALIAS>_AUTHORIZATION, the
+  # bearer token its routes name, composed from the value the credential
+  # publishes as AI_PROXY_<ALIAS>_API_KEY — the connection's alias in capitals
+  # with every character other than a letter or a digit as an underscore,
+  # between the fixed parts here. A locals entry cannot read a connection, so
+  # the workload applies the alias rule itself, once.
+  locals:
+    model_routes_delivery: compose_configs
+    model_routes_config_name: "{{ .context.instance_id }}-model-routes"
+    model_routes_path: /etc/kong/model-routes.yaml
+    connection_variable_prefix: AI_PROXY_
+    credential_variable_suffix: _API_KEY
+    header_variable_suffix: _AUTHORIZATION
+  # The models the gateway serves, as Kong's own declarative configuration,
+  # from the KongModelRoutes bundle every Recipe running this gateway imports,
+  # so the routes and the rules they are written by have one text wherever the
+  # gateway runs; the import step below loads them into the backend database.
+  # Each connection on the models socket gets a chat and a completion route
+  # under its alias, through Kong's AI proxy to the endpoint and the model name
+  # the model publishes, and one carrying a credential has its routes name
+  # AI_PROXY_<ALIAS>_AUTHORIZATION through Kong's environment vault, never the
+  # value. With model_routes_delivery set to compose_configs the bundle
+  # declares one compose config, named model_routes_config_name, writing every
+  # $ in a string a model publishes as $$, the compose file's spelling of a
+  # literal $; with nothing wired to the models socket it declares nothing. The
+  # bundle stops the build when a local above differs from its own side.
+  artifacts:
+    model-routes:
+      $import: KongModelRoutes#/artifacts/ModelRoutes
   # Synthesized-mode Workload: the image, the environment, the exposed port and
   # the schema-provisioning step are translated from the Workload kind by the
   # compose provider.
@@ -108,6 +156,27 @@ spec:
     {{- range $alias, $edge := .context.uses -}}
     {{- if and (eq $edge.socket "backend") (hasKey (default dict $edge.features) "credential") -}}
     {{- $backendCredential = true -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /* The models connections, in alias order, and those of them carrying a
+           credential. A connection's credential arrives on the inject pipe as
+           the value it publishes, under AI_PROXY_<ALIAS>_API_KEY; one that
+           publishes it under any other name would leave the bearer token
+           empty with every request still sent, so the build halts naming the
+           connection and the name. */ -}}
+    {{- $wired := list -}}
+    {{- $tokens := list -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- if eq $edge.socket "models" -}}
+    {{- $wired = append $wired $alias -}}
+    {{- if hasKey (default dict $edge.features) "credential" -}}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" -}}
+    {{- $keyVar := printf "%s%s%s" $.locals.connection_variable_prefix $name $.locals.credential_variable_suffix -}}
+    {{- if not (hasKey $env $keyVar) -}}
+    {{- fail (printf "the models connection %s of %q carries a credential, but its inject pipe holds nothing named %s, the name this Recipe reads that credential under; publish it under %s, which with core/secret-value is values.key" $alias $.context.instance_id $keyVar $keyVar) -}}
+    {{- end -}}
+    {{- $tokens = append $tokens (dict "name" (printf "%s%s%s" $.locals.connection_variable_prefix $name $.locals.header_variable_suffix) "value" (index $env $keyVar)) -}}
+    {{- end -}}
     {{- end -}}
     {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
@@ -167,6 +236,35 @@ spec:
     {{- else }}
           KONG_PG_PASSWORD: "{{ $devPassword }}"
     {{- end }}
+    #
+    # While the models socket holds a connection, a second step imports the
+    # routes config the artifact above declares into the same database, with
+    # the same image, backend connection and password. The entry is named so
+    # its service is named for its job. The import adds and updates each
+    # service, route and plugin under an id Kong derives from its name, so a
+    # re-run writes the same rows again; it removes nothing, so a route whose
+    # connection is removed stays in the database until it is deleted through
+    # the Admin API. The step reads no model credential: the routes hold a
+    # reference to one, which only the gateway resolves.
+    {{- if $wired }}
+      - name: model-routes
+        image: "kong:{{ .infra.engine_version }}"
+        args: [kong, config, db_import, "{{ .locals.model_routes_path }}"]
+        variables:
+          KONG_DATABASE: postgres
+          KONG_PG_HOST: "{{ $env.KONG_PG_HOST }}"
+          KONG_PG_PORT: "{{ $env.KONG_PG_PORT }}"
+          KONG_PG_USER: "{{ $env.KONG_PG_USER }}"
+          KONG_PG_DATABASE: "{{ $env.KONG_PG_DATABASE }}"
+    {{- if $backendCredential }}
+          KONG_PG_PASSWORD: "{{ .context.inject.env.KONG_PG_PASSWORD }}"
+    {{- else }}
+          KONG_PG_PASSWORD: "{{ $devPassword }}"
+    {{- end }}
+        volumeMounts:
+          - name: model-routes
+            path: "{{ .locals.model_routes_path }}"
+    {{- end }}
     containers:
       main:
         image: "kong:{{ .infra.engine_version }}"
@@ -189,6 +287,12 @@ spec:
           KONG_PG_PASSWORD: "{{ .context.inject.env.KONG_PG_PASSWORD }}"
     {{- else }}
           KONG_PG_PASSWORD: "{{ $devPassword }}"
+    {{- end }}
+    {{- /* Each models connection carrying a credential: the bearer token its
+           routes read through Kong's environment vault, composed from the
+           value the credential published, written as it was delivered. */ -}}
+    {{- range $tokens }}
+          {{ .name }}: {{ printf "Bearer %s" .value | toJson }}
     {{- end }}
         ports:
           tcp: {{ .infra.proxy_port }}
@@ -219,6 +323,12 @@ spec:
     # name and the port straight from the edge. Nothing is published to the
     # host, so neither the proxy port nor the admin API is reachable from
     # outside the network on this target.
+    {{- if $wired }}
+    volumes:
+      model-routes:
+        configmap:
+          source: "{{ .locals.model_routes_config_name }}"
+    {{- end }}
     services:
       default:
         type: ClusterIP

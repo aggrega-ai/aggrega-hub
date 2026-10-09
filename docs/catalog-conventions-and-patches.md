@@ -396,14 +396,22 @@ Three rules bind it:
   because the gateway describes a wired model to its proxy through the OpenAI
   API alone; the message names the connection and points at the gateway's
   hand-typed `values.models`, which takes such a provider in the proxy's own
-  provider/model notation.
+  provider/model notation. `core/gateway/kong`'s `models` socket selects the
+  same and its Component's assertion halts the same way, because it writes each
+  wired model's route through Kong's AI proxy for the OpenAI API alone.
 - **A component carrying the key publishes what a model publishes:** `endpoint`
   and `model` in its `provides`, the two keys a consumer's Recipe reads off a
   model edge. One that published no `model` would hand its
   consumers an empty model name, and no build would report it. A gateway
   publishes one alias of its model map as its `model`, named by a value of its
   own and checked against the map by an assertion on its Component, so the order
-  of the map never decides what a consumer asks for.
+  of the map never decides what a consumer asks for. A gateway whose every
+  model is wired to a socket — `core/gateway/kong`, whose `values.model` names
+  one of its `models` connections — serves none while nothing is wired there and
+  then publishes both keys empty; it carries the key all the same, since the
+  value names what the product serves rather than what one Release wires, so a
+  consumer wired to it in that state reads an empty address and model name, and
+  no build reports it.
 - **A value is read off the product's own reference** — the routes the server
   the Recipes pin registers, or the API its documentation names — and is added
   in the same act as the first component to carry it, as with every label family
@@ -411,8 +419,8 @@ Three rules bind it:
   whose endpoint an operator may repoint keeps the value of the product it
   describes.
 
-Components today: `core/gateway/litellm` carries `openai`, as do
-`core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
+Components today: `core/gateway/litellm` and `core/gateway/kong` carry `openai`,
+as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
 `openai-embedding`, `nvidia-api` and `openai-compatible` — the broker, whose
 whole contract is to be pointed at a service speaking that API, and which stays
 the handle for an endpoint the catalog does not model. Every other
@@ -2016,7 +2024,11 @@ and the variable it is delivered as. The `core/ai-agent` Components that reach
 a model declare it on their `model` socket, and their Recipes deliver it as
 `OPENAI_API_KEY`; a platform presenting a password to the datastore on its
 `backend` socket declares it there — `core/gateway/kong`, whose Recipes deliver
-it as `KONG_PG_PASSWORD` — as do the cache and object-store sockets of
+it as `KONG_PG_PASSWORD`, and which declares it on its `models` socket as well,
+for the key it presents to each model it serves, delivered as
+`AI_PROXY_<ALIAS>_API_KEY` and presented as the bearer token
+`AI_PROXY_<ALIAS>_AUTHORIZATION` that the connection's routes read through
+Kong's environment vault — as do the cache and object-store sockets of
 `core/observability/langfuse`, the sandbox and plugin-runtime sockets of
 `core/ai-agent/dify`, and the media-server socket of
 `core/messaging/livekit-sip`, where the slot is `required`. `core/gateway/litellm`

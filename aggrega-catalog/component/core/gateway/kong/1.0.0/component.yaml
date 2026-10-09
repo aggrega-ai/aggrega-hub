@@ -8,29 +8,41 @@ metadata:
   version: 1.0.0
   license: Apache-2.0
   description: >
-    Kong, a database-backed API gateway. Kong terminates client traffic on its
-    proxy data-plane and routes it according to configuration held in a
-    PostgreSQL backend wired through its `backend` uses-socket: the backend
-    host, port, user, and database arrive on the injection context and compose
-    Kong's PostgreSQL connection. The database schema is provisioned by a
-    migrations step that runs to completion before the gateway begins serving,
-    so the gateway starts against a ready schema. Kong holds no persistent state
-    of its own — the database is the system of record — so it renders as a
-    stateless server. Exports its proxy host, port, and protocol to consumers
-    via the uses topology.
+    Kong, a database-backed API gateway. It routes client traffic by
+    configuration held in the PostgreSQL backend wired to its `backend` socket,
+    whose host, port, user and database compose Kong's connection; a migrations
+    step provisions the schema before the gateway serves. The database is the
+    system of record, so Kong renders as a stateless server. It publishes its
+    proxy host, port and protocol.
 
-    On Kubernetes there are two realizations and the Manifest chooses between
-    them. `kong` synthesizes the gateway as a workload with a bootstrap step
-    ahead of it and fetches nothing, so it is the one to reach for where the
-    build must complete with no chart repository reachable. `kong-chart` renders
-    the official Kong Helm chart, which sequences three schema-migration steps
-    around a release rather than one ahead of a start — a bootstrap, an
-    up-migration before an upgrade and a finishing migration after it — so reach
-    for it where the gateway will be upgraded in place.
+    It also serves models: each one wired to its models socket gets a route
+    through Kong's AI proxy, at /<alias>/v1 under the connection's alias, sent
+    to the endpoint and model name the model publishes and presenting that
+    connection's credential. The routes are imported into the database before
+    the gateway starts, and stay there when a connection is removed. It
+    publishes values.model's route as its endpoint and that alias as its model,
+    so an agent's model socket takes it in place of a model; with nothing wired
+    both are empty.
+
+    On Kubernetes the Manifest chooses between two realizations. `kong`
+    synthesizes a workload with its bootstrap steps ahead of it and fetches
+    nothing, for a build with no chart repository reachable. `kong-chart`
+    renders the official Kong Helm chart, which also migrates the schema on
+    either side of an upgrade, for a gateway upgraded in place.
   labels:
     component.aggrega.ai/type: server
     component.aggrega.ai/category: gateway
     component.aggrega.ai/upstream-licensing: osi-approved
+    # Model API: the endpoint this gateway publishes answers the OpenAI API —
+    # the chat and completion routes its AI proxy serves for each model wired
+    # to its models socket, under that connection's alias in the path — so a
+    # consumer drives it with an OpenAI client whichever model answers behind
+    # it. It is what lets a model socket selecting this key admit the gateway
+    # beside the models themselves; the gateway publishes the endpoint and the
+    # model name such a socket's consumers read. The value names what the
+    # product serves, not a configured state: with nothing wired to the models
+    # socket the gateway serves no model, and both of those are empty.
+    model.aggrega.ai/api: openai
     # Data-path capability label. It states what this gateway is able to do,
     # never what a given Release has switched on — the two read alike to a
     # developer and only the first is a property of the product.
@@ -77,11 +89,71 @@ spec:
           sensitive: true
           inject: [env]
           description: "Optional password the gateway presents to the backend this connection reaches, shared with that backend. When attached, supplies the backend password via the credential subsystem; unattached, the Recipe uses its inline default."
+    # The models the gateway serves through its AI proxy, each wired as a
+    # connection: any ai-model Component, managed or self-hosted, one or
+    # several. Each connection becomes one service with a chat route at
+    # /<alias>/v1/chat/completions and a completion route at
+    # /<alias>/v1/completions, sent to the endpoint the model publishes and
+    # asking for the model name it publishes — pointers the compiler pipes into
+    # the configuration and never resolves. A route asks for the model it was
+    # written for whatever model name a request carries, so the path chooses the
+    # model. The gateway writes a wired model's route for the OpenAI API alone,
+    # so a connection whose target's model.aggrega.ai/api is not openai halts
+    # the build, naming it. The alias names the route's path and the service and
+    # routes in Kong; every character an alias can carry is one Kong accepts in
+    # both.
+    #
+    # Every Recipe imports the routes into the backend database in a step that
+    # runs after the schema is provisioned and before the gateway starts, so the
+    # Component's database contract is unchanged. The import adds and updates
+    # rows and removes none: a route whose connection is removed stays in the
+    # database, and keeps answering, until it is deleted through the Admin API.
+    #
+    # The credential the gateway presents to a wired model is the one its
+    # connection carries in the credential slot, sent as a bearer token in the
+    # Authorization header; the configuration names the variable holding it
+    # through Kong's environment vault, never the value, and it replaces any
+    # Authorization header the request carried. A connection carrying none adds
+    # no credential, and the request's own headers pass on as they came. A
+    # connection to a target labelled
+    # component.aggrega.ai/hosting: managed with no credential halts the build
+    # unless its values set unauthenticated: true. A self-hosted server that
+    # checks a key holds it in a slot of its own, and its connection carries a
+    # credential holding the same key.
+    #
+    # Optional: with nothing wired, the gateway serves no model and its
+    # rendered output is the same as a gateway without this socket.
+    models:
+      selector: "component.aggrega.ai/category=ai-model"
+      valueSchema:
+        unauthenticated:
+          type: boolean
+          default: false
+          description: Declares that the model this connection reaches takes no credential, so a connection carrying none is intended rather than an omission. It changes nothing this component renders.
+      featuresSchema:
+        credential:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [env]
+          description: "Optional credential the gateway presents to the model this connection reaches, as a bearer token. When attached, the Recipe delivers it as AI_PROXY_<ALIAS>_API_KEY, the connection's alias in capitals with every character other than a letter or a digit as an underscore — a Kubernetes secretKeyRef on helm, the value the credential publishes under that name on the inject pipe on compose — and the connection's route reads the token through Kong's environment vault, naming the variable rather than the value. Unattached, the route adds no credential."
 
   schema:
-    # Kong needs no developer values; the backend user and database arrive on
-    # the `backend` uses-edge.
-    values: {}
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate. The backend
+      # user and database arrive on the `backend` uses-edge.
+      #
+      # The alias this gateway publishes as its model. A component wired to the
+      # gateway's address over a model socket — an agent, a tool, a memory store
+      # — reads one endpoint and one model name off the edge, the same keys a
+      # model publishes; the endpoint is this alias's route and the model name
+      # is the alias. A Recipe writes the gateway's published values from what
+      # the gateway itself was given, which holds none of its connections, so
+      # the published alias is named here rather than taken from the socket:
+      # with a connection on the models socket this value is required, and with
+      # none it is omitted.
+      model:
+        type: string
+        description: The alias of a connection on the models socket that this gateway publishes as its model, and whose route its published endpoint addresses. It must be an alias a models connection carries, and the build halts naming this value otherwise; it is required while the models socket holds a connection, and omitted while it holds none.
     infra:
       # Operational Sizing — filled by the Operator in the Release. Developer
       # never sees this.
@@ -134,17 +206,92 @@ spec:
       protocol:
         type: string
         description: How the published address is spoken to — `http`, so a consumer composes an address on that scheme.
+      # endpoint and model together are the contract every model component
+      # publishes, which is what lets a model socket take this gateway in place
+      # of a model with its consumer's Recipe unchanged. Neither is required:
+      # with nothing wired to the models socket the gateway serves no model and
+      # publishes both empty.
+      endpoint:
+        type: string
+        description: >
+          Full base URL of the OpenAI-compatible API the gateway serves for the
+          model values.model names, with the host, the port and that alias's
+          route already composed. A caller hands it to a client library as its
+          base URL. Every other wired model is served at the same host and port
+          under its own alias in the path. Empty while nothing is wired to the
+          models socket.
+      model:
+        type: string
+        description: >
+          The alias a consumer wired to the gateway sends as its model name:
+          values.model. The route behind the endpoint asks for the model it was
+          written for whatever name a request carries. Empty while nothing is
+          wired to the models socket.
 
-  # A connection to a target its catalog labels a managed service
-  # (component.aggrega.ai/hosting: managed) carries a credential, or says on the
-  # connection that its target takes none. The rule reads the target's labels,
-  # the connection's unauthenticated value and its credential slot, all known
-  # before a Recipe binds, so it holds whichever Recipe renders this component;
-  # a self-hosted target draws nothing. The list names every socket of this
-  # component that declares unauthenticated.
+  # The rules of the models socket, and the credential rule every socket
+  # declaring unauthenticated carries. Each reads what the Aggregate and the
+  # Release wrote — the values, and each connection's target labels, values and
+  # attachments — all known before a Recipe binds, so each holds whichever
+  # Recipe renders this component and halts before anything renders.
   assertions:
+    # The model the gateway publishes must be one it serves. values.model names
+    # the alias of a connection on the models socket, and is required while the
+    # socket holds one, because the published values are written from what the
+    # gateway was given and a connection is not among it. With nothing wired, a
+    # value naming an alias names a route the gateway does not serve.
+    published_model_is_a_wired_alias: >-
+      {{- $wired := sortAlpha (keys (optional .uses "models" dict)) -}}
+      {{- with optional .values "model" "" -}}
+      {{- if not (has . $wired) -}}
+      {{- if $wired -}}
+      {{- fail (printf "values.model is %q, but no connection on the models socket carries that alias, so a component wired to this gateway would be sent to a route it does not serve; set values.model to one of the aliases the models socket carries: %s" . (join ", " $wired)) -}}
+      {{- else -}}
+      {{- fail (printf "values.model is %q, but nothing is wired to the models socket, so the gateway serves no model to publish under that alias; wire a model to the models socket under that alias, or remove values.model" .) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- else -}}
+      {{- if $wired -}}
+      {{- fail (printf "values.model is not set, but the models socket carries %s, so the gateway cannot tell which of them a component wired to it asks for, and the alias a connection is served under is not among what its published values are written from; set values.model to one of them" (join ", " $wired)) -}}
+      {{- end -}}
+      {{- end -}}
+    # A wired model's route is written from the endpoint and the model name the
+    # model publishes, for the AI proxy to reach over the OpenAI API, which is
+    # what model.aggrega.ai/api: openai asserts answers at that endpoint. A
+    # model whose API is another needs the proxy's own settings for that
+    # provider, which nothing the model publishes names, so it halts rather
+    # than being written as a guess.
+    wired_model_speaks_the_openai_api: >-
+      {{- range $alias, $connection := (optional .uses "models" dict) -}}
+      {{- $api := optional $connection.labels "model.aggrega.ai/api" "" -}}
+      {{- if ne $api "openai" -}}
+      {{- fail (printf "the models connection %s of %q reaches %q, whose model.aggrega.ai/api is %q, but the gateway writes a wired model's route from the endpoint and model name it publishes for the OpenAI API alone, so it cannot write a route for it; wire a model whose model.aggrega.ai/api is openai instead" $alias $.metadata.instance_id $connection.target $api) -}}
+      {{- end -}}
+      {{- end -}}
+    # Each Recipe names the variables a models connection's credential is
+    # delivered under after the connection's alias in capitals, with every
+    # character other than a letter or a digit as an underscore, so two aliases
+    # that rule maps to one name — fast-a and fast_a — would deliver two
+    # credentials under one variable. It halts, naming both connections.
+    credential_variables_are_distinct: >-
+      {{- $seen := dict -}}
+      {{- range $alias, $connection := (optional .uses "models" dict) -}}
+      {{- if hasKey $connection.features "credential" -}}
+      {{- $variable := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" -}}
+      {{- with get $seen $variable -}}
+      {{- fail (printf "the models connections %s and %s of %q would each deliver their credential under one variable, because the gateway names a connection's variables after its alias in capitals with every character other than a letter or a digit as an underscore; rename one of the two connections" . $alias $.metadata.instance_id) -}}
+      {{- end -}}
+      {{- $_ := set $seen $variable $alias -}}
+      {{- end -}}
+      {{- end -}}
+    # A connection to a target its catalog labels a managed service
+    # (component.aggrega.ai/hosting: managed) carries a credential, or says on
+    # the connection that its target takes none. The rule reads the target's
+    # labels, the connection's unauthenticated value and its credential slot,
+    # all known before a Recipe binds, so it holds whichever Recipe renders this
+    # component; a self-hosted target draws nothing. The list names every
+    # socket of this component that declares unauthenticated.
     managed_target_needs_a_credential: >-
-      {{- range $socket := list "backend" -}}
+      {{- range $socket := list "backend" "models" -}}
       {{- range $alias, $connection := (optional $.uses $socket dict) -}}
       {{- $managed := eq (optional $connection.labels "component.aggrega.ai/hosting" "") "managed" -}}
       {{- $optedOut := optional $connection.values "unauthenticated" false -}}
