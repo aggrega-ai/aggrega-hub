@@ -9,31 +9,33 @@ metadata:
   license: Apache-2.0
   description: >
     Apache APISIX on Kubernetes via the project's own Helm chart, served from
-    its HTTPS chart repository. The configuration store is the etcd component
-    wired on the `etcd` uses-socket, so the chart's bundled etcd and its
-    ingress controller are switched off. It renders a Deployment, ClusterIP
-    Services for the proxy data plane and the Admin API, and the configuration
-    map the gateway reads its runtime configuration from.
+    its HTTPS chart repository, with the chart's bundled etcd and its ingress
+    controller switched off. It renders a Deployment, a ClusterIP Service for
+    the proxy data plane and the configuration map the gateway reads its
+    runtime configuration from.
 
-    The Admin API is never published through provides and is authenticated by
-    the key the `admin_key` credential slot names: the chart reads it from the
-    Secret the attached credential publishes, for its read-only role as well as
-    for the admin one, so none of the gateway's rendered files carries a key and
-    the chart's own default keys are never rendered. Its client allowlist, the
-    chart's
-    `apisix.admin.allow.ipList`, admits every address: what holds it in-cluster
-    is the cluster boundary rather than the list, so narrow the list wherever
-    the admin port is routable from outside the cluster.
+    With nothing wired to the models socket the configuration store is the etcd
+    component wired on the `etcd` socket, and a ClusterIP Service fronts the
+    Admin API, never published through provides and authenticated by the key
+    the `admin_key` slot names: the chart reads it from the Secret the attached
+    credential publishes, for its read-only role as well as the admin one, so
+    no rendered file carries a key. Its client allowlist,
+    `apisix.admin.allow.ipList`, admits every address, so narrow it wherever the
+    admin port is routable from outside the cluster.
 
-    The chart assembles that configuration map from named settings — nginx
-    tuning, the plugin set, the router, DNS and service discovery — where a
+    With a model wired the chart runs in its standalone mode: each connection's
+    routes, through APISIX's AI proxy, sit in a ConfigMap named after the
+    gateway, which reads them with no etcd and no Admin API. A connection's
+    credential arrives as an env secretKeyRef the routes name through APISIX's
+    $env:// reference, so no credential value is in the rendered output.
+
+    The chart assembles that configuration map from named settings where a
     workload carries a hand-written file. Reach for this realization where a
-    chart repository is reachable at build time and the gateway's own
-    configuration is expected to follow the product; reach for `apisix`, the
-    workload-synthesis realization, where the build must complete with nothing
-    fetched. The gateway image and the chart version (source.version,
-    overridden via infra.source_version) are pinned, and provides.host is the
-    proxy data-plane Service name, with no namespace.
+    chart repository is reachable at build time, or a model is served; reach
+    for `apisix`, the workload-synthesis realization, where the build must
+    complete with nothing fetched. The gateway image and the chart version
+    (infra.source_version) are pinned; provides.host is the proxy Service name,
+    with no namespace.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -65,10 +67,115 @@ spec:
   # The name carries no namespace, so the recipe is independent of where it is
   # deployed; a consumer in another namespace qualifies the host with the target
   # namespace on its own side (caller-side routing).
+  #
+  # endpoint is the route the gateway serves for the model values.model names,
+  # under that alias in the path, on the proxy Service name and port; model is
+  # that alias. The Service name is spelled out again on purpose: a provides
+  # entry cannot read another provides entry, so the repetition is forced, and
+  # the entries are edited together. With nothing wired to the models socket
+  # values.model is omitted — the component's assertion halts on any other
+  # combination — and both are empty.
   provides:
     host: "{{ .context.rendered_name }}-gateway"
     port: "{{ .infra.http_port }}"
     protocol: "http"
+    endpoint: '{{ with optional .values "model" "" }}http://{{ $.context.rendered_name }}-gateway:{{ $.infra.http_port }}/{{ . }}/v1{{ end }}'
+    model: '{{ optional .values "model" "" }}'
+
+  # The names the routes ConfigMap below and the value mapping share, each
+  # written once here. The ConfigMap is named after the rendered name followed
+  # by model_routes_config_map_suffix; a locals entry cannot read the rendered
+  # name, so each template composes the two. A models connection's credential
+  # reaches the gateway under two variables, both named after the connection's
+  # alias in capitals with every character other than a letter or a digit as
+  # an underscore, between the fixed parts here: the connection fast carrying a
+  # credential gives AI_PROXY_FAST_API_KEY, which holds the credential, and
+  # AI_PROXY_FAST_AUTHORIZATION, the bearer token composed from it, which the
+  # connection's routes name. A locals entry cannot read a connection, so each
+  # template applies the alias rule itself, the rule the Component's assertion
+  # credential_variables_are_distinct checks.
+  locals:
+    model_routes_config_map_suffix: "-model-routes"
+    connection_variable_prefix: AI_PROXY_
+    credential_variable_suffix: _API_KEY
+    header_variable_suffix: _AUTHORIZATION
+
+  # The models the gateway serves, as the routes file of the chart's standalone
+  # mode: a ConfigMap named "<rendered_name>-model-routes", carrying the file
+  # under the data key apisix.yaml, the key the chart mounts from an existing
+  # ConfigMap. Naming it after the gateway keeps two gateways in one namespace
+  # apart, where the chart's own ConfigMap for that file is named apisix.yaml
+  # whatever the release. With nothing wired to the models socket the template
+  # writes nothing, and no file is emitted.
+  #
+  # Each connection, in alias order, gets a chat route and a completion route,
+  # ids model-<alias>-chat and model-<alias>-completions, at
+  # /<alias>/v1/chat/completions and /<alias>/v1/completions, each carrying
+  # APISIX's AI proxy for an OpenAI-compatible provider. The proxy sends the
+  # request to the endpoint the model publishes with the operation's path
+  # appended, the whole upstream address it dials, and writes the model name
+  # the model publishes into the request, replacing whatever name the caller
+  # sent, so the path chooses the model. An endpoint that is not an absolute URL
+  # stops the build, naming the connection, and so does an alias making a route
+  # id longer than the 64 characters APISIX accepts in one, which it would
+  # otherwise refuse when it reads the file.
+  #
+  # A connection carrying a credential gives its routes an Authorization header
+  # whose whole value is $env://AI_PROXY_<ALIAS>_AUTHORIZATION, which APISIX
+  # reads from its environment when it serves a request, so the file names the
+  # variable and never the value; the header replaces any the caller sent. One
+  # carrying none writes an empty auth, so the caller's own headers pass on.
+  #
+  # APISIX reads ${{NAME}} anywhere in this file as the value of the environment
+  # variable NAME, before it parses the file, and refuses the file when NAME is
+  # unset. So each string a model publishes is written with every $ as \u0024,
+  # the escape a double-quoted YAML string reads back as $, which that reading
+  # cannot match: a published string reaches the gateway as it was published.
+  # The file ends in #END, without which APISIX refuses it.
+  artifacts:
+    model-routes.yaml: |
+      {{- $wired := list }}
+      {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "models" }}{{ $wired = append $wired $alias }}{{ end }}{{ end }}
+      {{- if $wired -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}{{ .locals.model_routes_config_map_suffix }}
+      data:
+        apisix.yaml: |
+          routes:
+      {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "models" }}
+      {{- $u := urlParse $edge.provides.endpoint }}
+      {{- if not (and $u.scheme $u.host) }}{{ fail (printf "the models connection %s of %q reaches %q, whose published endpoint %q is not an absolute URL, so the gateway cannot write the address its route forwards to" $alias $.context.instance_id $edge.target $edge.provides.endpoint) }}{{ end }}
+      {{- $header := printf "%s%s%s" $.locals.connection_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_") $.locals.header_variable_suffix }}
+      {{- range $operation := list "chat" "completions" }}
+      {{- $path := ternary "/chat/completions" "/completions" (eq $operation "chat") }}
+      {{- $id := printf "model-%s-%s" $alias $operation }}
+      {{- if gt (len $id) 64 }}{{ fail (printf "the models connection %s of %q gives its route the id %q, longer than the 64 characters APISIX accepts in a route id, so the gateway would refuse the route; shorten the connection's alias" $alias $.context.instance_id $id) }}{{ end }}
+            - id: {{ $id | toJson }}
+              uri: {{ printf "/%s/v1%s" $alias $path | toJson }}
+              methods:
+                - POST
+              plugins:
+                ai-proxy:
+                  provider: openai-compatible
+      {{- if hasKey (default dict $edge.features) "credential" }}
+                  auth:
+                    header:
+                      Authorization: {{ printf "$env://%s" $header | toJson }}
+      {{- else }}
+                  auth: {}
+      {{- end }}
+                  options:
+                    model: {{ $edge.provides.model | toJson | replace "$" "\\u0024" }}
+                  override:
+                    endpoint: {{ printf "%s%s" (trimSuffix "/" $edge.provides.endpoint) $path | toJson | replace "$" "\\u0024" }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+          #END
+      {{- end }}
 
   # This Recipe reads from infra.overrides:
   #   image        - map[string]string (image.* fields; overrides the tag pin)
@@ -77,14 +184,23 @@ spec:
   #   nodeSelector - map[string]string (pod scheduling)
   #   tolerations  - []object (pod scheduling)
   #
-  # The chart is configured for the shape this Component describes: the
-  # configuration store is the etcd component wired on the `etcd` uses-socket,
-  # so the chart's own bundled etcd is switched off, and so is its Kubernetes
-  # ingress controller, because the Component describes neither. Under this
-  # configuration the chart renders a Deployment for the gateway, a ClusterIP
-  # Service for the proxy data plane, a ClusterIP Service for the Admin API, and
-  # the configuration map the gateway reads its whole runtime configuration
-  # from.
+  # The chart is configured for the shape this Component describes. With
+  # nothing wired to the models socket, the configuration store is the etcd
+  # component wired on the `etcd` uses-socket, so the chart's own bundled etcd
+  # is switched off, and so is its Kubernetes ingress controller, because the
+  # Component describes neither. Under this configuration the chart renders a
+  # Deployment for the gateway, a ClusterIP Service for the proxy data plane, a
+  # ClusterIP Service for the Admin API, and the configuration map the gateway
+  # reads its whole runtime configuration from.
+  #
+  # With a model wired, the chart runs in its standalone mode, in the data-plane
+  # role, whose configuration provider is the routes file the artifact above
+  # emits: the gateway reads no etcd and APISIX switches its Admin API off in
+  # that role, so the chart renders no etcd setting, no Admin API Service, no
+  # Admin API port and no admin key. The standalone mode alone keeps the
+  # traditional role, whose provider is etcd, so the role is set with it. The
+  # Component's assertion refuses an etcd connection and an admin_key
+  # attachment in this case, and requires both in the other.
   #
   # What it carries that a hand-assembled workload does not is that
   # configuration map: the gateway's nginx tuning, its plugin set, its router,
@@ -93,8 +209,24 @@ spec:
   # hand-written configuration file that has to be re-derived by hand every time
   # the gateway moves.
   valuesMapping: |
+    ## ── The models the gateway serves ──────────────────────────
+    ## The models connections, in alias order, and those of them carrying a
+    ## credential. Every setting below that differs between the two shapes
+    ## reads $wired.
+    {{- $wired := list }}
+    {{- $credentialed := list }}
+    {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "models" }}
+        {{- $wired = append $wired $alias }}
+        {{- if hasKey (default dict $edge.features) "credential" }}
+          {{- $credentialed = append $credentialed $alias }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+
     ## ── The configuration-store edge ───────────────────────────
-    ## The gateway keeps its routes here. The edge is required, so it is always
+    ## The gateway keeps its routes here while nothing is wired to the models
+    ## socket. The Component's assertion requires the edge then, so it is
     ## resolved by the time this template runs.
     {{- $store := dict }}
     {{- range $alias, $edge := .context.uses }}
@@ -108,12 +240,14 @@ spec:
     ## key and the data key it sits under. A credential publishing no such
     ## locator would leave the chart's secretName empty, and the chart would
     ## then render its own credentials.admin and credentials.viewer, keys every
-    ## reader of the chart holds, so the build halts on it instead.
+    ## reader of the chart holds, so the build halts on it instead. With a model
+    ## wired the gateway runs no Admin API and the Component's assertion
+    ## refuses the slot, so there is nothing to read.
     {{- $adminKeyFill := optional (default dict .features) "admin_key" dict }}
     {{- $adminKeyLocator := optional $adminKeyFill "provides" dict }}
     {{- $adminKeySecret := optional $adminKeyLocator "name" "" }}
     {{- $adminKeyDataKey := optional $adminKeyLocator "key" "" }}
-    {{- if not (and $adminKeySecret $adminKeyDataKey) }}
+    {{- if and (not $wired) (not (and $adminKeySecret $adminKeyDataKey)) }}
     {{- fail (printf "the credential attached to the admin_key slot of %q publishes no Secret name and data key, so the chart cannot read the Admin API key from a Secret; attach core/referenced-secret or core/random-password, which publish both" .context.instance_id) }}
     {{- end }}
 
@@ -166,10 +300,15 @@ spec:
     ## Composed from the resolved `etcd` edge. The user is emptied deliberately:
     ## the chart sends credentials whenever one is set, and the standard-library
     ## etcd Recipes leave authentication off, so presenting a user would fail the
-    ## connection rather than defaulting.
+    ## connection rather than defaulting. With a model wired there is no store,
+    ## so no host is written, and the user stays empty: the chart's default user
+    ## would render an etcd password Secret and a variable for it, which a
+    ## gateway reading no store would carry unreferenced.
     externalEtcd:
+      {{- if not $wired }}
       host:
         - "http://{{ $store.provides.host }}:{{ $store.provides.port }}"
+      {{- end }}
       user: ""
 
     ## ── Proxy data plane ───────────────────────────────────────
@@ -190,6 +329,21 @@ spec:
         containerPort: {{ .infra.http_port }}
 
     apisix:
+      {{- if $wired }}
+      ## ── Standalone mode, for the models the gateway serves ─────
+      ## The data-plane role reading the routes file from the ConfigMap the
+      ## artifact above emits, named after the gateway. APISIX switches the Admin
+      ## API off in that role, and the chart is told so too, so it renders no
+      ## Admin API Service, port or key, and no Admin API section in the
+      ## gateway's configuration.
+      deployment:
+        mode: standalone
+        role: data_plane
+        standalone:
+          existingConfigMap: "{{ .context.rendered_name }}{{ .locals.model_routes_config_map_suffix }}"
+      admin:
+        enabled: false
+      {{- else }}
       ## ── Admin API ────────────────────────────────────────────
       ## In-cluster only, on the port the operator set, authenticated by the key
       ## the admin_key credential publishes. The client allowlist is widened
@@ -233,6 +387,31 @@ spec:
         allow:
           ipList:
             - 0.0.0.0/0
+      {{- end }}
+
+    ## ── Model credentials ──────────────────────────────────────
+    ## Each models connection carrying a credential delivers it as
+    ## AI_PROXY_<ALIAS>_API_KEY, bound by NAME to the secret its attachment
+    ## publishes, and composes AI_PROXY_<ALIAS>_AUTHORIZATION from it, the
+    ## bearer token the connection's routes read through APISIX's $env://
+    ## reference. The chart writes these variables in list order, ahead of its
+    ## own, so the credential variable comes before the token, and the cluster
+    ## composes the token from it; neither carries the value in the rendered
+    ## artifact.
+    {{- with $credentialed }}
+    extraEnvVars:
+      {{- range $alias := . }}
+      {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+      {{- $credential := (get $.context.uses $alias).features.credential }}
+      - name: {{ $.locals.connection_variable_prefix }}{{ $name }}{{ $.locals.credential_variable_suffix }}
+        valueFrom:
+          secretKeyRef:
+            name: "{{ $credential.provides.name }}"
+            key: "{{ $credential.provides.key }}"
+      - name: {{ $.locals.connection_variable_prefix }}{{ $name }}{{ $.locals.header_variable_suffix }}
+        value: "Bearer $({{ $.locals.connection_variable_prefix }}{{ $name }}{{ $.locals.credential_variable_suffix }})"
+      {{- end }}
+    {{- end }}
 
     ## ── Gateway resources ──────────────────────────────────────
     resources:
