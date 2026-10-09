@@ -1833,7 +1833,10 @@ this catalog that is `core/referenced-secret`, `core/referenced-secret-set`,
 `core/secret-value` and `core/secret-provided`: the developer writes the locator
 in the attachment's `values`, in the Aggregate, and the operator writes it in the
 attachment's `infra`, in the Release. `core/random-password` and
-`core/generated-secret` take no locator and are not shaped this way.
+`core/generated-secret` take no locator and are not shaped this way. The locator
+is the one Feature input either author writes; every other input has a single
+owner, as "Who writes each input, and where a Feature is attached" under
+"Feature Pattern" sets out.
 
 **Why the operator's pillar.** A connection the Release wires has no entry in the
 Aggregate, and a Release writes `values` nowhere, so a credential that took its
@@ -2721,12 +2724,12 @@ which is exactly what a Feature is for.
 ### What earns a Feature: two independent products in the field
 
 A Feature is an attachment that brings something — resources, a pipeline step,
-wiring an operator attaches deliberately — and **it earns its name when at least
-two independent products in the field realize the capability it declares.** The
-products counted are products in the world, established from their own current
-configuration references, and not the components this catalog happens to ship: a
-capability two gateway products implement is portable whether the catalog carries
-one of those gateways, both of them, or neither.
+wiring the developer or the operator attaches deliberately — and **it earns its
+name when at least two independent products in the field realize the capability
+it declares.** The products counted are products in the world, established from
+their own current configuration references, and not the components this catalog
+happens to ship: a capability two gateway products implement is portable whether
+the catalog carries one of those gateways, both of them, or neither.
 
 What the catalog ships is a separate question, answered one product at a time. A
 Feature may be declared before anything here realizes it — attaching it then halts
@@ -2751,8 +2754,8 @@ only; so neither gateway realizes either Feature. APISIX at 3.18.0 carries a
 semantic cache and a budget counted in tokens, and the Envoy AI Gateway such a
 budget, in their open-source builds, but no Recipe here routes model traffic
 through either. Envoy Gateway on its own, Contour and NGINX offer none of the
-three. No gateway in this catalog checks a reply against a schema the operator
-sets, so `core/response-validation` is realized nowhere.
+three. No gateway in this catalog checks a reply against a schema the attachment
+carries, so `core/response-validation` is realized nowhere.
 
 `core/concurrency-limit`, the AI gateway control declaring a cap on the
 requests a gateway carries at once across everything it serves, is realized
@@ -2779,10 +2782,11 @@ guard — it keeps its routes in a store of its own, takes them from the
 applications behind it, or is a hosted service — and realizes none.
 
 **A capability that only one product in the field has is not a Feature.** It is a
-value on that product's own Component, where an operator sets it and reads it beside
-everything else that configures the product. A Recipe may declare `spec.pipeline`
-of its own, driven by the values and infrastructure the component was authored
-with, so that is where such a value is written into the product's configuration.
+setting on that product's own Component, which the author who decides it sets in
+that author's pillar and reads beside everything else that configures the product.
+A Recipe may declare `spec.pipeline` of its own, driven by the values and
+infrastructure the component was authored with, so that is where such a setting
+is written into the product's configuration.
 
 Counting the field rather than the catalog has three consequences for how a
 Feature's options are authored:
@@ -2803,6 +2807,69 @@ Feature's options are authored:
 enforces.** The compiler validates a Feature against its schema and pipes strings,
 so a Feature declaring options no product implements passes every gate and ships.
 The judgement stays with the author and the reviewer.
+
+### Who writes each input, and where a Feature is attached
+
+A Feature's `schema` has the two authored pillars a Component's has, with the
+owners "Component Schema Pattern" gives them: `values`, which the developer
+writes in the Aggregate, and `infra`, which the operator writes in the Release.
+Which pillar declares an input, and so where the Feature is attached, follows
+from one question: which of the two decides it.
+
+**This is a convention of this catalog, not something the compiler enforces.**
+The compiler validates each pillar against the Feature's schema and pipes the
+strings through. It is blind to which author decided an input, and it accepts a
+Feature attached in either document, so an enterprise catalog is free to draw
+the line elsewhere. One line under the convention is the schema's rather than
+the catalog's: the Release schema admits no `values`, so a Feature whose
+`values` require a field with no default cannot be attached by a Release alone.
+Such an attachment halts, naming each value it requires.
+
+**An input belongs to the author who decides it.**
+
+- **`values`** carries application behaviour the developer decides once and
+  keeps the same in every environment: what to mask, which guardrail lists
+  apply, which models a request may be routed to, how a response is validated,
+  what is counted.
+- **`infra`** carries what the operator decides, and anything that varies from
+  one environment to the next: capacity and spending limits (a budget's ceiling
+  and its period, a concurrency cap), sizing and sampling shares, a retention
+  period compliance sets, the names an environment gives things (a hostname, a
+  namespace, an identity), ports and network seams, and whether and how often a
+  platform scrapes.
+- **A guardrail list stays with the developer; its limits do not.** The
+  patterns a request is checked against are part of what the application is,
+  so the list is `values`. How much the traffic may spend, or how many requests
+  may run at once, is the operator's, so each is `infra`.
+- **A credential's locator is the one input either author writes**, in
+  `values` or in `infra` and exactly one per attachment, as "Who supplies a
+  credential's locator: values or infra, exactly one" sets out. Every other
+  input has one owner.
+
+**Where a Feature is attached follows from its inputs.**
+
+- **When every input is the operator's, the operator attaches it in the
+  Release**: on a boundary, under the boundary's `features:`, or on one
+  component, under `components.<id>.features`.
+- **When any input is the developer's, the developer attaches it in the
+  Aggregate**, and the operator sizes that same attachment in the Release,
+  writing only `infra`, under the same attachment name on the Release's entry
+  for the component; the type and the values come from the Aggregate. It is
+  also how the operator names the secret of a credential the Aggregate attached
+  without one.
+
+**A need the developer declares and the operator supplies is a slot.** A
+workload that needs an identity to run under is the case: the Component
+declares a slot for it in its `featuresSchema`, and the Release fills that slot
+on its entry for the component, with the Feature's `type` and its `infra`. The
+need is never written as an attachment in the Aggregate that configures
+nothing. The slot's fields are in the Component reference, under
+["Attachment Slots: `featuresSchema`"](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/entities/component.md#attachment-slots-featuresschema).
+
+**A Feature's description says who attaches it and where**, in those terms:
+attached by the operator in the Release, on a boundary or on a component; or
+attached by the developer in the Aggregate, naming the inputs the operator
+sizes in the Release.
 
 ### The Feature taxonomy
 
