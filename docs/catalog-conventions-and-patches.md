@@ -2929,6 +2929,43 @@ need is never written as an attachment in the Aggregate that configures
 nothing. The slot's fields are in the Component reference, under
 ["Attachment Slots: `featuresSchema`"](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/entities/component.md#attachment-slots-featuresschema).
 
+In the worked example
+[`workload-identity-binding`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/examples/workload-identity-binding/),
+the workload's Component declares the need:
+
+```yaml
+# the Component — its schema left out
+spec:
+  featuresSchema:
+    identity:
+      required: true
+      selector: "feature.aggrega.ai/kind!=secret"
+      inject: []
+```
+
+The Aggregate writes nothing for it, and the Release fills the slot on its
+entry for the component with `core/gcp-workload-identity`:
+
+```yaml
+# the Release
+spec:
+  boundaries:
+    main:
+      components:
+        app:
+          features:
+            identity:
+              type: core/gcp-workload-identity
+              infra:
+                service_account_name: app-workload-identity
+                gcp_service_account: app-dev@example-project.iam.gserviceaccount.com
+```
+
+A Release that leaves the slot unfilled halts, naming the slot. The identity
+Features carry no label, so the selector admits them by excluding what they are
+not: a credential filling the slot halts, and `core/aws-irsa` fills it as
+`core/gcp-workload-identity` does.
+
 **A Feature's description says who attaches it and where**, in those terms:
 attached by the operator in the Release, on a boundary or on a component; or
 attached by the developer in the Aggregate, naming the inputs the operator
