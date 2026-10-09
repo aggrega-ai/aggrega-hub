@@ -2921,6 +2921,73 @@ Each pillar is closed and both `limit` and `period` are required, so the build
 halts on an Aggregate writing either of them in `values`, and on a Release
 leaving either out.
 
+**`core/public-ingress` splits the same way.** The request path a component
+serves is part of what the application is, so `path` is `values`; the hostname
+is the environment's name for the component, and the routing knobs describe the
+cluster it lands in, so `host` and every other input are `infra`:
+
+```yaml
+# feature/core/public-ingress/1.0.0/feature.yaml — descriptions left out
+spec:
+  schema:
+    values:
+      $ref: "BaseComponents#/schemas/BaseFeatureParameter"
+      properties:
+        path:
+          type: string
+    infra:
+      host:
+        type: string
+      control_plane_present:
+        type: boolean
+        default: false
+      service_name:
+        type: string
+      service_port_name:
+        type: string
+      ingress_class_name:
+        type: string
+      tls_secret:
+        type: string
+```
+
+The developer attaches it in the Aggregate with the path, and the operator
+writes the host and the cluster knobs on the Release's entry for the component,
+under the same attachment name:
+
+```yaml
+# the Aggregate — the router's values and its other attachments left out
+spec:
+  components:
+    router:
+      type: core/gateway/litellm
+      features:
+        published:
+          type: core/public-ingress
+          values:
+            path: /
+```
+
+```yaml
+# the Release — the router's own infra and its other attachments left out
+spec:
+  components:
+    router:
+      features:
+        published:
+          infra:
+            host: assistant.example.internal
+            control_plane_present: true
+            service_port_name: http
+```
+
+The rendered Ingress routes `assistant.example.internal` and `/` to the router's
+Service. Each pillar is closed, so pulling the Release halts on an Aggregate
+writing `host` in `values`, and on a Release writing `path` in `infra`, naming
+the field. A path that has to differ from one environment to the next is a
+parameter of the Aggregate, written `path: "{{ .parameters.<name> }}"`, which
+each Release fulfils. `core/http-route` takes the same split.
+
 **A need the developer declares and the operator supplies is a slot.** A
 workload that needs an identity to run under is the case: the Component
 declares a slot for it in its `featuresSchema`, and the Release fills that slot
