@@ -244,7 +244,7 @@ The dimensions and their value sets:
 | `upstream-tls` | `trust-anchor` | The component can require the service it forwards to present a certificate chaining to a trust anchor the Release supplies. |
 | `upstream-pinning` | `public-key` | The component can refuse a service it forwards to unless a certificate that service presents carries one of the public keys the Release supplies for it. `public-key` names what is pinned: the key itself, so a certificate renewed over the same key still matches. |
 | `log-masking` | `entity-recognition` | The component can replace sensitive text with a placeholder in the copy of a call it hands to its logs, while the request it forwards and the reply it returns stay as they were sent. `entity-recognition` names the fidelity: it replaces matches of patterns supplied in its configuration and also entity types that a recognizer service it calls detects. A component that could only replace pattern matches would carry a narrower value, added in the same act as the first component to carry it. |
-| `period-budget` | `cost` | The component can refuse model requests once what it has counted over a period exceeds a limit set in its configuration, and the value names what it counts. `cost`: what the traffic cost, priced from a table the component keeps per model. A component that counts tokens would carry a value of its own, added in the same act as the first component to carry it. |
+| `period-budget` | `cost`, `tokens` | The component can refuse model requests once what it has counted over a period exceeds a limit set in its configuration, and the value names what it counts. `cost`: what the traffic cost, priced from a table the component keeps per model. `tokens`: the tokens each model's reply reports reading, writing or both, which the component counts and prices nothing. |
 
 Three rules bind the family, and each has already been got wrong once:
 
@@ -289,6 +289,9 @@ gateway carries several of them, and no amount of reading its tier would say so.
 `core/gateway/litellm` carries `period-budget: cost` as well, and so does
 `core/gateway/cloudflare-ai-gateway`, Cloudflare's hosted AI gateway, which
 carries no other value in this family and carries `semantic`.
+`core/gateway/apisix` carries `period-budget: tokens`, its one value in this
+family, and `semantic`, because its AI proxy reads the request body of every
+route it serves a model on.
 
 A component carrying `prompt-guard: classifier` is also something another
 component can send its traffic through: `core/gateway/litellm` and
@@ -396,9 +399,10 @@ Three rules bind it:
   because the gateway describes a wired model to its proxy through the OpenAI
   API alone; the message names the connection and points at the gateway's
   hand-typed `values.models`, which takes such a provider in the proxy's own
-  provider/model notation. `core/gateway/kong`'s `models` socket selects the
-  same and its Component's assertion halts the same way, because it writes each
-  wired model's route through Kong's AI proxy for the OpenAI API alone.
+  provider/model notation. The `models` sockets of `core/gateway/kong` and
+  `core/gateway/apisix` select the same and each Component's assertion halts the
+  same way, because each writes a wired model's route through its gateway's AI
+  proxy for the OpenAI API alone.
 - **A component carrying the key publishes what a model publishes:** `endpoint`
   and `model` in its `provides`, the two keys a consumer's Recipe reads off a
   model edge. One that published no `model` would hand its
@@ -406,9 +410,10 @@ Three rules bind it:
   publishes one alias of its model map as its `model`, named by a value of its
   own and checked against the map by an assertion on its Component, so the order
   of the map never decides what a consumer asks for. A gateway whose every
-  model is wired to a socket — `core/gateway/kong`, whose `values.model` names
-  one of its `models` connections — serves none while nothing is wired there and
-  then publishes both keys empty; it carries the key all the same, since the
+  model is wired to a socket — `core/gateway/kong` and `core/gateway/apisix`,
+  each of whose `values.model` names one of its `models` connections — serves
+  none while nothing is wired there and then publishes both keys empty; it
+  carries the key all the same, since the
   value names what the product serves rather than what one Release wires, so a
   consumer wired to it in that state reads an empty address and model name, and
   no build reports it.
@@ -419,8 +424,8 @@ Three rules bind it:
   whose endpoint an operator may repoint keeps the value of the product it
   describes.
 
-Components today: `core/gateway/litellm` and `core/gateway/kong` carry `openai`,
-as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
+Components today: `core/gateway/litellm`, `core/gateway/kong` and
+`core/gateway/apisix` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
 `openai-embedding`, `nvidia-api` and `openai-compatible` — the broker, whose
 whole contract is to be pointed at a service speaking that API, and which stays
 the handle for an endpoint the catalog does not model. Every other
@@ -2028,7 +2033,9 @@ it as `KONG_PG_PASSWORD`, and which declares it on its `models` socket as well,
 for the key it presents to each model it serves, delivered as
 `AI_PROXY_<ALIAS>_API_KEY` and presented as the bearer token
 `AI_PROXY_<ALIAS>_AUTHORIZATION` that the connection's routes read through
-Kong's environment vault — as do the cache and object-store sockets of
+Kong's environment vault, a shape `core/gateway/apisix` repeats on its own
+`models` socket under the same two names, its routes reading the token through
+APISIX's `$env://` reference — as do the cache and object-store sockets of
 `core/observability/langfuse`, the sandbox and plugin-runtime sockets of
 `core/ai-agent/dify`, and the media-server socket of
 `core/messaging/livekit-sip`, where the slot is `required`. `core/gateway/litellm`
@@ -2786,12 +2793,24 @@ Kong 3.9.3's open-source image, which carries neither a semantic cache nor a
 period budget, Kong offering both in its enterprise edition only, and
 `core/gateway/tyk` runs Tyk v5.14.0's gateway, which carries neither, the
 budget of Tyk's separate AI Studio being enforced in its enterprise edition
-only; so neither gateway realizes either Feature. APISIX at 3.18.0 carries a
-semantic cache and a budget counted in tokens, and the Envoy AI Gateway such a
-budget, in their open-source builds, but no Recipe here routes model traffic
-through either. Envoy Gateway on its own, Contour and NGINX offer none of the
-three. No gateway in this catalog checks a reply against a schema the attachment
-carries, so `core/response-validation` is realized nowhere.
+only; so neither gateway realizes either Feature. `core/gateway/apisix`
+realizes the period budget on its chart Recipe, which runs APISIX 3.18.0 in
+front of the models wired to it: counted in the tokens each reply reports, over
+a fixed window that opens with the first request after the last one closed, for
+the whole gateway or each model, on chat routes alone, since APISIX counts no
+tokens on a completion request, and on one replica, since each gateway process
+counts on its own. It refuses a budget in US dollars, one per caller and a
+calendar month. APISIX 3.18.0 carries a semantic cache as well, but keeps
+callers apart only by a consumer an authentication plugin names, or by a value
+the request itself carries, which it does not verify; the gateway the chart
+Recipe renders holds no consumer, so its realization halts every attachment
+rather than ship one cache every caller shares. Its workload Recipe,
+at APISIX 3.17.0, renders no route and halts on either Feature. The Envoy AI
+Gateway carries a budget counted in tokens in its open-source build, but no
+Recipe here routes model traffic through it. Envoy Gateway on its own, Contour
+and NGINX offer none of the three. No gateway in this catalog checks a reply
+against a schema the attachment carries, so `core/response-validation` is
+realized nowhere.
 
 `core/concurrency-limit`, the AI gateway control declaring a cap on the
 requests a gateway carries at once across everything it serves, is realized
@@ -2815,9 +2834,11 @@ forwards to the guard in place of the upstream. Each realization halts the
 build unless the guard's threshold is the one the attachment's sensitivity
 names. The Feature selects `component.aggrega.ai/category=gateway`, because all
 it needs of a gateway is that it forwards to an address it is configured with.
-Every other gateway here renders no route a realization could send through a
-guard — it keeps its routes in a store of its own, takes them from the
-applications behind it, or is a hosted service — and realizes none.
+Every other gateway here realizes none: most render no route a realization
+could send through a guard — they keep their routes in a store of their own,
+take them from the applications behind them, or are a hosted service — and
+`core/gateway/apisix`, whose chart Recipe renders the routes of the models
+wired to it, has no realization of the shield.
 
 **A capability that only one product in the field has is not a Feature.** It is a
 setting on that product's own Component, which the author who decides it sets in

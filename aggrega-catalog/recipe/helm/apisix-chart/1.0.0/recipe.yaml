@@ -27,15 +27,15 @@ metadata:
     routes, through APISIX's AI proxy, sit in a ConfigMap named after the
     gateway, which reads them with no etcd and no Admin API. A connection's
     credential arrives as an env secretKeyRef the routes name through APISIX's
-    $env:// reference, so no credential value is in the rendered output.
+    $env:// reference, so no credential value is in the rendered output. A
+    core/period-budget attachment is written onto those routes as APISIX's
+    token rate limiting, with no completion route and one replica.
 
-    The chart assembles that configuration map from named settings where a
-    workload carries a hand-written file. Reach for this realization where a
-    chart repository is reachable at build time, or a model is served; reach
-    for `apisix`, the workload-synthesis realization, where the build must
-    complete with nothing fetched. The gateway image and the chart version
-    (infra.source_version) are pinned; provides.host is the proxy Service name,
-    with no namespace.
+    Reach for this realization where a chart repository is reachable at build
+    time, or a model is served; reach for `apisix`, the workload-synthesis
+    realization, where the build must complete with nothing fetched. The
+    gateway image and the chart version (infra.source_version) are pinned;
+    provides.host is the proxy Service name, with no namespace.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -108,7 +108,8 @@ spec:
   # whatever the release. With nothing wired to the models socket the template
   # writes nothing, and no file is emitted.
   #
-  # Each connection, in alias order, gets a chat route and a completion route,
+  # Each connection, in alias order, gets a chat route and a completion route —
+  # the chat route alone while a period budget is attached, as said below —
   # ids model-<alias>-chat and model-<alias>-completions, at
   # /<alias>/v1/chat/completions and /<alias>/v1/completions, each carrying
   # APISIX's AI proxy for an OpenAI-compatible provider. The proxy sends the
@@ -132,10 +133,46 @@ spec:
   # the escape a double-quoted YAML string reads back as $, which that reading
   # cannot match: a published string reaches the gateway as it was published.
   # The file ends in #END, without which APISIX refuses it.
+  #
+  # A core/period-budget attachment, which period-budget-apisix realizes and
+  # checks, is written here as APISIX's token rate limiting, ai-rate-limiting,
+  # on a service the model routes name. APISIX keeps that plugin's count under
+  # the object the plugin is declared on, so on a route each route would count
+  # apart, while routes naming one service count together: scope gateway
+  # writes one service, model-budget, named by every route, and scope model one
+  # per connection, model-<alias>-budget, named by that connection's route; an
+  # alias making that id longer than 64 characters stops the build, as for a
+  # route. The plugin takes the limit as a whole number of tokens, the period
+  # as its window in seconds, and the unit as what it counts: total_tokens,
+  # prompt_tokens or completion_tokens, the names the Feature's unit takes. Its
+  # refusal status is left at APISIX's own, 503.
+  #
+  # While the budget is attached each connection gets its chat route only.
+  # APISIX reads the tokens a reply reports through the protocol it recognises
+  # the request as, and it recognises a completion request, whose body carries
+  # a prompt rather than messages, as none it can read usage from: it answers
+  # it and counts nothing. A completion route beside a budget would therefore
+  # serve model traffic the budget never counts, so it is not written. With
+  # no such attachment no service is written and every route is as it would
+  # be without one.
   artifacts:
     model-routes.yaml: |
       {{- $wired := list }}
       {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "models" }}{{ $wired = append $wired $alias }}{{ end }}{{ end }}
+      {{- $budget := dict }}
+      {{- range $name, $attachment := (default dict .features) }}{{ if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}{{ $budget = $attachment }}{{ end }}{{ end }}
+      {{- $operations := list "chat" "completions" }}
+      {{- $serviceOf := dict }}
+      {{- $services := list }}
+      {{- with $budget }}
+      {{- $operations = list "chat" }}
+      {{- range $alias := $wired }}
+      {{- $id := ternary "model-budget" (printf "model-%s-budget" $alias) (eq $budget.values.scope "gateway") }}
+      {{- if gt (len $id) 64 }}{{ fail (printf "the models connection %s of %q gives its budget's service the id %q, longer than the 64 characters APISIX accepts in a service id, so the gateway would refuse it; shorten the connection's alias" $alias $.context.instance_id $id) }}{{ end }}
+      {{- $_ := set $serviceOf $alias $id }}
+      {{- if not (has $id $services) }}{{ $services = append $services $id }}{{ end }}
+      {{- end }}
+      {{- end }}
       {{- if $wired -}}
       apiVersion: v1
       kind: ConfigMap
@@ -143,18 +180,33 @@ spec:
         name: {{ .context.rendered_name }}{{ .locals.model_routes_config_map_suffix }}
       data:
         apisix.yaml: |
+      {{- with $budget }}
+      {{- $window := mul (atoi (regexFind "^[0-9]+" .infra.period)) (index (dict "s" 1 "m" 60 "h" 3600 "d" 86400) (regexFind "[a-z]+$" .infra.period)) }}
+          services:
+      {{- range $id := $services }}
+            - id: {{ $id | toJson }}
+              plugins:
+                ai-rate-limiting:
+                  limit: {{ int64 $budget.infra.limit }}
+                  time_window: {{ $window }}
+                  limit_strategy: {{ $budget.values.unit | toJson }}
+      {{- end }}
+      {{- end }}
           routes:
       {{- range $alias, $edge := .context.uses }}
       {{- if eq $edge.socket "models" }}
       {{- $u := urlParse $edge.provides.endpoint }}
       {{- if not (and $u.scheme $u.host) }}{{ fail (printf "the models connection %s of %q reaches %q, whose published endpoint %q is not an absolute URL, so the gateway cannot write the address its route forwards to" $alias $.context.instance_id $edge.target $edge.provides.endpoint) }}{{ end }}
       {{- $header := printf "%s%s%s" $.locals.connection_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_") $.locals.header_variable_suffix }}
-      {{- range $operation := list "chat" "completions" }}
+      {{- range $operation := $operations }}
       {{- $path := ternary "/chat/completions" "/completions" (eq $operation "chat") }}
       {{- $id := printf "model-%s-%s" $alias $operation }}
       {{- if gt (len $id) 64 }}{{ fail (printf "the models connection %s of %q gives its route the id %q, longer than the 64 characters APISIX accepts in a route id, so the gateway would refuse the route; shorten the connection's alias" $alias $.context.instance_id $id) }}{{ end }}
             - id: {{ $id | toJson }}
               uri: {{ printf "/%s/v1%s" $alias $path | toJson }}
+      {{- with get $serviceOf $alias }}
+              service_id: {{ . | toJson }}
+      {{- end }}
               methods:
                 - POST
               plugins:
@@ -255,6 +307,27 @@ spec:
     ## Names the proxy Service "<rendered_name>-gateway", matching provides.host,
     ## and the Admin API Service "<rendered_name>-admin".
     fullnameOverride: "{{ .context.rendered_name }}"
+
+    ## ── One gateway while a period budget is attached ──────────
+    ## APISIX keeps a period budget's count in the memory of the gateway process
+    ## counting it, so each further replica would count its own share apart and
+    ## the gateway as a whole would serve more than the limit. While a
+    ## core/period-budget attachment is written onto the model routes, the
+    ## chart runs one replica, as a Deployment, with its autoscaler off. These
+    ## are the chart's own defaults, written out so that a chart version moving
+    ## them cannot split the count.
+    {{- $budgeted := false }}
+    {{- range $name, $attachment := (default dict .features) }}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}
+        {{- $budgeted = true }}
+      {{- end }}
+    {{- end }}
+    {{- if and $wired $budgeted }}
+    useDaemonSet: false
+    replicaCount: 1
+    autoscaling:
+      enabled: false
+    {{- end }}
 
     ## ── Gateway image pin ──────────────────────────────────────
     ## Pinned explicitly rather than left to whatever the chart's own default
