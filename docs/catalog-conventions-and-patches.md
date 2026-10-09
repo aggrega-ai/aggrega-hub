@@ -2858,6 +2858,43 @@ Such an attachment halts, naming each value it requires.
   also how the operator names the secret of a credential the Aggregate attached
   without one.
 
+**`core/compose-bridge` is the first case.** Its port base, the port a bridged
+edge falls back to when two edges resolve to one listen port, is a seam of the
+network the Release lands in, and so is the published field it takes as the
+upstream address. Both inputs are `infra`, and its `values` declare nothing of
+their own:
+
+```yaml
+# feature/core/compose-bridge/1.0.0/feature.yaml — descriptions left out
+spec:
+  schema:
+    values:
+      $ref: "BaseComponents#/schemas/BaseFeatureParameter"
+    infra:
+      portBase:
+        type: integer
+        default: 10000
+      providesField:
+        type: string
+        default: host
+```
+
+The operator attaches it in the Release, on the boundary holding the seam; two
+bridged edges resolving to one port then render one of them at 12000 rather
+than at 10000:
+
+```yaml
+# the Release
+spec:
+  boundaries:
+    bridge:
+      features:
+        gateway:
+          type: core/compose-bridge:1.0.0
+          infra:
+            portBase: 12000
+```
+
 **`core/period-budget` is the second case.** What a budget counts and whose traffic
 one limit covers are part of what the application is, so `unit` and `scope`
 are `values`; how much the traffic may spend and over how long are decided per
