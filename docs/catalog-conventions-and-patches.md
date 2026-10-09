@@ -2858,6 +2858,69 @@ Such an attachment halts, naming each value it requires.
   also how the operator names the secret of a credential the Aggregate attached
   without one.
 
+**`core/period-budget` is the second case.** What a budget counts and whose traffic
+one limit covers are part of what the application is, so `unit` and `scope`
+are `values`; how much the traffic may spend and over how long are decided per
+environment, so `limit` and `period` are `infra`:
+
+```yaml
+# feature/core/period-budget/1.0.0/feature.yaml — descriptions left out
+spec:
+  schema:
+    values:
+      $ref: "BaseComponents#/schemas/BaseFeatureParameter"
+      properties:
+        scope:
+          type: string
+          enum: [gateway, caller, model]
+        unit:
+          type: string
+          enum: [usd, total_tokens, prompt_tokens, completion_tokens]
+      required: [scope, unit]
+    infra:
+      limit:
+        type: number
+        exclusiveMinimum: 0
+        required: true
+      period:
+        type: string
+        pattern: "^[1-9][0-9]*(s|m|h|d|mo)$"
+        required: true
+```
+
+The developer attaches it in the Aggregate, and the operator sizes the same
+attachment on the Release's entry for the component:
+
+```yaml
+# the Aggregate — the gateway's other values and its credentials left out
+spec:
+  components:
+    router:
+      type: core/gateway/litellm
+      features:
+        budget:
+          type: core/period-budget
+          values:
+            scope: gateway
+            unit: usd
+```
+
+```yaml
+# the Release
+spec:
+  components:
+    router:
+      features:
+        budget:
+          infra:
+            limit: 50
+            period: 1d
+```
+
+Each pillar is closed and both `limit` and `period` are required, so the build
+halts on an Aggregate writing either of them in `values`, and on a Release
+leaving either out.
+
 **A need the developer declares and the operator supplies is a slot.** A
 workload that needs an identity to run under is the case: the Component
 declares a slot for it in its `featuresSchema`, and the Release fills that slot
