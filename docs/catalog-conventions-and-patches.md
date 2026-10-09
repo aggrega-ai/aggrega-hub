@@ -388,7 +388,15 @@ Three rules bind it:
   hold and its alternatives live inside one key's set, so no selector can admit
   an unlabelled model and a labelled gateway while refusing an unlabelled
   gateway — which is why every `ai-model` Component carries the key. A socket
-  that needs one particular API names its value.
+  that needs one particular API names its value — or, where a model it cannot
+  use has somewhere else to go, admits the whole category and refuses the value
+  in an assertion that says where. `core/gateway/litellm`'s `models` socket
+  selects `component.aggrega.ai/category=ai-model`, and its Component's
+  assertion halts on a connection whose target carries any value but `openai`,
+  because the gateway describes a wired model to its proxy through the OpenAI
+  API alone; the message names the connection and points at the gateway's
+  hand-typed `values.models`, which takes such a provider in the proxy's own
+  provider/model notation.
 - **A component carrying the key publishes what a model publishes:** `endpoint`
   and `model` in its `provides`, the two keys a consumer's Recipe reads off a
   model edge. One that published no `model` would hand its
@@ -2011,7 +2019,14 @@ a model declare it on their `model` socket, and their Recipes deliver it as
 it as `KONG_PG_PASSWORD` — as do the cache and object-store sockets of
 `core/observability/langfuse`, the sandbox and plugin-runtime sockets of
 `core/ai-agent/dify`, and the media-server socket of
-`core/messaging/livekit-sip`, where the slot is `required`. The name holds one
+`core/messaging/livekit-sip`, where the slot is `required`. `core/gateway/litellm`
+declares it on two sockets: on `models`, where each connection's credential is
+the key the gateway presents to that model, delivered under a variable of its
+own, `LITELLM_MODEL_<ALIAS>_API_KEY` — the connection's alias in capitals, every
+character other than a letter or a digit an underscore — which that model's
+entry in the routing table names; and on `cache_store`, where it is the
+password the gateway's semantic cache presents to the store, delivered as
+`REDIS_PASSWORD`. The name holds one
 credential; it is a key a developer writes on the connection
 (`uses.<socket>.<alias>.features.credential`) and an operator writes on a
 connection the Release wires, so it is the same word on every socket.
@@ -2036,6 +2051,15 @@ connection the Release wires, so it is the same word on every socket.
   slot. Each side's key is delivered under its own variable, `LLM_API_KEY` for
   extraction and `EMBEDDING_API_KEY` for embedding, because the server, given no
   embedding key, may present the extraction key to the embedding provider.
+  `core/gateway/litellm` meets the same case in its model map, which has two
+  parts. The models wired to its optional `models` socket are entries of the
+  routing table, each served under its connection's alias and presenting that
+  connection's `credential`; the entries typed by hand into `values.models`
+  name upstreams no connection reaches — one the catalog does not model, a
+  provider whose own API a wired entry cannot describe, several entries sharing
+  one alias — and present the Component's `provider_key`, one credential for
+  all of them. A wired entry never reads `provider_key`, and an alias both parts
+  publish halts the build, naming it.
 - **The socket says when none is intended.** Each such socket also declares
   `unauthenticated` (`type: boolean`, `default: false`) in its `valueSchema`: the
   connection's own statement that its target takes no credential. It changes
@@ -2772,7 +2796,9 @@ whose Recipes render the one route their model traffic takes.
 through the guard wired to the gateway's `guard` socket, a
 `core/security/nemo-guardrails` that checks each chat request with a trained
 classifier and forwards what it admits to the model: on the AI gateway, every
-entry of the model map is addressed to the guard; on NGINX, its one location
+entry of the hand-typed model map is addressed to the guard, and a model wired
+to its `models` socket halts the build, because its entry would be sent to that
+model's own endpoint, past the guard; on NGINX, its one location
 forwards to the guard in place of the upstream. Each realization halts the
 build unless the guard's threshold is the one the attachment's sensitivity
 names. The Feature selects `component.aggrega.ai/category=gateway`, because all
