@@ -27,6 +27,18 @@
 # loudly at push time and this script exits non-zero. The fix is a version
 # bump, which lands under a new version directory and publishes cleanly.
 #
+# Before anything is pushed, the selected entities go through
+# scripts/published-version-guard.sh --files, which compares each against the
+# version-to-digest record on the published branch, offline, and warns or refuses
+# as the committed .published-version-guard switch says — so an entity edited in
+# place at a recorded version is named before the first push of a run rather than
+# at its own push, part-way through. A dry run runs the guard too.
+#
+# With --record-out FILE, every reference a real run pushed or found already
+# published is written to FILE as reference, version and digest, tab-separated,
+# exactly as `aggrega push` printed them — the rows scripts/record-published.sh
+# records on the published branch. A dry run writes nothing to it.
+#
 # With --sign, each successfully-pushed reference is collected and, after the
 # push loop, batch-signed with one `aggrega sign <ref>...` invocation (a single
 # authentication for the whole batch). Signing is NON-INTERACTIVE ONLY in the
@@ -39,6 +51,7 @@
 #   ./publish-diff.sh [--registry <host:port>] [--catalog <dir>]
 #                     [--marker <tag>] [--full] [--yes] [--dry-run] [--no-advance]
 #                     [--sign [--key <path>] [--identity-token <token>]]
+#                     [--record-out <file>]
 #
 # Modes:
 #   (default)     differential — publish entities changed since the marker.
@@ -65,10 +78,11 @@ SIGN=""
 KEY=""
 IDTOKEN=""
 YES=""
+RECORD_OUT=""
 AGGREGA="${AGGREGA_BIN:-aggrega}"
 
 usage() {
-  echo "usage: $0 [--registry <host:port>] [--catalog <dir>] [--marker <tag>] [--full] [--yes] [--dry-run] [--no-advance] [--sign [--key <path>] [--identity-token <token>]]" >&2
+  echo "usage: $0 [--registry <host:port>] [--catalog <dir>] [--marker <tag>] [--full] [--yes] [--dry-run] [--no-advance] [--sign [--key <path>] [--identity-token <token>]] [--record-out <file>]" >&2
 }
 
 while [ $# -gt 0 ]; do
@@ -83,6 +97,7 @@ while [ $# -gt 0 ]; do
     --key)            KEY="$2"; shift 2 ;;
     --identity-token) IDTOKEN="$2"; shift 2 ;;
     --yes)            YES="1"; shift ;;
+    --record-out)     RECORD_OUT="$2"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
@@ -91,98 +106,24 @@ done
 [ -d "$CATALOG" ] || { echo "publish-diff: catalog dir not found: $CATALOG" >&2; exit 1; }
 
 # --- The entity kinds this publisher pushes -----------------------------------
-# The set is not written down here. It is read from the binary that does the
-# pushing: `aggrega push --list-kinds` emits every kind `aggrega push` addresses,
-# one per line, sorted and undecorated, and that is what this script consumes. So
-# this publisher cannot name a kind the push path does not handle, nor silently
-# miss one it does — the failure that motivated asking in the first place, where an
-# entity of a perfectly publishable kind was skipped with no message at all.
+# Read from the binary that does the pushing, through the one reader every script
+# here shares (scripts/lib/catalog-entities.sh, which carries why the set is asked
+# for rather than written down, and the plausibility floor that refuses a broken
+# answer).
 #
 # Minus one kind, named here with its reason: Plugin. This is an entities-only
 # publisher — a Plugin's .wasm is a separate artifact with its own mediatype and
-# its own publish path. Manifest / Release never appear in the answer at all, for
-# a different reason: they are deployment-side and `aggrega push` addresses
-# neither. A YAML with no `kind:` (recipe fragments, source/ files) is skipped.
-#
-# The exclusion is declared in the publisher that applies it, deliberately. What a
-# publisher declines to push is its own call, and one shared exclusion list would
-# let a widening made for a single publisher take effect silently in the others.
-#
-# Asking costs this script nothing it did not already require: it invokes the same
-# binary to push. That holds from a standalone checkout of this repository, which
-# carries no CLI source tree — the query needs a binary, not a source tree. What
-# such a checkout gives up is the chance to publish a wrong set quietly: a binary
-# that is missing, broken, or too old to answer refuses below, before anything is
-# pushed, rather than skipping entities one at a time with no message.
-#
-# Note that `aggrega get-schema --list` is not this route: it enumerates schemas,
-# including deployment-side kinds and the plugin socket contracts, so no filter
-# over it yields this answer.
-#
-# No count is stated anywhere here, on purpose: a count is a third thing to keep
-# in step, and it is the number that rots first.
+# its own publish path. The exclusion is declared in the publisher that applies it,
+# deliberately. What a publisher declines to push is its own call, and one shared
+# exclusion list would let a widening made for a single publisher take effect
+# silently in the others.
 PUBLISHABLE_EXCLUDE="Plugin"
-
-# Kinds whose absence means the QUERY broke rather than that the product changed.
-# A plausibility floor expressed as named kinds instead of a minimum count, for
-# the same reason no count appears above — and because a publishable set that has
-# lost Component or Recipe is not a set the platform could have shipped. Retiring
-# one of these genuinely would mean editing this line, which is the correct amount
-# of friction.
-#
-# The floor is written out here rather than read back from the query below, and
-# that is the one simplification to resist. A floor derived from the binary's own
-# answer would agree with every answer, including an empty one — and agreeing
-# with an empty answer is precisely the failure this floor exists to catch. It is
-# a deliberate independent statement of part of the set, not a second home for
-# it: deriving it from the thing it cross-checks would leave it checking nothing.
-PUBLISHABLE_SENTINELS="Component Feature Recipe FeatureRecipe"
-
-PUBLISHABLE_KINDS=""
-
-# load_publishable_kinds asks the binary ONCE per run and fills
-# PUBLISHABLE_KINDS. It refuses — non-zero, naming what to fix — when the binary
-# is missing, fails, does not understand the query, or answers with a set too
-# small to be real. It never falls back to a built-in list: a hard-coded list is
-# the drift this query removes, and an empty one would publish nothing while
-# reporting success.
-load_publishable_kinds() {
-  local answer kind sentinel
-  if ! answer="$("$AGGREGA" push --list-kinds)"; then
-    echo "publish-diff: cannot read the publishable entity kinds from '$AGGREGA push --list-kinds'." >&2
-    echo "  The binary is missing, failed, or predates that flag. Point AGGREGA_BIN at a current" >&2
-    echo "  build. Refusing rather than guessing which kinds to publish." >&2
-    return 1
-  fi
-  while IFS= read -r kind; do
-    [ -n "$kind" ] || continue
-    [ "$kind" = "$PUBLISHABLE_EXCLUDE" ] && continue
-    PUBLISHABLE_KINDS="${PUBLISHABLE_KINDS:+$PUBLISHABLE_KINDS }$kind"
-  done <<< "$answer"
-  for sentinel in $PUBLISHABLE_SENTINELS; do
-    case " $PUBLISHABLE_KINDS " in
-      *" $sentinel "*) ;;
-      *)
-        echo "publish-diff: the publishable entity kinds reported by the binary are missing '$sentinel'." >&2
-        echo "  Got: ${PUBLISHABLE_KINDS:-(nothing)}" >&2
-        echo "  That kind is load-bearing, so its absence means the query broke rather than that the" >&2
-        echo "  publishable set legitimately shrank. Refusing rather than publishing a partial catalog." >&2
-        return 1
-        ;;
-    esac
-  done
-}
-
-is_publishable() {
-  case " $PUBLISHABLE_KINDS " in
-    *" $1 "*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+# shellcheck source=lib/catalog-entities.sh
+. "$DIR/lib/catalog-entities.sh" || exit 1
 
 # Ask before the destructive-op confirm below, so a binary that cannot answer
 # refuses up front rather than after the operator has authorized a full re-push.
-load_publishable_kinds || exit 1
+load_publishable_kinds "$PUBLISHABLE_EXCLUDE" || exit 1
 
 # --- Destructive-op confirm (full reconcile) ---------------------------------
 # A real --full reconcile re-pushes every catalog entity. Guard it: --yes
@@ -236,11 +177,6 @@ marker_advance() {
 }
 # -----------------------------------------------------------------------------
 
-# peek_kind prints the top-level `kind:` value of a YAML file, or nothing.
-peek_kind() {
-  awk -F':[[:space:]]*' '/^kind:[[:space:]]/{print $2; exit}' "$1" | tr -d '\r'
-}
-
 # extract_reference reads captured `aggrega push` stdout and prints the
 # resolved <registry>/<path>:<tag> reference — exactly the string `aggrega
 # sign` consumes. "Push complete:" and "Already published:" carry it as the
@@ -291,14 +227,40 @@ else
   done < <(git -C "$HUB_ROOT" diff --name-only --diff-filter=ACMR "$base..HEAD" -- "$rel_catalog" | sort)
 fi
 
-# --- Push loop ---------------------------------------------------------------
-pushed=0; failed=0
-REFS=()
+# --- The entities among the candidates ---------------------------------------
+ENTITIES=()
 for f in ${FILES[@]+"${FILES[@]}"}; do
   [ -f "$f" ] || continue
   kind="$(peek_kind "$f")"
   [ -n "$kind" ] || continue          # non-entity YAML (no kind:) — skip
   is_publishable "$kind" || continue  # Plugin / deployment-side / unknown — skip
+  ENTITIES+=("$f")
+done
+
+# --- The published-version guard, before anything is pushed --------------------
+# Every entity this run would push is held to the version-to-digest record on the
+# published branch, offline; the committed switch decides whether a version changed
+# in place is a warning or a refusal. A refusal stops the run here, with nothing
+# pushed, signed or marked.
+if [ "${#ENTITIES[@]}" -gt 0 ]; then
+  if ! AGGREGA_BIN="$AGGREGA" "$DIR/published-version-guard.sh" --files "${ENTITIES[@]}"; then
+    echo "publish-diff: the published-version guard refused this run (above); nothing was pushed." >&2
+    exit 1
+  fi
+fi
+
+# The rows a real run records are read from each push's output by the one row
+# reader both publish workflows share, published_rows_from_push.
+# shellcheck source=lib/published-branch.sh
+. "$DIR/lib/published-branch.sh" || exit 1
+if [ -n "$RECORD_OUT" ]; then
+  : >"$RECORD_OUT" || { echo "publish-diff: cannot write $RECORD_OUT" >&2; exit 1; }
+fi
+
+# --- Push loop ---------------------------------------------------------------
+pushed=0; failed=0
+REFS=()
+for f in ${ENTITIES[@]+"${ENTITIES[@]}"}; do
   # Capture stdout to recover the resolved reference, then echo it so the push
   # output is still visible. The `if` guards the command substitution against
   # set -e while testing push's exit status.
@@ -307,6 +269,9 @@ for f in ${FILES[@]+"${FILES[@]}"}; do
     pushed=$((pushed + 1))
     ref="$(printf '%s\n' "$out" | extract_reference)"
     [ -n "$ref" ] && REFS+=("$ref")
+    if [ -n "$RECORD_OUT" ] && [ -z "$DRYRUN" ]; then
+      printf '%s\n' "$out" | published_rows_from_push >>"$RECORD_OUT"
+    fi
   else
     printf '%s\n' "$out"
     echo "publish-diff: PUSH FAILED: $f" >&2

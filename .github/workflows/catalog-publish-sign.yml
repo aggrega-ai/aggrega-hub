@@ -15,8 +15,22 @@ name: Publish and sign catalog
 #                 time for it. It runs on a GitHub-hosted runner, so a wait for
 #                 the image never holds the runner the CLI's own publisher needs
 #                 to publish that image.
-#   publish-sign  runs inside the tooling image, publishes and signs the
-#                 selected entities, and advances the publish marker.
+#   publish-sign  runs inside the tooling image, holds the selected entities to
+#                 the published-version guard, publishes and signs them, records
+#                 what it published on the published branch, and advances the
+#                 publish marker.
+#
+# The published-version guard runs before anything is pushed, a dry run's
+# included: each selected entity whose version the published branch records must
+# still carry the digest recorded for it, and the committed .published-version-guard
+# switch decides whether one that does not is a warning or stops the run.
+#
+# A real publish that succeeded records, on the published branch, every reference
+# it pushed or found already published, with its version and digest, through
+# scripts/record-published.sh: one commit on top of the branch as it stands,
+# pushed as a fast-forward and never forced, read again and rebuilt when another
+# publish recorded first. A dry run records nothing. Nothing here writes the main
+# branch; the workspace's sync takes the branch's owned paths into it.
 #
 # The credential check runs on every run, a dry run included, so a manual dry
 # run is also how to prove that the stored credential matches the registry. The
@@ -67,9 +81,11 @@ on:
 # short-lived identity token from the Actions runtime and signs against public
 # Sigstore (Fulcio + Rekor); no offline key is stored. The catalog publishes to
 # the public hub, so recording references in the public transparency log is
-# expected, not a leak. id-token:write lets the job mint the OIDC token. The one
-# git write this workflow needs is advancing the publish marker tag (see the
-# final step); nothing else here writes to the repository, hence contents:write.
+# expected, not a leak. id-token:write lets the job mint the OIDC token. The git
+# writes this workflow makes are two, both to its own repository and both with
+# the job's own token: recording what it published on the published branch, and
+# advancing the publish marker tag (the final two steps); nothing else here writes
+# to the repository, hence contents:write.
 permissions:
   contents: write
   id-token: write
@@ -300,7 +316,9 @@ jobs:
           # through `aggrega sign`, which reads the identity token from
           # SIGSTORE_ID_TOKEN (minted above) and uses the binary's public
           # Sigstore defaults for Fulcio and Rekor.
-          args=(--registry "$REGISTRY" --sign)
+          # Every reference a real run pushes or finds already published, with
+          # its version and digest, is written here for the next step to record.
+          args=(--registry "$REGISTRY" --sign --record-out "$RUNNER_TEMP/published-rows.tsv")
           if [ "$MODE" = "full" ]; then
             # A full reconcile re-pushes every catalog entity; --yes bypasses the
             # script's interactive confirm for non-interactive CI.
@@ -311,6 +329,27 @@ jobs:
           fi
 
           scripts/publish-diff.sh "${args[@]}"
+
+      - name: Record what was published on the published branch
+        # Records every reference the publish step pushed or found already
+        # published, with its version and digest, on the published branch: one
+        # commit on top of the branch as the remote holds it, pushed as a
+        # fast-forward with the job's own token and never forced; a branch that
+        # moved meanwhile is read again and the commit rebuilt on it. It runs
+        # before the marker is persisted, so a run whose record failed leaves the
+        # marker where it was and the next run publishes, and records, the same
+        # range again. Skipped on a dry run, which records nothing.
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          PUBLISHED_FROM: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          scripts/record-published.sh --rows "$RUNNER_TEMP/published-rows.tsv" \
+            --message "chore(catalog): record the catalog versions published from ${PUBLISHED_FROM:0:12}"
 
       - name: Persist the publish marker
         # MARKER SEAM: the publish script advances a local git tag (the marker it
