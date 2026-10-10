@@ -31,9 +31,9 @@ metadata:
     the data-plane Service Envoy Gateway creates and provides.endpoint its /v1
     base URL, qualified with envoy-gateway-system.
 
-    A core/period-budget attachment becomes a token cost on the route and a
-    traffic policy limiting it, counted in the cache socket's store by the
-    rate-limit service it turns on.
+    The route's one traffic policy holds core/period-budget as a rate limit
+    on the route's token cost, counted in the cache socket's store, and
+    core/retry-policy as a retry count.
 
     Images are pinned (infra.image; infra.overrides for the rate-limit and
     data-plane images); the chart version is source.version, overridden via
@@ -443,17 +443,23 @@ spec:
   # named after the gateway rather than with the project's fixed name, because
   # every gateway serving a model sits in the same namespace.
   #
+  # Then one traffic policy, named like the AI route after the gateway with
+  # -models appended, targets the HTTP route Envoy AI Gateway's controller
+  # creates for the AI route, under the AI route's own name, so what it carries
+  # covers model traffic and no other route on the gateway. Envoy Gateway
+  # attaches one traffic policy to a route and refuses a second one naming
+  # it, so this one policy carries every control written onto the model
+  # route: the period budget's rate limit and the retry policy's retry. It is
+  # written while either is attached; with neither, no policy is written.
+  #
   # A core/period-budget attachment, which period-budget-envoy-gateway
   # realizes and checks, is written as Envoy Gateway's usage-based rate limit.
   # The AI route gains one token cost, the count unit names as Envoy AI
   # Gateway calls it — TotalToken, InputToken or OutputToken, which it reads
   # from the total_tokens, prompt_tokens and completion_tokens a reply reports
   # — written into the request's metadata under locals.token_cost_namespace.
-  # Beside it, a traffic policy named after the gateway with -period-budget
-  # appended targets the HTTP route Envoy AI Gateway's controller creates for
-  # the AI route, under the AI route's own name, so the budget covers model
-  # traffic and no other route on the gateway. Its rate limit charges nothing
-  # when a request arrives and that cost when its reply completes, against
+  # The traffic policy's rate limit charges nothing when a request arrives
+  # and that cost when its reply completes, against
   # limit tokens per one unit of Envoy Gateway's rate limit: period's length
   # in seconds names the unit — 1 a Second, 60 a Minute, 3600 an Hour, 86400
   # a Day, 604800 a Week, 2592000 a Month of 30 days, 31536000 a Year of 365
@@ -467,8 +473,22 @@ spec:
   # the model name Envoy AI Gateway writes into locals.model_header, so each
   # wired model is counted apart. Every rule is shared, which keeps one count
   # across the route's rules rather than one per rule. With no such
-  # attachment neither the cost nor the policy is written, and the route is
-  # as it would be without one.
+  # attachment neither the cost nor the rate limit is written, and the route
+  # is as it would be without one.
+  #
+  # A core/retry-policy attachment, which retry-policy-envoy-gateway realizes
+  # and checks, is written as the traffic policy's retry, and this is the one
+  # place its count is computed. max_attempts counts every send, the first
+  # included, while Envoy Gateway's numRetries counts the sends after the
+  # first, so numRetries is max_attempts less one. A send is repeated on a
+  # refused connection or stream, on a reset — an upstream that does not
+  # answer at all — and on a reply of 429, 503 or 504; the list is written
+  # out because Envoy Gateway's own default retries neither a 429 nor a
+  # reset. No per-send timeout is written, so the AI route's request timeout
+  # spans every send, and a model that answers nothing within it is not sent
+  # again. The retry applies to every rule of the route, and each rule holds
+  # one backend, so a request for any wired model is sent at most
+  # max_attempts times.
   #
   # Each connection's resources are named after the gateway and the alias, in
   # lowercase with every underscore as a hyphen, the characters a Kubernetes
@@ -555,7 +575,12 @@ spec:
       {{- end }}
       {{- if gt (len $wired) 15 }}{{ fail (printf "%q has %d connections on its models socket, but the AI route serving them holds at most 15 rules, one per connection; serve the others through a second gateway" .context.instance_id (len $wired)) }}{{ end }}
       {{- $budget := dict }}
-      {{- range $name, $attachment := (default dict .features) }}{{ if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}{{ $budget = $attachment }}{{ end }}{{ end }}
+      {{- $retry := dict }}
+      {{- range $name, $attachment := (default dict .features) }}
+      {{- $type := first (splitList ":" (toString $attachment.type)) }}
+      {{- if eq $type "core/period-budget" }}{{ $budget = $attachment }}{{ end }}
+      {{- if eq $type "core/retry-policy" }}{{ $retry = $attachment }}{{ end }}
+      {{- end }}
       {{- $cost := dict }}
       {{- $unit := "" }}
       {{- with $budget }}
@@ -612,20 +637,21 @@ spec:
             name: {{ .context.rendered_name }}
         connection:
           bufferLimit: 50Mi
-      {{- with $budget }}
-      {{- $rules := list "" }}
-      {{- if eq .values.scope "model" }}{{ $rules = $wired }}{{ end }}
+      {{- if or $budget $retry }}
       ---
       apiVersion: gateway.envoyproxy.io/v1alpha1
       kind: BackendTrafficPolicy
       metadata:
-        name: {{ $.context.rendered_name }}-period-budget
+        name: {{ $.context.rendered_name }}-models
         namespace: "{{ $ns }}"
       spec:
         targetRefs:
           - group: gateway.networking.k8s.io
             kind: HTTPRoute
             name: {{ $.context.rendered_name }}-models
+      {{- with $budget }}
+      {{- $rules := list "" }}
+      {{- if eq .values.scope "model" }}{{ $rules = $wired }}{{ end }}
         rateLimit:
           global:
             rules:
@@ -650,6 +676,21 @@ spec:
                     metadata:
                       namespace: {{ $.locals.token_cost_namespace }}
                       key: {{ $cost.key }}
+      {{- end }}
+      {{- end }}
+      {{- with $retry }}
+        retry:
+          numRetries: {{ sub .values.max_attempts 1 }}
+          retryOn:
+            triggers:
+              - connect-failure
+              - refused-stream
+              - reset
+              - retriable-status-codes
+            httpStatusCodes:
+              - 429
+              - 503
+              - 504
       {{- end }}
       {{- end }}
       {{- range $alias := $wired }}

@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: retry-policy-envoy-gateway
+  version: 1.0.0
+  description: >
+    Realizes core/retry-policy on the gateway core/gateway/envoy-gateway; a
+    Release binds it in its Manifest. It emits no file: the gateway's Recipe,
+    envoy-gateway, reads the attachment and writes it as the retry of the one
+    traffic policy on the route serving the models wired to its models
+    socket, the policy that also carries a period budget's rate limit.
+
+    max_attempts counts every send, the first included, while Envoy Gateway
+    counts the sends after the first, so the number written is one fewer than
+    the attempts asked for: three attempts is two retries, and one attempt is
+    a single send. The retries are the gateway's, so a caller sees one answer
+    whichever send produced it. A send is repeated on a refused connection or
+    stream, on a reset — an upstream that does not answer at all — and on a
+    reply of 429, 503 or 504. The route's request timeout spans every send,
+    so a model that answers nothing within it is not sent again. Each wired
+    model's rule holds one backend, so a request for any model the gateway
+    serves is sent at most max_attempts times.
+
+    It refuses max_attempts above 2147483648, the most sends Envoy Gateway's
+    retry count holds, and halts on a second such attachment, with nothing
+    wired to the models socket, and on any component other than
+    core/gateway/envoy-gateway.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/retry-policy:1.0.0
+  # executionScope omitted -> component: evaluated once per attached component.
+  #
+  # No input kind and no pipeline: what this attachment changes is written by
+  # the gateway's Recipe, which reads it and computes the retry count there,
+  # in one place, so nothing here can disagree with what is rendered. What
+  # stays here is what that Recipe cannot honour.
+  #
+  # No assertion can read the host component's labels, so what the gateway is
+  # able to do is stated in the messages, and the check of the host's type
+  # first in the list is what keeps those statements true.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/envoy-gateway and core/gateway/envoy-gateway:1.0.0 are the
+    # same host.
+    component_writes_the_retry: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/envoy-gateway" -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q is bound to the Envoy Gateway realization, which only core/gateway/envoy-gateway carries out: that component's Recipe writes the retry onto the route it serves models on, and %s renders none for it, so no request would be sent again. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # Envoy Gateway holds its retry count, the sends after the first, as a
+    # 32-bit signed number, so it counts at most 2147483647 retries.
+    attempts_are_ones_the_gateway_keeps: >-
+      {{- if gt (int64 .values.max_attempts) 2147483648 -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q asks for max_attempts %d, but core/gateway/envoy-gateway counts at most 2147483647 retries after the first send, so it keeps at most 2147483648 sends in all; set max_attempts to 2147483648 or fewer" .metadata.feature_instance .metadata.instance_id (int64 .values.max_attempts)) -}}
+      {{- end -}}
+    # The retry is written onto the route serving the wired models, and with
+    # none wired the gateway renders no model route to retry on.
+    models_are_wired: >-
+      {{- if not (optional .uses "models" dict) -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q needs a model route to retry on, but nothing is wired to the models socket of %q, so the gateway serves no model and no request would be sent again; wire a model to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The Recipe writes one retry onto the route's one traffic policy, so a
+    # second attachment could not hold beside the first.
+    one_retry_policy_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/retry-policy" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/retry-policy is attached to %q more than once (%s), but core/gateway/envoy-gateway writes one retry onto the route serving its models, so the attachments cannot each hold; keep one attachment" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
+      {{- end -}}

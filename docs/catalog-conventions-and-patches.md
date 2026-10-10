@@ -2870,9 +2870,12 @@ limit that install keeps — for the whole gateway or each model, in the
 Redis-protocol store wired to its `cache` socket, and served uncounted while
 that store cannot be reached. It refuses a budget in US dollars, one per
 caller, since nothing on that path verifies who the caller is, and any other
-period. Envoy AI Gateway keeps no cache of replies and checks no reply against
-a schema, so the gateway realizes neither of the other two Features although it
-carries `semantic`: an attachment of either halts the build. Contour and NGINX
+period. On that route it also realizes `core/retry-policy`, whose retry count
+its Recipe writes onto the same traffic policy as the budget's rate limit,
+since Envoy Gateway attaches one traffic policy to a route. Envoy AI Gateway
+keeps no cache of replies and checks no reply against a schema, so the gateway
+realizes neither of the other two Features although it carries `semantic`: an
+attachment of either halts the build. Contour and NGINX
 offer none of the three. No gateway in this
 catalog checks a reply against a schema the attachment carries, so
 `core/response-validation` is realized nowhere.
@@ -2881,7 +2884,9 @@ catalog checks a reply against a schema the attachment carries, so
 requests a gateway carries at once across everything it serves, is realized
 nowhere either. The proxy `core/gateway/litellm` runs can cap the requests in
 flight for each entry of its model map, but holds no cap on their total, so
-that gateway carries no realization; and no Recipe of
+that gateway carries no realization; `core/gateway/envoy-gateway` can cap the
+requests in flight to each wired model's backend, one cap per route rule, and
+holds no cap on their total either, so it carries none; and no Recipe of
 `core/gateway/cloudflare-ai-gateway` writes such a cap: the request limit its
 terraform Recipe writes into the gateway's resource is a rate, a number of
 requests over an interval.
