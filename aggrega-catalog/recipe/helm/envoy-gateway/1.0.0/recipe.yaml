@@ -19,9 +19,8 @@ metadata:
     HTTP listener. Where infra.tls_secret names a certificate Secret, the
     gateway gains an `https` listener on port 443 terminating TLS with it; the
     Secret is referenced and never emitted. It emits neither the data plane,
-    which the control plane creates, nor a namespace. The gateway and every
-    namespaced resource of the chart land in the namespace the Release declares
-    for the component, or in `default` where none is declared.
+    which the control plane creates, nor a namespace. Every namespaced
+    resource lands in the namespace the Release declares, or in `default`.
 
     Wired to the AI gateway controller on the extension socket, the control
     plane names it as its extension server, and the gateway must sit in
@@ -32,10 +31,13 @@ metadata:
     the data-plane Service Envoy Gateway creates and provides.endpoint its /v1
     base URL, qualified with envoy-gateway-system.
 
-    The control-plane image is pinned (override: infra.image); the rate-limit
-    and data-plane images the render names do not float and are replaceable
-    through infra.overrides; the chart version is in source.version, overridden
-    via infra.source_version.
+    A core/period-budget attachment becomes a token cost on the route and a
+    traffic policy limiting it, counted in the cache socket's store by the
+    rate-limit service it turns on.
+
+    Images are pinned (infra.image; infra.overrides for the rate-limit and
+    data-plane images); the chart version is source.version, overridden via
+    infra.source_version.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -73,9 +75,14 @@ spec:
   #
   # model_header is the header Envoy AI Gateway writes the model name a request
   # carries into, which a route rule matches to choose a backend.
+  #
+  # token_cost_namespace is the namespace of the request metadata Envoy AI
+  # Gateway writes a route's token costs into, where a traffic policy's rate
+  # limit reads the cost it charges.
   locals:
     controller_gateway_namespace: envoy-gateway-system
     model_header: x-ai-eg-model
+    token_cost_namespace: io.envoy.ai_gateway
 
   # host is the Service Envoy Gateway creates for this gateway's data plane —
   # the entry point client traffic is sent to. Envoy Gateway names it from the
@@ -136,7 +143,9 @@ spec:
       {{- end -}}
 
   # This Recipe reads from infra.overrides:
-  #   ratelimit_image  - string (global.images.ratelimit.image; replaces the chart's pin)
+  #   ratelimit_image  - string (global.images.ratelimit.image; replaces the chart's pin, which reads
+  #                      USE_CALENDAR_MONTH_RATE_LIMIT; a replacement that does not counts a period
+  #                      budget of 1mo over 30 days instead)
   #   data_plane_image - string (global.images.envoyProxy.image; replaces the control plane's built-in default)
   #   requests         - { cpu: string, memory: string } (control-plane resource requests)
   #   service_type     - string (service.type; default ClusterIP)
@@ -172,6 +181,60 @@ spec:
       {{- fail (printf "%q has %q wired to its extension socket, and that controller looks for this gateway's control plane in the %s namespace, but the gateway is placed in %q; declare the annotation aggrega.ai/namespace: %s on %q in the Release" $.context.instance_id .target $.locals.controller_gateway_namespace $ns $.locals.controller_gateway_namespace $.context.instance_id) }}
       {{- end }}
       {{- $controllerNamespace = optional (optional (default dict .annotations) "release" dict) "aggrega.ai/namespace" "" | default "default" }}
+    {{- end }}
+
+    ## ── The period budget's store ──────────────────────────────
+    ## A core/period-budget attachment, which period-budget-envoy-gateway
+    ## realizes and checks, is counted by Envoy Gateway's rate-limit service,
+    ## which the control plane creates in its own namespace once its
+    ## configuration names a store. The store is the connection on the cache
+    ## socket, which that realization requires while the budget is attached;
+    ## with no attachment nothing here is written, whatever the cache socket
+    ## holds. The store must speak the Redis protocol, which a store publishes
+    ## as redis or valkey, and the build halts on any other. Its published
+    ## host carries no namespace, so a host with no dot and no colon is
+    ## qualified with the namespace the Release places the store in, or
+    ## `default` where it declares none. The connection's credential, where it
+    ## carries one, is handed to the service as a reference to the Secret it
+    ## publishes; one publishing no Secret name and data key halts the build,
+    ## since the service would then have no reference to read it from.
+    {{- $budget := dict }}
+    {{- range $name, $attachment := (default dict .features) }}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}
+        {{- $budget = $attachment }}
+      {{- end }}
+    {{- end }}
+    {{- $store := dict }}
+    {{- if $budget }}
+      {{- range $alias, $edge := .context.uses }}
+        {{- if eq $edge.socket "cache" }}
+          {{- $store = $edge }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- $storeAddress := "" }}
+    {{- $storeSecret := dict }}
+    {{- with $store }}
+      {{- $protocol := toString (optional (default dict .provides) "protocol" "") }}
+      {{- if not (has $protocol (list "redis" "valkey")) }}
+      {{- fail (printf "the cache socket of %q is wired to %q, whose published protocol is %q, but Envoy Gateway's rate-limit service keeps a period budget's count in a store speaking the Redis protocol, which a store publishes as redis or valkey; wire a core/datastore/redis to the cache socket instead" $.context.instance_id .target $protocol) }}
+      {{- end }}
+      {{- $host := lower (toString .provides.host) }}
+      {{- if not (or (contains "." $host) (contains ":" $host)) }}
+      {{- $host = printf "%s.%s.svc.cluster.local" $host (optional (optional (default dict .annotations) "release" dict) "aggrega.ai/namespace" "" | default "default") }}
+      {{- end }}
+      {{- $storeAddress = printf "%s:%v" $host .provides.port }}
+      {{- with optional (default dict .features) "credential" dict }}
+        {{- $locator := optional . "provides" dict }}
+        {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) }}
+        {{- fail (printf "the credential on the cache connection of %q publishes no Secret name and data key, so Envoy Gateway's rate-limit service could not be given a reference to read the store's password from; attach a credential publishing both, such as core/referenced-secret" $.context.instance_id) }}
+        {{- end }}
+        {{- $storeSecret = $locator }}
+      {{- end }}
+    {{- end }}
+    {{- $calendarMonth := false }}
+    {{- with $budget }}
+      {{- $calendarMonth = eq (toString (optional (default dict .infra) "period" "")) "1mo" }}
     {{- end }}
 
     ## ── Resource naming ────────────────────────────────────────
@@ -246,6 +309,46 @@ spec:
             fqdn:
               hostname: "{{ .provides.host }}.{{ $controllerNamespace }}.svc.cluster.local"
               port: {{ .provides.port }}
+        {{- end }}
+        {{- with $storeAddress }}
+        ## ── The rate-limit service ───────────────────────────────
+        ## Envoy Gateway's own rate-limit service, which counts a period
+        ## budget, keeping the count in the store above. The control plane
+        ## creates it from this configuration and turns it on for every
+        ## gateway it serves. Its failure mode is the product's default: while
+        ## the store or the service cannot be reached, or does not answer
+        ## within 20 ms, a request is let through and not counted. The
+        ## password reaches the service as REDIS_AUTH, read from the Secret
+        ## the cache connection's credential publishes, which the service
+        ## resolves in its own namespace, the gateway's. For a budget of one
+        ## calendar month the service is told, through
+        ## USE_CALENDAR_MONTH_RATE_LIMIT, to count a Month from the first day
+        ## of a calendar month to its last; the setting is the service's, so it
+        ## applies to every Month rate limit this install keeps. Any other
+        ## budget leaves it at its default, under which a Month is 30 days.
+        rateLimit:
+          backend:
+            type: Redis
+            redis:
+              url: {{ . | toJson }}
+        {{- if or $storeSecret $calendarMonth }}
+        provider:
+          kubernetes:
+            rateLimitDeployment:
+              container:
+                env:
+                  {{- with $storeSecret }}
+                  - name: REDIS_AUTH
+                    valueFrom:
+                      secretKeyRef:
+                        name: {{ .name | toJson }}
+                        key: {{ .key | toJson }}
+                  {{- end }}
+                  {{- if $calendarMonth }}
+                  - name: USE_CALENDAR_MONTH_RATE_LIMIT
+                    value: "true"
+                  {{- end }}
+        {{- end }}
         {{- end }}
 
     ## ── Control-plane workload ─────────────────────────────────
@@ -340,6 +443,33 @@ spec:
   # named after the gateway rather than with the project's fixed name, because
   # every gateway serving a model sits in the same namespace.
   #
+  # A core/period-budget attachment, which period-budget-envoy-gateway
+  # realizes and checks, is written as Envoy Gateway's usage-based rate limit.
+  # The AI route gains one token cost, the count unit names as Envoy AI
+  # Gateway calls it — TotalToken, InputToken or OutputToken, which it reads
+  # from the total_tokens, prompt_tokens and completion_tokens a reply reports
+  # — written into the request's metadata under locals.token_cost_namespace.
+  # Beside it, a traffic policy named after the gateway with -period-budget
+  # appended targets the HTTP route Envoy AI Gateway's controller creates for
+  # the AI route, under the AI route's own name, so the budget covers model
+  # traffic and no other route on the gateway. Its rate limit charges nothing
+  # when a request arrives and that cost when its reply completes, against
+  # limit tokens per one unit of Envoy Gateway's rate limit: period's length
+  # in seconds names the unit — 1 a Second, 60 a Minute, 3600 an Hour, 86400
+  # a Day, 604800 a Week, 2592000 a Month of 30 days, 31536000 a Year of 365
+  # days — and 1mo a Month counted as a calendar month, under the setting the
+  # value mapping above turns on. The realization's assertion keeps the same
+  # list of lengths, deliberately a second copy, because an assertion cannot
+  # hand a value to this Recipe; the two are edited together, and a period
+  # this template cannot map halts the build here. Scope gateway writes one
+  # rule, counting every model request on the route together; scope model
+  # writes one per connection on the models socket, in alias order, matching
+  # the model name Envoy AI Gateway writes into locals.model_header, so each
+  # wired model is counted apart. Every rule is shared, which keeps one count
+  # across the route's rules rather than one per rule. With no such
+  # attachment neither the cost nor the policy is written, and the route is
+  # as it would be without one.
+  #
   # Each connection's resources are named after the gateway and the alias, in
   # lowercase with every underscore as a hyphen, the characters a Kubernetes
   # name allows; an alias ending in a hyphen or an underscore, or two aliases
@@ -424,6 +554,23 @@ spec:
       {{- end }}
       {{- end }}
       {{- if gt (len $wired) 15 }}{{ fail (printf "%q has %d connections on its models socket, but the AI route serving them holds at most 15 rules, one per connection; serve the others through a second gateway" .context.instance_id (len $wired)) }}{{ end }}
+      {{- $budget := dict }}
+      {{- range $name, $attachment := (default dict .features) }}{{ if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}{{ $budget = $attachment }}{{ end }}{{ end }}
+      {{- $cost := dict }}
+      {{- $unit := "" }}
+      {{- with $budget }}
+      {{- $cost = get (dict "total_tokens" (dict "type" "TotalToken" "key" "llm_total_token") "prompt_tokens" (dict "type" "InputToken" "key" "llm_input_token") "completion_tokens" (dict "type" "OutputToken" "key" "llm_output_token")) (toString .values.unit) }}
+      {{- if not $cost }}{{ fail (printf "core/period-budget attachment on %q asks for unit %v, which Envoy AI Gateway counts no token cost for; set unit to total_tokens, prompt_tokens or completion_tokens" $.context.instance_id .values.unit) }}{{ end }}
+      {{- if not (has (toString .values.scope) (list "gateway" "model")) }}{{ fail (printf "core/period-budget attachment on %q asks for scope %v, which this gateway does not count; set scope to gateway or model" $.context.instance_id .values.scope) }}{{ end }}
+      {{- $count := atoi (regexFind "^[0-9]+" (toString .infra.period)) }}
+      {{- $suffix := regexFind "[a-z]+$" (toString .infra.period) }}
+      {{- if eq $suffix "mo" }}
+      {{- if eq $count 1 }}{{ $unit = "Month" }}{{ end }}
+      {{- else if has $suffix (list "s" "m" "h" "d") }}
+      {{- $unit = get (dict "1" "Second" "60" "Minute" "3600" "Hour" "86400" "Day" "604800" "Week" "2592000" "Month" "31536000" "Year") (toString (mul $count (index (dict "s" 1 "m" 60 "h" 3600 "d" 86400) $suffix))) }}
+      {{- end }}
+      {{- if not $unit }}{{ fail (printf "core/period-budget attachment on %q asks for a period of %v, which is no whole unit of Envoy Gateway's rate limit; set period to 1s, 1m, 1h, 1d, 7d, 30d, 365d or 1mo" $.context.instance_id .infra.period) }}{{ end }}
+      {{- end }}
       {{- if $wired -}}
       apiVersion: aigateway.envoyproxy.io/v1beta1
       kind: AIGatewayRoute
@@ -435,6 +582,11 @@ spec:
           - name: {{ .context.rendered_name }}
             kind: Gateway
             group: gateway.networking.k8s.io
+      {{- with $cost }}
+        llmRequestCosts:
+          - metadataKey: {{ .key }}
+            type: {{ .type }}
+      {{- end }}
         rules:
       {{- range $alias := $wired }}
       {{- $edge := get $.context.uses $alias }}
@@ -460,6 +612,46 @@ spec:
             name: {{ .context.rendered_name }}
         connection:
           bufferLimit: 50Mi
+      {{- with $budget }}
+      {{- $rules := list "" }}
+      {{- if eq .values.scope "model" }}{{ $rules = $wired }}{{ end }}
+      ---
+      apiVersion: gateway.envoyproxy.io/v1alpha1
+      kind: BackendTrafficPolicy
+      metadata:
+        name: {{ $.context.rendered_name }}-period-budget
+        namespace: "{{ $ns }}"
+      spec:
+        targetRefs:
+          - group: gateway.networking.k8s.io
+            kind: HTTPRoute
+            name: {{ $.context.rendered_name }}-models
+        rateLimit:
+          global:
+            rules:
+      {{- range $alias := $rules }}
+              - limit:
+                  requests: {{ int64 $budget.infra.limit }}
+                  unit: {{ $unit }}
+      {{- with $alias }}
+                clientSelectors:
+                  - headers:
+                      - name: {{ $.locals.model_header }}
+                        type: Exact
+                        value: {{ . | toJson }}
+      {{- end }}
+                shared: true
+                cost:
+                  request:
+                    from: Number
+                    number: 0
+                  response:
+                    from: Metadata
+                    metadata:
+                      namespace: {{ $.locals.token_cost_namespace }}
+                      key: {{ $cost.key }}
+      {{- end }}
+      {{- end }}
       {{- range $alias := $wired }}
       {{- $edge := get $.context.uses $alias }}
       {{- $name := get $names $alias }}

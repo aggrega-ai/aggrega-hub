@@ -1,0 +1,151 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: period-budget-envoy-gateway
+  version: 1.0.0
+  description: >
+    Realizes core/period-budget on the gateway core/gateway/envoy-gateway; a
+    Release binds it in its Manifest. It emits no file: the gateway's Recipe,
+    envoy-gateway, reads the attachment and writes it as Envoy Gateway's
+    usage-based rate limit on the route serving the models wired to its
+    models socket, counted by the control plane's rate-limit service in the
+    store wired to its cache socket.
+
+    The gateway counts the tokens each model's reply reports, read, written or
+    both as unit names, over fixed windows on the UTC clock: a second, a
+    minute, an hour, a day, a week starting on a Thursday, 30 or 365 days
+    counted from 1 January 1970, or for 1mo a calendar month, a setting the
+    Recipe turns on for every monthly rate limit that install keeps. Once the
+    count exceeds limit it answers model requests with HTTP 429 until the
+    window ends. It adds a request's tokens once the reply is complete, so the
+    request that crosses the limit, and any answered beside it, is served.
+    While the store or the rate-limit service cannot be reached, requests are
+    served and not counted, the product's default; a store keeping the count
+    in memory, as core/datastore/redis does by default, starts every window
+    again when it restarts.
+
+    So it honours unit total_tokens, prompt_tokens or completion_tokens, scope
+    gateway or model, and period 1s, 1m, 1h, 1d, 7d, 30d, 365d or 1mo, or the
+    same length spelt otherwise. It refuses usd, scope caller, since nothing on
+    this path verifies who the caller is, and any other period by name, and
+    halts on a limit that is not a whole number of tokens up to 4294967295, on a
+    second such attachment, with nothing wired to the models or cache socket,
+    and on any component other than core/gateway/envoy-gateway.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/period-budget:1.0.0
+  # executionScope omitted -> component: evaluated once per attached component.
+  #
+  # No input kind and no pipeline: what this attachment changes is written by
+  # the gateway's Recipe, which reads it. What stays here is what that Recipe
+  # cannot honour.
+  #
+  # How the gateway keeps the budget. The Recipe writes the token count unit
+  # names as a cost of the AI route serving the wired models — Envoy AI
+  # Gateway's InputToken, OutputToken or TotalToken, which it reads from the
+  # prompt_tokens, completion_tokens and total_tokens of each model reply, a
+  # streamed reply included, since it asks the model to report its usage at
+  # the end of a stream — and a traffic policy on the route that route
+  # becomes, which charges nothing when a request arrives and charges that
+  # count when its reply completes. Envoy Gateway's rate-limit service keeps
+  # the count; on each model request the gateway asks it whether the count
+  # charged so far exceeds limit, and answers 429 when it does. A reply
+  # reporting no usage adds nothing. Scope gateway counts every model request
+  # on the route together; scope model counts each connection on the models
+  # socket apart, by the model name a request carries, which is the alias the
+  # route chooses its model by.
+  #
+  # The service counts in fixed windows of one unit of Envoy Gateway's rate
+  # limit — Second, Minute, Hour, Day, Week, Month or Year — each starting at a
+  # multiple of its length since 1 January 1970, UTC, which a period of one
+  # such length takes exactly: a day starts at 00:00 UTC and a week on a
+  # Thursday. A Month is 30 such days, so 30d is one, unless the service reads
+  # its calendar-month setting, under which a Month runs from the first day of
+  # a calendar month to its last, which is what 1mo is; the Recipe sets it only
+  # for 1mo, and it applies to every Month rate limit that install keeps, the
+  # budget's and any other. A Year is 365 days. There is no count of units, so
+  # any other length, and any other number of months, has no window here.
+  #
+  # Nothing on this path verifies who a caller is: the gateway tells callers
+  # apart only by a header the caller writes itself, so a caller sending a new
+  # value would start a fresh budget, and one sending none would not be counted
+  # at all. Scope caller is therefore refused rather than counted that way.
+  #
+  # No assertion can read the host component's labels, so what the gateway is
+  # able to do is stated in the messages, and the check of the host's type
+  # first in the list is what keeps those statements true.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/envoy-gateway and core/gateway/envoy-gateway:1.0.0 are the
+    # same host.
+    component_writes_the_budget: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/envoy-gateway" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q is bound to the Envoy Gateway realization, which only core/gateway/envoy-gateway carries out: that component's Recipe writes the budget onto the route it serves models on, and %s renders none for it, so nothing would be counted. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # Envoy AI Gateway counts the tokens a model's reply reports and prices
+    # nothing.
+    unit_is_a_token_count: >-
+      {{- if eq .values.unit "usd" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for unit usd, but core/gateway/envoy-gateway, which declares dataplane.aggrega.ai/period-budget: tokens, counts the tokens each model's reply reports and prices nothing, so it keeps no budget in US dollars; set unit to total_tokens, prompt_tokens or completion_tokens, or attach the Feature to a gateway that counts cost" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+    # The gateway tells callers apart only by a header the caller writes.
+    scope_is_one_the_gateway_keeps: >-
+      {{- if eq .values.scope "caller" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for scope caller, but core/gateway/envoy-gateway tells callers apart only by a header the caller writes itself and nothing on this path verifies who the caller is, so a caller sending a new value would start a fresh budget and one sending none would not be counted. Set scope to gateway, for every model request it serves, or model, for each connection on its models socket" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+    # A period of one whole unit of Envoy Gateway's rate limit, written in any
+    # unit the Feature takes, or a calendar month. The lengths, in seconds, are
+    # the ones the gateway's Recipe maps to a unit; the two lists are kept
+    # apart deliberately, because an assertion cannot hand a value to the
+    # Recipe, and they are edited together: the Recipe halts on a period it
+    # cannot map, so a period admitted here and missing there stops the build
+    # rather than rendering a wrong window.
+    period_is_one_the_gateway_keeps: >-
+      {{- $count := atoi (regexFind "^[0-9]+" .infra.period) -}}
+      {{- $suffix := regexFind "[a-z]+$" .infra.period -}}
+      {{- $honoured := false -}}
+      {{- if eq $suffix "mo" -}}
+      {{- $honoured = eq $count 1 -}}
+      {{- else -}}
+      {{- $seconds := mul $count (index (dict "s" 1 "m" 60 "h" 3600 "d" 86400) $suffix) -}}
+      {{- $honoured = has (toString $seconds) (list "1" "60" "3600" "86400" "604800" "2592000" "31536000") -}}
+      {{- end -}}
+      {{- if not $honoured -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of %s, but core/gateway/envoy-gateway counts a budget over one whole unit of Envoy Gateway's rate limit, in fixed windows on the clock, and %s is none of them; set period to 1s, 1m, 1h, 1d, 7d, 30d, 365d or 1mo, a calendar month" .metadata.feature_instance .metadata.instance_id .infra.period .infra.period) -}}
+      {{- end -}}
+    # The gateway takes its limit as a whole number of requests, here tokens,
+    # no greater than 4294967295.
+    limit_is_a_whole_number_of_tokens: >-
+      {{- $limit := float64 .infra.limit -}}
+      {{- if or (ne $limit (floor $limit)) (gt $limit 4294967295.0) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q sets limit %v, but core/gateway/envoy-gateway takes its limit as a whole number of tokens no greater than 4294967295; set limit to such a number" .metadata.feature_instance .metadata.instance_id .infra.limit) -}}
+      {{- end -}}
+    # The budget is written onto the route serving the wired models, and with
+    # none wired the gateway renders no model route to count.
+    models_are_wired: >-
+      {{- if not (optional .uses "models" dict) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q needs a model route to count, but nothing is wired to the models socket of %q, so the gateway serves no model and there is nothing the budget could count; wire a model to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The rate-limit service keeps the count in the store wired to the cache
+    # socket, and with none it would keep nothing.
+    counter_store_is_wired: >-
+      {{- if not (optional .uses "cache" dict) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q needs a store for its count, but nothing is wired to the cache socket of %q, and Envoy Gateway's rate-limit service keeps the count in the Redis-protocol store wired there; wire a core/datastore/redis to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The Recipe writes one traffic policy for the budget on the route, so a
+    # second attachment could not hold beside the first.
+    one_budget_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/period-budget is attached to %q more than once (%s), but core/gateway/envoy-gateway writes one budget onto the route serving its models, so the attachments cannot each hold; keep one attachment" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
+      {{- end -}}

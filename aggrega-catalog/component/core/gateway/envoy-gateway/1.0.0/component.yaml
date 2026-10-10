@@ -13,15 +13,14 @@ metadata:
     resources and configures an Envoy data plane, which terminates client HTTP
     traffic — and HTTPS traffic too, where the Release names a certificate
     Secret through tls_secret — and load-balances it to the Services those
-    routes name. This
-    Component installs the control plane and claims the gateway class and the
-    gateway itself: a gateway class is cluster-scoped and one gateway serves
-    every route attached to it, so both belong to the install rather than to
-    any single application. An application reaches this gateway by declaring a
-    route that names the gateway as its parent; the gateway this Component
-    emits is named after the component the Aggregate declares, so that name is
-    the one a route carries. Realized on Kubernetes through a Helm Recipe; it
-    has no standalone local-container form, so no Compose Recipe is provided.
+    routes name. This Component installs the control plane and claims the
+    gateway class and the gateway itself: a gateway class is cluster-scoped
+    and one gateway serves every route attached to it, so both belong to the
+    install rather than to any single application. An application reaches
+    it by declaring a route naming the gateway as its parent, and the gateway
+    is named after the component the Aggregate declares. Realized on
+    Kubernetes through a Helm Recipe; it has no standalone local-container
+    form, so no Compose Recipe is provided.
 
     It also serves models through Envoy AI Gateway. Wired to the AI gateway
     controller on its extension socket, it calls that controller as its
@@ -29,11 +28,12 @@ metadata:
     or the build halts. Each model on its models socket is served under /v1
     at the gateway's address to a request naming the connection's alias,
     with that connection's credential. The gateway publishes that address as
-    its endpoint, qualified with envoy-gateway-system, the namespace the build
-    fixes, so an agent in any namespace reaches it, and values.model as its
-    model. While a model is wired, the gateway's per-connection request
-    buffer is raised to 50Mi, as Envoy AI Gateway configures it, for every
-    route on the gateway.
+    its endpoint, qualified with envoy-gateway-system so an agent in any
+    namespace reaches it, and values.model as its model. While a model is
+    wired, every route on the gateway takes the 50Mi per-connection request
+    buffer Envoy AI Gateway configures. With core/period-budget attached it
+    counts the tokens its models report against a limit, in the store wired
+    to its cache socket.
   labels:
     component.aggrega.ai/type: server
     component.aggrega.ai/category: gateway
@@ -70,6 +70,15 @@ metadata:
     # a named hostname. The capability is what the label asserts; whether a
     # given route turns it on is that route's own configuration.
     dataplane.aggrega.ai/upstream-tls: trust-anchor
+    # Period budget: the gateway can refuse model requests once the tokens it
+    # has counted over a period exceed a limit set in its configuration — the
+    # tokens each model's reply reports reading, writing or both, which Envoy
+    # AI Gateway reads and Envoy Gateway's rate limit counts — which is the
+    # fidelity this value names. It prices nothing, so it counts no cost. It
+    # refuses nothing until core/period-budget is attached; the Recipe then
+    # writes the budget onto the route serving the models wired to the models
+    # socket, and turns on the rate-limit service that counts it.
+    dataplane.aggrega.ai/period-budget: tokens
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -153,6 +162,45 @@ spec:
           selector: "feature.aggrega.ai/kind=secret"
           sensitive: true
           description: "Optional credential the gateway presents to the model this connection reaches, as a bearer token. When attached, the connection's backend security policy names the Secret the credential publishes, and the AI gateway controller reads the key from that Secret, in the gateway's namespace, under the data key apiKey, which the credential must publish: any other data key halts the build. The key appears in no rendered file. Unattached, the gateway adds no credential."
+    # The Redis-protocol store Envoy Gateway's rate-limit service keeps a
+    # period budget's count in. The selector admits the key-value stores; the
+    # Recipe halts on one whose published protocol is neither redis nor
+    # valkey, the two that speak the protocol the service talks. The selected
+    # component's provides host and port arrive on the connection and compose
+    # the store's address in the control plane's configuration, a host
+    # carrying no dot qualified with the namespace the Release places the
+    # store in, or `default` where it declares none, because the service runs
+    # in the gateway's namespace. The control plane creates that service from
+    # its configuration and turns rate limiting on for every gateway it serves.
+    #
+    # Optional: wired alone it changes nothing rendered, because the
+    # rate-limit service is configured only while core/period-budget is
+    # attached, and that attachment halts the build unless this socket holds a
+    # connection. The service keeps its count in one store, so a second
+    # connection halts the build.
+    #
+    # The password the service presents to the store is the connection's own,
+    # in its credential slot, for a store that requires one:
+    # core/datastore/redis does once a credential is attached to its own
+    # password slot, and a credential holding the same password is attached
+    # here, both reading one parameter. With none, the service presents no
+    # password.
+    cache:
+      selector: "datastore.aggrega.ai/engine=kv"
+      valueSchema:
+        unauthenticated:
+          type: boolean
+          default: false
+          description: Declares that the store this connection reaches takes no credential, so a connection carrying none is intended rather than an omission. It changes nothing this component renders.
+      # No inject list: no container of this component receives the credential
+      # through it. The Recipe names its Secret in the control plane's
+      # configuration, and the rate-limit service the control plane creates
+      # reads the password from that Secret.
+      featuresSchema:
+        credential:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          description: "Optional password the gateway's rate-limit service presents to the Redis-protocol store this connection reaches. When attached, the Recipe hands the service a reference to the Secret the credential publishes, under the data key it publishes, and the service reads the password from that Secret in the gateway's namespace, so the password appears in no rendered file; a credential publishing no Secret name and data key halts the build. Unattached, the service connects with no password, which is what the shipped store components expect by default."
 
   schema:
     values:
@@ -277,8 +325,8 @@ spec:
           model wired under that alias, asking for the model name that model
           publishes. Empty while nothing is wired to the models socket.
 
-  # The rules of the extension and models sockets, with the credential rule
-  # every socket declaring unauthenticated carries. Each reads what the
+  # The rules of the extension, models and cache sockets, with the credential
+  # rule every socket declaring unauthenticated carries. Each reads what the
   # Aggregate and the Release wrote — the values, and each connection's target
   # labels, values and attachments — all known before a Recipe binds, so each
   # holds whichever Recipe renders this component and halts before anything
@@ -289,6 +337,13 @@ spec:
       {{- $servers := sortAlpha (keys (optional .uses "extension" dict)) -}}
       {{- if gt (len $servers) 1 -}}
       {{- fail (printf "%q has %s on its extension socket, but Envoy Gateway calls one extension server; keep one of them" .metadata.instance_id (join " and " $servers)) -}}
+      {{- end -}}
+    # The control plane's configuration names one store for its rate-limit
+    # service.
+    one_counter_store: >-
+      {{- $stores := sortAlpha (keys (optional .uses "cache" dict)) -}}
+      {{- if gt (len $stores) 1 -}}
+      {{- fail (printf "%q has %s on its cache socket, but Envoy Gateway's rate-limit service keeps its count in one store; keep one of them" .metadata.instance_id (join " and " $stores)) -}}
       {{- end -}}
     # A wired model's route and backends are custom resources of Envoy AI
     # Gateway, which only its controller reconciles, and the gateway's control
@@ -341,7 +396,7 @@ spec:
     # component; a self-hosted target draws nothing. The list names every
     # socket of this component that declares unauthenticated.
     managed_target_needs_a_credential: >-
-      {{- range $socket := list "models" -}}
+      {{- range $socket := list "models" "cache" -}}
       {{- range $alias, $connection := (optional $.uses $socket dict) -}}
       {{- $managed := eq (optional $connection.labels "component.aggrega.ai/hosting" "") "managed" -}}
       {{- $optedOut := optional $connection.values "unauthenticated" false -}}
