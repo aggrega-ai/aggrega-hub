@@ -22,11 +22,33 @@ metadata:
     emits is named after the component the Aggregate declares, so that name is
     the one a route carries. Realized on Kubernetes through a Helm Recipe; it
     has no standalone local-container form, so no Compose Recipe is provided.
+
+    It also serves models, through Envoy AI Gateway. Wired to the AI gateway
+    controller on its extension socket, the control plane calls that
+    controller's extension server, and the Release must place the gateway in
+    the envoy-gateway-system namespace, as the controller expects, or the
+    build halts. Each model on its models socket, which needs that
+    connection, is served under /v1 at the gateway's own address to a request
+    naming the connection's alias as its model, sent to the endpoint and model
+    name the model publishes with that connection's credential. It publishes
+    that address as its endpoint and values.model as its model, so an agent's
+    model socket takes it in place of a model; with nothing wired to the
+    models socket both are empty.
   labels:
     component.aggrega.ai/type: server
     component.aggrega.ai/category: gateway
     component.aggrega.ai/hosting: self-hosted
     component.aggrega.ai/upstream-licensing: osi-approved
+    # Model API: the endpoint this gateway publishes answers the OpenAI API —
+    # the routes Envoy AI Gateway serves under /v1 for the models wired to the
+    # models socket, each chosen by the model name a request carries — so a
+    # consumer drives it with an OpenAI client whichever model answers behind
+    # it. It is what lets a model socket selecting this key admit the gateway
+    # beside the models themselves; the gateway publishes the endpoint and the
+    # model name such a socket's consumers read. The value names what the
+    # product serves, not a configured state: with nothing wired to the models
+    # socket the gateway serves no model, and both of those are empty.
+    model.aggrega.ai/api: openai
     # Data-path capability labels. Each states what this gateway is able to do,
     # never what a given Release has switched on — the two read alike to a
     # developer and only the first is a property of the product.
@@ -52,6 +74,82 @@ metadata:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
 spec:
+  usesSchema:
+    # The Envoy AI Gateway controller the control plane calls as its extension
+    # server. The selector takes a component labelled
+    # gateway.aggrega.ai/extension-server: envoy-gateway, which states that it
+    # serves Envoy Gateway's extension protocol, so any other gateway is
+    # refused here. The selected component's provides host and port arrive on
+    # the connection and compose the extension server's address in the control
+    # plane's configuration: the host qualified by the namespace the Release
+    # places the controller in, or `default` where it declares none, because a
+    # published host carries no namespace. The same configuration admits the
+    # Backend resources and the patch policies the controller writes, as the
+    # AI gateway's own installation configures Envoy Gateway. The control
+    # plane calls one extension server, so a second connection here halts the
+    # build.
+    #
+    # The controller expects this gateway's control plane in the
+    # envoy-gateway-system namespace, so with a connection here the Release
+    # places the gateway there, and a Release placing it elsewhere halts the
+    # build naming the namespace to declare.
+    #
+    # Optional: with nothing wired, the control plane carries no extension and
+    # its rendered output is the same as a gateway without this socket.
+    extension:
+      selector: "gateway.aggrega.ai/extension-server=envoy-gateway"
+    # The models the gateway serves through Envoy AI Gateway, each wired as a
+    # connection: any ai-model Component, managed or self-hosted, one or
+    # several. Each connection becomes a rule of one AI route attached to this
+    # gateway: a request whose model name is the connection's alias is sent to
+    # the endpoint the model publishes, asking for the model name it publishes
+    # in place of the alias — pointers the compiler pipes into the resources
+    # and never resolves. So every wired model is served at the gateway's own
+    # address under /v1, and the model name a request carries chooses the
+    # model. One route holds fifteen rules, so a sixteenth connection halts the
+    # build. The gateway reaches a wired model over the OpenAI API alone, so a
+    # connection whose target's model.aggrega.ai/api is not openai halts the
+    # build, naming it. The alias names the connection's resources too, in
+    # lowercase with every underscore as a hyphen, so two aliases giving one
+    # name, or an alias ending in a hyphen or an underscore, halt the build
+    # where the resources are rendered.
+    #
+    # The AI gateway controller reconciles those resources, so a connection
+    # here needs the controller wired to the extension socket, and the build
+    # halts naming both sockets while it is not.
+    #
+    # The credential the gateway presents to a wired model is the one its
+    # connection carries in the credential slot: the connection's backend
+    # security policy names the Secret the credential publishes, the
+    # controller reads the key from that Secret in the gateway's namespace
+    # under the data key apiKey, and the gateway sends it as a bearer token in
+    # the Authorization header, so no rendered file carries the key. A
+    # credential publishing any other data key halts the build, naming both. A
+    # connection carrying none renders no security policy, so the gateway adds
+    # no credential of its own. A connection to a target labelled
+    # component.aggrega.ai/hosting: managed with no credential halts the build
+    # unless its values set unauthenticated: true. A self-hosted server that
+    # checks a key holds it in a slot of its own, and its connection carries a
+    # credential holding the same key.
+    #
+    # Optional: with nothing wired, the gateway serves no model and its rendered
+    # output is the same as a gateway without this socket.
+    models:
+      selector: "component.aggrega.ai/category=ai-model"
+      valueSchema:
+        unauthenticated:
+          type: boolean
+          default: false
+          description: Declares that the model this connection reaches takes no credential, so a connection carrying none is intended rather than an omission. It changes nothing this component renders.
+      # No inject list: no container of this component receives the
+      # credential. The Recipe names its Secret in a policy, and the AI
+      # gateway reads the key from the Secret itself.
+      featuresSchema:
+        credential:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          description: "Optional credential the gateway presents to the model this connection reaches, as a bearer token. When attached, the connection's backend security policy names the Secret the credential publishes, and the AI gateway controller reads the key from that Secret, in the gateway's namespace, under the data key apiKey, which the credential must publish: any other data key halts the build. The key appears in no rendered file. Unattached, the gateway adds no credential."
+
   schema:
     values:
       # Developer Intent — filled by the Developer in the Aggregate.
@@ -64,6 +162,19 @@ spec:
         enum: [Same, All]
         default: Same
         description: Which namespaces may attach a route to the gateway's listeners. `Same` accepts routes from the gateway's own namespace only, which is what the routing API assumes when nothing says otherwise; `All` accepts routes from every namespace. Stated explicitly so the narrower of the two is a choice a reader can see rather than a default they meet later.
+      # The alias this gateway publishes as its model. A component wired to the
+      # gateway's address over a model socket — an agent, a tool, a memory store
+      # — reads one endpoint and one model name off the edge, the same keys a
+      # model publishes; the endpoint is the gateway's base URL and the model
+      # name is the alias, which the gateway's route sends to the model wired
+      # under it. A Recipe writes the gateway's published values from what the
+      # gateway itself was given, which holds none of its connections, so the
+      # published alias is named here rather than taken from the socket: with a
+      # connection on the models socket this value is required, and with none
+      # it is omitted.
+      model:
+        type: string
+        description: The alias of a connection on the models socket that this gateway publishes as its model, the model name a component wired to the gateway sends. It must be an alias a models connection carries, and the build halts naming this value otherwise; it is required while the models socket holds a connection, and omitted while it holds none.
     infra:
       # Operational Sizing — filled by the Operator in the Release. Developer
       # never sees this.
@@ -111,3 +222,122 @@ spec:
         type: object
         additionalProperties: true
         description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      #
+      # host is not required, unlike port: Envoy Gateway names the Service
+      # after the gateway's namespace, which a published value cannot read, and
+      # a Recipe publishes it only while a model is served, when the extension
+      # socket fixes that namespace.
+      host:
+        type: string
+        description: >
+          In-cluster DNS name of the Service Envoy Gateway creates for this
+          gateway's data plane, in the gateway's own namespace, the name alone
+          without a namespace. A consumer sends its client traffic here rather
+          than to the service behind the gateway. Empty while nothing is wired
+          to the models socket.
+      port:
+        type: integer
+        required: true
+        description: >
+          TCP port that Service accepts the gateway's plain HTTP listener on,
+          infra.port.
+      protocol:
+        type: string
+        description: How the published address is spoken to — `http`, so a consumer composes an address on that scheme.
+      # endpoint and model together are the contract every model component
+      # publishes, which is what lets a model socket take this gateway in place
+      # of a model with its consumer's Recipe unchanged. Neither is required:
+      # with nothing wired to the models socket the gateway serves no model and
+      # publishes both empty.
+      endpoint:
+        type: string
+        description: >
+          Full base URL of the OpenAI-compatible API the gateway serves for the
+          models wired to its models socket, with the host, the port and the
+          /v1 path already composed. A caller hands it to a client library as
+          its base URL and names values.model as its model; every other wired
+          model is served at the same URL under its own alias as the model
+          name. Empty while nothing is wired to the models socket.
+      model:
+        type: string
+        description: >
+          The alias a consumer wired to the gateway sends as its model name:
+          values.model. The gateway's route sends a request naming it to the
+          model wired under that alias, asking for the model name that model
+          publishes. Empty while nothing is wired to the models socket.
+
+  # The rules of the extension and models sockets, with the credential rule
+  # every socket declaring unauthenticated carries. Each reads what the
+  # Aggregate and the Release wrote — the values, and each connection's target
+  # labels, values and attachments — all known before a Recipe binds, so each
+  # holds whichever Recipe renders this component and halts before anything
+  # renders.
+  assertions:
+    # The control plane's configuration names one extension server.
+    one_extension_server: >-
+      {{- $servers := sortAlpha (keys (optional .uses "extension" dict)) -}}
+      {{- if gt (len $servers) 1 -}}
+      {{- fail (printf "%q has %s on its extension socket, but Envoy Gateway calls one extension server; keep one of them" .metadata.instance_id (join " and " $servers)) -}}
+      {{- end -}}
+    # A wired model's route and backends are custom resources of Envoy AI
+    # Gateway, which only its controller reconciles, and the gateway's control
+    # plane calls that controller only through the extension socket. With a
+    # model wired and no extension, the resources would sit in the cluster and
+    # nothing would serve them.
+    models_need_the_extension: >-
+      {{- $models := sortAlpha (keys (optional .uses "models" dict)) -}}
+      {{- if and $models (not (optional .uses "extension" dict)) -}}
+      {{- fail (printf "%q serves %s from its models socket, but nothing is wired to its extension socket, so no Envoy AI Gateway controller would reconcile the route and backends rendered for them; wire core/gateway/envoy-ai-gateway-operator to the extension socket, or remove the models connections" .metadata.instance_id (join ", " $models)) -}}
+      {{- end -}}
+    # The model the gateway publishes must be one it serves. values.model names
+    # the alias of a connection on the models socket, and is required while the
+    # socket holds one, because the published values are written from what the
+    # gateway was given and a connection is not among it. With nothing wired, a
+    # value naming an alias names a model the gateway does not serve.
+    published_model_is_a_wired_alias: >-
+      {{- $wired := sortAlpha (keys (optional .uses "models" dict)) -}}
+      {{- with optional .values "model" "" -}}
+      {{- if not (has . $wired) -}}
+      {{- if $wired -}}
+      {{- fail (printf "values.model is %q, but no connection on the models socket carries that alias, so a component wired to this gateway would ask for a model it does not serve; set values.model to one of the aliases the models socket carries: %s" . (join ", " $wired)) -}}
+      {{- else -}}
+      {{- fail (printf "values.model is %q, but nothing is wired to the models socket, so the gateway serves no model to publish under that alias; wire a model to the models socket under that alias, or remove values.model" .) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- else -}}
+      {{- if $wired -}}
+      {{- fail (printf "values.model is not set, but the models socket carries %s, so the gateway cannot tell which of them a component wired to it asks for, and the alias a connection is served under is not among what its published values are written from; set values.model to one of them" (join ", " $wired)) -}}
+      {{- end -}}
+      {{- end -}}
+    # A wired model's backend is written from the endpoint and the model name
+    # the model publishes, for the AI gateway to reach over the OpenAI API,
+    # which is what model.aggrega.ai/api: openai asserts answers at that
+    # endpoint. A model whose API is another needs the backend's own schema for
+    # that provider, which nothing the model publishes names, so it halts
+    # rather than being written as a guess.
+    wired_model_speaks_the_openai_api: >-
+      {{- range $alias, $connection := (optional .uses "models" dict) -}}
+      {{- $api := optional $connection.labels "model.aggrega.ai/api" "" -}}
+      {{- if ne $api "openai" -}}
+      {{- fail (printf "the models connection %s of %q reaches %q, whose model.aggrega.ai/api is %q, but the gateway writes a wired model's backend from the endpoint and model name it publishes for the OpenAI API alone, so it cannot write a backend for it; wire a model whose model.aggrega.ai/api is openai instead" $alias $.metadata.instance_id $connection.target $api) -}}
+      {{- end -}}
+      {{- end -}}
+    # A connection to a target its catalog labels a managed service
+    # (component.aggrega.ai/hosting: managed) carries a credential, or says on
+    # the connection that its target takes none. The rule reads the target's
+    # labels, the connection's unauthenticated value and its credential slot,
+    # all known before a Recipe binds, so it holds whichever Recipe renders this
+    # component; a self-hosted target draws nothing. The list names every
+    # socket of this component that declares unauthenticated.
+    managed_target_needs_a_credential: >-
+      {{- range $socket := list "models" -}}
+      {{- range $alias, $connection := (optional $.uses $socket dict) -}}
+      {{- $managed := eq (optional $connection.labels "component.aggrega.ai/hosting" "") "managed" -}}
+      {{- $optedOut := optional $connection.values "unauthenticated" false -}}
+      {{- if and $managed (not (hasKey $connection.features "credential")) (not $optedOut) -}}
+      {{- fail (printf "the %s connection %s of %q reaches %q, whose component.aggrega.ai/hosting label is managed, with no credential: attach one under credential on that connection, or set unauthenticated: true in its values" $socket $alias $.metadata.instance_id $connection.target) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
