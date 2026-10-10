@@ -278,8 +278,9 @@ Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 (`caller-identity: injected-header`, `content-masking: entity-recognition`, `log-masking: entity-recognition`,
 `prompt-guard: pattern-list`, `upstream-tls: trust-anchor`),
 `core/security/nemo-guardrails` and `core/security/trustyai-guardrails-gateway` (each
-`prompt-guard: classifier`). Seven of the eight carry no
-`gateway.aggrega.ai/intelligence` value and `core/gateway/litellm` carries `semantic` — and
+`prompt-guard: classifier`). Six of the eight carry no
+`gateway.aggrega.ai/intelligence` value, and `core/gateway/litellm` and
+`core/gateway/envoy-gateway` carry `semantic` — and
 that mixture is the separation working rather than an exception to it. The
 intelligence label names a **product tier** — whether the router parses the
 request body — while this family names **capabilities**, so the two answer
@@ -2869,9 +2870,10 @@ limit that install keeps — for the whole gateway or each model, in the
 Redis-protocol store wired to its `cache` socket, and served uncounted while
 that store cannot be reached. It refuses a budget in US dollars, one per
 caller, since nothing on that path verifies who the caller is, and any other
-period. Envoy AI Gateway keeps no cache of replies, and the gateway carries no
-`gateway.aggrega.ai/intelligence` value, so neither of the other two Features
-attaches to it. Contour and NGINX offer none of the three. No gateway in this
+period. Envoy AI Gateway keeps no cache of replies and checks no reply against
+a schema, so the gateway realizes neither of the other two Features although it
+carries `semantic`: an attachment of either halts the build. Contour and NGINX
+offer none of the three. No gateway in this
 catalog checks a reply against a schema the attachment carries, so
 `core/response-validation` is realized nowhere.
 
