@@ -399,10 +399,11 @@ Three rules bind it:
   because the gateway describes a wired model to its proxy through the OpenAI
   API alone; the message names the connection and points at the gateway's
   hand-typed `values.models`, which takes such a provider in the proxy's own
-  provider/model notation. The `models` sockets of `core/gateway/kong` and
-  `core/gateway/apisix` select the same and each Component's assertion halts the
-  same way, because each writes a wired model's route through its gateway's AI
-  proxy for the OpenAI API alone.
+  provider/model notation. The `models` sockets of `core/gateway/kong`,
+  `core/gateway/apisix` and `core/gateway/envoy-gateway` select the same and each
+  Component's assertion halts the same way, because each writes a wired model's
+  route for the OpenAI API alone — Kong and APISIX through their AI proxy, Envoy
+  Gateway through the Envoy AI Gateway resources its Recipe renders.
 - **A component carrying the key publishes what a model publishes:** `endpoint`
   and `model` in its `provides`, the two keys a consumer's Recipe reads off a
   model edge. One that published no `model` would hand its
@@ -410,8 +411,9 @@ Three rules bind it:
   publishes one alias of its model map as its `model`, named by a value of its
   own and checked against the map by an assertion on its Component, so the order
   of the map never decides what a consumer asks for. A gateway whose every
-  model is wired to a socket — `core/gateway/kong` and `core/gateway/apisix`,
-  each of whose `values.model` names one of its `models` connections — serves
+  model is wired to a socket — `core/gateway/kong`, `core/gateway/apisix` and
+  `core/gateway/envoy-gateway`, each of whose `values.model` names one of its
+  `models` connections — serves
   none while nothing is wired there and then publishes both keys empty; it
   carries the key all the same, since the
   value names what the product serves rather than what one Release wires, so a
@@ -424,8 +426,8 @@ Three rules bind it:
   whose endpoint an operator may repoint keeps the value of the product it
   describes.
 
-Components today: `core/gateway/litellm`, `core/gateway/kong` and
-`core/gateway/apisix` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
+Components today: `core/gateway/litellm`, `core/gateway/kong`,
+`core/gateway/apisix` and `core/gateway/envoy-gateway` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
 `openai-embedding`, `nvidia-api` and `openai-compatible` — the broker, whose
 whole contract is to be pointed at a service speaking that API, and which stays
 the handle for an endpoint the catalog does not model. Every other
@@ -434,6 +436,29 @@ product's terms, what answers at its endpoint. The compiler matches the string
 and checks nothing about what answers at the address, so a component carrying a
 value its endpoint does not speak is refused by nothing and fails when it is
 called.
+
+### The `gateway.aggrega.ai/extension-server` label
+
+`gateway.aggrega.ai/extension-server` records whose extension protocol a
+component serves: the protocol a gateway's control plane calls, at the address
+the component publishes, to have the configuration it translates for its data
+plane adjusted. It is a dimension of the `gateway.aggrega.ai/` capability
+family beside `intelligence`, and it is what a gateway's socket for an
+extension server selects on, so the socket takes a component serving that
+gateway's protocol and refuses any other.
+
+| Value | What the value asserts |
+| --- | --- |
+| `envoy-gateway` | The component serves Envoy Gateway's extension protocol over gRPC, so an Envoy Gateway control plane can call it as its extension server. |
+
+The value names whose protocol is served, never a configured state: the
+component serves it whether or not a gateway is wired to it. Components today:
+`core/gateway/envoy-ai-gateway-operator` carries `envoy-gateway`, and
+`core/gateway/envoy-gateway`'s `extension` socket selects
+`gateway.aggrega.ai/extension-server=envoy-gateway`. The compiler routes the
+address the selected component publishes and checks nothing about what answers
+there. As with every family on this page, a value is added in the same act as
+the first component to carry it.
 
 ### The `component.aggrega.ai/upstream-licensing` label
 
@@ -813,7 +838,6 @@ invented for the name:
 | The controller whose custom resource it emits | the controller's own project name | `kafka-strimzi`, `vllm-kserve`, `vllm-kubeai`, `function-keda`, `function-knative` |
 | The operator-managed instance it reconciles, where the controller carries the product's own name and repeating that would say nothing | what that instance is | `rabbitmq-cluster`, `mariadb-cluster` |
 | The managed product it provisions | the product's name | `mariadb-rds`, `mysql-rds` |
-| What stands between the application and the component | that mechanism | `openai-gateway` |
 | The artifact the Recipe sources | the artifact kind | `mariadb-rds-module`, `prometheus-chart` |
 | That the resource lives outside the Release | `external` | `postgres-external` |
 
@@ -2336,18 +2360,23 @@ adopted resource becomes Release-managed.
 
 The production way to run complex software on Kubernetes is often an **operator**:
 a controller that reconciles a **custom resource** into running infrastructure
-(a message broker becomes a Strimzi `Kafka`; a model-serving path becomes an
-Envoy AI Gateway `AIServiceBackend`). A Recipe realizes this by emitting the
-custom resource — one more realization of an existing component, selected per
-Release through the Manifest's component-type mapping, coexisting with that
-component's synthesis, reference, and cloud-native realizations.
+(a message broker becomes a Strimzi `Kafka`; a gateway's model routes become
+Envoy AI Gateway's `AIGatewayRoute` and `AIServiceBackend`). A Recipe realizes
+this by emitting the custom resource — as one more realization of an existing
+component, selected per Release through the Manifest's component-type mapping,
+coexisting with that component's synthesis, reference, and cloud-native
+realizations; or, where the resources describe what is wired to a component, as
+part of that component's own Recipe, once per connection, as Envoy Gateway's
+Recipe does for the models on its `models` socket.
 
 The custom resource carries in `artifacts:`, one map entry per emitted file. The
 recipe fulfils the **same `provides` contract** as the component's other
 realizations, so consumers are realization-agnostic: an operator-driven Kafka
-publishes `provides.host` as the operator-created client bootstrap Service, and a
-gateway-mediated model publishes `provides.endpoint` as the in-cluster gateway
-Service — the consumer's wiring is unchanged from the synthesized or managed form.
+publishes `provides.host` as the operator-created client bootstrap Service — the
+consumer's wiring is unchanged from the synthesized or managed form. A gateway
+emitting the resources for the models wired to it publishes what a model
+publishes, `endpoint` and `model`, so a consumer reaches the gateway exactly as
+it reaches a model.
 
 **The runtime-prerequisite discipline.** A custom resource only reconciles if its
 **control plane** — the custom-resource definition and its controller — already
@@ -2367,9 +2396,15 @@ never a silent emit. Two shapes, both explicit:
 - **Bundled-deploy** — the Release ships the control plane too. The operator
   install is a first-class **companion component** (a `server` component whose
   Recipe emits the ServiceAccount, cluster RBAC, and controller Deployment, or
-  sources the project's upstream install chart), declared in the same Aggregate
-  alongside the custom-resource-emitting component, so the custom resource and the
-  controller that reconciles it are deployed together.
+  sources the project's upstream install chart — and, where the project ships
+  its custom-resource definitions as a chart of their own, carries those
+  definitions beside the Recipe as published and emits them beside the chart's
+  render), declared in the same Aggregate alongside the custom-resource-emitting
+  component, so the custom resource and the controller that reconciles it are
+  deployed together. Where the emitting component reaches the controller through
+  a socket, that connection is the declared prerequisite: Envoy Gateway's models
+  need the AI gateway controller wired to its `extension` socket, and the build
+  halts while it is not.
 
 Both make the prerequisite a declared thing the reader can see. The shape to
 avoid is the third, silent one: emitting a custom resource with the control plane
@@ -2378,22 +2413,32 @@ merely hoped to be present and nothing in the model saying so.
 **Credential custody.** A gateway holds the provider credential and authenticates
 upstream on the application's behalf, so the credential never reaches the
 application. The credential is a referenceable Secret filled through the
-`core/referenced-secret` credential Feature on the component's credential slot; a
-security-policy custom resource binds it to the backend. A black-box credential
-slot still publishes its resource's locator to the Recipe — the name of the Secret
-the credential's realization emits, or of one that already exists — so the recipe
-reads the Secret's name for the security policy without exposing the value.
+`core/referenced-secret` credential Feature on a credential slot — the
+component's own, or, on a gateway serving the models wired to it, the slot of the
+connection that reaches each model; a security-policy custom resource binds it
+to the backend. A black-box credential slot still publishes its resource's
+locator to the Recipe — the name of the Secret the credential's realization
+emits, or of one that already exists — so the recipe reads the Secret's name for
+the security policy without exposing the value.
 
 **The exemplar.** Strimzi Kafka is the template for this pattern: `core/messaging/kafka`
 offers an operator-driven realization emitting a `Kafka` and `KafkaNodePool`
 custom resource alongside its synthesized StatefulSet realization, and ships both
 prerequisite modes (the Strimzi Cluster Operator as an ambient assumption or as a
 bundled companion component). The same shape carries to further operators —
-Elasticsearch, HA Postgres, additional AI gateways. The Envoy AI Gateway path
-(`AIServiceBackend` plus a `BackendSecurityPolicy` for the provider credential) is
-the AI-gateway instance of the pattern. Author custom-resource fields against the
-target project's current API documentation, since custom-resource schemas evolve
-independently of the catalog.
+Elasticsearch, HA Postgres, additional AI gateways. The Envoy AI Gateway path is
+the AI-gateway instance of the pattern, in its bundled shape.
+`core/gateway/envoy-ai-gateway-operator` is the companion: its Recipe sources the
+project's controller chart and emits the project's six custom-resource
+definitions beside it, as the definitions chart publishes them, and the
+controller's webhook certificate is a cert-manager `Certificate`, so cert-manager
+must already run in the cluster. `core/gateway/envoy-gateway` calls that
+controller through its `extension` socket and, for each model on its `models`
+socket, renders the AI route rule, the `AIServiceBackend`, the Envoy Gateway
+`Backend` it points at and, where the connection carries a credential, the
+`BackendSecurityPolicy` naming that credential's Secret. Author custom-resource
+fields against the target project's current API documentation, since
+custom-resource schemas evolve independently of the catalog.
 
 ### Self-hosted inference: dual realization (synthesis and controller-driven)
 

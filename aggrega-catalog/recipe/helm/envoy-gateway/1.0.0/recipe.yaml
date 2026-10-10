@@ -24,12 +24,13 @@ metadata:
     for the component, or in `default` where none is declared.
 
     Wired to the AI gateway controller on the extension socket, the control
-    plane names it as its extension server, as the AI gateway's installation
-    does, and the gateway must sit in envoy-gateway-system. Each model on the
-    models socket gets a rule of one AI route and the AI gateway's resources
-    for its published endpoint, its credential named only by its Secret. With
-    a model wired, provides.host is the data-plane Service Envoy Gateway
-    creates for the gateway and provides.endpoint its /v1 base URL.
+    plane names it as its extension server, and the gateway must sit in
+    envoy-gateway-system. Each model on the models socket gets a rule of one
+    AI route and the resources reaching its published endpoint, its
+    credential named only by its Secret; the project's client traffic policy
+    raises the gateway's buffer to 50Mi. With a model wired, provides.host is
+    the data-plane Service Envoy Gateway creates and provides.endpoint its /v1
+    base URL, qualified with envoy-gateway-system.
 
     The control-plane image is pinned (override: infra.image); the rate-limit
     and data-plane images the render names do not float and are replaceable
@@ -101,20 +102,24 @@ spec:
   # name hashed from a guess.
   #
   # endpoint is the base URL an OpenAI client takes for the models this gateway
-  # serves: the Service, its port and /v1, the path Envoy AI Gateway serves the
-  # OpenAI API under with the controller's chart defaults; model is
-  # values.model, the alias a consumer names as its model. The Service name is
-  # spelled out again on purpose: a provides entry cannot read another
-  # provides entry and a locals entry cannot read the rendered name, so the
-  # repetition is forced, and the entries are edited together. With nothing
-  # wired to the models socket values.model is omitted — the component's
-  # assertion halts on any other combination — and host, endpoint and model
-  # are empty.
+  # serves: the Service qualified with its namespace, its port and /v1, the
+  # path Envoy AI Gateway serves the OpenAI API under with the controller's
+  # chart defaults. Unlike host, it carries the namespace, so it resolves from
+  # any namespace a consumer sits in: it is written only while values.model is
+  # set, which is exactly when the namespace is fixed by construction to
+  # locals.controller_gateway_namespace, so the qualified name is always the
+  # true one. model is values.model, the alias a consumer names as its model.
+  # The Service name is spelled out again on purpose: a provides entry cannot
+  # read another provides entry and a locals entry cannot read the rendered
+  # name, so the repetition is forced, and the entries are edited together.
+  # With nothing wired to the models socket values.model is omitted — the
+  # component's assertion halts on any other combination — and host, endpoint
+  # and model are empty.
   provides:
     host: '{{- with optional .values "model" "" }}{{- $key := printf "%s/%s" $.locals.controller_gateway_namespace $.context.rendered_name }}{{- $base := replace "/" "-" $key }}{{- if gt (len $base) 48 }}{{- $base = trimSuffix "-" (trunc 48 $base) }}{{- end }}envoy-{{ $base }}-{{ trunc 8 (sha256sum $key) }}{{ end }}'
     port: "{{ .infra.port }}"
     protocol: "http"
-    endpoint: '{{- with optional .values "model" "" }}{{- $key := printf "%s/%s" $.locals.controller_gateway_namespace $.context.rendered_name }}{{- $base := replace "/" "-" $key }}{{- if gt (len $base) 48 }}{{- $base = trimSuffix "-" (trunc 48 $base) }}{{- end }}http://envoy-{{ $base }}-{{ trunc 8 (sha256sum $key) }}:{{ $.infra.port }}/v1{{ end }}'
+    endpoint: '{{- with optional .values "model" "" }}{{- $key := printf "%s/%s" $.locals.controller_gateway_namespace $.context.rendered_name }}{{- $base := replace "/" "-" $key }}{{- if gt (len $base) 48 }}{{- $base = trimSuffix "-" (trunc 48 $base) }}{{- end }}http://envoy-{{ $base }}-{{ trunc 8 (sha256sum $key) }}.{{ $.locals.controller_gateway_namespace }}.svc.cluster.local:{{ $.infra.port }}/v1{{ end }}'
     model: '{{ optional .values "model" "" }}'
 
   # The runtime prerequisite, declared rather than hoped for. By default this
@@ -312,8 +317,9 @@ spec:
   # routes attached to it declare. The certificate reference is written out in
   # full, kind and group included, which is the form the cluster stores it in.
   #
-  # The models the gateway serves, as the resources Envoy AI Gateway defines,
-  # all in the gateway's own namespace, written into models.yaml. With nothing
+  # The models the gateway serves, as the resources Envoy AI Gateway and Envoy
+  # Gateway define, all in the gateway's own namespace, written into
+  # models.yaml. With nothing
   # wired to the models socket the template writes nothing, and no file is
   # emitted.
   #
@@ -324,17 +330,33 @@ spec:
   # for the model name the model publishes in place of the alias. The route
   # takes fifteen rules, so a sixteenth connection stops the build.
   #
+  # Beside the route, the client traffic policy Envoy AI Gateway's own basic
+  # example and configuration generator write at the controller's version: it
+  # targets this gateway and raises the buffer Envoy Gateway allows each
+  # incoming connection from its default of 32768 bytes to 50Mi, because the AI
+  # gateway's external processor reads each request's whole body, in buffered
+  # mode, to find the model it names. It targets the gateway, so the raised
+  # buffer applies to every route attached to it, model routes or not. It is
+  # named after the gateway rather than with the project's fixed name, because
+  # every gateway serving a model sits in the same namespace.
+  #
   # Each connection's resources are named after the gateway and the alias, in
   # lowercase with every underscore as a hyphen, the characters a Kubernetes
   # name allows; an alias ending in a hyphen or an underscore, or two aliases
   # giving one name, stop the build, naming the connections. Per connection:
   # an Envoy Gateway Backend for the host and port of the endpoint the model
   # publishes — the port the scheme implies where the endpoint names none, and
-  # an address endpoint where the host is an address; an AI service backend
+  # an address endpoint where the host is an address. A host carrying no dot is
+  # a Service name published without a namespace, which the data plane in this
+  # gateway's namespace could not resolve, so the Backend qualifies it, as a
+  # consumer in another namespace does, with the namespace the Release places
+  # the model in, or `default` where it declares none:
+  # `<host>.<namespace>.svc.cluster.local`. A host carrying a dot, a managed
+  # API's included, is written as published. Then an AI service backend
   # for the OpenAI API whose prefix is the endpoint's path, `/` where it has
   # none, so a request reaches the model under the path it publishes; where
   # the endpoint is https, a TLS policy on the Backend checking the server's
-  # certificate against the system's trust anchors for the endpoint's host,
+  # certificate against the system's trust anchors for the Backend's host,
   # the Gateway API's own policy at its v1 version, which Envoy Gateway serves
   # at the chart version this Recipe pins; and, where the connection carries a
   # credential, a backend security policy of the API-key type naming the
@@ -425,6 +447,19 @@ spec:
               - name: {{ get $names $alias }}
                 modelNameOverride: {{ $edge.provides.model | toJson }}
       {{- end }}
+      ---
+      apiVersion: gateway.envoyproxy.io/v1alpha1
+      kind: ClientTrafficPolicy
+      metadata:
+        name: {{ .context.rendered_name }}-client-buffer-limit
+        namespace: "{{ $ns }}"
+      spec:
+        targetRefs:
+          - group: gateway.networking.k8s.io
+            kind: Gateway
+            name: {{ .context.rendered_name }}
+        connection:
+          bufferLimit: 50Mi
       {{- range $alias := $wired }}
       {{- $edge := get $.context.uses $alias }}
       {{- $name := get $names $alias }}
@@ -436,6 +471,9 @@ spec:
       {{- $hostname := lower (trimSuffix "]" (trimPrefix "[" $hostport)) }}
       {{- $address := or (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" $hostname) (contains ":" $hostname) }}
       {{- if and $address (eq $u.scheme "https") }}{{ fail (printf "the models connection %s of %q reaches %q, whose published endpoint %q is https on an address, but the gateway checks an https endpoint's certificate against the host name it names, and an address names none; publish an endpoint naming the server's host" $alias $.context.instance_id $edge.target $edge.provides.endpoint) }}{{ end }}
+      {{- if not (or $address (contains "." $hostname)) }}
+      {{- $hostname = printf "%s.%s.svc.cluster.local" $hostname (optional (optional (default dict $edge.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default") }}
+      {{- end }}
       ---
       apiVersion: gateway.envoyproxy.io/v1alpha1
       kind: Backend
