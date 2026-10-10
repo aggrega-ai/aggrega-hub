@@ -291,7 +291,9 @@ gateway carries several of them, and no amount of reading its tier would say so.
 carries no other value in this family and carries `semantic`.
 `core/gateway/apisix` carries `period-budget: tokens`, its one value in this
 family, and `semantic`, because its AI proxy reads the request body of every
-route it serves a model on.
+route it serves a model on. `core/gateway/envoy-gateway` carries
+`period-budget: tokens` as well: Envoy AI Gateway reads the tokens each reply
+of a wired model reports, and Envoy Gateway's rate limit counts them.
 
 A component carrying `prompt-guard: classifier` is also something another
 component can send its traffic through: `core/gateway/litellm` and
@@ -2034,9 +2036,9 @@ advisory, and a workspace whose two ends deliberately differ opts out with
 **A managed target's `api_key` is the vendor's key, and the rule does not
 judge it.** A Component labelled `component.aggrega.ai/hosting: managed`
 stands for a service its vendor runs, so nothing the Release runs checks a key
-on it. Where such a Component declares `api_key` — `core/ai-model/openai`,
-`core/ai-agent/bland`, `letta`, `retell` and `vapi`, and
-`core/messaging/telnyx` and `vonage` — the slot holds the key the Release
+on it. Where such a Component declares `api_key` — `core/ai-agent/bland`,
+`letta`, `retell` and `vapi`, and `core/messaging/telnyx` and `vonage` — the
+slot holds the key the Release
 presents to that vendor, named as the vendor's product names it, like the
 other product-named keys above, and never a key its callers present. The rule
 therefore passes over every connection whose target carries that label. A
@@ -2069,7 +2071,14 @@ own, `LITELLM_MODEL_<ALIAS>_API_KEY` — the connection's alias in capitals, eve
 character other than a letter or a digit an underscore — which that model's
 entry in the routing table names; and on `cache_store`, where it is the
 password the gateway's semantic cache presents to the store, delivered as
-`REDIS_PASSWORD`. The name holds one
+`REDIS_PASSWORD`. `core/gateway/envoy-gateway` declares it on two sockets as
+well, with no `inject` list, since no container of its own receives it: on
+`models`, where the connection's backend security policy names the Secret the
+credential publishes and Envoy AI Gateway's controller reads the key from it
+under the data key `apiKey`; and on `cache`, where it is the password Envoy
+Gateway's rate-limit service presents to the store keeping a period budget's
+count, handed to that service as `REDIS_AUTH` from the Secret the credential
+publishes. The name holds one
 credential; it is a key a developer writes on the connection
 (`uses.<socket>.<alias>.features.credential`) and an operator writes on a
 connection the Release wires, so it is the same word on every socket.
@@ -2850,12 +2859,21 @@ callers apart only by a consumer an authentication plugin names, or by a value
 the request itself carries, which it does not verify; the gateway the chart
 Recipe renders holds no consumer, so its realization halts every attachment
 rather than ship one cache every caller shares. Its workload Recipe,
-at APISIX 3.17.0, renders no route and halts on either Feature. The Envoy AI
-Gateway carries a budget counted in tokens in its open-source build, but no
-Recipe here routes model traffic through it. Envoy Gateway on its own, Contour
-and NGINX offer none of the three. No gateway in this catalog checks a reply
-against a schema the attachment carries, so `core/response-validation` is
-realized nowhere.
+at APISIX 3.17.0, renders no route and halts on either Feature.
+`core/gateway/envoy-gateway` realizes the period budget through Envoy Gateway's
+usage-based rate limit, on the route serving the models wired to it through
+Envoy AI Gateway: counted in the tokens each reply reports, over a fixed window
+on the UTC clock of one unit — a second, a minute, an hour, a day, a week, 30 or
+365 days, or a calendar month, a setting that then holds for every monthly rate
+limit that install keeps — for the whole gateway or each model, in the
+Redis-protocol store wired to its `cache` socket, and served uncounted while
+that store cannot be reached. It refuses a budget in US dollars, one per
+caller, since nothing on that path verifies who the caller is, and any other
+period. Envoy AI Gateway keeps no cache of replies, and the gateway carries no
+`gateway.aggrega.ai/intelligence` value, so neither of the other two Features
+attaches to it. Contour and NGINX offer none of the three. No gateway in this
+catalog checks a reply against a schema the attachment carries, so
+`core/response-validation` is realized nowhere.
 
 `core/concurrency-limit`, the AI gateway control declaring a cap on the
 requests a gateway carries at once across everything it serves, is realized
@@ -2883,7 +2901,8 @@ Every other gateway here realizes none: most render no route a realization
 could send through a guard — they keep their routes in a store of their own,
 take them from the applications behind them, or are a hosted service — and
 `core/gateway/apisix`, whose chart Recipe renders the routes of the models
-wired to it, has no realization of the shield.
+wired to it, and `core/gateway/envoy-gateway`, whose Recipe renders the AI
+route of the models wired to it, have no realization of the shield.
 
 **A capability that only one product in the field has is not a Feature.** It is a
 setting on that product's own Component, which the author who decides it sets in
