@@ -8,84 +8,122 @@ metadata:
   version: 1.0.0
   license: Apache-2.0
   description: >
-    Installs the Envoy AI Gateway control plane as an explicit
-    component: a ServiceAccount, the cluster RBAC the controller needs to
-    reconcile gateway custom resources, and the controller Deployment on the
-    upstream image. Emitting the control plane as a first-class component lets a
-    gateway-mediated model ship its runtime prerequisite alongside the custom
-    resources it emits (the bundled-deploy prerequisite mode), so the custom
-    resource and the controller that reconciles it are deployed together. This is
-    a minimal control-plane bootstrap; a production install typically sources the
-    project's upstream chart or manifests, which also carry the custom-resource
-    definitions and admission webhooks.
+    Installs the Envoy AI Gateway control plane through the project's own Helm
+    chart, referenced as an artifact in a container registry at the release
+    the controller image comes from. The chart's render carries the controller
+    Deployment and its arguments, the Service Envoy Gateway and the cluster's
+    API server reach it on, its service account, the cluster role and binding
+    granting what the project's chart grants, a cluster role letting Envoy
+    Gateway read inference pools, and the mutating webhook configuration that
+    adds the AI external processor to each Envoy Gateway data-plane pod.
+
+    Beside the chart it emits the six AI Gateway custom-resource definitions,
+    carried beside this Recipe exactly as the project's definitions chart
+    publishes them at the same release. The webhook's serving certificate
+    comes from cert-manager: the chart's Certificate and self-signed Issuer
+    are rendered, so cert-manager must already run in the cluster. Every
+    namespaced resource lands in the namespace the Release declares for the
+    component, or in `default` where none is declared; the controller expects
+    the Envoy Gateway it extends in `envoy-gateway-system`, the chart's own
+    default.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
 spec:
   capability: helm
   implements: core/gateway/envoy-ai-gateway-operator:1.0.0
+
+  # The controller chart is distributed as an artifact in a container registry
+  # and referenced as one here. It is published by the project's own
+  # maintainers at the same version as the controller image the Component
+  # pins, and it carries the controller's access control, its Service, its
+  # webhook configuration and the arguments it runs with; the custom-resource
+  # definitions are a separate chart, emitted below. This Recipe maps the
+  # Component's surface into it rather than re-deriving any of that by hand,
+  # so the grant the controller runs under is the project's own at this
+  # release.
+  source:
+    kind: helm-oci-chart
+    url: oci://docker.io/envoyproxy/ai-gateway-helm
+    version: "v1.1.0"
+
+  # The address Envoy Gateway calls the controller's extension server on. The
+  # chart names the controller's Service after controller.fullnameOverride,
+  # which the mapping below binds to the rendered name, and serves the
+  # extension server on the Service's `grpc` port, 1063 — the chart's own
+  # port list, which this Recipe leaves as published. The same Service carries
+  # the webhook port the cluster's API server calls, the metrics port and the
+  # port the rate-limit service reads its configuration from.
+  provides:
+    host: "{{ .context.rendered_name }}"
+    port: "1063"
+
+  # The chart is read for these values only; everything else stays the chart's
+  # own default at its release.
+  #
+  # The controller's resource names are bound to the rendered name, the release
+  # name the helm provider gives the chart: the chart derives its Deployment,
+  # Service and service-account names from controller.fullnameOverride rather
+  # than from a top-level key, and its own default for it is a fixed name.
+  #
+  # The controller image is the Component's infra.image. The chart writes it as
+  # "<repository>:<tag>", so the reference is cut at the last colon after its
+  # last slash, and the two halves join back into exactly the reference the
+  # Release names, a digest reference included; a reference with no tag
+  # leaves the chart's own tag, its release, in place. The external processor
+  # image the controller adds to each data-plane pod is the chart's own,
+  # tagged with the chart's release, so it does not float; it is not restated
+  # here.
+  #
+  # The webhook's serving certificate is the chart's cert-manager mode: the
+  # chart renders a cert-manager Certificate for the controller's Service name
+  # and the self-signed Issuer that signs it, and annotates the webhook
+  # configuration so cert-manager writes its CA bundle. Outside that mode the
+  # chart generates a key and certificate at render time, which differs on
+  # every render, so that mode is not used.
+  #
+  # The controller is told which namespace Envoy Gateway runs in, because it
+  # rolls the data-plane pods there, and the chart binds Envoy Gateway's service
+  # account in that namespace to the inference-pool reader role; the chart's
+  # own default for it, `envoy-gateway-system`, is left in place, so the Envoy
+  # Gateway this controller extends is expected there.
+  valuesMapping: |
+    {{- $repository := .infra.image }}
+    {{- $tag := "" }}
+    {{- $name := last (splitList "/" .infra.image) }}
+    {{- if contains ":" $name }}
+      {{- $tag = last (splitList ":" $name) }}
+      {{- $repository = trimSuffix (printf ":%s" $tag) .infra.image }}
+    {{- end }}
+    controller:
+      fullnameOverride: "{{ .context.rendered_name }}"
+      image:
+        repository: "{{ $repository }}"
+        tag: "{{ $tag }}"
+      mutatingWebhook:
+        certManager:
+          enable: true
+
+  # The six AI Gateway custom-resource definitions, taken from the project's
+  # own definitions chart at the release the controller runs. The controller
+  # watches every one of them when it starts, so all six are installed rather
+  # than only the kinds a model route uses. Each file is the definitions
+  # chart's template unchanged, upstream licence header included, and none
+  # carries a template action, so it renders as written.
+  #
+  # Two of the definitions are larger than the copy of the applied object a
+  # client-side apply records in an annotation can hold, so they are applied
+  # server-side: a client-side apply refuses them.
   artifacts:
-    serviceaccount.yaml: |
-      apiVersion: v1
-      kind: ServiceAccount
-      metadata:
-        name: {{ .context.instance_id }}
-        namespace: {{ .infra.namespace }}
-    clusterrole.yaml: |
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRole
-      metadata:
-        name: {{ .context.instance_id }}
-      rules:
-        - apiGroups: ["aigateway.envoyproxy.io"]
-          resources: ["aiservicebackends", "backendsecuritypolicies"]
-          verbs: ["get", "list", "watch", "update", "patch"]
-    clusterrolebinding.yaml: |
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRoleBinding
-      metadata:
-        name: {{ .context.instance_id }}
-      roleRef:
-        apiGroup: rbac.authorization.k8s.io
-        kind: ClusterRole
-        name: {{ .context.instance_id }}
-      subjects:
-        - kind: ServiceAccount
-          name: {{ .context.instance_id }}
-          namespace: {{ .infra.namespace }}
-    # The controller's health checks are the ones the project's own chart gives
-    # it at the release the image pins: a gRPC liveness and readiness probe on
-    # port 1063, where the controller serves the standard gRPC health service
-    # beside its extension server. It listens there by default, so no flag is
-    # needed, and a gRPC probe names its port by number, so no container port is
-    # declared for it.
-    deployment.yaml: |
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: {{ .context.instance_id }}
-        namespace: {{ .infra.namespace }}
-      spec:
-        replicas: 1
-        selector:
-          matchLabels:
-            app.kubernetes.io/name: {{ .context.instance_id }}
-        template:
-          metadata:
-            labels:
-              app.kubernetes.io/name: {{ .context.instance_id }}
-          spec:
-            serviceAccountName: {{ .context.instance_id }}
-            containers:
-              - name: controller
-                image: {{ .infra.image }}
-                livenessProbe:
-                  grpc:
-                    port: 1063
-                  initialDelaySeconds: 5
-                  periodSeconds: 2
-                readinessProbe:
-                  grpc:
-                    port: 1063
-                  initialDelaySeconds: 5
-                  periodSeconds: 2
+    aigateway.envoyproxy.io_aigatewayroutes.yaml:
+      $import: ./artifacts/aigateway.envoyproxy.io_aigatewayroutes.yaml
+    aigateway.envoyproxy.io_aiservicebackends.yaml:
+      $import: ./artifacts/aigateway.envoyproxy.io_aiservicebackends.yaml
+    aigateway.envoyproxy.io_backendsecuritypolicies.yaml:
+      $import: ./artifacts/aigateway.envoyproxy.io_backendsecuritypolicies.yaml
+    aigateway.envoyproxy.io_gatewayconfigs.yaml:
+      $import: ./artifacts/aigateway.envoyproxy.io_gatewayconfigs.yaml
+    aigateway.envoyproxy.io_mcproutes.yaml:
+      $import: ./artifacts/aigateway.envoyproxy.io_mcproutes.yaml
+    aigateway.envoyproxy.io_quotapolicies.yaml:
+      $import: ./artifacts/aigateway.envoyproxy.io_quotapolicies.yaml
