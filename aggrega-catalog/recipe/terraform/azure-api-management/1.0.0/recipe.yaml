@@ -1,0 +1,214 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: azure-api-management
+  version: 1.0.0
+  description: >
+    Adds an API serving a model to an Azure API Management instance that
+    already exists, rendered as Terraform for the azurerm provider: the API,
+    its chat completions operation, the backend it forwards to and its policy.
+    Reach for it where the instance exists and the Release is to configure the
+    API; reach for the helm or compose reference where the API is configured
+    outside the Release. It never creates the instance, so a Release without
+    one creates it outside first.
+
+    The policy sends each request to the backend, removes the caller's
+    subscription key from what it forwards, and authenticates as
+    infra.backend_authentication says. Terraform authenticates to Azure with
+    the credentials in the environment it runs in, and a provider key reaches
+    the configuration only as the identifier of the Key Vault secret holding
+    it, so the rendered files carry no credential.
+
+    Applying it is outside any build: whether the API then behaves as
+    Microsoft documents is not observed by the compiler.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/gateway/azure-api-management:1.0.0
+
+  # The API's name in the instance, derived once from its path, which the
+  # instance already holds unique: a slash becomes a hyphen. The backend and the
+  # named value are named after it. The gateway's host defaults to the one Azure
+  # gives the instance.
+  locals:
+    api_name: '{{ .infra.api_path | replace "/" "-" }}'
+    gateway_url: '{{ default (printf "https://%s.azure-api.net" .infra.api_management_name) (optional .infra "gateway_url" "") }}'
+
+  # The address is composed from values the operator names, so it is a fixed
+  # string a consumer on any target can use, not a Terraform reference.
+  provides:
+    endpoint: "{{ .locals.gateway_url }}/{{ .infra.api_path }}"
+    model: "{{ .values.model }}"
+
+  # Each halts before anything renders, naming what to set.
+  assertions:
+    resource_group_name_supplied: >-
+      {{- if not (optional .infra "resource_group_name" "") -}}
+      {{- fail (printf "%q sets no infra.resource_group_name, but the terraform realization of core/gateway/azure-api-management reads the API Management instance %s in the resource group it names before adding the API to it; set infra.resource_group_name in the Release" .metadata.instance_id .infra.api_management_name) -}}
+      {{- end -}}
+    backend_url_supplied: >-
+      {{- if not (optional .infra "backend_url" "") -}}
+      {{- fail (printf "%q sets no infra.backend_url, but the terraform realization of core/gateway/azure-api-management writes the backend the API forwards model requests to from it; set infra.backend_url in the Release to the base address of the model API, such as https://<resource>.openai.azure.com/openai/v1" .metadata.instance_id) -}}
+      {{- end -}}
+    # No default, because a managed identity token sent to the wrong backend
+    # is a token that backend can use; the operator says which it is.
+    backend_authentication_supplied: >-
+      {{- if not (optional .infra "backend_authentication" "") -}}
+      {{- fail (printf "%q sets no infra.backend_authentication, but the terraform realization of core/gateway/azure-api-management has to know how the gateway authenticates to the model API at %s: managed_identity for Azure OpenAI or another Microsoft Foundry model the instance's identity holds a role on, provider_key with the provider_key slot attached, or none for a model API taking no credential; set it in the Release" .metadata.instance_id (optional .infra "backend_url" "infra.backend_url")) -}}
+      {{- end -}}
+    provider_key_follows_the_authentication: >-
+      {{- $attached := hasKey (optional . "features" dict) "provider_key" -}}
+      {{- $mode := optional .infra "backend_authentication" "" -}}
+      {{- if and (eq $mode "provider_key") (not $attached) -}}
+      {{- fail (printf "%q sets infra.backend_authentication to provider_key with nothing attached to its provider_key slot, so the gateway would have no key to present; attach the identifier of the Key Vault secret holding the key to provider_key, or choose another backend_authentication" .metadata.instance_id) -}}
+      {{- else if and $attached (ne $mode "provider_key") -}}
+      {{- fail (printf "%q carries an attachment on its provider_key slot while infra.backend_authentication is %q, so the key would be written and never sent; set backend_authentication to provider_key, or remove the attachment" .metadata.instance_id $mode) -}}
+      {{- end -}}
+
+  # The body renders into this component's own module directory.
+  #
+  # required_providers names the provider by its full source address and pins
+  # its version, so Terraform installs the provider whose resource schema this
+  # body was written against. The azurerm provider refuses to plan without a
+  # features block in its configuration, and the root configuration of a
+  # boundary holds module blocks only, so the provider block sits here, in the
+  # component's module. Terraform then keeps the module's resources tied to
+  # this block: remove the component from a Release only after destroying
+  # what its module created, or Terraform has no configuration left to
+  # destroy them with. The provider reads its credentials and subscription
+  # from the environment Terraform runs in.
+  #
+  # The instance is read, never created: a data source fails the plan when it
+  # does not exist. The API is named after its path, its backend and named
+  # value after the API.
+  #
+  # provider_key arrives as the value its attachment delivers on this node's
+  # inject pipe, under the key the attachment names; terraform/variable-secret
+  # delivers the attachment's origin there unchanged. It is written as the
+  # identifier of a Key Vault secret, so the instance reads the key from Key
+  # Vault and the key itself appears nowhere in this configuration. Anything
+  # else delivered there halts the build, and the message does not repeat it.
+  # The secret named value is referenced in the backend's header as {{name}},
+  # API Management's own notation, which the template writes as a quoted
+  # literal.
+  #
+  # The policy removes the caller's subscription key from the request it
+  # forwards, in the header and in the query string, so the model API never
+  # receives the key a caller presents to the gateway; Microsoft's policy
+  # reference does not say whether the gateway would forward it otherwise.
+  artifacts:
+    main.tf: |
+      {{- $nv := printf "%s-provider-key" .locals.api_name }}
+      {{- $key := "" }}
+      {{- with (optional . "features" dict).provider_key }}
+      {{- $env := dict }}
+      {{- with $.context.inject }}{{ with optional . "env" "" }}{{ $env = . }}{{ end }}{{ end }}
+      {{- $key = optional $env .values.key "" }}
+      {{- if not (regexMatch "^https://[a-z0-9-]+(\\.[a-z0-9-]+)+/secrets/[A-Za-z0-9-]+(/[A-Za-z0-9]+)?$" $key) }}
+      {{- fail (printf "the provider_key attachment on %q delivers a value that is not the identifier of a Key Vault secret, https://<vault>.vault.azure.net/secrets/<name>, so the terraform realization of core/gateway/azure-api-management does not write it; store the key in Key Vault and attach the secret's identifier, which the instance reads with its managed identity" $.context.instance_id) }}
+      {{- end }}
+      {{- end }}
+      terraform {
+        required_providers {
+          azurerm = {
+            source  = "hashicorp/azurerm"
+            version = "5.9.0"
+          }
+        }
+      }
+
+      provider "azurerm" {
+        features {}
+      }
+
+      data "azurerm_api_management" "this" {
+        name                = "{{ .infra.api_management_name }}"
+        resource_group_name = "{{ .infra.resource_group_name }}"
+      }
+      {{- if $key }}
+
+      resource "azurerm_api_management_named_value" "provider_key" {
+        name                = "{{ $nv }}"
+        api_management_name = data.azurerm_api_management.this.name
+        resource_group_name = data.azurerm_api_management.this.resource_group_name
+        display_name        = "{{ $nv }}"
+        secret              = true
+
+        value_from_key_vault {
+          secret_id = "{{ $key }}"
+        }
+      }
+      {{- end }}
+
+      resource "azurerm_api_management_backend" "model" {
+        name                = "{{ .locals.api_name }}-backend"
+        api_management_name = data.azurerm_api_management.this.name
+        resource_group_name = data.azurerm_api_management.this.resource_group_name
+        protocol            = "http"
+        url                 = "{{ .infra.backend_url }}"
+      {{- if $key }}
+
+        credentials {
+          header = {
+            "{{ .infra.provider_key_header }}" = "{{ printf "{{%s}}" $nv }}"
+          }
+        }
+
+        depends_on = [azurerm_api_management_named_value.provider_key]
+      {{- end }}
+      }
+
+      resource "azurerm_api_management_api" "this" {
+        name                  = "{{ .locals.api_name }}"
+        api_management_name   = data.azurerm_api_management.this.name
+        resource_group_name   = data.azurerm_api_management.this.resource_group_name
+        revision              = "1"
+        display_name          = "{{ .locals.api_name }}"
+        path                  = "{{ .infra.api_path }}"
+        protocols             = ["https"]
+        subscription_required = {{ .infra.subscription_required }}
+      }
+
+      resource "azurerm_api_management_api_operation" "chat_completions" {
+        operation_id        = "chat-completions"
+        api_name            = azurerm_api_management_api.this.name
+        api_management_name = data.azurerm_api_management.this.name
+        resource_group_name = data.azurerm_api_management.this.resource_group_name
+        display_name        = "Chat completions"
+        method              = "POST"
+        url_template        = "/chat/completions"
+      }
+
+      resource "azurerm_api_management_api_policy" "this" {
+        api_name            = azurerm_api_management_api.this.name
+        api_management_name = data.azurerm_api_management.this.name
+        resource_group_name = data.azurerm_api_management.this.resource_group_name
+
+        xml_content = <<XML
+      <policies>
+        <inbound>
+          <base />
+          <set-backend-service backend-id="${azurerm_api_management_backend.model.name}" />
+          <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+          <set-query-parameter name="subscription-key" exists-action="delete" />
+      {{- if eq .infra.backend_authentication "managed_identity" }}
+          <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+      {{- end }}
+        </inbound>
+        <backend>
+          <base />
+        </backend>
+        <outbound>
+          <base />
+        </outbound>
+        <on-error>
+          <base />
+        </on-error>
+      </policies>
+      XML
+      }
