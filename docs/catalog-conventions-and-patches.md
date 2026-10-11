@@ -1390,6 +1390,11 @@ spec:
       source_version: { type: string }
 ```
 
+A Recipe that delivers code holding a Feature's guarantee into the product
+honours `engine_version` only at the versions that code was proven at, as "A
+guarantee held in catalog code pins the product version it was proven at" under
+"Feature Pattern" sets out.
+
 ## 5. Shared schema and mapping reuse
 
 Schema fragments shared across multiple Components or Features live in **SchemaLibrary** entries under `schemalibrary/`. Go template fragments shared across multiple Recipes or FeatureRecipes live in **MappingLibrary** entries under `mappinglibrary/`. Reuse via cross-document references — `$ref:` for schemas, `$import:` for mappings — replaces the inline-duplication pattern.
@@ -2822,7 +2827,9 @@ The distinction to hold, because it decides which kind you are authoring:
 A runtime guardrail or gateway binding to a node is a Feature (or its annotation
 shortcut), **not** a `uses` edge. A `uses` edge is dumb string-routing between
 components that already exist; a guardrail is new runtime configuration to attach,
-which is exactly what a Feature is for.
+which is exactly what a Feature is for. Whether a given guardrail earns a Feature
+of its own is the test below: one that only a single product in the field has is
+a value on that product's own Component.
 
 ### What earns a Feature: two independent products in the field
 
@@ -2832,101 +2839,22 @@ name when at least two independent products in the field realize the capability
 it declares.** The products counted are products in the world, established from
 their own current configuration references, and not the components this catalog
 happens to ship: a capability two gateway products implement is portable whether
-the catalog carries one of those gateways, both of them, or neither.
+the catalog carries one of those gateways, both of them, or neither. Kong
+3.9.3's open-source image carries neither a semantic cache nor a period budget,
+which Kong offers in its enterprise edition only, and Tyk v5.14.0's gateway
+carries neither, the budget of Tyk's separate AI Studio being enforced in its
+enterprise edition only: those editions count toward the field whether or not
+this catalog runs them.
 
 What the catalog ships is a separate question, answered one product at a time. A
-Feature may be declared before anything here realizes it — attaching it then halts
-the build naming the type, which is the honest state for a control no
-FeatureRecipe realizes — and it may be realized on one component or on several. Each realization is a FeatureRecipe for one product that honours the
-Feature in that product's own terms.
-
-The AI gateway controls `core/semantic-caching`, `core/period-budget` and
-`core/response-validation` show that answer gateway by gateway.
-`core/gateway/litellm` realizes the period budget, and the semantic cache on a
-`core/datastore/redis` wired to its `cache_store` socket.
-`core/gateway/cloudflare-ai-gateway`, Cloudflare's hosted gateway, realizes the
-period budget through its terraform Recipe, as a spend-limit rule on the
-gateway's own resource, and not the semantic cache: its cache answers only a
-request identical to an earlier one. Its helm and compose Recipes reference a
-gateway configured elsewhere and realize neither. `core/gateway/kong` runs
-Kong 3.9.3's open-source image, which carries neither a semantic cache nor a
-period budget, Kong offering both in its enterprise edition only, and
-`core/gateway/tyk` runs Tyk v5.14.0's gateway, which carries neither, the
-budget of Tyk's separate AI Studio being enforced in its enterprise edition
-only; so neither gateway realizes either Feature. `core/gateway/apisix`
-realizes the period budget on its chart Recipe, which runs APISIX 3.18.0 in
-front of the models wired to it: counted in the tokens each reply reports, over
-a fixed window that opens with the first request after the last one closed, for
-the whole gateway or each model, on chat routes alone, since APISIX counts no
-tokens on a completion request, and on one replica, since each gateway process
-counts on its own. It refuses a budget in US dollars, one per caller and a
-calendar month. APISIX 3.18.0 carries a semantic cache as well, but keeps
-callers apart only by a consumer an authentication plugin names, or by a value
-the request itself carries, which it does not verify; the gateway the chart
-Recipe renders holds no consumer, so its realization halts every attachment
-rather than ship one cache every caller shares. Its workload Recipe,
-at APISIX 3.17.0, renders no route and halts on either Feature.
-`core/gateway/envoy-gateway` realizes the period budget through Envoy Gateway's
-usage-based rate limit, on the route serving the models wired to it through
-Envoy AI Gateway: counted in the tokens each reply reports, over a fixed window
-on the UTC clock of one unit — a second, a minute, an hour, a day, a week, 30 or
-365 days, or a calendar month, a setting that then holds for every monthly rate
-limit that install keeps — for the whole gateway or each model, in the
-Redis-protocol store wired to its `cache` socket, and served uncounted while
-that store cannot be reached. It refuses a budget in US dollars, one per
-caller, since nothing on that path verifies who the caller is, and any other
-period. On that route it also realizes `core/retry-policy`, whose retry count
-its Recipe writes onto the same traffic policy as the budget's rate limit,
-since Envoy Gateway attaches one traffic policy to a route. Envoy AI Gateway
-keeps no cache of replies and checks no reply against a schema, so the gateway
-realizes neither of the other two Features although it carries `semantic`: an
-attachment of either halts the build. Contour and NGINX
-offer none of the three. No gateway in this
-catalog checks a reply against a schema the attachment carries, so
-`core/response-validation` is realized nowhere.
-
-`core/concurrency-limit`, the AI gateway control declaring a cap on the
-requests a gateway carries at once across everything it serves, is realized
-nowhere either. The proxy `core/gateway/litellm` runs can cap the requests in
-flight for each entry of its model map, but holds no cap on their total, so
-that gateway carries no realization; `core/gateway/envoy-gateway` can cap the
-requests in flight to each wired model's backend, one cap per route rule, and
-holds no cap on their total either, so it carries none; and no Recipe of
-`core/gateway/cloudflare-ai-gateway` writes such a cap: the request limit its
-terraform Recipe writes into the gateway's resource is a rate, a number of
-requests over an interval.
-
-`core/gateway/envoy-gateway` does not realize `core/fallback-chain`: Envoy AI
-Gateway falls back by retrying onto further backends of a model's rule, and the
-gateway writes its one traffic policy's retry count onto every rule of the route
-serving its models, so a fallback list would get exactly its sends only where
-every wired model's list has the same length. Its realization of
-`core/audit-logging`, `audit-logging-envoy-gateway`, halts every attachment,
-naming what the request log Envoy Gateway writes does not keep: what a request
-cost, since the per-request cost Envoy AI Gateway can compute has no unit and
-the gateway keeps no prices; the verified caller it is billed to, since nothing
-on that path verifies the caller; and a retention, since that log has no store
-and no retention setting.
-
-`core/prompt-injection-shield` is answered the same way, on the two gateways
-whose Recipes render the one route their model traffic takes.
-`core/gateway/litellm` and `core/gateway/nginx` realize it by sending that route
-through the guard wired to the gateway's `guard` socket, a
-`core/security/nemo-guardrails` that checks each chat request with a trained
-classifier and forwards what it admits to the model: on the AI gateway, every
-entry of the hand-typed model map is addressed to the guard, and a model wired
-to its `models` socket halts the build, because its entry would be sent to that
-model's own endpoint, past the guard; on NGINX, its one location
-forwards to the guard in place of the upstream. Each realization halts the
-build unless the guard's threshold is the one the attachment's sensitivity
-names. The Feature selects `component.aggrega.ai/category=gateway`, because all
-it needs of a gateway is that it forwards to an address it is configured with.
-Every other gateway here realizes none: most render no route a realization
-could send through a guard — they keep their routes in a store of their own,
-take them from the applications behind them, or are a hosted service — and
-`core/gateway/apisix`, whose chart Recipe renders the routes of the models
-wired to it, and `core/gateway/envoy-gateway`, whose Recipe renders the AI
-route of the models wired to it, have no realization of the shield.
+Feature may be declared before anything here realizes it — attaching it then
+halts the build naming the type, which is the honest state while no product the
+catalog ships can realize it — and it may be realized on one component or on
+several. Each realization is a FeatureRecipe for one product that honours the
+Feature in that product's own terms. Where a product the catalog ships could
+realize a Feature and only the catalog's own rendering of that product stands in
+the way, the missing realization is the catalog's to write, as "Before a
+realization refuses, establish whose refusal it is" below sets out.
 
 **A capability that only one product in the field has is not a Feature.** It is a
 setting on that product's own Component, which the author who decides it sets in
@@ -2934,6 +2862,21 @@ that author's pillar and reads beside everything else that configures the produc
 A Recipe may declare `spec.pipeline` of its own, driven by the values and
 infrastructure the component was authored with, so that is where such a setting
 is written into the product's configuration.
+
+**A Feature that fails the test is widened or removed, never kept as a contract
+only one product can meet.** Where the field shares a shape of the same
+capability — the same promise kept at a narrower scope or a finer grain — the
+Feature is widened to that shape. A different control serving the same concern
+is not a shape of it; it has a name and a test of its own. Where the field
+shares no shape of the capability, the Feature is removed — its declaration, its
+validation and its realizations together — and the capability becomes a value
+on the Component of the one product that has it. LiteLLM v1.103.1 caps the
+requests in flight for each entry of its model map, and Envoy Gateway v1.9.1 for
+each backend of a route rule, its connection limit counting connections rather
+than requests; neither holds a cap on the total across everything it serves. A
+cap per target passes the test and a cap on that total does not, so a Feature
+capping the requests in flight is widened to the cap per target rather than kept
+as a total alone.
 
 Counting the field rather than the catalog has three consequences for how a
 Feature's options are authored:
@@ -2947,13 +2890,173 @@ Feature's options are authored:
   third sorts providers by price — the option is portable and the Feature keeps it.
   A realization for a product that cannot honour the option refuses that value at
   build time and says why; it never accepts the value and ignores it.
-- **An option no product implements is dropped**, rather than kept so the set reads
-  as complete.
+- **An option no product honours is dropped** — in its configuration or in code a
+  realization delivers into it — rather than kept so the set reads as complete. A
+  protection one product keeps only through such code is not dropped: it stays an
+  option whose default is the protection, as "Core, option or drop — and a
+  protection keeps its default" below sets out.
 
 **This is a convention catalog authors uphold, not something the compiler
 enforces.** The compiler validates a Feature against its schema and pipes strings,
 so a Feature declaring options no product implements passes every gate and ships.
 The judgement stays with the author and the reviewer.
+
+### Measure the field first, and re-measure after a release
+
+**Before a Feature is written, measure the field.** Read the current
+configuration reference of each product that offers the capability, and keep
+with every read the date it was made and the product version it describes.
+Then establish, member by member, that every core promise is honoured
+**exactly, by configuration**, by two or more independent products: by a setting
+the product's own reference documents, not by code a realization would have to
+deliver into it, and not by a looser behaviour carrying the same name.
+
+A period budget is the worked case. Refusing further model requests once what
+was counted over a period exceeds a limit is configuration on LiteLLM v1.103.1,
+as a budget in US dollars over a number of days or a calendar month; on APISIX
+3.18.0, as token rate limiting over a fixed window that opens with the first
+request after the last window closed; on Envoy Gateway v1.9.1 with Envoy AI
+Gateway v1.1.0, as a usage-based rate limit counting the tokens each reply
+reports; and on Cloudflare's AI Gateway, a hosted service with no version to
+pin, so that the date of the read places it, as a spend-limit rule. What each
+counts, over which period and for whom differs from one product to the next,
+which is why `core/period-budget` declares those as values each realization
+keeps or refuses by name, and the refusal past the limit as its core.
+
+**Re-measure a vendor fact before relying on it when the product has released
+since it was read.** A reading answers for the version it describes. A later
+release can add what the reading found missing, or change what it found there,
+and a member's classification, a realization's refusal or a version pin resting
+on the older reading is then wrong in a way no build shows. Compare the date of
+the reading with the product's releases since, and re-read the reference where
+one has shipped. APISIX 3.18 carries a semantic cache, its `ai-cache` plugin,
+and a check for prompt injection, its `ai-lakera-guard` plugin, which has Lakera
+Guard inspect each prompt; APISIX 3.17 carries neither. A reading of APISIX 3.17
+answers neither question for 3.18, and a refusal written from it would refuse
+what 3.18 can do.
+
+### Core, option or drop — and a protection keeps its default
+
+Classify every member of a Feature before writing it: each promise its
+description makes and each value its schema declares.
+
+- **Core** — honoured exactly, by configuration, by two or more independent
+  products, and by nearly every product that offers the capability at all.
+  Every attachment gets it, and the Feature's description states it.
+- **Option** — a declared value that a realization honours, or refuses by name
+  without refusing the rest of the attachment. It carries a default where one
+  value suits every attachment, and is required where none does, as a period
+  budget's unit, scope and period are.
+- **Drop** — a member no product honours, in its configuration or in code a
+  realization delivers into it, leaves the Feature's promise. Where it is one
+  realization's own behaviour, that realization's description states it.
+
+**The deciding question is not how many products honour a member, but whether a
+realization lacking it can decline it alone.** A member several products honour
+is still an option where many products offering the capability lack it — a cost
+in an audit record, a budget in a currency, a list of patterns a request must
+match to be admitted — because a realization for a product without it refuses
+that value and keeps the rest. A member exactly one product honours leaves the Feature and
+becomes a value on that product's own Component, as "What earns a Feature" sets
+out; a protection is the exception, kept however few products give it, as the
+rule on guarantees below sets out.
+
+A cost in an audit record shows the question at work. LiteLLM v1.103.1 records
+what each request cost in US dollars, the unit its budgets count in; Kong 3.9.3
+computes a cost only where both of a model's per-token prices are configured,
+and names no currency; and the per-request cost Envoy AI Gateway v1.1.0
+computes is a whole number with no unit, the gateway keeping no prices. A
+gateway that keeps a record of each request can lack the cost, so the cost is an
+option: a realization for such a gateway refuses it by name and keeps the
+record.
+
+**A guarantee a gateway may lack is a value with a default, never an
+unconditional sentence.** Where the guarantee is a protection, its default is
+the protection. An attachment written without the value gets the protection; a
+realization whose product cannot give it refuses the attachment by name at
+build time; and an author who accepts less writes the relaxation visibly, on
+that attachment, in the document of the author who decides it — where that is
+the operator, in the attachment's `infra` in the Release, as "Who writes each
+input, and where a Feature is attached" below sets out. A realization never
+accepts such a value and ignores it. A sentence in a Feature's description that
+no realization can decline — "a request a realization cannot mask is refused
+before it is forwarded", say — leaves a product lacking that one promise
+nothing to refuse but the whole Feature, so its realization halts on every
+attachment rather than on the one promise the product lacks.
+
+Kong Gateway Enterprise's AI PII Sanitizer, which reaches replies from Kong
+3.12, masks a reply's message text and not the reasoning a reasoning model
+returns beside it. `core/data-masking` declares masking that reasoning as
+`mask_reasoning`, an `infra` value on by default, so Kong's realization refuses
+an attachment masking replies while it is on, naming the value, and the
+operator who accepts reasoning reaching callers unmasked sets
+`mask_reasoning: false` on that attachment in the Release.
+
+### Before a realization refuses, establish whose refusal it is
+
+A refusal by name is honest when the **product** lacks the capability. It is a
+catalog defect when the cause is the catalog's own rendering of the product: a
+gateway rendered with no caller authentication, a route rendered with a single
+target, an input the catalog never supplies, such as a price. A catalog cause is
+fixed in the catalog — render the authentication, the targets, the input — and
+the refusal that remains names only what the product lacks. So before writing a
+refusal, ask whether the product, configured as its own reference allows, would
+keep the promise; where it would, the refusal is the catalog's to remove rather
+than to ship.
+
+APISIX 3.18.0's semantic cache keeps one caller's stored replies apart from
+another's by the consumer an authentication plugin names, where its
+`include_consumer` setting is on, and otherwise only by values the request
+carries, which it does not verify. A rendering of the gateway that declares no
+consumer leaves the cache no caller to keep apart, so a realization over that
+rendering could only refuse every attachment, and the refusal would be the
+catalog's rather than APISIX's. The fix is to render consumers with key
+authentication, so the cache keeps each key's replies apart, and to refuse by
+name only what APISIX itself cannot keep.
+
+### One home per setting
+
+A choice a Feature declares is not also a value on the gateway's Component. Two
+homes for one setting disagree the first time one of them is edited, and a
+reader of either cannot tell which one the rendered configuration took. Where
+both exist, one is retired, and the test in "What earns a Feature" says which: a
+choice two or more products offer has earned its Feature, and the Feature is its
+home; a choice only one product offers is a value on that product's Component,
+and no Feature declares it.
+
+LiteLLM v1.103.1 picks among the entries of its model map that publish one
+alias by a single setting, its routing strategy, which offers latency-based
+routing; the AI Proxy Advanced plugin of Kong's AI Gateway Enterprise picks the
+target observed to answer quickest as well. Choosing a target by latency passes
+the test, so its home is `core/target-selection`, and a routing-strategy value
+on the gateway's Component offering the same choice is a second home to retire.
+
+### A guarantee held in catalog code pins the product version it was proven at
+
+Most realizations keep a promise through the product's own configuration, which
+the product's reference documents. Where a guarantee is kept instead by code the
+catalog delivers into the product — a module the product loads, a hook it
+calls — the guarantee is only as good as the product internals that code was
+proven against. So the Recipe delivering that code halts the build on any
+product version outside the set the code was proven at, naming that set, and a
+version joins the set only once the proof has run at it.
+
+"Version knobs: `engine_version` and `source_version`", under "Component Schema
+Pattern", states both knobs as conventions: "Both are provider-neutral
+conventions — the compiler reads neither; each Recipe decides which it honors
+and how." A Recipe delivering such code decides it this way: it honours
+`engine_version` within the proven set and refuses every other value by name,
+because outside that set the delivered code may fail to load or, worse, load
+over changed internals and keep less than the Feature promises while the build
+stays green.
+
+The masking `core/gateway/litellm` delivers for `core/data-masking` is Python
+the proxy loads, which imports LiteLLM's own guardrail classes, its Presidio
+guardrail and its content filter among them, so it rests on internals no
+LiteLLM setting describes. What it refuses and withholds is proven by running it
+at LiteLLM v1.103.1, the release the gateway's `engine_version` defaults to; at
+another release the import may fail and stop the proxy, or succeed over changed
+internals and keep less, with nothing in the build to show which.
 
 ### Who writes each input, and where a Feature is attached
 
@@ -3273,7 +3376,9 @@ Two realms, never conflated:
 The boundary is where the thing acts: pipeline and output for the first, output
 and runtime for the second. This is why the runtime AI-control tier above, and
 operator-driven custom resources generally, are Features and artifacts rather than
-workload dials or edges.
+workload dials or edges, wherever a control earns a Feature; a control only one
+product in the field has is a value on that product's own Component, as "What
+earns a Feature" sets out.
 
 ### Name an emitted resource for the scope that carries it
 
