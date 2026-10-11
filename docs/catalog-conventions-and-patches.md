@@ -3067,7 +3067,11 @@ guardrail and its content filter among them, so it rests on internals no
 LiteLLM setting describes. What it refuses and withholds is proven by running it
 at LiteLLM v1.103.1, the release the gateway's `engine_version` defaults to; at
 another release the import may fail and stop the proxy, or succeed over changed
-internals and keep less, with nothing in the build to show which.
+internals and keep less. So the gateway's Recipe holds the releases its code is
+proven at in one local, and an assertion reading it halts the build on any other
+`engine_version`, naming them. The halt holds on every Release of that Recipe,
+masking attached or not, because the request guard it delivers on every Release
+is code of the same kind.
 
 ### Who writes each input, and where a Feature is attached
 
