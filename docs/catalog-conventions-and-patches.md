@@ -295,6 +295,17 @@ family, and `semantic`, because its AI proxy reads the request body of every
 route it serves a model on. `core/gateway/envoy-gateway` carries
 `period-budget: tokens` as well: Envoy AI Gateway reads the tokens each reply
 of a wired model reports, and Envoy Gateway's rate limit counts them.
+`core/gateway/kong-enterprise` carries `period-budget: tokens`, the tokens
+each reply reports as Kong's AI Rate Limiting Advanced counts them,
+`content-masking: entity-recognition` and `semantic`. `core/gateway/traefik-hub`
+carries `content-masking: entity-recognition`, `prompt-guard: pattern-list`,
+`period-budget: cost`, priced from the per-model price list its Token Rate
+Limit & Quota middleware ships with, and `semantic`.
+`core/gateway/azure-api-management`, the AI gateway of Azure API Management, a
+hosted service, carries `period-budget: tokens`, its one value in this family,
+and `semantic`: its token limit counts the prompt and completion tokens each
+reply reports, together, and keeps a separate count at each gateway of the
+instance.
 
 A component carrying `prompt-guard: classifier` is also something another
 component can send its traffic through: `core/gateway/litellm` and

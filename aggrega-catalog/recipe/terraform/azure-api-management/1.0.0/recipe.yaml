@@ -17,10 +17,11 @@ metadata:
 
     The policy sends each request to the backend, removes the caller's
     subscription key from what it forwards, and authenticates as
-    infra.backend_authentication says. Terraform authenticates to Azure with
-    the credentials in the environment it runs in, and a provider key reaches
-    the configuration only as the identifier of the Key Vault secret holding
-    it, so the rendered files carry no credential.
+    infra.backend_authentication says; what an attached core/semantic-caching
+    or core/period-budget sets is written into the same policy. Terraform
+    authenticates to Azure with the credentials in the environment it runs in,
+    and a provider key reaches the configuration only as the identifier of the
+    Key Vault secret holding it, so the rendered files carry no credential.
 
     The azurerm provider is configured inside this component's own module,
     because it does not plan without its features block. So a Release that
@@ -107,8 +108,43 @@ spec:
   # forwards, in the header and in the query string, so the model API never
   # receives the key a caller presents to the gateway; Microsoft's policy
   # reference does not say whether the gateway would forward it otherwise.
+  #
+  # An attached FeatureRecipe delivers its policy element on the
+  # azure_api_management mechanism of this node's inject pipe, and this body
+  # places it as delivered:
+  #   semantic_cache_lookup       - core/semantic-caching's lookup, in inbound
+  #   token_limit.<name>          - one token limit per core/period-budget
+  #                                 attachment, in inbound after the lookup,
+  #                                 in the order of their names
+  #   semantic_cache_store        - core/semantic-caching's store, in outbound
+  #   subscription_scoped.<name>  - names an attachment that keys on the
+  #                                 caller's API Management subscription
+  # The token limits follow the cache lookup, the order Microsoft's reference
+  # recommends for a limit beside a cache. With nothing attached nothing is
+  # written. An element's policy expressions keep their double quotes
+  # unescaped, the form Microsoft's reference writes them in: the provider
+  # sends xml_content to Azure as raw XML. The build halts on a delivered
+  # element carrying ${ or %{, which Terraform would read inside the heredoc
+  # as its own template syntax, and while infra.subscription_required is false
+  # under an attachment keyed on the subscription, because a request then need
+  # present no subscription key, so there is no verified subscription to key
+  # on.
   artifacts:
     main.tf: |
+      {{- $set := dict }}
+      {{- with .context.inject }}{{ with optional . "azure_api_management" "" }}{{ $set = . }}{{ end }}{{ end }}
+      {{- $limits := list }}
+      {{- $keyed := list }}
+      {{- range $name, $element := $set }}
+      {{- if or (contains "${" $element) (contains "%{" $element) }}
+      {{- fail (printf "the element delivered as %q for the policy of %q carries ${ or %%{, which Terraform reads inside the policy's heredoc as its own template syntax, so the terraform realization of core/gateway/azure-api-management does not write it" $name $.context.instance_id) }}
+      {{- end }}
+      {{- if hasPrefix "token_limit." $name }}{{ $limits = append $limits $element }}{{ end }}
+      {{- if hasPrefix "subscription_scoped." $name }}{{ $keyed = append $keyed (printf "%s attachment %q" $element (trimPrefix "subscription_scoped." $name)) }}{{ end }}
+      {{- end }}
+      {{- if and $keyed (not .infra.subscription_required) }}
+      {{- fail (printf "%q sets infra.subscription_required to false, but its %s keys on the API Management subscription whose key the gateway verifies, and a request need then present no subscription key, so there is no verified subscription to key on; set infra.subscription_required to true, or change what the attachment keys on" .context.instance_id (join " and " $keyed)) }}
+      {{- end }}
       {{- $nv := printf "%s-provider-key" .locals.api_name }}
       {{- $key := "" }}
       {{- with (optional . "features" dict).provider_key }}
@@ -205,11 +241,14 @@ spec:
       {{- if eq .infra.backend_authentication "managed_identity" }}
           <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
       {{- end }}
+      {{- with optional $set "semantic_cache_lookup" "" }}{{ . | nindent 4 }}{{ end }}
+      {{- range $limits }}{{ . | nindent 4 }}{{ end }}
         </inbound>
         <backend>
           <base />
         </backend>
         <outbound>
+      {{- with optional $set "semantic_cache_store" "" }}{{ . | nindent 4 }}{{ end }}
           <base />
         </outbound>
         <on-error>

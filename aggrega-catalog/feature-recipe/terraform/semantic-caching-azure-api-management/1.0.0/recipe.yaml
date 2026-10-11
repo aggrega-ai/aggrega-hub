@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: semantic-caching-azure-api-management
+  version: 1.0.0
+  description: >
+    Realizes core/semantic-caching on core/gateway/azure-api-management's
+    terraform Recipe; a Release binds it in its Manifest. It writes a cache
+    lookup and a cache store into the API's policy and emits no file.
+
+    embedding_model names an API Management backend for an embeddings model
+    that the instance already holds and reaches with its managed identity; the
+    instance also needs a Redis cache with RediSearch configured as its
+    external cache. The build cannot see either. A reply is kept for
+    ttl_seconds, apart per API and per API Management subscription, so it
+    honours scope key and refuses end_user by name: the API validates no end
+    user's token, so the gateway has no verified end user to keep apart. Key
+    needs the subscription key the API requires by default.
+
+    similarity_threshold is written as score-threshold, 1 minus the threshold,
+    reading Azure's score as a cosine distance: Microsoft gives the score's
+    range and direction, lower requiring closer prompts, but not its measure.
+    Microsoft warns a similar prompt can be served a reply that is wrong for
+    it. That the policy applies as described is not observed by any build.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: terraform
+  implements: core/semantic-caching:1.0.0
+  # executionScope omitted -> component: the checks and the delivery run once
+  # per attached component.
+
+  # The lookup's score-threshold, from the Feature's cosine similarity.
+  # Microsoft's llm-semantic-cache-lookup takes a score from 0.0 to 1.0 where
+  # lower values require higher semantic similarity, and its tutorial for the
+  # external Redis cache warns against copying a threshold between that cache's
+  # own client library, which counts a cosine distance, and the gateway without
+  # validating their units. One minus a cosine similarity is a cosine distance,
+  # and Microsoft's suggested starting score, 0.05, is then a similarity of
+  # 0.95; the reading is an inference from the range and the direction, and
+  # nothing Microsoft states confirms the measure.
+  locals:
+    score_threshold: '{{ printf "%.6g" (subf 1.0 (float64 .values.similarity_threshold)) }}'
+
+  # How the gateway keeps callers apart. The lookup's vary-by values are
+  # concatenated into the partition a reply is stored and served under, and
+  # this realization writes two: the API's own id, so an API on the same
+  # instance never serves this one's replies, and the id of the subscription
+  # whose key the gateway verified. A user of API Management is the account
+  # owning a subscription, not an end user, and an end user is identified only
+  # by a token the gateway validates, which the API this Recipe renders does
+  # not, so end_user is refused rather than written over a value a caller
+  # could choose. The lookup can appear once in a policy section, so a gateway
+  # takes one cache.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside.
+    component_renders_the_body: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/azure-api-management" -}}
+      {{- fail (printf "core/semantic-caching attachment %q on %q is bound to the Azure API Management realization, which writes a cache lookup and store into the API policy core/gateway/azure-api-management renders on terraform; %s renders no such policy. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    gateway_identifies_the_end_user: >-
+      {{- if eq (optional .values "scope" "end_user") "end_user" -}}
+      {{- fail (printf "core/semantic-caching attachment %q on %q asks for scope end_user, the default, which keeps each end user's replies apart, but the API that core/gateway/azure-api-management's terraform Recipe configures validates no end user's token, so the gateway has no verified end user to keep apart and would share one cache across every end user behind a subscription; set scope to key to share one cache per API Management subscription, knowing that an end user behind one subscription can then be served a reply generated for another" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+    # The name is written into the lookup element as an attribute, so it is
+    # held to characters that cannot end the attribute or open a policy
+    # expression. This is what the policy can carry, not Azure's rule for a
+    # backend's name.
+    embedding_model_names_a_backend: >-
+      {{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]*$" .values.embedding_model) -}}
+      {{- fail (printf "core/semantic-caching attachment %q on %q names embedding_model %q, but core/gateway/azure-api-management reads it as the id of the API Management backend serving the embeddings model, written into the API's policy, which takes letters, digits, dots, underscores and hyphens there; name the backend's id" .metadata.feature_instance .metadata.instance_id .values.embedding_model) -}}
+      {{- end -}}
+    one_cache_per_gateway: >-
+      {{- $count := 0 -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" $attachment.type)) "core/semantic-caching" -}}{{- $count = add1 $count -}}{{- end -}}
+      {{- end -}}
+      {{- if gt $count 1 -}}
+      {{- fail (printf "core/semantic-caching attachment %q on %q is one of %d semantic caches on this gateway, but Azure API Management takes one cache lookup in a policy section; attach one semantic cache" .metadata.feature_instance .metadata.instance_id $count) -}}
+      {{- end -}}
+
+  # Delivered on this node's inject pipe, on the azure_api_management mechanism
+  # the gateway's terraform Recipe reads, which places the lookup in the
+  # policy's inbound section and the store in its outbound section. Scope key
+  # keys on the subscription, which it says beside them, so the Recipe halts
+  # while the API requires no subscription key.
+  injectMapping: |
+    azure_api_management:
+      semantic_cache_lookup: {{ printf "<llm-semantic-cache-lookup score-threshold=\"%s\" embeddings-backend-id=\"%s\" embeddings-backend-auth=\"system-assigned\">\n  <vary-by>@(context.Api.Id)</vary-by>\n  <vary-by>@(context.Subscription.Id)</vary-by>\n</llm-semantic-cache-lookup>" .locals.score_threshold .values.embedding_model | toJson }}
+      semantic_cache_store: {{ printf "<llm-semantic-cache-store duration=\"%v\" />" .values.ttl_seconds | toJson }}
+      subscription_scoped.{{ .attachment_name }}: "core/semantic-caching"

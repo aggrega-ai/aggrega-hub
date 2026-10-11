@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: period-budget-azure-api-management
+  version: 1.0.0
+  description: >
+    Realizes core/period-budget on core/gateway/azure-api-management's
+    terraform Recipe; a Release binds it in its Manifest. It writes one token
+    limit into the API's policy and emits no file.
+
+    The gateway counts the prompt and completion tokens each reply reports,
+    together, and prices nothing: past a quota over an hour, a day, a week, a
+    month or a year, each a fixed window on the UTC clock, it answers HTTP 403
+    until the window ends, and past a rate over one minute HTTP 429. So it
+    honours unit total_tokens, a period of 1h, 1d, 7d, 1mo, 12mo or 1m, and a
+    whole-number limit, for everything the API serves or for each API
+    Management subscription, and refuses the rest by name. It counts after a
+    reply arrives, so concurrent requests can pass the limit, and keeps a
+    separate count at each gateway of the instance.
+
+    It halts on any component other than core/gateway/azure-api-management.
+    That the policy applies and refuses as described is Microsoft's documented
+    behaviour on every tier but Consumption, and no build observes it.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: terraform
+  implements: core/period-budget:1.0.0
+  # executionScope omitted -> component: the checks and the delivery run once
+  # per attached component.
+
+  # The element's limit attribute and its period: token-quota over a
+  # token-quota-period for a quota, tokens-per-minute for a rate. Microsoft's
+  # llm-token-limit takes a quota over Hourly, Daily, Weekly, Monthly or
+  # Yearly, each a fixed window starting at the UTC time truncated to that unit
+  # (the reference does not say which day a week starts on), and a rate per
+  # minute, counted over a sliding window on the classic tiers and as a token
+  # bucket on the v2 tiers. Each period below is the one length that names the
+  # same window; any other is left empty here and refused below.
+  locals:
+    limit_attributes: >-
+      {{- $quota := dict "1h" "Hourly" "1d" "Daily" "7d" "Weekly" "1mo" "Monthly" "12mo" "Yearly" -}}
+      {{- $limit := printf "%.0f" (float64 .infra.limit) -}}
+      {{- if hasKey $quota .infra.period -}}
+      {{- printf "token-quota=\"%s\" token-quota-period=\"%s\"" $limit (index $quota .infra.period) -}}
+      {{- else if eq .infra.period "1m" -}}
+      {{- printf "tokens-per-minute=\"%s\"" $limit -}}
+      {{- end -}}
+
+  # How the gateway keeps the budget. One counter is kept per value of the
+  # element's counter-key, shared by every policy on the instance that writes
+  # the same value, so the key is the API's own id followed by the attachment's
+  # name — and, for scope caller, the id of the subscription whose key the
+  # gateway verified. The budget covers this API alone, and two attachments
+  # keep two counts. estimate-prompt-tokens is false: the count is the usage
+  # each reply reports, so a request is refused only once an earlier reply has
+  # taken the count past the limit, and the request that does so is served;
+  # Microsoft's reference says a streamed request's tokens are estimated
+  # whatever this setting says.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside.
+    component_renders_the_body: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/azure-api-management" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q is bound to the Azure API Management realization, which writes a token limit into the API policy core/gateway/azure-api-management renders on terraform; %s renders no such policy. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The token limit counts prompt and completion tokens together and prices
+    # nothing.
+    unit_is_what_the_gateway_counts: >-
+      {{- if ne .values.unit "total_tokens" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for unit %s, but core/gateway/azure-api-management counts the prompt and completion tokens each reply reports, together, and prices nothing, so it keeps a budget in total_tokens alone; set unit to total_tokens, or attach the Feature to a gateway that counts what you asked for" .metadata.feature_instance .metadata.instance_id .values.unit) -}}
+      {{- end -}}
+    # A budget per model would key on the model a request names, which the
+    # caller writes into the request and which several names can reach, so a
+    # caller could spread one model's traffic over counts that never meet.
+    scope_is_one_the_gateway_keeps: >-
+      {{- if eq .values.scope "model" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for scope model, but core/gateway/azure-api-management serves one API forwarding to one model API, and tells models apart only by the name a request writes into its own body, which the caller chooses and which several names can reach, so this realization writes no budget per model; set scope to gateway, or to caller for one budget per API Management subscription" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+    # The windows the token limit keeps, each named by the one period that
+    # spans it. The list repeats the periods locals maps, because an
+    # assertion here reads the gateway Recipe's locals rather than this
+    # FeatureRecipe's; the two are edited together.
+    period_is_one_the_gateway_keeps: >-
+      {{- if not (has .infra.period (list "1h" "1d" "7d" "1mo" "12mo" "1m")) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of %s, but core/gateway/azure-api-management keeps a token quota over an hour, a day, a week, a month or a year, each a fixed window on the UTC clock, and a token rate over one minute; set period to 1h, 1d, 7d, 1mo, 12mo or 1m" .metadata.feature_instance .metadata.instance_id .infra.period) -}}
+      {{- end -}}
+    # The quota and the rate are counts of tokens.
+    limit_is_a_whole_number: >-
+      {{- $limit := float64 .infra.limit -}}
+      {{- if ne $limit (floor $limit) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a limit of %v tokens, but core/gateway/azure-api-management counts whole tokens; set limit to a whole number" .metadata.feature_instance .metadata.instance_id .infra.limit) -}}
+      {{- end -}}
+
+  # Delivered on this node's inject pipe, on the azure_api_management mechanism
+  # the gateway's terraform Recipe reads, which places the element in the
+  # policy's inbound section. An attachment keyed on the subscription says so
+  # beside it, so the Recipe halts while the API requires no subscription key.
+  injectMapping: |
+    {{- $key := printf "context.Api.Id + \"/%s\"" .attachment_name }}
+    {{- if eq .values.scope "caller" }}{{ $key = printf "context.Api.Id + \"/%s/\" + context.Subscription.Id" .attachment_name }}{{ end }}
+    azure_api_management:
+      token_limit.{{ .attachment_name }}: {{ printf "<llm-token-limit counter-key=\"@(%s)\" %s estimate-prompt-tokens=\"false\" />" $key .locals.limit_attributes | toJson }}
+    {{- if eq .values.scope "caller" }}
+      subscription_scoped.{{ .attachment_name }}: "core/period-budget"
+    {{- end }}
