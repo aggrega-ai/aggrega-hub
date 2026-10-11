@@ -2891,6 +2891,18 @@ holds no cap on their total either, so it carries none; and no Recipe of
 terraform Recipe writes into the gateway's resource is a rate, a number of
 requests over an interval.
 
+`core/gateway/envoy-gateway` does not realize `core/fallback-chain`: Envoy AI
+Gateway falls back by retrying onto further backends of a model's rule, and the
+gateway writes its one traffic policy's retry count onto every rule of the route
+serving its models, so a fallback list would get exactly its sends only where
+every wired model's list has the same length. Its realization of
+`core/audit-logging`, `audit-logging-envoy-gateway`, halts every attachment,
+naming what the request log Envoy Gateway writes does not keep: what a request
+cost, since the per-request cost Envoy AI Gateway can compute has no unit and
+the gateway keeps no prices; the verified caller it is billed to, since nothing
+on that path verifies the caller; and a retention, since that log has no store
+and no retention setting.
+
 `core/prompt-injection-shield` is answered the same way, on the two gateways
 whose Recipes render the one route their model traffic takes.
 `core/gateway/litellm` and `core/gateway/nginx` realize it by sending that route
