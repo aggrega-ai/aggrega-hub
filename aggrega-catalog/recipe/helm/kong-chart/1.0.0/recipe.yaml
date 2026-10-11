@@ -34,9 +34,10 @@ metadata:
     Each model wired to the models socket gets a chat and a completion route
     through Kong's AI proxy, in a ConfigMap beside the chart that an init
     container imports into the database, retried on a first install until the
-    bootstrap Job has provisioned the schema. A connection's credential arrives
-    as an env secretKeyRef the routes name through Kong's environment vault, so
-    no credential value is in the rendered output.
+    bootstrap Job provisions the schema. A changed route set rolls the gateway.
+    A connection's credential arrives as an env secretKeyRef the routes name
+    through Kong's environment vault, so no credential value is in the
+    rendered output.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -162,18 +163,25 @@ spec:
     {{- /* The models connections, in alias order, and those of them carrying a
            credential. The directory the routes file is mounted at is the
            single authored home for the mount and the path the import step
-           reads. */}}
+           reads. The route set is written from each connection's alias, the
+           endpoint and model name its model publishes, and whether it
+           carries a credential; their digest is what rolls the gateway's pod
+           when the route set changes, below. */}}
     {{- $routesDir := "/etc/kong/model-routes" }}
     {{- $wired := list }}
     {{- $credentialed := list }}
+    {{- $routeSet := list }}
     {{- range $alias, $edge := .context.uses }}
       {{- if eq $edge.socket "models" }}
         {{- $wired = append $wired $alias }}
-        {{- if hasKey (default dict $edge.features) "credential" }}
+        {{- $hasCredential := hasKey (default dict $edge.features) "credential" }}
+        {{- if $hasCredential }}
           {{- $credentialed = append $credentialed $alias }}
         {{- end }}
+        {{- $routeSet = append $routeSet (list $alias $edge.provides.endpoint $edge.provides.model $hasCredential) }}
       {{- end }}
     {{- end }}
+    {{- $routesDigest := sha256sum (toJson $routeSet) }}
     {{- /* The inline development password, the single authored home for the
            gateway's and the import step's connection when the backend
            connection carries no credential. */}}
@@ -252,6 +260,22 @@ spec:
     ## own wait for the database, so on a first install it fails until the
     ## bootstrap migration Job has provisioned the schema and the cluster
     ## retries it; once the schema is there it succeeds and the gateway starts.
+    ##
+    ## The chart also places this container in each of its three migration
+    ## Jobs, ahead of the migration itself, and there an import that needs the
+    ## schema would hold back the very Job that provisions it. So the step reads
+    ## its pod's app.kubernetes.io/component label, which the chart sets to app
+    ## on the gateway's pods and to the migration's name on each Job's, and
+    ## exits at once anywhere but in the gateway's own pod. Like the chart's own
+    ## wait for the database, it runs through a shell the image carries.
+    ##
+    ## The ConfigMap's content is no part of the pod's own specification, so
+    ## the pod carries the digest of what the route set is written from as the
+    ## annotation checksum/model-routes: a changed route set changes the pod's
+    ## specification, the Deployment rolls the gateway, and the new pod imports
+    ## the changed routes before it serves. The chart writes podAnnotations onto
+    ## the gateway's pods alone, never onto a migration Job's.
+    ##
     ## The import adds and updates each service, route and plugin under an id
     ## Kong derives from its name, so a re-run writes the same rows again; it
     ## removes nothing, so a route whose connection is removed stays in the
@@ -259,12 +283,21 @@ spec:
     ## model credential: the routes hold a reference to one, which only the
     ## gateway resolves.
     {{- if $wired }}
+    podAnnotations:
+      checksum/model-routes: "{{ $routesDigest }}"
     deployment:
       initContainers:
         - name: model-routes
           image: "{{ $image }}"
-          args: [kong, config, db_import, "{{ $routesDir }}/{{ .locals.model_routes_file }}"]
+          args:
+            - /bin/sh
+            - -c
+            - 'if [ "$MODEL_ROUTES_POD_COMPONENT" != app ]; then exit 0; fi; exec kong config db_import {{ $routesDir }}/{{ .locals.model_routes_file }}'
           env:
+            - name: MODEL_ROUTES_POD_COMPONENT
+              valueFrom:
+                fieldRef:
+                  fieldPath: "metadata.labels['app.kubernetes.io/component']"
             - name: KONG_DATABASE
               value: postgres
             - name: KONG_PG_HOST

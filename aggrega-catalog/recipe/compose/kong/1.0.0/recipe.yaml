@@ -28,11 +28,12 @@ metadata:
 
     Each model wired to the models socket gets a chat and a completion route
     through Kong's AI proxy, in Kong's declarative configuration that a second
-    step imports into the database before the gateway starts. A connection's
-    credential is the value it publishes as AI_PROXY_<ALIAS>_API_KEY, written
-    into the bearer token the routes name through Kong's environment vault: a
-    Compose variable reference such as ${OPENAI_API_KEY} lands as that
-    reference, a literal as itself.
+    step imports into the database before the gateway starts. A changed route
+    set rolls the gateway: the next docker compose up re-creates that step,
+    then the gateway. A connection's credential is the value it publishes as
+    AI_PROXY_<ALIAS>_API_KEY, written into the bearer token the routes name
+    through Kong's environment vault: a Compose variable reference such as
+    ${OPENAI_API_KEY} lands as that reference, a literal as itself.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -163,13 +164,20 @@ spec:
            the value it publishes, under AI_PROXY_<ALIAS>_API_KEY; one that
            publishes it under any other name would leave the bearer token
            empty with every request still sent, so the build halts naming the
-           connection and the name. */ -}}
+           connection and the name. The route set is written from each
+           connection's alias, the endpoint and model name its model
+           publishes, and whether it carries a credential; their digest is
+           what re-creates the import step and the gateway when the route set
+           changes, below. */ -}}
     {{- $wired := list -}}
     {{- $tokens := list -}}
+    {{- $routeSet := list -}}
     {{- range $alias, $edge := .context.uses -}}
     {{- if eq $edge.socket "models" -}}
     {{- $wired = append $wired $alias -}}
-    {{- if hasKey (default dict $edge.features) "credential" -}}
+    {{- $hasCredential := hasKey (default dict $edge.features) "credential" -}}
+    {{- $routeSet = append $routeSet (list $alias $edge.provides.endpoint $edge.provides.model $hasCredential) -}}
+    {{- if $hasCredential -}}
     {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" -}}
     {{- $keyVar := printf "%s%s%s" $.locals.connection_variable_prefix $name $.locals.credential_variable_suffix -}}
     {{- if not (hasKey $env $keyVar) -}}
@@ -179,6 +187,7 @@ spec:
     {{- end -}}
     {{- end -}}
     {{- end -}}
+    {{- $routesDigest := sha256sum (toJson $routeSet) -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # Kong holds no durable state — the PostgreSQL backend is the system of
@@ -246,6 +255,15 @@ spec:
     # connection is removed stays in the database until it is deleted through
     # the Admin API. The step reads no model credential: the routes hold a
     # reference to one, which only the gateway resolves.
+    #
+    # docker compose up re-creates a service's container when the service's own
+    # definition changed since the container was created, and a config's
+    # content is no part of that definition. So this step and the gateway each
+    # carry the digest of what the route set is written from as
+    # MODEL_ROUTES_DIGEST, a variable nothing reads: a changed route set
+    # changes both definitions, and the next docker compose up re-creates the
+    # step, which imports the changed routes, and then the gateway, which
+    # starts serving them.
     {{- if $wired }}
       - name: model-routes
         image: "kong:{{ .infra.engine_version }}"
@@ -256,6 +274,7 @@ spec:
           KONG_PG_PORT: "{{ $env.KONG_PG_PORT }}"
           KONG_PG_USER: "{{ $env.KONG_PG_USER }}"
           KONG_PG_DATABASE: "{{ $env.KONG_PG_DATABASE }}"
+          MODEL_ROUTES_DIGEST: "{{ $routesDigest }}"
     {{- if $backendCredential }}
           KONG_PG_PASSWORD: "{{ .context.inject.env.KONG_PG_PASSWORD }}"
     {{- else }}
@@ -290,9 +309,14 @@ spec:
     {{- end }}
     {{- /* Each models connection carrying a credential: the bearer token its
            routes read through Kong's environment vault, composed from the
-           value the credential published, written as it was delivered. */ -}}
+           value the credential published, written as it was delivered. Then,
+           while a connection is wired, the route set's digest, which re-creates
+           the gateway when the route set changes. */ -}}
     {{- range $tokens }}
           {{ .name }}: {{ printf "Bearer %s" .value | toJson }}
+    {{- end }}
+    {{- if $wired }}
+          MODEL_ROUTES_DIGEST: "{{ $routesDigest }}"
     {{- end }}
         ports:
           tcp: {{ .infra.proxy_port }}

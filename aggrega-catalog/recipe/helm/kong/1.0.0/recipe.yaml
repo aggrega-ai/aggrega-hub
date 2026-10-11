@@ -22,9 +22,10 @@ metadata:
     Each model wired to the models socket gets a chat and a completion route
     through Kong's AI proxy, written as Kong's declarative configuration in a
     ConfigMap that a second step imports into the database before the gateway
-    starts. A connection's credential arrives as an env secretKeyRef and the
-    routes name it through Kong's environment vault, so no credential value is
-    in the rendered output.
+    starts. A changed route set rolls the gateway, whose new pod imports it
+    before serving. A connection's credential arrives as an env secretKeyRef
+    and the routes name it through Kong's environment vault, so no credential
+    value is in the rendered output.
 
     provides.host is the bare in-cluster Service name, with no namespace; a
     consumer in another namespace qualifies it on its own side. Reach for this
@@ -139,10 +140,16 @@ spec:
            the locals hold. The rule is applied here once, and every variable
            below reads it. The import step below runs only while a connection
            is wired; the directory the routes file is mounted at is the single
-           authored home for the mount and the path the step reads. */ -}}
+           authored home for the mount and the path the step reads. The route
+           set is written from each connection's alias, the endpoint and model
+           name its model publishes, and whether it carries a credential; their
+           digest is what rolls the gateway's pod when the route set changes,
+           below. */ -}}
     {{- $wired := list -}}
     {{- $credentialed := list -}}
-    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "models" }}{{ $wired = append $wired $alias }}{{ if hasKey (default dict $edge.features) "credential" }}{{ $name := printf "%s%s" $.locals.connection_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_") }}{{ $credentialed = append $credentialed (dict "alias" $alias "credential" (printf "%s%s" $name $.locals.credential_variable_suffix) "header" (printf "%s%s" $name $.locals.header_variable_suffix)) }}{{ end }}{{ end }}{{ end -}}
+    {{- $routeSet := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "models" }}{{ $wired = append $wired $alias }}{{ $hasCredential := hasKey (default dict $edge.features) "credential" }}{{ $routeSet = append $routeSet (list $alias $edge.provides.endpoint $edge.provides.model $hasCredential) }}{{ if $hasCredential }}{{ $name := printf "%s%s" $.locals.connection_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_") }}{{ $credentialed = append $credentialed (dict "alias" $alias "credential" (printf "%s%s" $name $.locals.credential_variable_suffix) "header" (printf "%s%s" $name $.locals.header_variable_suffix)) }}{{ end }}{{ end }}{{ end -}}
+    {{- $routesDigest := sha256sum (toJson $routeSet) -}}
     {{- $routesDir := "/etc/kong/model-routes" -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
@@ -168,6 +175,13 @@ spec:
     # route whose connection is removed stays in the database until it is
     # deleted through the Admin API. The step reads no model credential: the
     # routes hold a reference to one, which only the gateway resolves.
+    #
+    # The ConfigMap's content is no part of the pod's own specification, and a
+    # workload carries no pod annotation, so the step carries the digest of
+    # what the route set is written from as MODEL_ROUTES_DIGEST, a variable
+    # nothing reads: a changed route set changes the pod's specification, the
+    # Deployment rolls the gateway, and the new pod imports the changed routes
+    # before it serves.
     initContainers:
       - image: "kong:{{ .infra.engine_version }}"
         args: [kong, migrations, bootstrap]
@@ -196,6 +210,7 @@ spec:
           KONG_PG_PORT: "{{ $env.KONG_PG_PORT }}"
           KONG_PG_USER: "{{ $env.KONG_PG_USER }}"
           KONG_PG_DATABASE: "{{ $env.KONG_PG_DATABASE }}"
+          MODEL_ROUTES_DIGEST: "{{ $routesDigest }}"
     {{- if not $backendCredential }}
           KONG_PG_PASSWORD: apppass
     {{- end }}
