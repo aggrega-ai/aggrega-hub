@@ -1,0 +1,371 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: traefik-hub-chart
+  version: 1.0.0
+  description: >
+    Traefik Hub on Kubernetes via Traefik's own Helm chart, served from that
+    project's HTTPS chart repository, with the chart's Traefik Hub settings
+    and its AI gateway on. It renders the gateway's Deployment, a ClusterIP
+    Service for its plain HTTP listener, its access control and the chart's
+    custom-resource definitions; the chart's Kubernetes Ingress provider and
+    its IngressClass are off.
+
+    The image is the one infra.image names and no other: the chart's own
+    default never decides it, and the build halts naming infra.image when it is
+    unset or names no tag. The licence token is read from the Secret the
+    license slot names, under the data key token, and the build halts on any
+    other key; only the Secret's name is written, so no token material is in
+    the rendered output.
+
+    Each model wired to the models socket gets a route at
+    /<alias>/v1/chat/completions through Traefik Hub's Chat Completion
+    middleware, written beside the chart as an IngressRoute, two Middlewares
+    and a Service of type ExternalName per model. This is the component's only
+    realization.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/gateway/traefik-hub:1.0.0
+
+  # The chart Traefik publishes for Traefik Proxy and Traefik Hub alike, the
+  # one Traefik's installation guide for Traefik Hub installs. Its chart
+  # artifact is published under the Apache-2.0 licence; the Traefik Hub image
+  # it runs is the one the Release names.
+  source:
+    kind: helm-https-chart
+    url: https://traefik.github.io/charts
+    chart: traefik
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"41.7.1\" }}"
+
+  # provides.host is the Service fronting the gateway — the entry point client
+  # traffic is sent to. The value mapping below pins the chart's
+  # fullnameOverride to the rendered name, the release name the helm provider
+  # gives the chart, which spells the Component's name in the alphabet a
+  # Kubernetes name allows, and the chart names its Service by that name alone,
+  # as a render of the chart shows. The name carries no namespace; a consumer
+  # in another namespace qualifies it on its own side.
+  #
+  # endpoint is the route the gateway serves for the model values.model names,
+  # under that alias in the path, on the Service name and port; model is that
+  # alias. A provides entry cannot read another, so the Service name is spelled
+  # out again and the entries are edited together. With nothing wired to the
+  # models socket values.model is omitted — the component's assertion halts on
+  # any other combination — and both are empty.
+  provides:
+    host: "{{ .context.rendered_name }}"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+    endpoint: '{{ with optional .values "model" "" }}http://{{ $.context.rendered_name }}:{{ $.infra.port }}/{{ . }}/v1{{ end }}'
+    model: '{{ optional .values "model" "" }}'
+
+  # The catalog names no Traefik Hub image, so the Release names the one it
+  # runs; the chart's own default image is never rendered in its place. An
+  # image the Release does not name at all halts earlier, where the
+  # component's infra is checked against its schema. The image's tag and the
+  # licence's locator are checked where they are read, at the head of the
+  # value mapping.
+  assertions:
+    image_supplied: >-
+      {{- if not (optional .infra "image" "") -}}
+      {{- fail "this realization runs the Traefik Hub image the Release supplies, because access to that image is governed by Traefik's terms and the catalog therefore names none: set infra.image to the full reference of the image the operator is entitled to pull, tag included, as in ghcr.io/traefik/traefik-hub:v3.21.2" -}}
+      {{- end -}}
+
+  # This Recipe reads from infra.overrides:
+  #   service_type - string (service.spec.type; how the gateway is exposed, default ClusterIP)
+  #   requests     - { cpu: string, memory: string } (gateway resource requests)
+  #   nodeSelector - map[string]string (pod scheduling)
+  #   tolerations  - []object (pod scheduling)
+  #
+  # It reads no image override: the image is infra.image and nothing else.
+  #
+  # The chart's own defaults stay in place for what this Recipe does not set.
+  # Among them, two reach outside the cluster as the gateway runs: the export
+  # of its error logs to Traefik's platform, which the chart's hub.sendlogs
+  # documents as on by default, and the check for a newer release, which the
+  # chart's global.checkNewVersion leaves on.
+  valuesMapping: |
+    {{- /* The models connections, in alias order. */}}
+    {{- $wired := list }}
+    {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "models" }}
+        {{- $wired = append $wired $alias }}
+      {{- end }}
+    {{- end }}
+    {{- /* The Secret the license slot's attachment names. Traefik's chart
+           mounts the Secret hub.token names as a directory and Traefik Hub
+           reads its token from the file the data key token becomes, so the
+           attachment has to publish a Secret's name and the data key token,
+           and nothing else is read. The chart also takes a hub.token value of
+           65 characters or more for the token itself and renders it into a
+           Secret of its own, so a Secret name that long would be written into
+           the rendered output as a token; it stops the build here. */}}
+    {{- $license := optional (optional (default dict .features) "license" dict) "provides" dict }}
+    {{- $tokenSecret := optional $license "name" "" }}
+    {{- $tokenKey := optional $license "key" "" }}
+    {{- if not (and $tokenSecret $tokenKey) }}
+    {{- fail (printf "the license slot of %q is bound to an attachment that publishes no Secret name and data key, but this realization hands Traefik Hub the name of the Secret its licence token is read from; bind the slot to core/referenced-secret, whose k8s-existing-secret realization names a Secret that already exists" .context.instance_id) }}
+    {{- end }}
+    {{- if ne $tokenKey "token" }}
+    {{- fail (printf "the license slot of %q is bound to a Secret whose published data key is %q, but Traefik Hub reads its licence token from the data key token alone; publish the key token: declare the attachment in the Aggregate with values.key set to token, since an attachment the Release alone makes publishes the key value" .context.instance_id $tokenKey) }}
+    {{- end }}
+    {{- if ge (len $tokenSecret) 65 }}
+    {{- fail (printf "the license slot of %q names the Secret %q, whose name is %d characters long, but Traefik's chart takes a hub.token value of 65 characters or more for the licence token itself and writes it into a Secret of its own; name a Secret of at most 64 characters" .context.instance_id $tokenSecret (len $tokenSecret)) }}
+    {{- end }}
+    {{- /* The image, split into the registry, repository and tag the chart
+           composes its image from, so the chart's own defaults for each never
+           reach the render: a digest after an @ is kept after the tag, which
+           the chart accepts in image.tag; a reference whose first path
+           segment names no registry host — no dot, no colon, not localhost —
+           is read as Docker Hub's, as a container runtime reads it. The tag is
+           also the gateway's version, which the chart reads for its version
+           checks from versionOverride; a reference with no tag stops the
+           build here. */}}
+    {{- $image := .infra.image }}
+    {{- $ref := regexReplaceAll `@.*$` $image "" }}
+    {{- $digest := "" }}
+    {{- if contains "@" $image }}{{ $digest = regexReplaceAll `^[^@]*@` $image "" }}{{ end }}
+    {{- $last := regexReplaceAll `^.*/` $ref "" }}
+    {{- $tag := "" }}
+    {{- if contains ":" $last }}{{ $tag = regexReplaceAll `^[^:]*:` $last "" }}{{ end }}
+    {{- if not $tag }}
+    {{- fail (printf "infra.image is %q, which names no tag, but Traefik's chart composes the gateway's image from a repository and a tag, and reads the gateway's version from the tag; name the image by its tag, as in ghcr.io/traefik/traefik-hub:v3.21.2, a digest after it where one is pinned" $image) }}
+    {{- end }}
+    {{- $name := trimSuffix (printf ":%s" $tag) $ref }}
+    {{- $first := regexReplaceAll `/.*$` $name "" }}
+    {{- $registry := "docker.io" }}
+    {{- $repository := $name }}
+    {{- if and (contains "/" $name) (or (contains "." $first) (contains ":" $first) (eq $first "localhost")) }}
+      {{- $registry = $first }}
+      {{- $repository = trimPrefix (printf "%s/" $first) $name }}
+    {{- else if not (contains "/" $name) }}
+      {{- $repository = printf "library/%s" $name }}
+    {{- end }}
+
+    ## ── Pin the chart's resource names to the rendered name ────
+    ## Names the gateway's Service "<rendered_name>", matching provides.host.
+    fullnameOverride: "{{ .context.rendered_name }}"
+
+    ## ── The gateway image ──────────────────────────────────────
+    ## The reference infra.image names, in the three parts the chart composes
+    ## it from, so the chart renders it exactly as the Release wrote it where
+    ## that names its registry.
+    image:
+      registry: "{{ $registry }}"
+      repository: "{{ $repository }}"
+      tag: "{{ $tag }}{{ with $digest }}@{{ . }}{{ end }}"
+    versionOverride: "{{ $tag }}"
+    {{- with .infra.image_pull_secret }}
+    deployment:
+      imagePullSecrets:
+        - name: "{{ . }}"
+    {{- end }}
+
+    ## ── Traefik Hub and its AI gateway ─────────────────────────
+    ## The chart installs Traefik Hub's distribution, mounts the Secret the
+    ## license slot names and passes Traefik Hub the path of its token file,
+    ## and turns the AI gateway on. The chart writes the AI gateway's flag only
+    ## while hub.token is set, which the required license slot makes so.
+    hub:
+      enabled: true
+      token: "{{ $tokenSecret }}"
+      aigateway:
+        enabled: true
+
+    ## ── Providers this Component does not describe ─────────────
+    ## The chart's Kubernetes Ingress provider and its IngressClass, which
+    ## would make this gateway the cluster's default class for every Ingress
+    ## naming none, are off. Its provider for Traefik's own route resources
+    ## stays on with the chart's defaults: it is the one that serves the model
+    ## routes written below. While a model is wired, it may reach a Service of
+    ## type ExternalName, which is how each model route reaches its model.
+    ingressClass:
+      enabled: false
+    providers:
+      kubernetesIngress:
+        enabled: false
+      {{- if $wired }}
+      kubernetesCRD:
+        allowExternalNameServices: true
+      {{- end }}
+
+    ## ── Listeners ──────────────────────────────────────────────
+    ## The plain HTTP listener takes infra.port as both the container port and
+    ## the Service port, so the published address and the listener move
+    ## together. The chart's TLS listener is left out of the Service, matching
+    ## the "http" this Recipe publishes; TLS is terminated outside the cluster.
+    ports:
+      web:
+        port: {{ .infra.port }}
+        exposedPort: {{ .infra.port }}
+      websecure:
+        expose:
+          default: false
+    service:
+      spec:
+        {{- if and .infra.overrides .infra.overrides.service_type }}
+        type: "{{ .infra.overrides.service_type }}"
+        {{- else }}
+        type: ClusterIP
+        {{- end }}
+
+    ## ── Gateway resources ──────────────────────────────────────
+    resources:
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      {{- if and .infra.overrides .infra.overrides.requests }}
+      requests:
+        cpu: "{{ .infra.overrides.requests.cpu }}"
+        memory: "{{ .infra.overrides.requests.memory }}"
+      {{- end }}
+
+    ## ── Scheduling overrides ───────────────────────────────────
+    {{- if .infra.overrides }}
+    {{- if .infra.overrides.nodeSelector }}
+    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+    {{- end }}
+    {{- if .infra.overrides.tolerations }}
+    tolerations: {{ toJson .infra.overrides.tolerations }}
+    {{- end }}
+    {{- end }}
+
+  # The models the gateway serves, as Traefik's own route resources, all in the
+  # gateway's namespace — the one the Release declares for the component, or
+  # `default` — written into models.yaml. With nothing wired to the models
+  # socket the template writes nothing.
+  #
+  # One IngressRoute, named after the gateway with -models appended, on the
+  # chart's plain HTTP listener, holds a route per connection in alias order:
+  # a request to /<alias>/v1/chat/completions passes the connection's two
+  # Middlewares and goes to its Service. The first Middleware replaces the
+  # request's path with the endpoint's own path followed by
+  # /chat/completions, so the request reaches the model under the path it
+  # publishes. The second is Traefik Hub's Chat Completion middleware, which
+  # writes the model name the model publishes into every request in place of
+  # whatever model the request names, and, where the connection carries a
+  # credential, names the Secret the credential publishes and the data key in
+  # it in the reference form Traefik Hub reads, urn:k8s:secret:<name>:<key>,
+  # so the key is in no rendered file. A credential publishing no Secret name
+  # and data key stops the build, naming the connection.
+  #
+  # The Service, of type ExternalName, names the host of the endpoint the
+  # model publishes, and the route sends to the port the endpoint names, or
+  # the one its scheme implies, over that scheme, with the Service's host as
+  # the request's Host. A host carrying no dot is a Service name published
+  # without a namespace, which the gateway in its own namespace could not
+  # resolve, so it is qualified, as a consumer in another namespace does, with
+  # the namespace the Release places the model in, or `default` where it
+  # declares none: `<host>.<namespace>.svc.cluster.local`. A host carrying a
+  # dot, a managed API's included, is written as published. An endpoint that
+  # is not an absolute http or https URL, or whose host is an address, which
+  # an ExternalName Service cannot name, stops the build, naming the
+  # connection.
+  #
+  # Each connection's resources are named after the gateway and the alias, in
+  # lowercase with every underscore as a hyphen, the characters a Kubernetes
+  # name allows; an alias ending in a hyphen or an underscore, two aliases
+  # giving one name, or a name longer than the 63 characters a Service name
+  # takes stop the build, naming the connections.
+  artifacts:
+    models.yaml: |
+      {{- $ns := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default" }}
+      {{- $wired := list }}
+      {{- $names := dict }}
+      {{- $hosts := dict }}
+      {{- $ports := dict }}
+      {{- $schemes := dict }}
+      {{- $paths := dict }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "models" }}
+      {{- $wired = append $wired $alias }}
+      {{- $name := printf "%s-%s" $.context.rendered_name (lower (replace "_" "-" $alias)) }}
+      {{- if hasSuffix "-" $name }}{{ fail (printf "the models connection %s of %q gives its resources the name %q, which ends in a hyphen and so is no Kubernetes name; rename the connection so its alias ends in a letter or a digit" $alias $.context.instance_id $name) }}{{ end }}
+      {{- if gt (len $name) 63 }}{{ fail (printf "the models connection %s of %q gives its Service the name %q, %d characters long, but a Service name takes at most 63; shorten the connection's alias or the component's name" $alias $.context.instance_id $name (len $name)) }}{{ end }}
+      {{- range $other, $taken := $names }}{{ if eq $taken $name }}{{ fail (printf "the models connections %s and %s of %q would each name their resources %q, because the gateway names a connection's resources after its alias in lowercase with every underscore as a hyphen; rename one of the two connections" $other $alias $.context.instance_id $name) }}{{ end }}{{ end }}
+      {{- $_ := set $names $alias $name }}
+      {{- $u := urlParse $edge.provides.endpoint }}
+      {{- if not (and (has $u.scheme (list "http" "https")) $u.host) }}{{ fail (printf "the models connection %s of %q reaches %q, whose published endpoint %q is not an absolute http or https URL, so the gateway cannot write the route it forwards to" $alias $.context.instance_id $edge.target $edge.provides.endpoint) }}{{ end }}
+      {{- $hostport := $u.host }}
+      {{- $port := ternary "443" "80" (eq $u.scheme "https") }}
+      {{- with regexFind ":[0-9]+$" $hostport }}{{ $port = trimPrefix ":" . }}{{ $hostport = trimSuffix . $hostport }}{{ end }}
+      {{- $hostname := lower (trimSuffix "]" (trimPrefix "[" $hostport)) }}
+      {{- if or (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" $hostname) (contains ":" $hostname) }}{{ fail (printf "the models connection %s of %q reaches %q, whose published endpoint %q names an address, but the gateway reaches a wired model through a Service of type ExternalName, which names a host; publish an endpoint naming the server's host" $alias $.context.instance_id $edge.target $edge.provides.endpoint) }}{{ end }}
+      {{- if not (contains "." $hostname) }}
+      {{- $hostname = printf "%s.%s.svc.cluster.local" $hostname (optional (optional (default dict $edge.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default") }}
+      {{- end }}
+      {{- $_ := set $hosts $alias $hostname }}
+      {{- $_ := set $ports $alias $port }}
+      {{- $_ := set $schemes $alias $u.scheme }}
+      {{- $_ := set $paths $alias (printf "%s/chat/completions" (trimSuffix "/" $u.path)) }}
+      {{- end }}
+      {{- end }}
+      {{- if $wired -}}
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: {{ .context.rendered_name }}-models
+        namespace: "{{ $ns }}"
+      spec:
+        entryPoints:
+          - web
+        routes:
+      {{- range $alias := $wired }}
+          - kind: Rule
+            match: Path(`/{{ $alias }}/v1/chat/completions`)
+            middlewares:
+              - name: {{ get $names $alias }}-upstream-path
+              - name: {{ get $names $alias }}-chat-completion
+            services:
+              - name: {{ get $names $alias }}
+                port: {{ get $ports $alias }}
+                scheme: {{ get $schemes $alias }}
+                passHostHeader: false
+      {{- end }}
+      {{- range $alias := $wired }}
+      {{- $edge := get $.context.uses $alias }}
+      {{- $name := get $names $alias }}
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: {{ $name }}
+        namespace: "{{ $ns }}"
+      spec:
+        type: ExternalName
+        externalName: {{ get $hosts $alias | toJson }}
+        ports:
+          - port: {{ get $ports $alias }}
+      ---
+      apiVersion: traefik.io/v1alpha1
+      kind: Middleware
+      metadata:
+        name: {{ $name }}-upstream-path
+        namespace: "{{ $ns }}"
+      spec:
+        replacePath:
+          path: {{ get $paths $alias | toJson }}
+      ---
+      apiVersion: traefik.io/v1alpha1
+      kind: Middleware
+      metadata:
+        name: {{ $name }}-chat-completion
+        namespace: "{{ $ns }}"
+      spec:
+        plugin:
+          chat-completion:
+            model: {{ $edge.provides.model | toJson }}
+            allowModelOverride: false
+      {{- with optional (default dict $edge.features) "credential" dict }}
+      {{- $locator := optional . "provides" dict }}
+      {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) }}{{ fail (printf "the models connection %s of %q carries a credential publishing no Secret name and data key, so the gateway could not be given a reference to read the key from; attach a credential publishing both, such as core/referenced-secret" $alias $.context.instance_id) }}{{ end }}
+            token: {{ printf "urn:k8s:secret:%s:%s" $locator.name $locator.key | toJson }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
