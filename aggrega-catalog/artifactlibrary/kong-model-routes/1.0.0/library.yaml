@@ -91,6 +91,18 @@ spec:
     #   its count in the Kong data store: for the whole gateway, matching the
     #   OpenAI-API provider every route here proxies to, under scope gateway;
     #   on each wired model's service, under scope model.
+    # - core/data-masking: the AI PII Sanitizer on each wired model's two
+    #   routes, given the scheme, host and port the importing component's one
+    #   pii_sanitizer connection publishes, the entity types listed as Kong's
+    #   categories, the patterns as its custom patterns, each with a score of
+    #   1, a numbered placeholder for each match, nothing restored and the
+    #   request failed when the PII service cannot be reached; while the scope
+    #   reaches replies, the setting naming what it masks is written and the AI
+    #   proxy refuses a request asking for a streamed reply. Kong runs a
+    #   route's plugins by priority rather than by their order here, so the
+    #   sanitizer reads a request after the request transformer and before the
+    #   AI proxy. Its realization, data-masking-kong-enterprise, halts every
+    #   attachment, naming why, so no build writes this plugin while it does.
     # Each attachment's realization refuses what this bundle cannot write; the
     # bundle stops the build on any value it cannot map all the same.
     #
@@ -245,15 +257,17 @@ spec:
         {{- end }}
         {{- end }}
         {{- /* The attachments this bundle writes on Kong Gateway Enterprise, read only for that edition: at most one
-          core/fallback-chain and one core/period-budget, each with its own realization holding the refusals. A value
-          this template cannot map stops the build here rather than being written as a guess. */}}
+          core/fallback-chain, one core/period-budget and one core/data-masking, each with its own realization holding
+          the refusals. A value this template cannot map stops the build here rather than being written as a guess. */}}
         {{- $chain := dict }}
         {{- $budget := dict }}
+        {{- $masking := dict }}
         {{- if $enterprise }}
         {{- range $name, $attachment := (default dict .features) }}
         {{- $type := first (splitList ":" (toString $attachment.type)) }}
         {{- if eq $type "core/fallback-chain" }}{{ if $chain }}{{ fail (printf "%s writes one fallback chain for %q, and core/fallback-chain is attached more than once; keep one attachment" $bundle $.context.instance_id) }}{{ end }}{{ $chain = $attachment }}{{ end }}
         {{- if eq $type "core/period-budget" }}{{ if $budget }}{{ fail (printf "%s writes one period budget for %q, and core/period-budget is attached more than once; keep one attachment" $bundle $.context.instance_id) }}{{ end }}{{ $budget = $attachment }}{{ end }}
+        {{- if eq $type "core/data-masking" }}{{ if $masking }}{{ fail (printf "%s writes one AI PII Sanitizer on each route of %q, and core/data-masking is attached more than once; keep one attachment" $bundle $.context.instance_id) }}{{ end }}{{ $masking = $attachment }}{{ end }}
         {{- end }}
         {{- end }}
         {{- /* The walk of each alias a core/fallback-chain entry names: the alias, then its entry's fallbacks in order,
@@ -316,6 +330,46 @@ spec:
         {{- $seconds := mul (atoi (regexFind "^[0-9]+" $period)) (get (dict "s" 1 "m" 60 "h" 3600 "d" 86400) $suffix) }}
         {{- $budgetPolicy = dict "window_type" "fixed" "limits" (list (dict "limit" .infra.limit "window_size" $seconds "tokens_count_strategy" $unit)) }}
         {{- end }}
+        {{- /* The data masking's one AI PII Sanitizer configuration, read only for that edition, written onto each wired
+          model's two routes. The PII service is the one connection on the importing component's pii_sanitizer
+          socket, at the protocol, host and port it publishes, since the sanitizer sends it every text it masks, the
+          patterns included. The entity types are Kong's own categories, each listed once, and the patterns go as its
+          custom patterns, each with a score of 1, the highest Kong takes, a regular expression's match being certain,
+          and add the category custom. Each match is replaced by a numbered placeholder and nothing is restored, and a
+          PII service that cannot be reached fails the request. The setting naming what is masked is written only for
+          a scope reaching replies, the gateways older than 3.12 that mask requests alone taking no such setting; the
+          AI proxy then refuses a request asking for a streamed reply. */}}
+        {{- $sanitizer := "" }}
+        {{- $denyStreaming := false }}
+        {{- with $masking }}
+        {{- $scope := toString (optional .values "scope" "request") }}
+        {{- $action := toString (optional .values "action" "redact") }}
+        {{- if ne $action "redact" }}{{ fail (printf "%s writes the data masking of %q, which asks for action %s, and it writes action redact, Kong's sanitizer restoring nothing here" $bundle $.context.instance_id $action) }}{{ end }}
+        {{- if not (has $scope (list "request" "response" "both")) }}{{ fail (printf "%s writes the data masking of %q, which asks for scope %s, and it writes scope request, response or both" $bundle $.context.instance_id $scope) }}{{ end }}
+        {{- $categories := list "bank" "credentials" "creditcard" "crypto" "date" "driverlicense" "email" "general" "ip" "medical" "nationalid" "nrp" "passport" "phone" "ssn" "url" }}
+        {{- $anonymize := list }}
+        {{- range $e := (optional .values "entities" list) }}
+        {{- if not (has (toString $e) $categories) }}{{ fail (printf "%s writes the data masking of %q, which lists the entity type %s, and Kong's sanitizer takes the categories %s" $bundle $.context.instance_id (toString $e) (join ", " $categories)) }}{{ end }}
+        {{- if not (has (toString $e) $anonymize) }}{{ $anonymize = append $anonymize (toString $e) }}{{ end }}
+        {{- end }}
+        {{- $custom := list }}
+        {{- $patternNames := list }}
+        {{- range $p := (optional .values "patterns" list) }}
+        {{- if has (toString $p.name) $patternNames }}{{ fail (printf "%s writes the data masking of %q, which lists two patterns named %s, and Kong's sanitizer takes each custom pattern under a name of its own" $bundle $.context.instance_id (toString $p.name)) }}{{ end }}
+        {{- $patternNames = append $patternNames (toString $p.name) }}
+        {{- $custom = append $custom (dict "name" (toString $p.name) "regex" (toString $p.regex) "score" 1) }}
+        {{- end }}
+        {{- if $custom }}{{ $anonymize = append $anonymize "custom" }}{{ end }}
+        {{- $pii := list }}
+        {{- range $alias, $edge := $.context.uses }}{{ if eq $edge.socket "pii_sanitizer" }}{{ $pii = append $pii $edge }}{{ end }}{{ end }}
+        {{- if ne (len $pii) 1 }}{{ fail (printf "%s writes the data masking of %q, which needs one connection on its pii_sanitizer socket, the PII service its sanitizer calls, and that socket carries %d" $bundle $.context.instance_id (len $pii)) }}{{ end }}
+        {{- $service := (first $pii).provides }}
+        {{- if not (and (optional $service "protocol" "") (optional $service "host" "") (optional $service "port" "")) }}{{ fail (printf "%s writes the data masking of %q, whose pii_sanitizer connection reaches %q, which publishes no protocol, host and port for the sanitizer to call" $bundle $.context.instance_id (first $pii).target) }}{{ end }}
+        {{- $config := dict "scheme" (toString $service.protocol) "host" (toString $service.host) "port" (atoi (toString $service.port)) "anonymize" $anonymize "redact_type" "placeholder" "recover_redacted" false "stop_on_error" true }}
+        {{- if $custom }}{{ $_ := set $config "custom_patterns" $custom }}{{ end }}
+        {{- if ne $scope "request" }}{{ $_ := set $config "sanitization_mode" (ternary "OUTPUT" "BOTH" (eq $scope "response")) }}{{ $denyStreaming = true }}{{ end }}
+        {{- $sanitizer = toJson $config }}
+        {{- end }}
         {{- if $wired }}
         {{- /* The envelope. The configuration below is written once and wrapped by the envelope the importing Recipe
           chose: a compose config's content or a ConfigMap key. Both are block scalars holding it at one indentation,
@@ -366,6 +420,9 @@ spec:
           here; non_idempotent lets it pass a POST on. */}}
                       - name: ai-proxy-advanced
                         config:
+        {{- if $denyStreaming }}
+                          response_streaming: deny
+        {{- end }}
                           balancer:
                             algorithm: priority
                             retries: {{ sub (len $walk) 1 }}
@@ -399,6 +456,9 @@ spec:
                       - name: ai-proxy
                         config:
                           route_type: {{ ternary "llm/v1/chat" "llm/v1/completions" (eq $operation "chat") }}
+        {{- if $denyStreaming }}
+                          response_streaming: deny
+        {{- end }}
         {{- if hasKey (default dict $edge.features) "credential" }}
                           auth:
                             header_name: Authorization
@@ -409,6 +469,10 @@ spec:
                             name: {{ $edge.provides.model | toJson | replace "$" $dollar }}
                             options:
                               upstream_url: {{ printf "%s%s" $base $path | toJson | replace "$" $dollar }}
+        {{- end }}
+        {{- if $sanitizer }}
+                      - name: ai-sanitizer
+                        config: {{ $sanitizer | replace "$" $dollar }}
         {{- end }}
         {{- end }}
         {{- if eq $budgetScope "model" }}

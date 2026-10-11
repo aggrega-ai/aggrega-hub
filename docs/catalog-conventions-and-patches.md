@@ -309,27 +309,32 @@ stores and whose Recipe halts on any store but `core/datastore/redis`.
 ### The `security.aggrega.ai/text-anonymization` label
 
 `security.aggrega.ai/text-anonymization` records which role a service plays in
-masking sensitive data in text where that work is split across two services —
-one finds the sensitive spans in a text and reports them, the other rewrites the
-spans it is handed — and it is what a consumer's socket selects on to be handed
-the right address. A consumer that masks text through such a pair calls both, so
-it declares a socket per role and each selector names the value it needs:
+masking sensitive data in text — finding the sensitive spans in a text and
+reporting them, rewriting the spans it is handed, or doing both in one call —
+and it is what a consumer's socket selects on to be handed the right address.
+Where the work is split across two services, a consumer that masks text through
+the pair calls both, so it declares a socket per role and each selector names
+the value it needs; where one service does both, the consumer declares one
+socket selecting it:
 
 | Value | What the value asserts |
 | --- | --- |
 | `analyzer` | The component finds sensitive spans in the text it is sent — an entity type, a position and a confidence for each — and changes nothing. |
 | `anonymizer` | The component rewrites the spans a caller hands it, by the operator the caller names for each entity type, and finds nothing on its own. |
+| `sanitizer` | The component finds the sensitive spans in the text it is sent and rewrites them itself, answering with the rewritten text. |
 
 The value names the role, not the interface. Components today:
 `core/security/presidio-analyzer` (`analyzer`) and
 `core/security/presidio-anonymizer` (`anonymizer`), which speak the Presidio HTTP
 API; `core/gateway/litellm` selects them on its `pii_analyzer` and
-`pii_anonymizer` sockets. The compiler routes the address a selected component
-publishes and checks nothing about what answers there, so a component carrying a
-value here that speaks a different API is refused by nothing and fails when it
-is called; each socket's comment names the API its consumer speaks. As with the
-data-path family, a value is added in the same act as the first component to
-carry it.
+`pii_anonymizer` sockets. `core/security/kong-ai-pii-service` (`sanitizer`)
+speaks Kong's AI PII service API, and `core/gateway/kong-enterprise` selects it
+on its `pii_sanitizer` socket. The compiler routes the address a selected
+component publishes and checks nothing about what answers there, so a component
+carrying a value here that speaks a different API is refused by nothing and
+fails when it is called; each socket's comment names the API its consumer
+speaks. As with the data-path family, a value is added in the same act as the
+first component to carry it.
 
 ### The `security.aggrega.ai/text-detection` label
 

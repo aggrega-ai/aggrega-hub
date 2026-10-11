@@ -29,7 +29,8 @@ metadata:
     through Kong's AI proxy, the routes core/gateway/kong serves, in a
     ConfigMap beside the chart that a step in the gateway's own pod imports
     into the database, retried on a first install until the bootstrap Job has
-    provisioned the schema. This is the component's only realization.
+    provisioned the schema; a changed route set rolls the gateway. It is the
+    component's only realization.
 
     The same file carries what a core/fallback-chain or core/period-budget
     attachment asks for, as Kong's AI Proxy Advanced and AI Rate Limiting
@@ -82,8 +83,8 @@ spec:
   # through Kong's environment vault. A locals entry cannot read a connection,
   # so the value mapping applies the alias rule itself, once.
   # model_routes_edition has the bundle also write the AI plugins this
-  # component's core/fallback-chain and core/period-budget attachments ask
-  # for, which only Kong Gateway Enterprise carries.
+  # component's core/fallback-chain, core/period-budget and core/data-masking
+  # attachments ask for, which only Kong Gateway Enterprise carries.
   locals:
     model_routes_edition: enterprise
     model_routes_delivery: config_map
@@ -153,18 +154,50 @@ spec:
     {{- /* The models connections, in alias order, and those of them carrying a
            credential. The directory the routes file is mounted at is the
            single authored home for the mount and the path the import step
-           reads. */}}
+           reads.
+
+           The route set is written by the KongModelRoutes bundle from each
+           models connection's alias, the endpoint and model name its model
+           publishes and whether it carries a credential; from the values of
+           the core/fallback-chain, core/period-budget and core/data-masking
+           attachments it writes plugins for; and, beside a core/data-masking
+           attachment, from the protocol, host and port the pii_sanitizer
+           connection publishes. Their digest is what rolls the gateway's pod
+           when the route set changes, below. It reads exactly what the bundle
+           reads, field by field, so a change the routes do not carry rolls
+           nothing; a field the bundle comes to read is added here in the same
+           edit. */}}
     {{- $routesDir := "/etc/kong/model-routes" }}
     {{- $wired := list }}
     {{- $credentialed := list }}
+    {{- $routeSet := list }}
+    {{- $sanitizerAddress := list }}
     {{- range $alias, $edge := .context.uses }}
       {{- if eq $edge.socket "models" }}
         {{- $wired = append $wired $alias }}
-        {{- if hasKey (default dict $edge.features) "credential" }}
+        {{- $hasCredential := hasKey (default dict $edge.features) "credential" }}
+        {{- if $hasCredential }}
           {{- $credentialed = append $credentialed $alias }}
         {{- end }}
+        {{- $routeSet = append $routeSet (list $alias $edge.provides.endpoint $edge.provides.model $hasCredential) }}
+      {{- else if eq $edge.socket "pii_sanitizer" }}
+        {{- $sanitizerAddress = append $sanitizerAddress (list $alias (optional $edge.provides "protocol" "") (optional $edge.provides "host" "") (optional $edge.provides "port" "")) }}
       {{- end }}
     {{- end }}
+    {{- $routeInputs := dict "routes" $routeSet }}
+    {{- range $attachment := (default dict .features) }}
+      {{- $type := first (splitList ":" (toString $attachment.type)) }}
+      {{- $values := default dict $attachment.values }}
+      {{- $infra := default dict $attachment.infra }}
+      {{- if eq $type "core/fallback-chain" }}
+        {{- $_ := set $routeInputs $type (list (pick $values "chains" "max_hops")) }}
+      {{- else if eq $type "core/period-budget" }}
+        {{- $_ := set $routeInputs $type (list (pick $values "scope" "unit") (pick $infra "limit" "period")) }}
+      {{- else if eq $type "core/data-masking" }}
+        {{- $_ := set $routeInputs $type (list (pick $values "action" "entities" "patterns" "scope") $sanitizerAddress) }}
+      {{- end }}
+    {{- end }}
+    {{- $routesDigest := sha256sum (toJson $routeInputs) }}
     {{- /* The inline development password, the single authored home for the
            gateway's and the import step's connection when the backend
            connection carries no credential. */}}
@@ -190,12 +223,20 @@ spec:
            release that stopped it retrying the first target more than once; AI
            Rate Limiting Advanced's policy form beside AI Proxy, from 3.15, the
            first release whose first three numbers tell that pairing's fix
-           apart. An older image stops the build here, naming both. */}}
+           apart; the AI PII Sanitizer from 3.10, the release that added it. An
+           older image stops the build here, naming both. The sanitizer masks
+           replies from 3.12, the release that added the setting saying what it
+           masks, so a data masking attachment whose scope reaches replies stops
+           the build on an image older than that, naming the scope. */}}
     {{- range $name, $attachment := (default dict .features) }}
       {{- $type := first (splitList ":" (toString $attachment.type)) }}
-      {{- $oldest := get (dict "core/fallback-chain" "3.12.0" "core/period-budget" "3.15.0") $type }}
+      {{- $oldest := get (dict "core/fallback-chain" "3.12.0" "core/period-budget" "3.15.0" "core/data-masking" "3.10.0") $type }}
       {{- if and $oldest (not (semverCompare (printf ">=%s" $oldest) $version)) }}
       {{- fail (printf "the %s attachment %q on %q is written as Kong Gateway Enterprise %s and later configure it, but infra.image is %q, whose tag reads %s; name an image of Kong Gateway Enterprise %s or later" $type $name $.context.instance_id $oldest $image $version $oldest) }}
+      {{- end }}
+      {{- $scope := toString (optional (default dict $attachment.values) "scope" "request") }}
+      {{- if and (eq $type "core/data-masking") (ne $scope "request") (not (semverCompare ">=3.12.0" $version)) }}
+      {{- fail (printf "the core/data-masking attachment %q on %q asks for scope %s, which reaches replies, and Kong Gateway Enterprise's AI PII Sanitizer masks replies from 3.12.0, but infra.image is %q, whose tag reads %s; name an image of Kong Gateway Enterprise 3.12.0 or later, or set scope to request" $name $.context.instance_id $scope $image $version) }}
       {{- end }}
     {{- end }}
     {{- /* The Secret the license slot's attachment names. The licence is read as
@@ -307,17 +348,24 @@ spec:
     ## exits at once anywhere but in the gateway's own pod. Like the chart's own
     ## wait for the database, it runs through a shell the image carries.
     ##
+    ## The ConfigMap's content is no part of the pod's own specification, so
+    ## the pod carries the digest of what the route set is written from as the
+    ## annotation checksum/model-routes: a changed route set changes the pod's
+    ## specification, the Deployment rolls the gateway, and the new pod imports
+    ## the changed routes before it serves. The chart writes podAnnotations onto
+    ## the gateway's pods alone, never onto a migration Job's.
+    ##
     ## The import adds and updates each service, route and plugin under an id
     ## Kong derives from its name, so a re-run writes the same rows again; it
     ## removes nothing, so a route whose connection is removed stays in the
     ## database until it is deleted through the Admin API, and so does a
     ## plugin an attachment wrote once the attachment is removed — AI Proxy
     ## Advanced stays on a route beside the AI proxy written back onto it. The
-    ## ConfigMap's content is no part of the pod's own specification, so a
-    ## changed route set reaches the database only when the gateway's pod next
-    ## starts. The step reads no model credential: the routes hold a reference
-    ## to one, which only the gateway resolves.
+    ## step reads no model credential: the routes hold a reference to one,
+    ## which only the gateway resolves.
     {{- if $wired }}
+    podAnnotations:
+      checksum/model-routes: "{{ $routesDigest }}"
     deployment:
       initContainers:
         - name: model-routes
