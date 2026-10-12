@@ -245,7 +245,7 @@ The dimensions and their value sets:
 | `upstream-pinning` | `public-key` | The component can refuse a service it forwards to unless a certificate that service presents carries one of the public keys the Release supplies for it. `public-key` names what is pinned: the key itself, so a certificate renewed over the same key still matches. |
 | `log-masking` | `entity-recognition` | The component can replace sensitive text with a placeholder in the copy of a call it hands to its logs, while the request it forwards and the reply it returns stay as they were sent. `entity-recognition` names the fidelity: it replaces matches of patterns supplied in its configuration and also entity types that a recognizer service it calls detects. A component that could only replace pattern matches would carry a narrower value, added in the same act as the first component to carry it. |
 | `period-budget` | `cost`, `tokens` | The component can refuse model requests once what it has counted over a period exceeds a limit set in its configuration, and the value names what it counts. `cost`: what the traffic cost, priced from a table the component keeps per model. `tokens`: the tokens each model's reply reports reading, writing or both, which the component counts and prices nothing. |
-| `concurrency-cap` | `total` | The component can hold or refuse a request that would take the requests it is carrying at once past a cap set in its configuration, and the value names what one cap counts. `total`: every request the component forwards, whatever it forwards it to, against one cap. |
+| `concurrency-cap` | `total`, `per-target` | The component can hold or refuse a request that would take the requests it is carrying at once past a cap set in its configuration, and the value names what one cap counts. `total`: every request the component forwards, whatever it forwards it to, against one cap. `per-target`: one cap for each upstream target the component sends to, each counting the requests in flight to that target, and none on their total. |
 
 Three rules bind the family, and each has already been got wrong once:
 
@@ -273,8 +273,8 @@ Three rules bind the family, and each has already been got wrong once:
 Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 `upstream-tls: trust-anchor`, `concurrency-cap: total`), `core/gateway/contour`
 (`request-mirroring: sampled`, `caller-identity: client-certificate`,
-`upstream-tls: trust-anchor`), `core/gateway/envoy-gateway` (the same three and
-`period-budget: tokens`), `core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/tyk`
+`upstream-tls: trust-anchor`), `core/gateway/envoy-gateway` (the same three,
+`period-budget: tokens` and `concurrency-cap: per-target`), `core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/tyk`
 (`upstream-pinning: public-key`), `core/gateway/litellm`
 (`caller-identity: injected-header`, `content-masking: entity-recognition`, `log-masking: entity-recognition`,
 `prompt-guard: pattern-list`, `upstream-tls: trust-anchor`, `period-budget: cost`),
@@ -294,7 +294,9 @@ gateway carries several of them, and no amount of reading its tier would say so.
 family, and `semantic`, because its AI proxy reads the request body of every
 route it serves a model on. On `core/gateway/envoy-gateway`, the tokens its
 `period-budget` value names are the ones Envoy AI Gateway reads from each reply
-of a wired model, which Envoy Gateway's rate limit counts.
+of a wired model, which Envoy Gateway's rate limit counts, and the targets its
+`concurrency-cap` value counts apart are the backends of its route rules, one
+for each wired model.
 `core/gateway/kong-enterprise` carries `period-budget: tokens`, the tokens
 each reply reports as Kong's AI Rate Limiting Advanced counts them,
 `content-masking: entity-recognition` and `semantic`. `core/gateway/traefik-hub`

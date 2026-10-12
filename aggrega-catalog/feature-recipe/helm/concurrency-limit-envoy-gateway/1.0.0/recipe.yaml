@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: concurrency-limit-envoy-gateway
+  version: 1.0.0
+  description: >
+    Realizes core/concurrency-limit on the gateway core/gateway/envoy-gateway;
+    a Release binds it in its Manifest. It emits no file: the gateway's
+    Recipe, envoy-gateway, reads the attachment and writes it as the circuit
+    breaker of the one traffic policy on the route serving the models wired
+    to its models socket, the policy that also carries a period budget's
+    rate limit and a retry policy's retry.
+
+    Envoy Gateway applies that circuit breaker to the backend of each rule of
+    the route, and each wired model has a rule of its own, so each wired
+    model is capped on its own: at most max_in_flight requests are sent to it
+    at once, and a request past the cap is answered 503 and is not sent
+    again; a send the retry policy repeats counts against the cap like the
+    first. The count is each running data-plane replica's own. Envoy's
+    worker threads check the count and then add to it, so requests arriving
+    together can take it briefly above the cap.
+
+    Envoy Gateway keeps a cap for each backend and none on the total across
+    everything the gateway serves — the gateway declares
+    dataplane.aggrega.ai/concurrency-cap: per-target — so this recipe halts
+    on scope gateway, the Feature's default, rather than capping each model
+    in its place. It refuses a max_in_flight above 4294967295, and halts with
+    nothing wired to the models socket, on a second such attachment, and on
+    any component other than core/gateway/envoy-gateway.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/concurrency-limit:1.0.0
+  # executionScope omitted -> component: evaluated once per attached component.
+  #
+  # No input kind and no pipeline: what this attachment changes is written by
+  # the gateway's Recipe, which reads it and computes the circuit breaker's
+  # numbers there, in one place, so nothing here can disagree with what is
+  # rendered. What stays here is what that Recipe cannot honour.
+  #
+  # No assertion can read the host component's labels, so what the gateway is
+  # able to do is stated in the messages, and the check of the host's type
+  # first in the list is what keeps those statements true.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/envoy-gateway and core/gateway/envoy-gateway:1.0.0 are the
+    # same host.
+    component_writes_the_cap: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/envoy-gateway" -}}
+      {{- fail (printf "core/concurrency-limit attachment %q on %q is bound to the Envoy Gateway realization, which only core/gateway/envoy-gateway carries out: that component's Recipe writes the cap onto the route it serves models on, and %s renders none for it, so nothing would be capped. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # Envoy Gateway's circuit breaker caps the requests in flight to one
+    # backend of a route rule, and its connection limit counts connections,
+    # so it holds no cap on every request the gateway forwards counted
+    # together; a total is refused rather than written as a cap per model.
+    # scope defaults to gateway, so an attachment leaving it out is refused
+    # here too.
+    caps_each_model_only: >-
+      {{- if ne (toString .infra.scope) "model" -}}
+      {{- fail (printf "core/concurrency-limit attachment %q on %q asks for scope %v, but core/gateway/envoy-gateway declares dataplane.aggrega.ai/concurrency-cap: per-target — Envoy Gateway caps the requests in flight to each backend it sends to, one for each wired model, and holds no cap on the total across everything the gateway serves. Set scope to model to cap each wired model on its own, or attach the Feature to a gateway whose cap counts the total" .metadata.feature_instance .metadata.instance_id .infra.scope) -}}
+      {{- end -}}
+    # Envoy Gateway holds maxParallelRequests as a number from 0 to
+    # 4294967295, and a traffic policy above that is refused when it is
+    # applied to the cluster.
+    cap_within_the_field: >-
+      {{- if gt (int64 .infra.max_in_flight) 4294967295 -}}
+      {{- fail (printf "core/concurrency-limit attachment %q on %q asks for max_in_flight %v, but core/gateway/envoy-gateway holds at most 4294967295 requests in flight to a backend, and a traffic policy asking for more is refused when it is applied. Set max_in_flight to 4294967295 or less" .metadata.feature_instance .metadata.instance_id .infra.max_in_flight) -}}
+      {{- end -}}
+    # The cap is written onto the route serving the wired models, and with
+    # none wired the gateway renders no model route to cap.
+    models_are_wired: >-
+      {{- if not (optional .uses "models" dict) -}}
+      {{- fail (printf "core/concurrency-limit attachment %q on %q needs a model route to cap, but nothing is wired to the models socket of %q, so the gateway serves no model and nothing would be capped; wire a model to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The Recipe writes one circuit breaker onto the route's one traffic
+    # policy, so a second attachment could not hold beside the first.
+    one_cap_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/concurrency-limit" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/concurrency-limit is attached to %q more than once (%s), but core/gateway/envoy-gateway writes one circuit breaker onto the route serving its models, so the attachments cannot each hold; keep one attachment" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
+      {{- end -}}

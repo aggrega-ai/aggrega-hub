@@ -32,12 +32,12 @@ metadata:
     base URL, qualified with envoy-gateway-system.
 
     The route's one traffic policy holds core/period-budget as a rate limit
-    on the route's token cost, counted in the cache socket's store, and
-    core/retry-policy as a retry count.
+    on the route's token cost, counted in the cache socket's store,
+    core/retry-policy as a retry count, and core/concurrency-limit as a
+    per-model cap on requests in flight.
 
-    Images are pinned (infra.image; infra.overrides for the rate-limit and
-    data-plane images); the chart version is source.version, overridden via
-    infra.source_version.
+    Images are pinned (infra.image, infra.overrides); infra.source_version
+    overrides the chart version.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -449,8 +449,9 @@ spec:
   # covers model traffic and no other route on the gateway. Envoy Gateway
   # attaches one traffic policy to a route and refuses a second one naming
   # it, so this one policy carries every control written onto the model
-  # route: the period budget's rate limit and the retry policy's retry. It is
-  # written while either is attached; with neither, no policy is written.
+  # route: the period budget's rate limit, the retry policy's retry and the
+  # concurrency limit's circuit breaker, in that order. It is
+  # written while any of them is attached; with none, no policy is written.
   #
   # A core/period-budget attachment, which period-budget-envoy-gateway
   # realizes and checks, is written as Envoy Gateway's usage-based rate limit.
@@ -489,6 +490,36 @@ spec:
   # again. The retry applies to every rule of the route, and each rule holds
   # one backend, so a request for any wired model is sent at most
   # max_attempts times.
+  #
+  # A core/concurrency-limit attachment, which concurrency-limit-envoy-gateway
+  # realizes and checks, is written as the traffic policy's circuit breaker,
+  # and this is the one place its numbers are computed. Envoy Gateway applies
+  # it to the backend of each rule of the route, and each rule holds one
+  # wired model's backend, so each wired model is capped on its own:
+  # maxParallelRequests, the most requests Envoy sends to that backend at
+  # once, is max_in_flight. A request past it is answered 503 and is not sent
+  # again, and a send the retry repeats is counted like the first, so one
+  # that finds the cap full is answered 503 in its place. The count is each
+  # running data-plane replica's own.
+  #
+  # Two more of the circuit breaker's limits stand in front of that one, each
+  # 1024 by default. Envoy sends a request on a connection to the backend and
+  # queues one waiting for a connection to open, and the circuit breaker
+  # bounds both the connections and the queue; over HTTP/1.1, which a backend
+  # reached over plain http speaks, a connection carries one request at a
+  # time. With the defaults kept, a max_in_flight above 1024 would let no
+  # more than 1024 requests reach the model at once, the rest waiting in the
+  # queue, and a max_in_flight level with the connection limit would leave a
+  # request past the cap waiting for a connection rather than refused. So
+  # maxConnections and maxPendingRequests are each max_in_flight plus that
+  # default of 1024, held at 4294967295, the most either takes: neither stops
+  # a request within the cap, and a request past it is refused on a
+  # connection of its own. The realization refuses a max_in_flight above
+  # 4294967295, the most maxParallelRequests takes. The circuit breaker's
+  # retry limit is left to Envoy Gateway, which writes 1024 for every route
+  # whether or not a circuit breaker is written, so the retry above is sent
+  # as it would be without the cap. With no such attachment no circuit
+  # breaker is written, and the policy is as it would be without one.
   #
   # Each connection's resources are named after the gateway and the alias, in
   # lowercase with every underscore as a hyphen, the characters a Kubernetes
@@ -576,10 +607,12 @@ spec:
       {{- if gt (len $wired) 15 }}{{ fail (printf "%q has %d connections on its models socket, but the AI route serving them holds at most 15 rules, one per connection; serve the others through a second gateway" .context.instance_id (len $wired)) }}{{ end }}
       {{- $budget := dict }}
       {{- $retry := dict }}
+      {{- $cap := dict }}
       {{- range $name, $attachment := (default dict .features) }}
       {{- $type := first (splitList ":" (toString $attachment.type)) }}
       {{- if eq $type "core/period-budget" }}{{ $budget = $attachment }}{{ end }}
       {{- if eq $type "core/retry-policy" }}{{ $retry = $attachment }}{{ end }}
+      {{- if eq $type "core/concurrency-limit" }}{{ $cap = $attachment }}{{ end }}
       {{- end }}
       {{- $cost := dict }}
       {{- $unit := "" }}
@@ -637,7 +670,7 @@ spec:
             name: {{ .context.rendered_name }}
         connection:
           bufferLimit: 50Mi
-      {{- if or $budget $retry }}
+      {{- if or $budget $retry $cap }}
       ---
       apiVersion: gateway.envoyproxy.io/v1alpha1
       kind: BackendTrafficPolicy
@@ -691,6 +724,14 @@ spec:
               - 429
               - 503
               - 504
+      {{- end }}
+      {{- with $cap }}
+      {{- $max := int64 .infra.max_in_flight }}
+      {{- $room := min 4294967295 (add $max 1024) }}
+        circuitBreaker:
+          maxConnections: {{ $room }}
+          maxPendingRequests: {{ $room }}
+          maxParallelRequests: {{ $max }}
       {{- end }}
       {{- end }}
       {{- range $alias := $wired }}
