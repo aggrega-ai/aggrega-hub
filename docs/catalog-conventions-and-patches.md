@@ -277,7 +277,7 @@ Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 `period-budget: tokens` and `concurrency-cap: per-target`), `core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/tyk`
 (`upstream-pinning: public-key`), `core/gateway/litellm`
 (`caller-identity: injected-header`, `content-masking: entity-recognition`, `log-masking: entity-recognition`,
-`prompt-guard: pattern-list`, `upstream-tls: trust-anchor`, `period-budget: cost`),
+`prompt-guard: pattern-list`, `upstream-tls: trust-anchor`, `period-budget: cost`, `concurrency-cap: per-target`),
 `core/security/nemo-guardrails` and `core/security/trustyai-guardrails-gateway` (each
 `prompt-guard: classifier`). Of these, `core/gateway/litellm` and
 `core/gateway/envoy-gateway` carry `gateway.aggrega.ai/intelligence: semantic`
@@ -296,7 +296,8 @@ route it serves a model on. On `core/gateway/envoy-gateway`, the tokens its
 `period-budget` value names are the ones Envoy AI Gateway reads from each reply
 of a wired model, which Envoy Gateway's rate limit counts, and the targets its
 `concurrency-cap` value counts apart are the backends of its route rules, one
-for each wired model.
+for each wired model; on `core/gateway/litellm` they are the entries of its
+model map, typed by hand or wired.
 `core/gateway/kong-enterprise` carries `period-budget: tokens`, the tokens
 each reply reports as Kong's AI Rate Limiting Advanced counts them,
 `content-masking: entity-recognition` and `semantic`. `core/gateway/traefik-hub`
@@ -2884,9 +2885,10 @@ is not a shape of it; it has a name and a test of its own. Where the field
 shares no shape of the capability, the Feature is removed — its declaration, its
 validation and its realizations together — and the capability becomes a value
 on the Component of the one product that has it. LiteLLM v1.103.1 caps the
-requests in flight for each entry of its model map, and Envoy Gateway v1.9.1 for
-each backend of a route rule, its connection limit counting connections rather
-than requests; neither holds a cap on the total across everything it serves. A
+requests in flight for each entry of its model map, its one total counting a
+request for its first second only, and Envoy Gateway v1.9.1 for each backend of
+a route rule, its connection limit counting connections rather than requests;
+neither holds a cap on the total across everything it serves. A
 cap per target passes the test and a cap on that total does not, so a Feature
 capping the requests in flight is widened to the cap per target rather than kept
 as a total alone.

@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: concurrency-limit-litellm
+  version: 1.0.0
+  description: >
+    Realizes core/concurrency-limit on the AI gateway core/gateway/litellm; a
+    Release binds it in its Manifest. The gateway's Recipe, litellm-gateway,
+    reads the attachment and writes max_in_flight as the
+    max_parallel_requests of every entry of the model map, typed by hand and
+    wired alike. The proxy keeps each entry's count in memory, where a record
+    lapses ten minutes after it is made and a new count starts at zero while
+    requests counted by the old one are in flight, so the Recipe also sets
+    that lifetime to a century, keeping each count as long as the proxy runs.
+
+    The proxy takes one of an entry's slots for each request it sends there,
+    so at most max_in_flight requests are in flight to each entry at once. A
+    request finding its entry full is answered 429: after the gateway's
+    retries where its alias has one entry, and at once where it has several,
+    even while another of them has room, since the proxy picks the entry
+    before it counts; a fallback chain attached to the gateway sends it on to
+    its alias's fallbacks instead. The count is each running proxy's own.
+
+    The proxy keeps no total that holds — its one total is read only by a
+    request limiter an environment variable switches on, which counts a
+    request for its first second — so this recipe halts on scope gateway,
+    the Feature's default. It halts on a model map of more than 100 entries,
+    past which the store the counts are kept in, 200 records, can drop one,
+    on a second such attachment, and on any component other than
+    core/gateway/litellm; and the gateway refuses a request carrying
+    priority, whose queue the century lifetime would keep.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/concurrency-limit:1.0.0
+  # executionScope omitted -> component: the checks and the pipeline run once
+  # per attached component and receive that component's rendered documents.
+  #
+  # What is written, and where. The gateway's Recipe reads the attachment and
+  # writes, in one place, both settings the cap needs, so nothing here can
+  # disagree with what is rendered: max_in_flight as max_parallel_requests on
+  # every entry of the model map, and litellm_settings.default_in_memory_ttl
+  # at a century. The proxy's router builds, for each entry with a
+  # max_parallel_requests, one count of the requests in flight to it, the
+  # first time a request is sent there, and keeps it in its in-memory cache
+  # with no lifetime of its own, so the cache's default of ten minutes from
+  # when it was built applies; once it lapses the router builds a fresh count
+  # at zero, and the requests the old one counted release only the old one,
+  # so an entry could carry twice its cap. The cache gives every record
+  # written with no lifetime of its own the lifetime that setting names, read
+  # when the router is built, so the count lapses a century after it is
+  # built. Measured at LiteLLM v1.103.1, with the proxy's own configuration
+  # loader, on 2026-10-12: with the setting, a request past a cap of one is
+  # still refused after the cache's clock is moved ninety-nine years on; at
+  # the default it is admitted ten minutes and one second on.
+  #
+  # The setting reaches only the caches the router builds after the
+  # configuration is read. Of the records they hold, the counts and, after a
+  # rare timing, an entry's usage counter, which only an rpm limit reads and
+  # no entry here carries, are the ones written with no lifetime of their
+  # own; everything else names its own. The one other is the queue of
+  # requests carrying priority, which keeps an entry for every such request
+  # while the entries are healthy and is dropped only when its record lapses,
+  # so with the century it would grow as long as the proxy runs. The request
+  # guard already refuses priority, which no route declares, unless the
+  # Release admits it, so the policy below refuses it while the cap is
+  # attached.
+  #
+  # The cache holds at most 200 records and, when full, drops the one that
+  # lapses soonest; its size is not a setting the configuration reaches. With
+  # the century, every record with a shorter lifetime goes first, and a count
+  # is dropped only once 200 century-long records are held: each entry holds
+  # at most two, its count and that usage counter, and at 199 no usage
+  # counter can become one, so a map of at most 100 entries keeps every
+  # count. Measured: 199 entries, each sent a request, and 99 or 100 entries,
+  # each with its usage counter made century-long, kept the first entry's
+  # count; 200 entries, and 101 so made, dropped it and admitted a request
+  # past its cap.
+  #
+  # No assertion can read the host component's labels, so what the gateway is
+  # able to do is stated in the messages, and the check of the host's type
+  # first in the list is what keeps those statements true.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/litellm and core/gateway/litellm:1.0.0 are the same host.
+    component_writes_the_cap: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/litellm" -}}
+      {{- fail (printf "core/concurrency-limit attachment %q on %q is bound to the LiteLLM realization, which only core/gateway/litellm carries out: that component's Recipe writes the cap onto every entry of its model map, and %s renders no such map, so nothing would be capped. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The proxy's router caps each entry of the model map on its own. Its one
+    # total, global_max_parallel_requests, is read only by the legacy request
+    # limiter, which the proxy loads only when LEGACY_MULTI_INSTANCE_RATE_LIMITING
+    # is set, and which keeps its count in a cache whose records lapse after a
+    # second, so a request in flight longer than that stops counting. A total
+    # is refused rather than written as a cap per entry. scope defaults to
+    # gateway, so an attachment leaving it out is refused here too.
+    caps_each_entry_only: >-
+      {{- if ne (toString .infra.scope) "model" -}}
+      {{- fail (printf "core/concurrency-limit attachment %q on %q asks for scope %v, but core/gateway/litellm declares dataplane.aggrega.ai/concurrency-cap: per-target — the proxy caps the requests in flight to each entry of its model map, and keeps no total across everything the gateway serves that holds. Set scope to model to cap each entry on its own, or attach the Feature to a gateway whose cap counts the total" .metadata.feature_instance .metadata.instance_id .infra.scope) -}}
+      {{- end -}}
+    # The counts are kept in a cache of 200 records, which drops the one that
+    # lapses soonest when full; at most two records of each entry outlast the
+    # rest, so beyond 100 entries a count could be dropped and the entry's cap
+    # start again at zero. The entries are those typed into values.models,
+    # which the gateway's Recipe publishes in model_aliases, one alias per
+    # entry, and the models wired to its models socket.
+    map_fits_the_count_store: >-
+      {{- $typed := len (fromJson (optional .locals "model_aliases" "[]")) -}}
+      {{- $wired := len (optional .uses "models" dict) -}}
+      {{- if gt (add $typed $wired) 100 -}}
+      {{- fail (printf "core/concurrency-limit attachment %q on %q caps every entry of the model map, which holds %d entries (%d in values.models, %d wired to the models socket), but the proxy keeps the counts in a cache of 200 records that drops one whenever it is full, so past 100 entries an entry's count could be dropped and its cap start again at zero. Serve at most 100 entries from this gateway, and the rest from a second one" .metadata.feature_instance .metadata.instance_id (add $typed $wired) $typed $wired) -}}
+      {{- end -}}
+    # The Recipe writes one max_parallel_requests on every entry, so a second
+    # attachment could not hold beside the first.
+    one_cap_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/concurrency-limit" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/concurrency-limit is attached to %q more than once (%s), but core/gateway/litellm writes one cap onto every entry of its model map, so the attachments cannot each hold; keep one attachment" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
+      {{- end -}}
+  pipeline:
+    # A request policy, written into the request guard's settings under a
+    # member of this attachment's own: while the cap is attached the gateway
+    # refuses a request carrying priority with HTTP 400 saying why, forwarding
+    # nothing, even where the Release admits the field in
+    # infra.admitted_request_fields. Such a request is queued per alias, and
+    # the queue keeps an entry for it after it is served; with the century
+    # lifetime the Recipe sets, that queue would never be dropped. The member
+    # is named after the guard's module, which the gateway's Recipe holds in
+    # request_filter_module.
+    - id: write_priority_refusal
+      plugin: pipeline-step/litellm-gateway-config:1.0.0
+      function: step
+      with: |
+        {{- $id := printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-") }}
+        section: callback_settings
+        settings:
+          {{ .locals.request_filter_module }}.{{ $id }}:
+            policies:
+              - reason: "caps the requests in flight to each entry of its model map"
+                refuse_fields: [priority]

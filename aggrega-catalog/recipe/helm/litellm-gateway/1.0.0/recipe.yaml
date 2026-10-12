@@ -438,11 +438,33 @@ spec:
     # wired entry is sent to its own model's endpoint and would pass the guard
     # by. With no such attachment, no hand-typed entry carries an api_base.
     #
+    # While a core/concurrency-limit attachment is present, which
+    # concurrency-limit-litellm realizes and checks, every entry of the model
+    # map, typed by hand and wired alike, carries the attachment's
+    # max_in_flight as its max_parallel_requests: the proxy sends at most that
+    # many requests to the entry at once and answers a request finding it full
+    # with HTTP 429, or sends it on along the alias's fallbacks where
+    # core/fallback-chain lists some. The entry's own setting is the one
+    # written, rather than the router's default for every entry, because the
+    # proxy ranks an entry's rpm or tpm above that default, and only the
+    # entry's own max_parallel_requests above both. The proxy keeps each
+    # entry's count in an in-memory cache, with no lifetime of its own, where
+    # a record lapses ten minutes after it is made, and then starts a fresh
+    # count at zero while the requests the old one counted are still in
+    # flight. So the same attachment sets litellm_settings.default_in_memory_ttl,
+    # the lifetime that cache gives a record written with none, to a century,
+    # 3153600000 seconds, which keeps every count as long as the proxy runs;
+    # what else that lifetime reaches, and what the realization refuses
+    # because of it, is stated on concurrency-limit-litellm. This is the one
+    # place the cap is written. With no such attachment, no entry carries a
+    # max_parallel_requests and the lifetime is the proxy's own.
+    #
     # Each of those attachments is found by its type with any version it was
     # authored with set aside, so core/context-propagation and
     # core/context-propagation:1.0.0 are both read, as are core/data-masking
     # and core/data-masking:1.0.0, core/log-masking and core/log-masking:1.0.0,
-    # and core/prompt-injection-shield and core/prompt-injection-shield:1.0.0.
+    # core/prompt-injection-shield and core/prompt-injection-shield:1.0.0, and
+    # core/concurrency-limit and core/concurrency-limit:1.0.0.
     #
     # On every Release the body registers the request guard first, before any
     # hook that reads the request. Its module is not a file of this ConfigMap:
@@ -457,6 +479,7 @@ spec:
       {{- $masking := false }}
       {{- $logMasking := false }}
       {{- $shield := false }}
+      {{- $cap := "" }}
       {{- range $name, $attachment := (default dict .features) }}
       {{- if eq (first (splitList ":" (toString $attachment.type))) "core/context-propagation" }}
       {{- $identity = true }}
@@ -473,6 +496,7 @@ spec:
       {{- if or (optional $values "entities" list) (optional $values "patterns" list) }}{{ $logMasking = true }}{{ end }}
       {{- end }}
       {{- if eq (first (splitList ":" (toString $attachment.type))) "core/prompt-injection-shield" }}{{ $shield = true }}{{ end }}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/concurrency-limit" }}{{ $cap = toString (int64 $attachment.infra.max_in_flight) }}{{ end }}
       {{- end }}
       {{- $guardBase := "" }}
       {{- $wired := list }}
@@ -500,6 +524,9 @@ spec:
       {{- else if hasKey (default dict $.features) "provider_key" }}
                 api_key: os.environ/{{ $.locals.provider_key_variable }}
       {{- end }}
+      {{- with $cap }}
+                max_parallel_requests: {{ . }}
+      {{- end }}
       {{- end }}
       {{- range $alias, $edge := .context.uses }}
       {{- if eq $edge.socket "models" }}
@@ -513,11 +540,17 @@ spec:
                 model: {{ printf "hosted_vllm/%s" $edge.provides.model | toJson }}
                 api_base: {{ $edge.provides.endpoint | toJson }}
       {{- end }}
+      {{- with $cap }}
+                max_parallel_requests: {{ . }}
+      {{- end }}
       {{- end }}
       {{- end }}
           router_settings:
             routing_strategy: {{ .values.routing_strategy }}
           litellm_settings:
+      {{- if $cap }}
+            default_in_memory_ttl: 3153600000
+      {{- end }}
             callbacks:
               - {{ .locals.request_guard_dir }}/{{ .locals.request_filter_module }}.filter
       {{- if $logMasking }}
