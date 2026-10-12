@@ -423,10 +423,11 @@ Three rules bind it:
   API alone; the message names the connection and points at the gateway's
   hand-typed `values.models`, which takes such a provider in the proxy's own
   provider/model notation. The `models` sockets of `core/gateway/kong`,
-  `core/gateway/apisix` and `core/gateway/envoy-gateway` select the same and each
-  Component's assertion halts the same way, because each writes a wired model's
-  route for the OpenAI API alone — Kong and APISIX through their AI proxy, Envoy
-  Gateway through the Envoy AI Gateway resources its Recipe renders.
+  `core/gateway/kong-enterprise`, `core/gateway/apisix` and
+  `core/gateway/envoy-gateway` select the same and each Component's assertion
+  halts the same way, because each writes a wired model's route for the OpenAI
+  API alone — the two Kongs and APISIX through their AI proxy, Envoy Gateway
+  through the Envoy AI Gateway resources its Recipe renders.
 - **A component carrying the key publishes what a model publishes:** `endpoint`
   and `model` in its `provides`, the two keys a consumer's Recipe reads off a
   model edge. One that published no `model` would hand its
@@ -434,7 +435,8 @@ Three rules bind it:
   publishes one alias of its model map as its `model`, named by a value of its
   own and checked against the map by an assertion on its Component, so the order
   of the map never decides what a consumer asks for. A gateway whose every
-  model is wired to a socket — `core/gateway/kong`, `core/gateway/apisix` and
+  model is wired to a socket — `core/gateway/kong`,
+  `core/gateway/kong-enterprise`, `core/gateway/apisix` and
   `core/gateway/envoy-gateway`, each of whose `values.model` names one of its
   `models` connections — serves
   none while nothing is wired there and then publishes both keys empty; it
@@ -450,7 +452,8 @@ Three rules bind it:
   describes.
 
 Components today: `core/gateway/litellm`, `core/gateway/kong`,
-`core/gateway/apisix` and `core/gateway/envoy-gateway` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
+`core/gateway/kong-enterprise`, `core/gateway/apisix` and
+`core/gateway/envoy-gateway` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
 `openai-embedding`, `nvidia-api` and `openai-compatible` — the broker, whose
 whole contract is to be pointed at a service speaking that API, and which stays
 the handle for an endpoint the catalog does not model. Every other
