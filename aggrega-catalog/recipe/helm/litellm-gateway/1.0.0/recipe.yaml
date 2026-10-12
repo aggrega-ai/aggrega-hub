@@ -720,7 +720,9 @@ spec:
           of the reply, one piece or streamed, and the caller receives the rest. And
           an error the model call raises reaches the caller without the message the
           provider wrote in it, which can quote text the masking never saw: the
-          message is replaced on the exception the gateway answers from, and the
+          message is replaced on the exception the gateway answers from, by one
+          saying that the gateway masks sensitive text in its replies or, where the
+          entry refuses, that it refuses the replies that carry it, and the
           error keeps its status code and its type. An entry that sets
           allow_unmasked_reply_parts does neither: what masking cannot read reaches
           the caller as the provider sent it, and so does the provider's message.
@@ -780,10 +782,15 @@ spec:
           )
 
           PROVIDER_ERROR_WITHHELD = (
-              "The call to the model failed{status}. This gateway masks sensitive text in its "
-              "replies, so it does not pass on the message the model provider returned with "
-              "the error, which can quote text from the request or from the reply."
+              "The call to the model failed{status}. This gateway {what}, so it does not pass "
+              "on the message the model provider returned with the error, which can quote text "
+              "from the request or from the reply."
           )
+
+          # What the fixed message says the gateway does with its replies: what an entry does
+          # where its marks are MASK, and where they are BLOCK.
+          MASKS_REPLIES = "masks sensitive text in its replies"
+          REFUSES_REPLIES = "refuses the replies that carry sensitive text"
 
 
           class NotJson(ValueError):
@@ -1206,19 +1213,23 @@ spec:
                           await _mask_fields(specific, _REASONING, mask)
 
 
-          def _withhold_provider_message(exception):
+          def _withhold_provider_message(exception, refuses):
               # An error the call to the model raised carries the message the provider answered
               # with, which can quote text the masking never saw: the gateway's own error for a
               # provider's answer, or, on the messages route, the provider's error as it came. The
               # message is replaced on the exception itself, which every route the gateway serves
               # reads when it answers with the error, and the error keeps its status code, type and
-              # code.
+              # code. The message says what the entry does with replies: it refuses the replies that
+              # carry sensitive text where refuses is true, and masks that text otherwise.
               # An error the gateway raises itself, such as a refusal of the request guard's or a
               # recognizer that cannot be reached, is not one of these and keeps its message.
               if not isinstance(exception, (openai.APIError, BaseLLMException)):
                   return
               status = getattr(exception, "status_code", None)
-              exception.message = PROVIDER_ERROR_WITHHELD.format(status=" with HTTP " + str(status) if status else "")
+              exception.message = PROVIDER_ERROR_WITHHELD.format(
+                  status=" with HTTP " + str(status) if status else "",
+                  what=REFUSES_REPLIES if refuses else MASKS_REPLIES,
+              )
               exception.args = (exception.message,)
               if getattr(exception, "provider_specific_fields", None):
                   exception.provider_specific_fields = None
@@ -1247,6 +1258,14 @@ spec:
               # Whether an entry withholds what masking cannot read and a provider's error message:
               # always, unless its settings carry allow_unmasked_reply_parts as true.
               return allow_unmasked_reply_parts is not True
+
+
+          def _refuses(marks):
+              # Whether an entry refuses rather than masks: its listed patterns or entity types
+              # are marked BLOCK, as every entry of an attachment with action refuse writes them,
+              # rather than MASK. A mark arrives as the word or as the gateway's own enumeration
+              # of it, which compares equal to the word.
+              return any(getattr(mark, "value", mark) == "BLOCK" for mark in marks)
 
 
           def _assembled_reply(chunks, request_data):
@@ -1287,12 +1306,15 @@ spec:
                   # mapped back to an original. mask_reasoning and
                   # allow_unmasked_reply_parts come from the entry's own settings; only
                   # false turns the masking of reasoning text off, and only true lets what
-                  # masking cannot read, and a provider's error message, through.
+                  # masking cannot read, and a provider's error message, through. Whether
+                  # the entry refuses is read from the marks of its entity types.
+                  refuses = _refuses((kwargs.get("pii_entities_config") or {}).values())
                   kwargs["apply_to_output"] = True
                   kwargs["output_parse_pii"] = False
                   super().__init__(**kwargs)
                   self.mask_reasoning = mask_reasoning is not False
                   self.withholds = _withholds(allow_unmasked_reply_parts)
+                  self.refuses = refuses
 
               async def async_post_call_success_hook(self, data, user_api_key_dict, response):
                   # The reply's text is masked through the gateway's own handler for its
@@ -1319,7 +1341,7 @@ spec:
                   # reaches the caller without the message the provider returned with it,
                   # unless the entry sets allow_unmasked_reply_parts.
                   if self.withholds and self.should_run_guardrail(data=request_data or {}, event_type=GuardrailEventHooks.post_call):
-                      _withhold_provider_message(original_exception)
+                      _withhold_provider_message(original_exception, self.refuses)
                   return None
 
               async def _mask_tool_calls(self, reply, request_data):
@@ -1489,9 +1511,12 @@ spec:
 
               def __init__(self, allow_unmasked_reply_parts=False, **kwargs):
                   # allow_unmasked_reply_parts comes from the entry's own settings; only true lets
-                  # what masking cannot read, and a provider's error message, through.
+                  # what masking cannot read, and a provider's error message, through. Whether the
+                  # entry refuses is read from the marks of its patterns.
+                  refuses = _refuses(_field(pattern, "action") for pattern in kwargs.get("patterns") or [])
                   super().__init__(**kwargs)
                   self.withholds = _withholds(allow_unmasked_reply_parts)
+                  self.refuses = refuses
 
               async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
                   mask = _pattern_masker(self)
@@ -1516,7 +1541,7 @@ spec:
                   # reaches the caller without the message the provider returned with it,
                   # unless the entry sets allow_unmasked_reply_parts.
                   if self.withholds and self.should_run_guardrail(data=request_data or {}, event_type=GuardrailEventHooks.post_call):
-                      _withhold_provider_message(original_exception)
+                      _withhold_provider_message(original_exception, self.refuses)
                   return None
 
               async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data):
