@@ -245,6 +245,7 @@ The dimensions and their value sets:
 | `upstream-pinning` | `public-key` | The component can refuse a service it forwards to unless a certificate that service presents carries one of the public keys the Release supplies for it. `public-key` names what is pinned: the key itself, so a certificate renewed over the same key still matches. |
 | `log-masking` | `entity-recognition` | The component can replace sensitive text with a placeholder in the copy of a call it hands to its logs, while the request it forwards and the reply it returns stay as they were sent. `entity-recognition` names the fidelity: it replaces matches of patterns supplied in its configuration and also entity types that a recognizer service it calls detects. A component that could only replace pattern matches would carry a narrower value, added in the same act as the first component to carry it. |
 | `period-budget` | `cost`, `tokens` | The component can refuse model requests once what it has counted over a period exceeds a limit set in its configuration, and the value names what it counts. `cost`: what the traffic cost, priced from a table the component keeps per model. `tokens`: the tokens each model's reply reports reading, writing or both, which the component counts and prices nothing. |
+| `concurrency-cap` | `total` | The component can hold or refuse a request that would take the requests it is carrying at once past a cap set in its configuration, and the value names what one cap counts. `total`: every request the component forwards, whatever it forwards it to, against one cap. |
 
 Three rules bind the family, and each has already been got wrong once:
 
@@ -270,31 +271,30 @@ Three rules bind the family, and each has already been got wrong once:
   no `upstream-pinning` value.
 
 Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
-`upstream-tls: trust-anchor`), `core/gateway/contour` and
-`core/gateway/envoy-gateway` (each `request-mirroring: sampled`,
-`caller-identity: client-certificate`, `upstream-tls: trust-anchor`),
-`core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/tyk`
+`upstream-tls: trust-anchor`, `concurrency-cap: total`), `core/gateway/contour`
+(`request-mirroring: sampled`, `caller-identity: client-certificate`,
+`upstream-tls: trust-anchor`), `core/gateway/envoy-gateway` (the same three and
+`period-budget: tokens`), `core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/tyk`
 (`upstream-pinning: public-key`), `core/gateway/litellm`
 (`caller-identity: injected-header`, `content-masking: entity-recognition`, `log-masking: entity-recognition`,
-`prompt-guard: pattern-list`, `upstream-tls: trust-anchor`),
+`prompt-guard: pattern-list`, `upstream-tls: trust-anchor`, `period-budget: cost`),
 `core/security/nemo-guardrails` and `core/security/trustyai-guardrails-gateway` (each
-`prompt-guard: classifier`). Six of the eight carry no
-`gateway.aggrega.ai/intelligence` value, and `core/gateway/litellm` and
-`core/gateway/envoy-gateway` carry `semantic` — and
+`prompt-guard: classifier`). Of these, `core/gateway/litellm` and
+`core/gateway/envoy-gateway` carry `gateway.aggrega.ai/intelligence: semantic`
+and the others carry no value of it — and
 that mixture is the separation working rather than an exception to it. The
 intelligence label names a **product tier** — whether the router parses the
 request body — while this family names **capabilities**, so the two answer
 different questions and a component may honestly carry both. What a component's
 tier value never tells a reader is which of these capabilities it has: the AI
 gateway carries several of them, and no amount of reading its tier would say so.
-`core/gateway/litellm` carries `period-budget: cost` as well, and so does
-`core/gateway/cloudflare-ai-gateway`, Cloudflare's hosted AI gateway, which
-carries no other value in this family and carries `semantic`.
+`core/gateway/cloudflare-ai-gateway`, Cloudflare's hosted AI gateway, carries
+`period-budget: cost`, its one value in this family, and `semantic`.
 `core/gateway/apisix` carries `period-budget: tokens`, its one value in this
 family, and `semantic`, because its AI proxy reads the request body of every
-route it serves a model on. `core/gateway/envoy-gateway` carries
-`period-budget: tokens` as well: Envoy AI Gateway reads the tokens each reply
-of a wired model reports, and Envoy Gateway's rate limit counts them.
+route it serves a model on. On `core/gateway/envoy-gateway`, the tokens its
+`period-budget` value names are the ones Envoy AI Gateway reads from each reply
+of a wired model, which Envoy Gateway's rate limit counts.
 `core/gateway/kong-enterprise` carries `period-budget: tokens`, the tokens
 each reply reports as Kong's AI Rate Limiting Advanced counts them,
 `content-masking: entity-recognition` and `semantic`. `core/gateway/traefik-hub`

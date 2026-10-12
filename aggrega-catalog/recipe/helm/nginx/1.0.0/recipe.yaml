@@ -21,17 +21,17 @@ metadata:
     halts naming the edge and its socket; with neither on the pipe and no such
     edge, the location answers 503. A core/prompt-injection-shield attachment's
     realization (prompt-injection-shield-nginx) writes the two variables with
-    the address of the guard wired to the guard socket. provides.host is the
-    bare in-cluster service name of the synthesized Service and carries no
-    namespace; a consumer in another namespace qualifies it on its own side
-    (caller-side routing). Each core/traffic-shadowing attachment adds a mirror
-    to that location: an upstream group naming the Service the attachment's
-    infra names, and an internal location sending a copy of every forwarded
-    request there with its original URI, whose response NGINX discards. NGINX
-    copies every request it forwards and cannot copy a share of them, so the
-    FeatureRecipe realizing the attachment (traffic-shadowing-nginx) halts on a
-    share below 100, and this Recipe halts on an attachment to a gateway that
-    forwards nothing.
+    the address of the guard wired to the guard socket. Each
+    core/traffic-shadowing attachment adds a mirror to that location: an
+    upstream group naming the Service the attachment's infra names, and an
+    internal location sending a copy of every forwarded request there with its
+    original URI, whose response NGINX discards. NGINX copies every request it
+    forwards and cannot copy a share of them, so the FeatureRecipe realizing
+    the attachment (traffic-shadowing-nginx) halts on a share below 100, and
+    this Recipe halts on an attachment to a gateway that forwards nothing. Each
+    core/concurrency-limit attachment adds a cap, one total across NGINX's
+    worker processes, and a request past it is answered 503;
+    concurrency-limit-nginx refuses scope model.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -79,6 +79,31 @@ spec:
     {{- range $name, $f := (default dict .features) -}}
     {{- if eq (first (splitList ":" $f.type)) "core/traffic-shadowing" -}}
     {{- $mirrors = append $mirrors (dict "name" $name "group" (printf "mirror_%s" $name) "location" (printf "/__mirror_%s" $name) "server" (printf "%s:%v" $f.infra.service_name $f.infra.service_port)) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /*
+      One cap per core/concurrency-limit attachment, in attachment-name order,
+      found by its type with any version it was authored with set aside. Each
+      is a limit_conn zone keyed on one fixed word, the same for every request,
+      so NGINX counts every request the server is processing against one key,
+      and it keeps that count in shared memory every worker process reads: one
+      total across everything the gateway forwards. The zone is declared ahead
+      of the server block, which the image includes inside its http block, and
+      the limit inside the server block, where it reaches the forwarding
+      location and every location beside it; the copy a mirror sends is part
+      of the request it copies and is not counted again. The zone is one
+      megabyte, above the eight memory pages NGINX requires at the least, and
+      the one key it holds takes a few dozen bytes. A request past the cap is
+      answered 503, NGINX's default. The attachment's max_in_flight is read as
+      the Feature declares it; its realization, concurrency-limit-nginx, refuses
+      a scope other than gateway and a cap NGINX cannot hold. No attachment, no
+      cap: the range is empty and the configuration is exactly the one written
+      without it.
+    */ -}}
+    {{- $caps := list -}}
+    {{- range $name, $f := (default dict .features) -}}
+    {{- if eq (first (splitList ":" $f.type)) "core/concurrency-limit" -}}
+    {{- $caps = append $caps (dict "zone" (printf "concurrency_%s" $name) "max" (int64 $f.infra.max_in_flight)) -}}
     {{- end -}}
     {{- end -}}
     {{- /*
@@ -134,11 +159,12 @@ spec:
         # no target on the pipe the location carries no proxy_pass and answers
         # 503. Each mirror adds its upstream group ahead of the server block, a
         # mirror directive in the forwarded location, and the internal location
-        # the copy is sent from.
+        # the copy is sent from. Each cap adds its zone ahead of the server
+        # block and its limit at the head of it.
         command:
           - /bin/sh
           - -c
-          - "echo '{{ range $mirrors }}upstream {{ .group }} { server {{ .server }}; } {{ end }}server { listen {{ .infra.port }}; location {{ .values.upstream_path }} { {{ range $mirrors }}mirror {{ .location }}; {{ end }}{{ if $missing }}return 503;{{ else }}proxy_pass http://{{ index $env $hostVar }}:{{ index $env $portVar }};{{ end }} }{{ range $mirrors }} location = {{ .location }} { internal; proxy_pass http://{{ .group }}$request_uri; }{{ end }} }' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
+          - "echo '{{ range $caps }}limit_conn_zone gateway zone={{ .zone }}:1m; {{ end }}{{ range $mirrors }}upstream {{ .group }} { server {{ .server }}; } {{ end }}server { listen {{ .infra.port }}; {{ range $caps }}limit_conn {{ .zone }} {{ .max }}; {{ end }}location {{ .values.upstream_path }} { {{ range $mirrors }}mirror {{ .location }}; {{ end }}{{ if $missing }}return 503;{{ else }}proxy_pass http://{{ index $env $hostVar }}:{{ index $env $portVar }};{{ end }} }{{ range $mirrors }} location = {{ .location }} { internal; proxy_pass http://{{ .group }}$request_uri; }{{ end }} }' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
         ports:
           http: {{ .infra.port }}
         # NGINX documents no health endpoint, and the one location this server
