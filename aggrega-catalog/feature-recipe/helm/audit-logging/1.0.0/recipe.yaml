@@ -7,21 +7,28 @@ metadata:
   name: audit-logging
   version: 1.0.0
   description: >
-    Component-scope FeatureRecipe for core/audit-logging on an AI gateway whose
-    realization renders its routing table as a configuration body. The control it
-    turns on is a setting the running proxy reads out of that body rather than a
-    resource of its own, so this recipe emits no file: it writes the setting into
-    the configuration the attached gateway already renders, and every other byte
-    of that body is left as the gateway's own Recipe authored it. Attaching it
-    states that the gateway keeps a row per request it served — which model
-    answered, what it cost, and the caller it is billed to. Where retention_days
-    is given, it also states how long such a row is kept before the gateway
-    deletes it, and the gateway runs no deletion at all unless a retention is
-    asked for. The rows land in the gateway's own bookkeeping database, so
-    where none is configured the gateway has nowhere to write them and this
-    attachment changes nothing it serves. The body it writes into is the one
-    core/gateway/litellm renders, so the build halts when the attachment is
-    carried by any other component.
+    Realizes core/audit-logging on the AI gateway core/gateway/litellm; a
+    Release binds it in its Manifest. It writes the gateway's request-log
+    settings into the configuration the gateway's Recipe renders, and emits
+    no file.
+
+    The gateway keeps a row for each model request it served in its
+    bookkeeping database, naming the model that answered and the tokens the
+    reply reports, and it honours every value. The row says what the request
+    cost in US dollars, priced from the table the gateway keeps per model; a
+    model the table does not price is recorded as costing nothing. It names
+    the key the gateway verified, as the hash of a key the gateway issued or
+    as a fixed name for its administrative key, with the user and team the
+    key belongs to; the end user a row names is whatever the request writes,
+    unchecked. Where retention_days is given, the gateway deletes a row once
+    it is that many days old, and otherwise it deletes none.
+
+    The gateway writes no row without its bookkeeping database, and without
+    an administrative key it checks no caller and writes no row for a request
+    that presents no key and names no end user, so the build halts unless its
+    database_url and api_key credential slots are both attached. It halts
+    when the attachment is carried by any component other than
+    core/gateway/litellm.
 
     Beside core/log-masking, the LiteLLM gateway's request log keeps answered
     requests only: failed and refused requests are counted in the gateway's
@@ -32,8 +39,34 @@ metadata:
 spec:
   capability: helm
   implements: core/audit-logging:1.0.0
-  # executionScope omitted -> component: the pipeline runs once per attached
-  # component and receives that component's rendered documents.
+  # executionScope omitted -> component: the checks and the pipeline run once
+  # per attached component and receive that component's rendered documents.
+  #
+  # What the gateway's request log holds, value by value. The log is the
+  # LiteLLM gateway's spend logs: one row per model request in its
+  # bookkeeping database, carrying the model that answered and the prompt,
+  # completion and total token counts the reply reports.
+  # - require_cost: the row's spend is what the gateway priced the request at,
+  #   in US dollars, the unit of the price table it keeps per model. A model
+  #   that table does not price is recorded at nothing rather than left out,
+  #   so a row reading zero is either a free request or an unpriced one. The
+  #   cost is recorded on or off, so nothing is refused.
+  # - require_verified_caller: with the administrative key attached, every
+  #   model request presents a key the gateway checks. A key the gateway
+  #   issued is recorded as its hash, never in the clear, with the user and
+  #   the team it was issued to; the administrative key is recorded under a
+  #   fixed name, never as its hash, with the gateway's administrator as its
+  #   user. The verified caller is recorded on or off. The end user a row
+  #   names is read from the request as the caller wrote it, which the
+  #   gateway does not check, so it is not a verified caller.
+  # - retention_days: the gateway's own setting for how long it keeps a row,
+  #   and a job it runs deletes the rows older than that. With none written,
+  #   the job does not run and no row is deleted.
+  #
+  # No assertion can read the host component's values, so what the gateway
+  # was given is read from the attachments the host carries, its credential
+  # slots among them, which an assertion here sees; the guard at the top keeps
+  # those the LiteLLM gateway's.
   assertions:
     # The host's type reaches this check as the Aggregate wrote it, so it is
     # compared with any version it was authored with set aside:
@@ -43,6 +76,36 @@ spec:
     component_renders_the_body: >-
       {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/litellm" -}}
       {{- fail (printf "core/audit-logging attachment %q on %q is bound to the LiteLLM realization, which writes the request log's settings into the configuration body core/gateway/litellm renders; %s renders no such body. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The rows are kept only in the gateway's bookkeeping database; with none
+    # the gateway writes no row at all. And the gateway checks its callers
+    # only once it has an administrative key. With none it lets every caller
+    # through, records a request under the hash of whatever key the caller
+    # sent, which it never checked, and writes no row for a request that
+    # presents no key and names no end user. So without either slot a record
+    # of each request is not kept, whatever require_verified_caller says, and
+    # this recipe halts naming whichever is missing, both in one failure when
+    # both are. The reason given for a missing api_key follows
+    # require_verified_caller, which only false turns off.
+    gateway_keeps_the_record: >-
+      {{- $infra := default dict .infra -}}
+      {{- $unverified := and (hasKey $infra "require_verified_caller") (eq (toString (index $infra "require_verified_caller")) "false") -}}
+      {{- $missing := list -}}
+      {{- $attach := list -}}
+      {{- if not (hasKey .features "database_url") -}}
+      {{- $missing = append $missing "its database_url credential slot is not attached, so it has no bookkeeping database and writes no record at all" -}}
+      {{- $attach = append $attach (printf "a credential holding the bookkeeping database's connection string to the database_url slot of %q" .metadata.instance_id) -}}
+      {{- end -}}
+      {{- if not (hasKey .features "api_key") -}}
+      {{- if $unverified -}}
+      {{- $missing = append $missing "its api_key credential slot is not attached, so it requires no key of its callers and writes no record of a request that presents none and names no end user" -}}
+      {{- else -}}
+      {{- $missing = append $missing "its api_key credential slot is not attached, so it verifies no caller, which require_verified_caller asks for" -}}
+      {{- end -}}
+      {{- $attach = append $attach (printf "a credential holding the gateway's administrative key to the api_key slot of %q" .metadata.instance_id) -}}
+      {{- end -}}
+      {{- if $missing -}}
+      {{- fail (printf "core/audit-logging attachment %q on %q needs core/gateway/litellm to keep a record of each model request it serves, but %s. Attach %s" .metadata.feature_instance .metadata.instance_id (join ", and " $missing) (join ", and " $attach)) -}}
       {{- end -}}
   # The request log is the LiteLLM gateway's spend logs, which
   # disable_spend_logs: false keeps writing. core/log-masking's realization on
@@ -54,6 +117,11 @@ spec:
   # per team and per tag count answered requests only. The gateway's daily
   # request count still counts it, by day and route, naming no key, model or
   # caller.
+  #
+  # The settings are ones the running proxy reads out of the configuration
+  # body the gateway's Recipe renders, so the step writes them into that body
+  # and every other byte of it is left as the gateway's own Recipe authored
+  # it.
   pipeline:
     - id: write_request_record_settings
       plugin: pipeline-step/litellm-gateway-config:1.0.0
