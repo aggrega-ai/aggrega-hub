@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: target-selection-litellm
+  version: 1.0.0
+  description: >
+    Realizes core/target-selection on the AI gateway core/gateway/litellm; a
+    Release binds it in its Manifest. It writes the proxy's routing strategy
+    into the configuration the gateway's own Recipe renders, and emits no file.
+
+    The choice applies only among entries of the gateway's model map that
+    publish the same alias. A model wired to the models socket is served under
+    its connection's own alias, which no other entry may publish, so the
+    entries that share an alias are the ones typed into values.models. With no
+    attachment the proxy picks among them at random.
+
+    Strategy latency is written as latency-based-routing: the proxy sends a
+    request to the entry whose last ten replies took the least time on
+    average, per output token where a reply reports its tokens, or to its
+    first token for a streamed request, and an entry not yet tried counts as
+    quickest.
+
+    Strategy cost is refused by name. The proxy looks an entry's target up,
+    as written, in a price table that names OpenAI's and Anthropic's models
+    without the provider prefix a target carries, and prices an entry it does
+    not find at a fixed fallback, so the entries sharing an alias cost alike
+    and the first is taken. The build also halts when the attachment is
+    carried by any component other than core/gateway/litellm.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/target-selection:1.0.0
+  # executionScope omitted -> component: the pipeline runs once per attached
+  # component and receives that component's rendered documents.
+  #
+  # How the proxy measures each strategy, read in LiteLLM's source at v1.103.1,
+  # the release the gateway's engine_version defaults to, and run against it.
+  #
+  # latency-based-routing keeps, for each entry, the last ten samples for an
+  # hour: a sample is the time a reply took divided by the output tokens it
+  # reports, or the whole time where it reports none, and for a streamed
+  # request the time to the first token, which a streamed request is then
+  # judged by. A call that times out adds a sample of a thousand seconds. The
+  # entry with the lowest average is taken, at random among entries tied with
+  # it, and an entry with no sample yet counts as zero, so each is tried before
+  # the averages decide.
+  #
+  # cost-based-routing prices an entry from input_cost_per_token and
+  # output_cost_per_token on the entry itself, which this catalog's gateway
+  # renders on none, and otherwise from the proxy's price table, looked up by
+  # the entry's target exactly as written. That table names OpenAI's models
+  # and Anthropic's without the provider prefix the gateway's targets are
+  # written with, so openai/gpt-4o and anthropic/claude-sonnet-4 are not found
+  # in it; the proxy, building its router, adds the second to the table with no
+  # price. An entry with no price is counted at 5.0 per input token and 5.0 per
+  # output token, every such entry costs the same, and the proxy then takes the
+  # first entry it holds a count for, which is the first entry of the map and,
+  # once that one has answered, still the same one: run against two entries
+  # under one alias, it took the first in both orders, every time, where the
+  # same pair written as the table names them, gpt-4o and
+  # claude-sonnet-4-20250514, went to gpt-4o, the cheaper, in both orders. The
+  # proxy also fetches that table afresh from its project when it starts,
+  # unless the bundled copy is forced, so no build can tell which targets it
+  # names. Choosing by order while an attachment asks for cost is the silent
+  # failure a refusal by name exists to prevent, so cost halts the build.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/litellm and core/gateway/litellm:1.0.0 are the same host.
+    # Another gateway renders no such body, and without this check the step
+    # below would fail there naming neither the Feature nor the gateway.
+    component_renders_the_body: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/litellm" -}}
+      {{- fail (printf "core/target-selection attachment %q on %q is bound to the LiteLLM realization, which writes the routing strategy into the configuration body core/gateway/litellm renders; %s renders no such body. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    proxy_can_choose_by_cost: >-
+      {{- if eq (toString .values.strategy) "cost" -}}
+      {{- fail (printf "core/target-selection attachment %q on %q asks for strategy cost, but core/gateway/litellm cannot choose between the entries of its model map by cost: the proxy looks each entry's target up, exactly as written, in its own price table, which names OpenAI's and Anthropic's models without the provider prefix a target carries (gpt-4o, not openai/gpt-4o) and which the proxy may fetch afresh when it starts, and it prices an entry it does not find, and that carries no price of its own, at a fixed fallback, so the entries sharing an alias are priced alike and the choice falls to their order. Ask for strategy latency, or remove the attachment" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+  pipeline:
+    # One step writes the strategy into router_settings, the section of the
+    # gateway's body that holds the proxy's router settings. Each of the
+    # Feature's strategies has a name in the proxy; cost is stopped by the
+    # assertion above for how the proxy prices an entry, not for want of one.
+    - id: write_routing_strategy
+      plugin: pipeline-step/litellm-gateway-config:1.0.0
+      function: step
+      with: |
+        section: router_settings
+        settings:
+          routing_strategy: {{ get (dict "latency" "latency-based-routing" "cost" "cost-based-routing") (toString .values.strategy) }}

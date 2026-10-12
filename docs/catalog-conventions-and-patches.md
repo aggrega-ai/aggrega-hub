@@ -3056,8 +3056,9 @@ LiteLLM v1.103.1 picks among the entries of its model map that publish one
 alias by a single setting, its routing strategy, which offers latency-based
 routing; the AI Proxy Advanced plugin of Kong's AI Gateway Enterprise picks the
 target observed to answer quickest as well. Choosing a target by latency passes
-the test, so its home is `core/target-selection`, and a routing-strategy value
-on the gateway's Component offering the same choice is a second home to retire.
+the test, so its home is `core/target-selection`: `core/gateway/litellm`
+declares no routing-strategy value of its own, and `target-selection-litellm`
+writes the proxy's setting from the attachment.
 
 ### A guarantee held in catalog code pins the product version it was proven at
 
