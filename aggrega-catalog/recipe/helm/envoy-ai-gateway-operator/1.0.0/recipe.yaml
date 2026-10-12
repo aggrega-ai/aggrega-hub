@@ -20,8 +20,12 @@ metadata:
     Beside the chart it emits the six AI Gateway custom-resource definitions,
     carried beside this Recipe exactly as the project's definitions chart
     publishes them at the same release. The webhook's serving certificate
-    comes from cert-manager: the chart's Certificate and self-signed Issuer
-    are rendered, so cert-manager must already run in the cluster. Every
+    comes from cert-manager by default: the chart's Certificate and
+    self-signed Issuer are rendered, so cert-manager must already run in the
+    cluster. With infra.webhook_tls_secret set it is the certificate in the
+    Secret that key names, which the operator creates beforehand: no
+    Certificate or Issuer is rendered, cert-manager is not needed, and the
+    Secret the chart would otherwise generate is left out. Every
     namespaced resource lands in the namespace the Release declares for the
     component, or in `default` where none is declared; the controller expects
     the Envoy Gateway it extends in `envoy-gateway-system`, the chart's own
@@ -77,12 +81,17 @@ spec:
   # tagged with the chart's release, so it does not float; it is not restated
   # here.
   #
-  # The webhook's serving certificate is the chart's cert-manager mode: the
-  # chart renders a cert-manager Certificate for the controller's Service name
-  # and the self-signed Issuer that signs it, and annotates the webhook
-  # configuration so cert-manager writes its CA bundle. Outside that mode the
-  # chart generates a key and certificate at render time, which differs on
-  # every render, so that mode is not used.
+  # The webhook's serving certificate takes one of two modes, and
+  # infra.webhook_tls_secret chooses between them. Unset, it is the chart's
+  # cert-manager mode: the chart renders a cert-manager Certificate for the
+  # controller's Service name and the self-signed Issuer that signs it, and
+  # annotates the webhook configuration so cert-manager writes its CA bundle.
+  # Set, the chart mounts the Secret that key names into the controller's pod
+  # at /certs instead: it renders no Certificate and no Issuer and leaves the
+  # webhook configuration's CA bundle empty, and the controller, when it
+  # starts, writes the Secret's `ca.crt` into the webhook configuration as its
+  # CA bundle. In that mode the chart also renders a Secret of its own under
+  # the same name, which the omits entry below leaves out.
   #
   # The controller is told which namespace Envoy Gateway runs in, because it
   # rolls the data-plane pods there, and the chart binds Envoy Gateway's service
@@ -115,8 +124,14 @@ spec:
         repository: "{{ $repository }}"
         tag: "{{ $tag }}"
       mutatingWebhook:
+        {{- with optional .infra "webhook_tls_secret" "" }}
+        tlsCertSecretName: {{ . | toJson }}
+        certManager:
+          enable: false
+        {{- else }}
         certManager:
           enable: true
+        {{- end }}
       {{- with optional .infra "mcp_session_seed_secret" "" }}
       mcp:
         sessionEncryption:
@@ -128,6 +143,21 @@ spec:
               name: {{ . | toJson }}
               key: seed
       {{- end }}
+
+  # Outside its cert-manager mode the chart renders a Secret of its own under
+  # the name the controller's pod mounts its certificate from, holding a key
+  # and certificate it generates afresh on every render: two builds would
+  # differ, and applying one would overwrite the operator's Secret. So with
+  # infra.webhook_tls_secret set, that generated Secret is left out, and the
+  # Secret the Release names, which the operator creates beforehand, is the
+  # one the controller's pod mounts. Unset, the chart renders no such Secret
+  # and the entry does not apply. The condition compares the key with the
+  # empty string, so the entry applies exactly when the mapping above selects
+  # this mode, whatever the Secret is named.
+  omits:
+    - kind: Secret
+      name: "{{ .infra.webhook_tls_secret }}"
+      when: '{{ ne (optional .infra "webhook_tls_secret" "") "" }}'
 
   # The six AI Gateway custom-resource definitions, taken from the project's
   # own definitions chart at the release the controller runs. The controller

@@ -1555,6 +1555,17 @@ grows:
   twice and comparing. Supply the value on **both** paths, bound by name where a
   credential is wired in and a fixed development value where nothing is, so the
   realization renders the same bytes twice whatever is attached to it.
+  `aggrega build --verify-determinism` renders twice and halts when the two renders
+  differ, which is how such a value shows itself. Where the chart offers no setting
+  that stops it generating the value — it renders the generated document whatever
+  it is given — **leave that document out with `omits:`** and supply the value
+  another way. The `helm/envoy-ai-gateway-operator` Recipe is the shape: in the
+  mode where the Release names its own webhook certificate, the chart still
+  renders a Secret under that name holding a certificate it generates, so the
+  Recipe leaves that Secret out and the controller's pod mounts the one the
+  Release names. An entry that stops matching after a chart upgrade — the document
+  renamed, or no longer rendered — halts the build, naming the entry, so the entry
+  is updated with the upgrade.
 
 **Per-entity validation does not render a sourced Recipe, so its success says
 less than it looks.** Validating a chart-backed Recipe reports that the render was
@@ -2466,7 +2477,9 @@ the AI-gateway instance of the pattern, in its bundled shape.
 project's controller chart and emits the project's six custom-resource
 definitions beside it, as the definitions chart publishes them, and the
 controller's webhook certificate is a cert-manager `Certificate`, so cert-manager
-must already run in the cluster. `core/gateway/envoy-gateway` calls that
+must already run in the cluster — unless the Release names a Secret holding the
+certificate in `infra.webhook_tls_secret`, in which case no `Certificate` is
+rendered and cert-manager is not needed. `core/gateway/envoy-gateway` calls that
 controller through its `extension` socket and, for each model on its `models`
 socket, renders the AI route rule, the `AIServiceBackend`, the Envoy Gateway
 `Backend` it points at and, where the connection carries a credential, the
