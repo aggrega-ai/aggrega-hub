@@ -1,0 +1,462 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: higress-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Higress on Kubernetes via the project's own `higress-core` Helm chart: the
+    controller with its discovery service and the gateway, each a Deployment
+    behind a ClusterIP Service, their access control, the IngressClass the
+    controller watches and the custom-resource definitions Higress is
+    configured through. Neither the console nor the bundled Redis is rendered.
+
+    The controller watches only the Release's namespace, under an IngressClass
+    named for the gateway and that namespace, so Higress gateways in different
+    namespaces stay apart; two in one namespace collide, because Higress names
+    some of its resources itself.
+
+    With a model wired it emits the gateway's registry of the models' hosts,
+    an ingress per alias and the AI proxy, pinned by tag and digest, with one
+    rule per connection naming its credential's Secret, never the key. The
+    gateway checks an https model's certificate chain against the system's
+    trust anchors, but not that the certificate names the model's host.
+
+    The images, the AI proxy module and the chart version are pinned;
+    infra.source_version accepts only the chart versions this configuration
+    is proven at.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/gateway/higress:1.0.0
+
+  # The project publishes two charts of the same version from one repository:
+  # `higress`, which adds the console to everything else, and `higress-core`,
+  # the controller, the gateway and their resources, which `higress` carries
+  # as its subchart byte for byte. The console has no setting that leaves it
+  # out of `higress`, and the Component describes no console, so this Recipe
+  # takes `higress-core`.
+  source:
+    kind: helm-https-chart
+    url: https://higress.io/helm-charts
+    chart: higress-core
+    # Default chart version. Override via infra.source_version, which the
+    # assertion chart_version_is_proven holds to the proven versions.
+    version: "{{ optional .infra `source_version` \"2.2.5\" }}"
+
+  # provides.host is the gateway's Service: the valuesMapping below names the
+  # gateway after the rendered name — the release name the helm provider
+  # gives the chart, which spells the Component's name in the alphabet a
+  # Kubernetes name allows — followed by "-gateway", and the chart names the
+  # gateway's Deployment, Service and service account after it. The name
+  # carries no namespace, so the recipe is independent of where it is
+  # deployed; a consumer in another namespace qualifies the host with the
+  # target namespace on its own side.
+  #
+  # endpoint is the route the gateway serves for the alias values.model names,
+  # under that alias in the path, on the gateway's Service name and port;
+  # model is that alias. The Service name is spelled out again on purpose: a
+  # provides entry cannot read another provides entry, so the repetition is
+  # forced, and the entries are edited together. With nothing wired to the
+  # models socket values.model is omitted — the component's assertion halts
+  # on any other combination — and both are empty.
+  provides:
+    host: "{{ .context.rendered_name }}-gateway"
+    port: "{{ .infra.http_port }}"
+    protocol: "http"
+    endpoint: '{{ with optional .values "model" "" }}http://{{ $.context.rendered_name }}-gateway:{{ $.infra.http_port }}/{{ . }}/v1{{ end }}'
+    model: '{{ optional .values "model" "" }}'
+
+  # The pins and the fixed strings the templates below share, each written
+  # once here.
+  #
+  # proven_chart_versions holds the chart versions the configuration this
+  # Recipe writes is proven at, comma-separated; the assertion below halts on
+  # any other infra.source_version, naming them. A version joins the list only
+  # once that proof has run at it.
+  #
+  # The three images the chart runs, pinned by tag and by the digest of each
+  # image's index, so every platform the project publishes resolves to the
+  # build read here: the gateway, the controller, and the discovery service
+  # that runs beside the controller in its pod. The chart composes each as
+  # <registry>/higress/<image>:<tag>.
+  #
+  # The AI proxy module, pinned by tag in its address and by its digest in
+  # ai_proxy_module_sha256: the gateway compares the digest of the module's
+  # manifest with that value and loads nothing on a mismatch. Its rules are
+  # written for that module as published and proven at it, so no setting
+  # moves either pin.
+  #
+  # registry_domain_pattern is the host-name shape the gateway's registry
+  # accepts for a DNS entry; an entry whose host does not match it is dropped
+  # when the Higress controller reads the registry, with every request to it
+  # failing, so the build halts on it instead. operation_path_pattern matches the
+  # endpoint paths the AI proxy reads as the one path every request is sent
+  # to, where any other path is a base to which it appends each operation.
+  locals:
+    proven_chart_versions: "2.2.5"
+    image_registry: higress-registry.cn-hangzhou.cr.aliyuncs.com
+    gateway_image_tag: "2.2.5@sha256:a82de493902012ce6b555ecb2244156f3c73824474d67549144a7efa334d0299"
+    controller_image_tag: "2.2.5@sha256:38663f158d1e9aa8233f268cc3bc4776aaaa5d5e1e15fdde88db0c7a626ef0f4"
+    discovery_image_tag: "2.2.5@sha256:10334ca1baf0d8e1f8a97bb47845d6c12d118eda3d330c86a7707aa9f0628aa9"
+    ai_proxy_module: "oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-proxy:2.0.3"
+    ai_proxy_module_sha256: "cacd268f76e245bcc1d2c05f549d514038e888d460c194e0059a0e7b92f98eec"
+    model_registry_prefix: "model-"
+    registry_domain_pattern: '^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$'
+    operation_path_pattern: '/(completions|embeddings|audio/speech|audio/transcriptions|audio/translations|images/generations|images/variations|images/edits|models|responses|fine_tuning/jobs|fine_tuning/checkpoints|realtime|videos)$'
+
+  # The chart version decides the controller, the gateway and the resources
+  # this Recipe configures, so a version the configuration was not proven at
+  # halts the build rather than rendering a gateway whose settings may mean
+  # something else.
+  assertions:
+    chart_version_is_proven: >-
+      {{- with optional .infra "source_version" "" -}}
+      {{- $proven := splitList "," $.locals.proven_chart_versions -}}
+      {{- if not (has . $proven) -}}
+      {{- fail (printf "infra.source_version of %q is %q, but the configuration this Recipe writes into the Higress chart and its AI proxy is proven at chart version %s alone; set infra.source_version to one of them, or remove it" $.metadata.instance_id . (join ", " $proven)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The models the gateway serves, as the resources Higress routes a model
+  # with, all in the Release's namespace, where the controller reads them.
+  # With nothing wired to the models socket the template writes nothing, and
+  # no file is emitted.
+  #
+  # One registry, the McpBridge named `default` — the one name the controller
+  # reads — with a DNS entry per connection, in connection-name order, named
+  # model-<connection> in lowercase with every underscore as a hyphen: the
+  # host and port of the endpoint the model publishes, the port the scheme
+  # implies where the endpoint names none, and https or http as its scheme
+  # says. A host carrying no dot is a Service name published without a
+  # namespace, which the gateway in this namespace could not resolve, so the
+  # entry qualifies it with the namespace the Release places the model in, or
+  # `default` where it declares none: <host>.<namespace>.svc.cluster.local. A
+  # host carrying a dot, a managed API's included, is written as published.
+  # The gateway reaches the entry's host by DNS, and over https it presents
+  # the host as the server name.
+  #
+  # One Ingress per alias, in alias order, named after the gateway and the
+  # alias as the entries are, on the gateway's IngressClass, at the path
+  # /<alias>/v1, which the gateway sends to the entries of the alias's
+  # connections in equal shares: Higress's destination annotation lists each
+  # entry with a weight, the weights summing to 100.
+  #
+  # One AI proxy for the gateway, with one rule per connection, applied to a
+  # request on its alias's Ingress that the gateway sends to that
+  # connection's entry: the OpenAI provider, with the endpoint the model
+  # publishes as its base URL, to which it appends the operation a request's
+  # path names, and every model name a request carries replaced with the
+  # model name the model publishes. A connection carrying a credential names
+  # it as ${secret.<Secret>.<data key>}, which the Higress controller replaces
+  # with the key it reads from that Secret, in its own namespace, before it
+  # hands the gateway its configuration; a connection carrying none names no
+  # key, and the AI proxy passes on the key the request presents. The module
+  # is pinned as the locals above say, and a module that fails to load fails
+  # every request it would have served rather than letting one through
+  # unproxied (failStrategy FAIL_CLOSE, which is also Higress's default,
+  # written out). priority is the module's own, 100.
+  #
+  # The controller reads ${…} anywhere in the plugin's configuration as a
+  # Secret reference, so a published endpoint or model name carrying "${"
+  # stops the build, naming the connection, as do an endpoint that is not an
+  # absolute http or https URL, a host the registry would not accept (an
+  # address among them), an endpoint path the AI proxy would read as the one
+  # path every request goes to, a credential publishing no Secret name or no
+  # data key, a Secret name holding a dot, two connections or two aliases
+  # giving one name, a name ending in a hyphen or an underscore, an entry
+  # name longer than the 63 characters a host-name label takes, and an alias
+  # with more than 100 connections, which equal whole-number weights cannot
+  # share.
+  artifacts:
+    model-routes.yaml: |
+      {{- $ns := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default" }}
+      {{- $connections := list }}
+      {{- range $name, $edge := .context.uses }}{{ if eq $edge.socket "models" }}{{ $connections = append $connections $name }}{{ end }}{{ end }}
+      {{- if $connections }}
+      {{- $entries := dict }}
+      {{- $members := dict }}
+      {{- $registryOwner := dict }}
+      {{- $ingressOwner := dict }}
+      {{- range $name := $connections }}
+      {{- $edge := get $.context.uses $name }}
+      {{- $alias := optional (optional $edge "values" dict) "serves" $name }}
+      {{- $registry := printf "%s%s" $.locals.model_registry_prefix (lower $name | replace "_" "-") }}
+      {{- if hasSuffix "-" $registry }}{{ fail (printf "the models connection %s of %q ends in a hyphen or an underscore, which the gateway's registry entry named after it cannot end in; rename the connection" $name $.context.instance_id) }}{{ end }}
+      {{- if gt (len $registry) 63 }}{{ fail (printf "the models connection %s of %q gives the gateway's registry entry the name %q, longer than the 63 characters a host-name label takes; shorten the connection's name" $name $.context.instance_id $registry) }}{{ end }}
+      {{- with get $registryOwner $registry }}{{ fail (printf "the models connections %s and %s of %q give the gateway's registry one entry name, %q, because the gateway names an entry after its connection in lowercase with every underscore as a hyphen; rename one of the two connections" . $name $.context.instance_id $registry) }}{{ end }}
+      {{- $_ := set $registryOwner $registry $name }}
+      {{- if or (contains "${" $edge.provides.endpoint) (contains "${" $edge.provides.model) }}{{ fail (printf "the models connection %s of %q reaches %q, whose published endpoint %q or model %q holds \"${\", which Higress reads in a plugin's configuration as a reference to a Secret's value; publish an endpoint and a model name without it" $name $.context.instance_id $edge.target $edge.provides.endpoint $edge.provides.model) }}{{ end }}
+      {{- $u := urlParse $edge.provides.endpoint }}
+      {{- if not (and (has $u.scheme (list "http" "https")) $u.host) }}{{ fail (printf "the models connection %s of %q reaches %q, whose published endpoint %q is not an absolute http or https URL, so the gateway cannot write the address its route forwards to" $name $.context.instance_id $edge.target $edge.provides.endpoint) }}{{ end }}
+      {{- if regexMatch $.locals.operation_path_pattern $u.path }}{{ fail (printf "the models connection %s of %q reaches %q, whose published endpoint %q ends in a path Higress's AI proxy reads as the one path every request is sent to, rather than as a base URL it appends each operation to; publish the base URL of the model's OpenAI API" $name $.context.instance_id $edge.target $edge.provides.endpoint) }}{{ end }}
+      {{- $hostport := $u.host }}
+      {{- $port := ternary "443" "80" (eq $u.scheme "https") }}
+      {{- $portSuffix := "" }}
+      {{- with regexFind ":[0-9]+$" $hostport }}{{ $port = trimPrefix ":" . }}{{ $portSuffix = . }}{{ $hostport = trimSuffix . $hostport }}{{ end }}
+      {{- $host := lower $hostport }}
+      {{- if not (contains "." $host) }}{{ $host = printf "%s.%s.svc.cluster.local" $host (optional (optional (default dict $edge.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default") }}{{ end }}
+      {{- if not (regexMatch $.locals.registry_domain_pattern $host) }}{{ fail (printf "the models connection %s of %q reaches %q, whose published endpoint %q names the host %q, which the gateway's registry does not accept as a host name — it takes no address — so every request to it would fail; publish an endpoint naming the server by host name" $name $.context.instance_id $edge.target $edge.provides.endpoint $host) }}{{ end }}
+      {{- $token := "" }}
+      {{- with optional (default dict $edge.features) "credential" dict }}
+      {{- $secret := optional (optional . "provides" dict) "name" "" }}
+      {{- $key := optional (optional . "provides" dict) "key" "" }}
+      {{- if not (and $secret $key) }}{{ fail (printf "the credential on the models connection %s of %q publishes no Secret name and data key, so the gateway cannot name the Secret it reads the key from; attach core/referenced-secret, which publishes both" $name $.context.instance_id) }}{{ end }}
+      {{- if or (contains "." $secret) (contains "}" $secret) (contains "}" $key) }}{{ fail (printf "the credential on the models connection %s of %q publishes the Secret name %q and data key %q, but Higress reads a Secret reference's name up to its first dot and both up to a closing brace, so it would read another Secret. A realization that names its own Secret after the connection and the slot writes a dot between them; realize the credential with one that names an existing Secret, k8s-existing-secret, and give that Secret a name without a dot" $name $.context.instance_id $secret $key) }}{{ end }}
+      {{- $token = printf "${secret.%s.%s}" $secret $key }}
+      {{- end }}
+      {{- $_ := set $entries $name (dict "registry" $registry "host" $host "port" $port "protocol" $u.scheme "url" (printf "%s%s%s" $host $portSuffix $u.path) "model" $edge.provides.model "token" $token) }}
+      {{- $peers := list }}
+      {{- if hasKey $members $alias }}{{ $peers = get $members $alias }}{{ end }}
+      {{- $_ := set $members $alias (append $peers $name) }}
+      {{- end }}
+      {{- $aliases := sortAlpha (keys $members) }}
+      {{- range $alias := $aliases }}
+      {{- $ingress := printf "%s-model-%s" $.context.rendered_name (lower $alias | replace "_" "-") }}
+      {{- if hasSuffix "-" $ingress }}{{ fail (printf "the alias %s that the models socket of %q serves ends in a hyphen or an underscore, which the gateway's Ingress named after it cannot end in; rename it" $alias $.context.instance_id) }}{{ end }}
+      {{- with get $ingressOwner $ingress }}{{ fail (printf "the aliases %s and %s that the models socket of %q serves give the gateway one Ingress name, %q, because the gateway names an alias's Ingress after it in lowercase with every underscore as a hyphen; rename one of the two" . $alias $.context.instance_id $ingress) }}{{ end }}
+      {{- $_ := set $ingressOwner $ingress $alias }}
+      {{- if gt (len (get $members $alias)) 100 }}{{ fail (printf "the alias %s that the models socket of %q serves has %d connections, more than the 100 equal whole-number shares of its requests the gateway's weights can give; serve fewer connections under it" $alias $.context.instance_id (len (get $members $alias))) }}{{ end }}
+      {{- end -}}
+      apiVersion: networking.higress.io/v1
+      kind: McpBridge
+      metadata:
+        name: default
+        namespace: "{{ $ns }}"
+      spec:
+        registries:
+      {{- range $name := $connections }}
+      {{- $e := get $entries $name }}
+          - name: {{ $e.registry | toJson }}
+            type: dns
+            domain: {{ $e.host | toJson }}
+            port: {{ $e.port }}
+            protocol: {{ $e.protocol | toJson }}
+      {{- end }}
+      {{- range $alias := $aliases }}
+      {{- $peers := get $members $alias }}
+      {{- $count := len $peers }}
+      {{- $lines := list }}
+      {{- range $i, $name := $peers }}
+      {{- $e := get $entries $name }}
+      {{- $weight := add (div 100 $count) (ternary 1 0 (lt $i (mod 100 $count))) }}
+      {{- $lines = append $lines (printf "%d%% %s.dns:%s" $weight $e.registry $e.port) }}
+      {{- end }}
+      ---
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: {{ printf "%s-model-%s" $.context.rendered_name (lower $alias | replace "_" "-") | toJson }}
+        namespace: "{{ $ns }}"
+        annotations:
+          higress.io/destination: {{ join "\n" $lines | toJson }}
+      spec:
+        ingressClassName: "{{ $.context.rendered_name }}-{{ $ns }}"
+        rules:
+          - http:
+              paths:
+                - path: {{ printf "/%s/v1" $alias | toJson }}
+                  pathType: Prefix
+                  backend:
+                    resource:
+                      apiGroup: networking.higress.io
+                      kind: McpBridge
+                      name: default
+      {{- end }}
+      ---
+      apiVersion: extensions.higress.io/v1alpha1
+      kind: WasmPlugin
+      metadata:
+        name: "{{ .context.rendered_name }}-ai-proxy"
+        namespace: "{{ $ns }}"
+      spec:
+        url: "{{ .locals.ai_proxy_module }}"
+        sha256: "{{ .locals.ai_proxy_module_sha256 }}"
+        failStrategy: FAIL_CLOSE
+        priority: 100
+        defaultConfigDisable: true
+        matchRules:
+      {{- range $alias := $aliases }}
+      {{- range $name := get $members $alias }}
+      {{- $e := get $entries $name }}
+          - ingress:
+              - {{ printf "%s-model-%s" $.context.rendered_name (lower $alias | replace "_" "-") | toJson }}
+            service:
+              - {{ printf "%s.dns:%s" $e.registry $e.port | toJson }}
+            config:
+              provider:
+                type: openai
+                openaiCustomUrl: {{ $e.url | toJson }}
+      {{- with $e.token }}
+                apiTokens:
+                  - {{ . | toJson }}
+      {{- end }}
+                modelMapping:
+                  "*": {{ $e.model | toJson }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+
+  # This Recipe reads from infra.overrides:
+  #   service_type  - string (the gateway Service's type; how the proxy is exposed, default ClusterIP)
+  #   requests      - { cpu: string, memory: string } (the gateway's resource requests; default infra.compute)
+  #   nodeSelector  - map[string]string (gateway pod scheduling)
+  #   tolerations   - []object (gateway pod scheduling)
+  #
+  # The chart is configured for the shape this Component describes: a gateway
+  # serving Ingress routes in the Release's namespace, with nothing beside it
+  # the Component does not describe. Under this configuration the chart
+  # renders the controller's and the gateway's Deployments, Services, service
+  # accounts, roles and cluster roles, the configuration map both read, the
+  # IngressClass, the custom-response filter the chart adds to the gateway's
+  # listeners, and the custom-resource definitions of the plugins, the
+  # registry, the protocol conversions and Istio's Envoy filters.
+  #
+  # Cluster-wide, two Higress gateways in different namespaces share only
+  # those definitions, which each Release carries alike; their cluster roles
+  # and their IngressClasses are named after the gateway and its namespace. In one namespace they collide: Higress names
+  # its configuration map `higress-config`, the certificate map its
+  # controller writes `higress-ca-root-cert` and the registry it reads
+  # `default`, whatever the release, so a namespace holds one Higress
+  # gateway.
+  valuesMapping: |
+    ## ── The Release's namespace ────────────────────────────────
+    ## The namespace the Release places the gateway in through the
+    ## aggrega.ai/namespace annotation, or `default` where it declares none —
+    ## the namespace the chart is rendered against, and the one the model
+    ## resources above are written into.
+    {{- $ns := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default" }}
+    {{- $overrides := optional .infra "overrides" dict | default dict }}
+
+    global:
+      ## ── Image registry pin ───────────────────────────────────
+      ## The chart pulls every image from <registry>/higress/<image>; written
+      ## out rather than left to whatever the chart's default becomes.
+      hub: "{{ .locals.image_registry }}"
+      ## ── One namespace, one IngressClass ──────────────────────
+      ## The controller watches the Release's namespace alone and the
+      ## Ingresses of an IngressClass named after the gateway and that
+      ## namespace, which the chart creates, so a second Higress gateway in
+      ## the cluster neither reads this one's routes nor claims its class.
+      watchNamespace: "{{ $ns }}"
+      ingressClass: "{{ .context.rendered_name }}-{{ $ns }}"
+      createIngressClass: true
+      ## ── What the Component does not describe ─────────────────
+      ## The Component serves Ingress routes, so the controller does not
+      ## watch the routing API's Gateway resources, and does not claim the
+      ## cluster-wide gateway class `higress` every Higress install would
+      ## otherwise share. The chart's bundled Redis (a redis-stack-server of
+      ## its own) stays off, as do its plugin server and its observability
+      ## stack, which the Component describes none of.
+      enableGatewayAPI: false
+      enableRedis: false
+      enablePluginServer: false
+      o11y:
+        enabled: false
+
+    gateway:
+      ## ── The gateway, named after the rendered name ───────────
+      ## Its Deployment, Service and service account are "<rendered_name>-gateway",
+      ## matching provides.host.
+      name: "{{ .context.rendered_name }}-gateway"
+      tag: "{{ .locals.gateway_image_tag }}"
+      ## ── Proxy port ───────────────────────────────────────────
+      ## infra.http_port is both the port the controller programs the
+      ## gateway's listener on and the Service's port, so the published
+      ## address and the listener move together. The chart's default Service
+      ## exposes the gateway outside the cluster and adds an HTTPS port; the
+      ## Component describes an in-cluster HTTP address, so it is a ClusterIP
+      ## with that one port unless an operator says otherwise.
+      httpPort: {{ .infra.http_port }}
+      service:
+        {{- with optional $overrides "service_type" "" }}
+        type: "{{ . }}"
+        {{- else }}
+        type: ClusterIP
+        {{- end }}
+        ports:
+          - name: http2
+            port: {{ .infra.http_port }}
+            protocol: TCP
+            targetPort: {{ .infra.http_port }}
+      ## ── A non-root gateway, decided at render time ───────────
+      ## Left unset, the chart asks the cluster's nodes for their kernel
+      ## version to decide whether the gateway may bind a low port without
+      ## root, which an ahead-of-time render cannot ask, and it then picks
+      ## the gateway's security from the Kubernetes version the render is
+      ## told, which is not the target cluster's. So both are written out,
+      ## as the chart writes them for Kubernetes 1.22 and later: the pod
+      ## allows the unprivileged-port range from 0, which Kubernetes admits
+      ## as a safe setting from 1.22, and the gateway runs as user 1337 with
+      ## every capability dropped, no privilege escalation and a read-only
+      ## root file system.
+      unprivilegedPortSupported: true
+      securityContext:
+        sysctls:
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
+      containerSecurityContext:
+        capabilities:
+          drop:
+            - ALL
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        runAsUser: 1337
+        runAsGroup: 1337
+        runAsNonRoot: true
+      ## ── Gateway resources ────────────────────────────────────
+      ## infra.compute as both the requests and the limits, the chart's own
+      ## shape; infra.overrides.requests sets the requests apart.
+      resources:
+        requests:
+          {{- with optional $overrides "requests" dict }}
+          cpu: "{{ .cpu }}"
+          memory: "{{ .memory }}"
+          {{- else }}
+          cpu: "{{ .infra.compute.cpu }}"
+          memory: "{{ .infra.compute.memory }}"
+          {{- end }}
+        limits:
+          cpu: "{{ .infra.compute.cpu }}"
+          memory: "{{ .infra.compute.memory }}"
+      {{- with optional $overrides "nodeSelector" dict }}
+      nodeSelector: {{ toJson . }}
+      {{- end }}
+      {{- with optional $overrides "tolerations" list }}
+      tolerations: {{ toJson . }}
+      {{- end }}
+
+    controller:
+      ## ── The controller, named after the rendered name ────────
+      ## Its Deployment, Service and service account are
+      ## "<rendered_name>-controller". The pod runs the controller and the
+      ## discovery service beside it, and keeps the chart's own requests:
+      ## the controller 500m CPU and 2048Mi of memory, limited to 1000m and
+      ## 2048Mi, and the discovery service 500m and 2048Mi.
+      name: "{{ .context.rendered_name }}-controller"
+      tag: "{{ .locals.controller_image_tag }}"
+      ## The controller can request certificates from a public certificate
+      ## authority for the hosts of its routes; the Component describes no
+      ## certificate, so it does not.
+      automaticHttps:
+        enabled: false
+
+    pilot:
+      tag: "{{ .locals.discovery_image_tag }}"
+      ## ── Checking an https model's certificate ────────────────
+      ## The discovery service writes the gateway's connection to each
+      ## registry entry. Higress leaves a server's certificate unchecked
+      ## unless this setting is on; on, the gateway checks the chain of the
+      ## certificate an https model presents against the system's trust
+      ## anchors. It does not check that the certificate names the model's
+      ## host: the registry's connection always names the server it asks
+      ## for, and Higress matches a certificate's names only where none is
+      ## named. The chart's other settings for the discovery service stay.
+      env:
+        VERIFY_CERTIFICATE_AT_CLIENT: "true"
