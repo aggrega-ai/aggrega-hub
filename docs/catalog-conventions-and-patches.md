@@ -290,10 +290,11 @@ tier value never tells a reader is which of these capabilities it has: the AI
 gateway carries several of them, and no amount of reading its tier would say so.
 `core/gateway/cloudflare-ai-gateway`, Cloudflare's hosted AI gateway, carries
 `period-budget: cost`, its one value in this family, and `semantic`.
-`core/gateway/apisix` carries `period-budget: tokens`, its one value in this
-family, and `semantic`, because its AI proxy reads the request body of every
-route it serves a model on. On `core/gateway/envoy-gateway`, the tokens its
-`period-budget` value names are the ones Envoy AI Gateway reads from each reply
+`core/gateway/apisix` carries `period-budget: tokens`, `prompt-guard:
+pattern-list`, its `ai-prompt-guard` matching a request's messages against the
+lists its configuration holds, and `semantic`, because its AI proxy reads the
+request body of every route it serves a model on. On
+`core/gateway/envoy-gateway`, the tokens its `period-budget` value names are the ones Envoy AI Gateway reads from each reply
 of a wired model, which Envoy Gateway's rate limit counts, and the targets its
 `concurrency-cap` value counts apart are the backends of its route rules, one
 for each wired model; on `core/gateway/litellm` they are the entries of its
@@ -2097,9 +2098,11 @@ for the key it presents to each model it serves, delivered as
 `AI_PROXY_<ALIAS>_AUTHORIZATION` that the connection's routes read through
 Kong's environment vault, a shape `core/gateway/apisix` repeats on its own
 `models` socket under the same two names, its routes reading the token through
-APISIX's `$env://` reference — as do the cache and object-store sockets of
-`core/observability/langfuse`, the sandbox and plugin-runtime sockets of
-`core/ai-agent/dify`, and the media-server socket of
+APISIX's `$env://` reference, and which declares it on its `cache_store` socket
+for the password its semantic cache presents to the store, delivered as
+`CACHE_STORE_PASSWORD` and read through the same reference — as do the cache
+and object-store sockets of `core/observability/langfuse`, the sandbox and
+plugin-runtime sockets of `core/ai-agent/dify`, and the media-server socket of
 `core/messaging/livekit-sip`, where the slot is `required`. `core/gateway/litellm`
 declares it on two sockets: on `models`, where each connection's credential is
 the key the gateway presents to that model, delivered under a variable of its
@@ -2175,6 +2178,19 @@ connection the Release wires, so it is the same word on every socket.
   references; under `k8s-secret-from-parameter`, the key itself, rendered once per
   connection. The worked example is
   [`language-reference/examples/model-api-key-sharing/`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/examples/model-api-key-sharing/).
+
+**A gateway's own callers are `infra.callers`, and their keys are
+`caller_keys`.** A gateway that authenticates the callers sending it traffic,
+so that a control can keep them apart, declares them as `infra.callers`, a list
+of caller names the operator writes in the Release, and their keys in one
+Component credential slot, `caller_keys`: one Secret holding a data key per
+caller name, the data key being the name, which a secret-set attachment such as
+`core/referenced-secret-set` fills. Each key reaches the gateway by reference
+to that Secret, never as a value in a rendered file. The two names are the same
+on every gateway that declares callers. `core/gateway/apisix` declares them:
+each caller is a consumer of its routes file, authenticated by the key it
+presents as `Authorization: Bearer <key>`, and its semantic cache and period
+budget keep callers apart by it.
 
 **A pair presented on one connection adds `credential_id`.** Where a caller
 presents an identifier and its secret together on one connection — an object
@@ -3038,9 +3054,12 @@ another's by the consumer an authentication plugin names, where its
 carries, which it does not verify. A rendering of the gateway that declares no
 consumer leaves the cache no caller to keep apart, so a realization over that
 rendering could only refuse every attachment, and the refusal would be the
-catalog's rather than APISIX's. The fix is to render consumers with key
-authentication, so the cache keeps each key's replies apart, and to refuse by
-name only what APISIX itself cannot keep.
+catalog's rather than APISIX's. So `core/gateway/apisix` renders a consumer
+with key authentication for each caller its Release declares, the cache keeps
+each key's replies apart, and `semantic-caching-apisix` refuses by name only
+what APISIX itself cannot keep: the end users behind one key, under `scope:
+end_user`. The same consumers let `period-budget-apisix` count each caller
+apart.
 
 ### One home per setting
 

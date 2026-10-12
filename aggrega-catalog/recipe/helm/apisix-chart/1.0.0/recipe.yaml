@@ -8,32 +8,31 @@ metadata:
   version: 1.0.0
   license: Apache-2.0
   description: >
-    Apache APISIX on Kubernetes via the project's own Helm chart, served from
-    its HTTPS chart repository, with the chart's bundled etcd and its ingress
-    controller switched off. It renders a Deployment, a ClusterIP Service for
-    the proxy data plane and the configuration map the gateway reads its
-    runtime configuration from.
+    Apache APISIX on Kubernetes via the project's own Helm chart, its bundled
+    etcd and ingress controller switched off: a Deployment, a ClusterIP Service
+    for the proxy data plane and the configuration map the gateway reads.
 
     With nothing wired to the models socket the configuration store is the etcd
     component wired on the `etcd` socket, and a ClusterIP Service fronts the
     Admin API, never published through provides and authenticated by the key
     the `admin_key` slot names: the chart reads it from the Secret the attached
-    credential publishes, for its read-only role as well as the admin one, so
-    no rendered file carries a key. Its client allowlist,
-    `apisix.admin.allow.ipList`, admits every address, so narrow it wherever the
-    admin port is routable from outside the cluster.
+    credential publishes, so no rendered file carries a key. Its client
+    allowlist, `apisix.admin.allow.ipList`, admits every address, so narrow it
+    wherever the admin port is routable from outside the cluster.
 
     With a model wired the chart runs in its standalone mode: each connection's
     routes, through APISIX's AI proxy, sit in a ConfigMap named after the
     gateway, which reads them with no etcd and no Admin API. A connection's
-    credential arrives as an env secretKeyRef the routes name through APISIX's
-    $env:// reference, so no credential value is in the rendered output. A
-    core/period-budget attachment is written onto those routes as APISIX's
-    token rate limiting, with no completion route and one replica.
+    credential, and each key of the callers infra.callers declares, arrives as
+    an env secretKeyRef the routes file names through APISIX's $env://
+    reference, so no key is in the rendered output; each caller is a consumer
+    whose key every route checks. Written onto the routes:
+    core/period-budget as token rate limiting, with one replica;
+    core/semantic-caching as a semantic cache; core/prompt-deny-patterns as a
+    prompt guard — no completion route beside the budget or the guard.
 
-    Reach for this realization where a chart repository is reachable at build
-    time, or a model is served; reach for `apisix`, the workload-synthesis
-    realization, where the build must complete with nothing fetched. The
+    Reach for it where a chart repository is reachable at build time or a
+    model is served, and for `apisix` where the build must fetch nothing. The
     gateway image and the chart version (infra.source_version) are pinned;
     provides.host is the proxy Service name, with no namespace.
   maintainers:
@@ -94,11 +93,32 @@ spec:
   # connection's routes name. A locals entry cannot read a connection, so each
   # template applies the alias rule itself, the rule the Component's assertion
   # credential_variables_are_distinct checks.
+  #
+  # A caller infra.callers declares presents its key under two variables named
+  # the same way after the caller's name: the caller alice gives
+  # CALLER_ALICE_KEY, which holds the key, read from the Secret the caller_keys
+  # slot names under the data key alice, and CALLER_ALICE_AUTHORIZATION, the
+  # whole Authorization header composed from it, which the caller's consumer
+  # names. The Component's assertion callers_are_declared_with_their_keys
+  # checks that rule. The password the semantic cache presents to the store
+  # on the cache_store connection travels as cache_store_password_variable.
+  #
+  # callers is the list infra.callers declares, joined by commas — empty with
+  # none — so the realizations of the period budget and the semantic cache,
+  # whose assertions read this Recipe's locals and not the gateway's infra, can
+  # tell whether the gateway authenticates its callers. It is written with the
+  # template language's own range rather than a helper function, because this
+  # Recipe's structured source resolves its locals when the chart is pinned,
+  # with Aggrega's own helpers alone.
   locals:
     model_routes_config_map_suffix: "-model-routes"
     connection_variable_prefix: AI_PROXY_
     credential_variable_suffix: _API_KEY
     header_variable_suffix: _AUTHORIZATION
+    caller_variable_prefix: CALLER_
+    caller_key_variable_suffix: _KEY
+    cache_store_password_variable: CACHE_STORE_PASSWORD
+    callers: '{{ with optional .infra "callers" "" }}{{ range $i, $caller := . }}{{ if $i }}, {{ end }}{{ $caller }}{{ end }}{{ end }}'
 
   # The models the gateway serves, as the routes file of the chart's standalone
   # mode: a ConfigMap named "<rendered_name>-model-routes", carrying the file
@@ -154,20 +174,79 @@ spec:
   # it and counts nothing. A completion route beside a budget would therefore
   # serve model traffic the budget never counts, so it is not written. With
   # no such attachment no service is written and every route is as it would
-  # be without one.
+  # be without one. Under scope caller the one service model-budget counts
+  # through a rule keyed on the consumer a request authenticated as, so each
+  # caller infra.callers declares has a count of its own across every route.
+  #
+  # With callers declared in infra.callers, each is a consumer, in the order
+  # the Release lists them, whose key-auth key is the whole value of
+  # $env://CALLER_<NAME>_AUTHORIZATION, and every route carries key-auth
+  # reading the Authorization header, so a request presenting no declared key
+  # is refused with HTTP 401 before anything else runs. key-auth matches the
+  # header's whole value, Bearer and the key, which is what an OpenAI client
+  # sends. hide_credentials removes the caller's header from the request
+  # forwarded, so a caller's key never reaches a model, whether or not the
+  # connection carries a credential of its own. A consumer whose variable
+  # does not resolve is skipped, so its key is refused rather than its
+  # reference matched. With no caller declared nothing of this is written.
+  #
+  # A core/semantic-caching attachment, which semantic-caching-apisix
+  # realizes and checks, is written onto each chat route as APISIX's ai-cache
+  # with its exact and semantic layers, the semantic layer being what engages
+  # on a chat request: a reply is stored under the route and the consumer the
+  # request authenticated as (cache_key.include_consumer), so no caller is
+  # served a reply stored for another, and both layers keep it ttl_seconds.
+  # The semantic layer embeds the request's last user message with the
+  # models connection embedding_model names — its published endpoint with
+  # /embeddings appended, its published model, and its credential by $env://
+  # where it carries one, an empty key where it does not — and serves a reply
+  # stored under the same earlier messages whose message is at least
+  # similarity_threshold alike. The store is the cache_store connection: its
+  # published host and port, and its credential by $env:// where it carries
+  # one; any store but core/datastore/redis stops the build. The vector index
+  # is named for the gateway and the attachment. A completion route is not
+  # cached, since only the exact layer would act on it.
+  #
+  # A core/prompt-deny-patterns attachment, which prompt-deny-patterns-apisix
+  # realizes and checks, is written onto each chat route as APISIX's
+  # ai-prompt-guard reading every message of every role, its text joined into
+  # one string, with the attachment's deny and allow patterns, and refusing a
+  # request it cannot read as a model request (fail_mode error) rather than
+  # forwarding it unchecked. It reads no completion request, so while it is
+  # attached each connection gets its chat route only, as under a budget.
+  #
+  # Each pattern is written as a JSON string with every $ as \u0024, so its
+  # backslashes, quotes and dollar signs reach APISIX as the attachment wrote
+  # them.
   artifacts:
     model-routes.yaml: |
       {{- $wired := list }}
       {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "models" }}{{ $wired = append $wired $alias }}{{ end }}{{ end }}
       {{- $budget := dict }}
-      {{- range $name, $attachment := (default dict .features) }}{{ if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}{{ $budget = $attachment }}{{ end }}{{ end }}
+      {{- $cache := dict }}
+      {{- $cacheName := "" }}
+      {{- $guard := dict }}
+      {{- range $name, $attachment := (default dict .features) }}
+      {{- $type := first (splitList ":" (toString $attachment.type)) }}
+      {{- if eq $type "core/period-budget" }}{{ $budget = $attachment }}{{ end }}
+      {{- if eq $type "core/semantic-caching" }}{{ $cache = $attachment }}{{ $cacheName = $name }}{{ end }}
+      {{- if eq $type "core/prompt-deny-patterns" }}{{ $guard = $attachment }}{{ end }}
+      {{- end }}
+      {{- $callers := optional .infra "callers" list }}
+      {{- $store := dict }}
+      {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "cache_store" }}{{ $store = $edge }}{{ end }}{{ end }}
+      {{- with $cache }}{{ with $store }}
+      {{- $storeType := first (splitList ":" (toString .component)) }}
+      {{- if ne $storeType "core/datastore/redis" }}{{ fail (printf "the cache_store socket of %q is wired to %q, a %s, but the gateway's semantic cache stores and searches its replies with the Redis query engine's vector search, which only core/datastore/redis is established to carry in this catalog; a store without it would cache nothing while every request still succeeds. Wire a core/datastore/redis to cache_store instead" $.context.instance_id .target $storeType) }}{{ end }}
+      {{- end }}{{ end }}
       {{- $operations := list "chat" "completions" }}
+      {{- if $guard }}{{ $operations = list "chat" }}{{ end }}
       {{- $serviceOf := dict }}
       {{- $services := list }}
       {{- with $budget }}
       {{- $operations = list "chat" }}
       {{- range $alias := $wired }}
-      {{- $id := ternary "model-budget" (printf "model-%s-budget" $alias) (eq $budget.values.scope "gateway") }}
+      {{- $id := ternary (printf "model-%s-budget" $alias) "model-budget" (eq $budget.values.scope "model") }}
       {{- if gt (len $id) 64 }}{{ fail (printf "the models connection %s of %q gives its budget's service the id %q, longer than the 64 characters APISIX accepts in a service id, so the gateway would refuse it; shorten the connection's alias" $alias $.context.instance_id $id) }}{{ end }}
       {{- $_ := set $serviceOf $alias $id }}
       {{- if not (has $id $services) }}{{ $services = append $services $id }}{{ end }}
@@ -187,9 +266,25 @@ spec:
             - id: {{ $id | toJson }}
               plugins:
                 ai-rate-limiting:
+      {{- if eq $budget.values.scope "caller" }}
+                  rules:
+                    - key: "$consumer_name"
+                      count: {{ int64 $budget.infra.limit }}
+                      time_window: {{ $window }}
+      {{- else }}
                   limit: {{ int64 $budget.infra.limit }}
                   time_window: {{ $window }}
+      {{- end }}
                   limit_strategy: {{ $budget.values.unit | toJson }}
+      {{- end }}
+      {{- end }}
+      {{- with $callers }}
+          consumers:
+      {{- range $caller := . }}
+            - username: {{ $caller | toJson }}
+              plugins:
+                key-auth:
+                  key: {{ printf "$env://%s%s%s" $.locals.caller_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $caller) "_") $.locals.header_variable_suffix | toJson }}
       {{- end }}
       {{- end }}
           routes:
@@ -210,6 +305,27 @@ spec:
               methods:
                 - POST
               plugins:
+      {{- if $callers }}
+                key-auth:
+                  header: Authorization
+                  hide_credentials: true
+      {{- end }}
+      {{- with $guard }}
+                ai-prompt-guard:
+                  match_all_roles: true
+                  match_all_conversation_history: true
+                  fail_mode: error
+      {{- with optional .values "allow_patterns" list }}
+                  allow_patterns:
+      {{- range $pattern := . }}
+                    - {{ $pattern | toJson | replace "$" "\\u0024" }}
+      {{- end }}
+      {{- end }}
+                  deny_patterns:
+      {{- range $pattern := .values.deny_patterns }}
+                    - {{ $pattern | toJson | replace "$" "\\u0024" }}
+      {{- end }}
+      {{- end }}
                 ai-proxy:
                   provider: openai-compatible
       {{- if hasKey (default dict $edge.features) "credential" }}
@@ -223,6 +339,39 @@ spec:
                     model: {{ $edge.provides.model | toJson | replace "$" "\\u0024" }}
                   override:
                     endpoint: {{ printf "%s%s" (trimSuffix "/" $edge.provides.endpoint) $path | toJson | replace "$" "\\u0024" }}
+      {{- if and $cache (eq $operation "chat") }}
+      {{- $embedding := get $.context.uses $cache.values.embedding_model }}
+                ai-cache:
+                  layers:
+                    - exact
+                    - semantic
+                  exact:
+                    ttl: {{ int64 $cache.values.ttl_seconds }}
+                  cache_key:
+                    share_across_routes: false
+                    include_consumer: true
+                  policy: redis
+                  redis_host: {{ $store.provides.host | toJson }}
+                  redis_port: {{ $store.provides.port }}
+      {{- if hasKey (default dict $store.features) "credential" }}
+                  redis_password: {{ printf "$env://%s" $.locals.cache_store_password_variable | toJson }}
+      {{- end }}
+                  semantic:
+                    similarity_threshold: {{ $cache.values.similarity_threshold }}
+                    ttl: {{ int64 $cache.values.ttl_seconds }}
+                    embedding:
+                      openai:
+                        endpoint: {{ printf "%s/embeddings" (trimSuffix "/" $embedding.provides.endpoint) | toJson | replace "$" "\\u0024" }}
+                        model: {{ $embedding.provides.model | toJson | replace "$" "\\u0024" }}
+      {{- if hasKey (default dict $embedding.features) "credential" }}
+                        api_key: {{ printf "$env://%s%s%s" $.locals.connection_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $cache.values.embedding_model) "_") $.locals.credential_variable_suffix | toJson }}
+      {{- else }}
+                        api_key: ""
+      {{- end }}
+                    vector_search:
+                      redis:
+                        index: {{ printf "%s-%s" $.context.instance_id ($cacheName | replace "_" "-") | toJson }}
+      {{- end }}
       {{- end }}
       {{- end }}
       {{- end }}
@@ -462,18 +611,56 @@ spec:
             - 0.0.0.0/0
       {{- end }}
 
-    ## ── Model credentials ──────────────────────────────────────
+    ## ── The callers' keys and the cache store's password ───────
+    ## The callers infra.callers declares read their keys from the Secret the
+    ## caller_keys credential publishes, each under the caller's own name as
+    ## the data key; a credential publishing no Secret name would leave the
+    ## gateway nowhere to read them from, so the build halts on it. The
+    ## Component's assertion holds that the slot is attached exactly when a
+    ## caller is declared. The cache store's password is delivered only while
+    ## core/semantic-caching is attached, the one thing that reads it, from
+    ## the credential on the cache_store connection, which must publish a
+    ## Secret's name and data key.
+    {{- $callers := optional .infra "callers" list }}
+    {{- $callerKeySecret := "" }}
+    {{- with $callers }}
+    {{- $callerKeySecret = optional (optional (optional (default dict $.features) "caller_keys" dict) "provides" dict) "name" "" }}
+    {{- if not $callerKeySecret }}
+    {{- fail (printf "the credential attached to the caller_keys slot of %q publishes no Secret name, so the gateway cannot read its callers' keys from a Secret; attach core/referenced-secret-set, which publishes one" $.context.instance_id) }}
+    {{- end }}
+    {{- end }}
+    {{- $cached := false }}
+    {{- range $name, $attachment := (default dict .features) }}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/semantic-caching" }}
+        {{- $cached = true }}
+      {{- end }}
+    {{- end }}
+    {{- $storeCredential := dict }}
+    {{- if $cached }}
+      {{- range $alias, $edge := .context.uses }}
+        {{- if and (eq $edge.socket "cache_store") (hasKey (default dict $edge.features) "credential") }}
+          {{- $storeCredential = $edge.features.credential }}
+          {{- if not (and (optional (optional $storeCredential "provides" dict) "name" "") (optional (optional $storeCredential "provides" dict) "key" "")) }}
+          {{- fail (printf "the credential on the cache_store connection %s of %q publishes no Secret name and data key, so the gateway cannot read the store's password from a Secret; attach core/referenced-secret, which publishes both" $alias $.context.instance_id) }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+
+    ## ── Model credentials, callers' keys, the store's password ─
     ## Each models connection carrying a credential delivers it as
     ## AI_PROXY_<ALIAS>_API_KEY, bound by NAME to the secret its attachment
     ## publishes, and composes AI_PROXY_<ALIAS>_AUTHORIZATION from it, the
     ## bearer token the connection's routes read through APISIX's $env://
-    ## reference. The chart writes these variables in list order, ahead of its
-    ## own, so the credential variable comes before the token, and the cluster
-    ## composes the token from it; neither carries the value in the rendered
-    ## artifact.
-    {{- with $credentialed }}
+    ## reference. Each caller delivers its key as CALLER_<NAME>_KEY and
+    ## composes CALLER_<NAME>_AUTHORIZATION from it, the whole header its
+    ## consumer reads; the store's password is CACHE_STORE_PASSWORD. The chart
+    ## writes these variables in list order, ahead of its own, so each key
+    ## variable comes before the header composed from it, and the cluster
+    ## composes the header; none carries a value in the rendered artifact.
+    {{- if or $credentialed $callers $storeCredential }}
     extraEnvVars:
-      {{- range $alias := . }}
+      {{- range $alias := $credentialed }}
       {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
       {{- $credential := (get $.context.uses $alias).features.credential }}
       - name: {{ $.locals.connection_variable_prefix }}{{ $name }}{{ $.locals.credential_variable_suffix }}
@@ -483,6 +670,23 @@ spec:
             key: "{{ $credential.provides.key }}"
       - name: {{ $.locals.connection_variable_prefix }}{{ $name }}{{ $.locals.header_variable_suffix }}
         value: "Bearer $({{ $.locals.connection_variable_prefix }}{{ $name }}{{ $.locals.credential_variable_suffix }})"
+      {{- end }}
+      {{- range $caller := $callers }}
+      {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $caller) "_" }}
+      - name: {{ $.locals.caller_variable_prefix }}{{ $name }}{{ $.locals.caller_key_variable_suffix }}
+        valueFrom:
+          secretKeyRef:
+            name: "{{ $callerKeySecret }}"
+            key: "{{ $caller }}"
+      - name: {{ $.locals.caller_variable_prefix }}{{ $name }}{{ $.locals.header_variable_suffix }}
+        value: "Bearer $({{ $.locals.caller_variable_prefix }}{{ $name }}{{ $.locals.caller_key_variable_suffix }})"
+      {{- end }}
+      {{- with $storeCredential }}
+      - name: {{ $.locals.cache_store_password_variable }}
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .provides.name }}"
+            key: "{{ .provides.key }}"
       {{- end }}
     {{- end }}
 

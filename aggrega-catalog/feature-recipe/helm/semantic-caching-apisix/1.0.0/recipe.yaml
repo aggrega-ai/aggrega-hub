@@ -7,22 +7,30 @@ metadata:
   name: semantic-caching-apisix
   version: 1.0.0
   description: >
-    Binds core/semantic-caching on the gateway core/gateway/apisix to a halt
-    naming why the gateway cannot keep it; a Release binds it in its Manifest.
-    It emits no file and writes no cache.
+    Realizes core/semantic-caching on the gateway core/gateway/apisix; a
+    Release binds it in its Manifest. It emits no file: the gateway's chart
+    Recipe, apisix-chart, reads the attachment and writes APISIX 3.18.0's
+    ai-cache onto the chat route of each model wired to the gateway's models
+    socket, keeping the replies in the core/datastore/redis wired to its
+    cache_store socket.
 
-    APISIX 3.18.0 carries a semantic cache, but keeps two callers' replies
-    apart only by the consumer an authentication plugin names, or by a value
-    the request carries, which it does not verify. While a model
-    is wired the gateway reads its routes from a file rendered with it and
-    runs no Admin API, so its consumers would have to be declared in that
-    file, and nothing the catalog renders declares one. With no caller it can
-    tell apart, every request would share one cache, under end_user and under
-    key alike, and a reply generated for one caller could be served to
-    another. So the build halts on every attachment, naming the scope asked
-    for and the caller identity the gateway lacks. With nothing wired to the
-    models socket the gateway serves no model route to cache, and it halts
-    saying so. It halts on any component other than core/gateway/apisix.
+    A reply is stored per route and per caller: under the consumer the
+    request authenticated as, one of the callers infra.callers declares, each
+    by its own key, so no caller is served a reply stored for another. The
+    gateway embeds a request's last user message with embedding_model, the
+    alias of a models connection, through that model's own endpoint and
+    credential, and serves a stored reply whose message is at least
+    similarity_threshold alike and whose earlier messages are the same; a
+    request identical to a stored one is served from the exact layer. A
+    reply is kept ttl_seconds, and one served by meaning is stored again
+    under that request for ttl_seconds more. Completion requests are not
+    cached. A store or embedding failure is a miss: the request is answered.
+
+    So it keeps scope key alone, and refuses end_user, the default, by name:
+    the gateway cannot tell end users behind one key apart. It halts with no
+    caller declared, with nothing wired to cache_store or the models socket,
+    on an embedding_model no models connection carries, on a second such
+    attachment, and on any component other than core/gateway/apisix.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -31,28 +39,36 @@ spec:
   implements: core/semantic-caching:1.0.0
   # executionScope omitted -> component: evaluated once per attached component.
   #
-  # No input kind and no pipeline: nothing is written, because nothing this
-  # realization could write keeps callers apart.
+  # No input kind and no pipeline: what this attachment changes is written by
+  # the gateway's chart Recipe, which reads it. What stays here is what that
+  # Recipe cannot honour.
   #
-  # What the gateway would cache under. APISIX 3.18.0's ai-cache stores a reply
-  # under a key made of the route, then the consumer name only where its
-  # include_consumer setting is on and a consumer is named, then any request
-  # variables its include_vars lists; with none of those set, every request on
-  # a route shares one entry for a prompt. A consumer is named only by an
-  # authentication plugin that matched a consumer the gateway holds. A request
-  # variable — a header, a body field — is whatever the caller sends, which the
-  # gateway does not verify, so a caller naming another would be served that
-  # caller's replies. In the standalone mode the gateway runs while a model is
-  # wired, it holds no consumer the rendered file does not declare, and the
-  # file declares none. So under end_user, which keeps each end user the gateway
-  # identifies apart, and under key, which keeps apart the callers presenting
-  # one key to the gateway, the gateway identifies nobody: either would serve
-  # one caller a reply generated for another under a name that says it does
-  # not.
+  # What the gateway caches under. APISIX's ai-cache stores a reply under a key
+  # made of the route, then the consumer name where its include_consumer
+  # setting is on, which the chart Recipe writes, and the request's own
+  # content; its semantic layer partitions the same way. A consumer is named
+  # only by key-auth, which matched the key a request presented against one of
+  # the callers infra.callers declares, and every model route refuses a
+  # request matching none before the cache is read. So each caller has a
+  # cache of its own, which is scope key: every request presenting one key
+  # shares it. An end user behind a key is not something the gateway
+  # identifies — a value a request names for one is whatever the caller sent,
+  # which the gateway does not verify — so scope end_user is refused rather
+  # than written as a cache every end user behind a key shares.
+  #
+  # The semantic layer engages on a chat request, the protocol whose messages
+  # it reads faithfully; a completion request would meet the exact layer
+  # alone, so the cache is written on chat routes only. It embeds the last user
+  # message and folds every earlier message — a system prompt, earlier turns —
+  # into the partition, so a reply is served by meaning only to a request
+  # whose earlier messages are the ones it was stored under.
   #
   # No assertion can read the host component's labels, so what the gateway is
   # able to do is stated in the messages, and the check of the host's type
-  # first in the list is what keeps those statements true.
+  # first in the list is what keeps those statements true. The callers are read
+  # from the local callers that apisix-chart publishes, the list infra.callers
+  # declares, because this check reads the host Recipe's locals and not the
+  # host's infra.
   assertions:
     # The host's type reaches this check as the Aggregate wrote it, so it is
     # compared with any version it was authored with set aside:
@@ -61,13 +77,44 @@ spec:
       {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/apisix" -}}
       {{- fail (printf "core/semantic-caching attachment %q on %q is bound to the APISIX realization, which describes core/gateway/apisix alone, and %s is not it. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
       {{- end -}}
-    # Every attachment halts: with a model wired, for the caller identity the
-    # gateway lacks; with none, for the model route it does not serve.
-    gateway_tells_callers_apart: >-
-      {{- $scope := optional .values "scope" "end_user" -}}
-      {{- $asked := ternary "end_user, which keeps each end user the gateway identifies apart" "key, which keeps apart the callers presenting each key to the gateway" (eq $scope "end_user") -}}
-      {{- if optional .uses "models" dict -}}
-      {{- fail (printf "core/semantic-caching attachment %q on %q asks for scope %s, but core/gateway/apisix keeps two callers' cached replies apart only by the consumer an authentication plugin names, or by a value the request itself carries, which it does not verify, and while it serves the models wired to it, it reads its routes from a file rendered with it and runs no Admin API, so it has no consumers: the file declares none, and it identifies no caller, no end user and no key. Every request would share one cache, and a reply generated for one caller could be served to another; remove the attachment" .metadata.feature_instance .metadata.instance_id $asked) -}}
-      {{- else -}}
+    # The cache is written onto the routes of the wired models, and with none
+    # wired the gateway serves no model route whose replies could be cached.
+    models_are_wired: >-
+      {{- if not (optional .uses "models" dict) -}}
       {{- fail (printf "core/semantic-caching attachment %q on %q asks for a cache of model replies, but nothing is wired to the models socket of %q, so the gateway serves no model route whose replies could be cached; remove the attachment" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The gateway keeps replies apart by the caller a key authenticates, and
+    # by nothing finer it verifies.
+    scope_is_one_the_gateway_keeps: >-
+      {{- if eq (optional .values "scope" "end_user") "end_user" -}}
+      {{- fail (printf "core/semantic-caching attachment %q on %q asks for scope end_user, which keeps each end user the gateway identifies apart, but core/gateway/apisix tells its callers apart only by the key each presents, and cannot tell apart the end users behind one key: a value a request names for one is whatever the caller sent, which the gateway does not verify. Set scope to key, which keeps each caller infra.callers declares apart, or attach the Feature to a gateway that identifies end users" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+    # With no caller declared every route is open, no request names a
+    # consumer, and every request on a route would share one cache.
+    callers_are_declared: >-
+      {{- if not (optional .locals "callers" "") -}}
+      {{- fail (printf "core/semantic-caching attachment %q on %q asks for scope key, but infra.callers of %q declares no caller, so the gateway authenticates no key and every request on a route would share one cache, a reply generated for one caller served to another; declare the callers in infra.callers, with their keys through the caller_keys slot" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The replies live in the store wired to the gateway's cache_store socket;
+    # with none, the cache would name a store nothing provides.
+    store_is_wired: >-
+      {{- if not (hasKey .uses "cache_store") -}}
+      {{- fail (printf "core/semantic-caching attachment %q on %q needs a store for the replies core/gateway/apisix caches, but nothing is wired to its cache_store socket; wire a core/datastore/redis to the cache_store socket of %q" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The gateway embeds a prompt through a model it reaches as one of its
+    # models connections, so embedding_model must be the alias of one.
+    embedding_model_is_a_wired_alias: >-
+      {{- $wired := sortAlpha (keys (optional .uses "models" dict)) -}}
+      {{- if not (has .values.embedding_model $wired) -}}
+      {{- fail (printf "core/semantic-caching attachment %q on %q names %q as its embedding_model, but no connection on the models socket of core/gateway/apisix carries that alias, so the gateway could not turn a prompt into a vector; name the alias of the models connection reaching the embeddings model: %s" .metadata.feature_instance .metadata.instance_id .values.embedding_model (join ", " $wired)) -}}
+      {{- end -}}
+    # APISIX carries one ai-cache on a route, so a second attachment could not
+    # hold beside the first.
+    one_cache_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/semantic-caching" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/semantic-caching is attached to %q more than once (%s), but core/gateway/apisix carries one semantic cache on a route, so the attachments cannot each hold; keep one attachment" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
       {{- end -}}
