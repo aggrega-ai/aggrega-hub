@@ -16,10 +16,17 @@ metadata:
 
     Each model wired to the models socket is one entry of that file, named by
     the connection's alias and sent to the endpoint and model name the model
-    publishes. A connection's credential arrives as an environment variable
-    by secretKeyRef to the Secret the credential publishes, and the entry
-    names the variable, so no key is in the rendered output. The file
-    attaches no UI to the data-plane port.
+    publishes. A connection's credential, and each key of the callers
+    infra.callers declares, arrives as an environment variable by
+    secretKeyRef, and the file names the variable, so no key is in the
+    rendered output; each caller is an API key checked in strict mode. The
+    file attaches no UI to the data-plane port.
+
+    Written into the file: core/data-masking and core/prompt-deny-patterns
+    as agentgateway's regular-expression guards, core/period-budget as a
+    token budget, and core/audit-logging as a record of each model request.
+    The per-caller budget and the records are kept in a SQLite file on a
+    volume this Recipe renders while either needs it, with one replica.
 
     Reach for it on Kubernetes, where the build can reach the chart's
     registry; reach for `agentgateway` under Docker Compose. The image is
@@ -92,11 +99,48 @@ spec:
   # locals entry cannot read a connection, so each template applies the alias
   # rule itself, the rule the Component's assertion
   # credential_variables_are_distinct checks.
+  #
+  # A caller infra.callers declares presents its key under a variable named the
+  # same way after the caller's name: the caller alice gives CALLER_ALICE_KEY,
+  # read from the Secret the caller_keys slot names under the data key alice,
+  # which the caller's API key in the configuration names. The Component's
+  # assertion callers_are_declared_with_their_keys checks that rule.
+  #
+  # callers is the list infra.callers declares, joined by commas — empty with
+  # none — so the realizations of the period budget and of audit logging,
+  # whose assertions read this Recipe's locals and not the gateway's infra, can
+  # tell whether the gateway verifies its callers. It is written with the
+  # template language's own range rather than a helper function, as
+  # apisix-chart writes the same local.
+  #
+  # The store is one SQLite file in the directory store_mount_path, on the
+  # volume claim named after the rendered name followed by store_claim_suffix,
+  # which the artifact below emits and the value mapping mounts. The image runs
+  # as user store_group_id, and the volume is given to the group of that number,
+  # which every process of the pod then belongs to, so the gateway can write
+  # there.
+  #
+  # The two rules the configuration's authorization may carry, each a CEL
+  # expression agentgateway requires to hold for a model request, refusing it
+  # with HTTP 403 when it does not or cannot be evaluated: empty_key_refusal
+  # refuses a verified key that is empty, written while callers are declared,
+  # and stream_refusal refuses a request asking for a streamed reply, written
+  # while replies are masked, since agentgateway does not mask a streamed reply.
+  # A POST whose body is not JSON, or is larger than the 2 MiB agentgateway
+  # reads into a rule, cannot be evaluated and is refused.
   locals:
     proven_chart_versions: "v1.6.0"
     image: "cr.agentgateway.dev/agentgateway:v1.6.0@sha256:9d3e6044ddcdc0878b1787f77bd401252b95e22684203fb5e874c4c42d2ed90c"
     connection_variable_prefix: AI_PROXY_
     credential_variable_suffix: _API_KEY
+    caller_variable_prefix: CALLER_
+    caller_key_variable_suffix: _KEY
+    callers: '{{ with optional .infra "callers" "" }}{{ range $i, $caller := . }}{{ if $i }}, {{ end }}{{ $caller }}{{ end }}{{ end }}'
+    store_mount_path: /data
+    store_claim_suffix: "-store"
+    store_group_id: "65532"
+    empty_key_refusal: 'apiKey.key.unredacted() != ""'
+    stream_refusal: 'request.method != "POST" || default(json(request.body).stream, false) == false'
 
   # The chart version decides the Deployment, the Service and the part of the
   # configuration file the chart writes itself, so a version the configuration
@@ -110,6 +154,38 @@ spec:
       {{- fail (printf "infra.source_version of %q is %q, but the configuration this Recipe writes into the agentgateway standalone chart is proven at chart version %s alone; set infra.source_version to one of them, or remove it" $.metadata.instance_id . (join ", " $proven)) -}}
       {{- end -}}
       {{- end -}}
+
+  # The volume the store lives on: a claim on the cluster's default storage
+  # class, of infra.storage.size, emitted beside the chart's own resources and
+  # mounted by the value mapping below. The chart renders no volume of its own,
+  # and its container's root file system is read-only. The store is needed
+  # while core/audit-logging is attached, whose records it holds, or
+  # core/period-budget with scope caller, whose counts it holds across a
+  # restart; with neither the template writes nothing and no file is emitted.
+  #
+  # DELIBERATE NEAR-DUPLICATE: the value mapping below decides the same thing
+  # from the same attachments, since a template cannot hand a value to another
+  # and a locals entry cannot read an attachment; the two are edited together.
+  artifacts:
+    agentgateway-store.yaml: |
+      {{- $store := false }}
+      {{- range $name, $attachment := (default dict .features) }}
+      {{- $type := first (splitList ":" (toString $attachment.type)) }}
+      {{- if eq $type "core/audit-logging" }}{{ $store = true }}{{ end }}
+      {{- if and (eq $type "core/period-budget") (eq (toString (optional (default dict $attachment.values) "scope" "")) "caller") }}{{ $store = true }}{{ end }}
+      {{- end }}
+      {{- if $store -}}
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: {{ .context.rendered_name }}{{ .locals.store_claim_suffix }}
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: "{{ .infra.storage.size }}"
+      {{- end }}
 
   # This Recipe reads from infra.overrides:
   #   service_type - string (data-plane Service type; how the gateway is exposed, default ClusterIP)
@@ -138,6 +214,60 @@ spec:
       {{- end }}
     {{- end }}
 
+    ## ── What the attachments ask for ───────────────────────────
+    ## One attachment of each Feature this Recipe writes: the realizations of
+    ## data masking, prompt deny patterns and the period budget halt on a
+    ## second, and a second audit-logging attachment asks for the same records.
+    ## Its type is compared with any version it was authored with set aside. A period budget with scope caller, and audit logging,
+    ## need the store; a budget with any other scope is a token rate limit.
+    ## DELIBERATE NEAR-DUPLICATE of the store decision in the artifact above.
+    {{- $masking := dict }}
+    {{- $guard := dict }}
+    {{- $budget := dict }}
+    {{- $budgetName := "" }}
+    {{- $audit := dict }}
+    {{- range $name, $attachment := (default dict .features) }}
+      {{- $type := first (splitList ":" (toString $attachment.type)) }}
+      {{- if eq $type "core/data-masking" }}{{ $masking = $attachment }}{{ end }}
+      {{- if eq $type "core/prompt-deny-patterns" }}{{ $guard = $attachment }}{{ end }}
+      {{- if eq $type "core/period-budget" }}{{ $budget = $attachment }}{{ $budgetName = $name }}{{ end }}
+      {{- if eq $type "core/audit-logging" }}{{ $audit = $attachment }}{{ end }}
+    {{- end }}
+    {{- $budgetScope := "" }}
+    {{- with $budget }}{{ $budgetScope = toString (optional (default dict .values) "scope" "") }}{{ end }}
+    {{- $store := or $audit (eq $budgetScope "caller") }}
+    {{- $rateLimit := and $budget (ne $budgetScope "caller") }}
+    {{- $maskRequest := false }}
+    {{- $maskResponse := false }}
+    {{- $maskAction := "mask" }}
+    {{- with $masking }}
+      {{- $scope := toString (optional (default dict .values) "scope" "request") }}
+      {{- $maskRequest = ne $scope "response" }}
+      {{- $maskResponse = ne $scope "request" }}
+      {{- if eq (toString (optional (default dict .values) "action" "redact")) "refuse" }}{{ $maskAction = "reject" }}{{ end }}
+    {{- end }}
+
+    ## ── The callers ────────────────────────────────────────────
+    ## The callers infra.callers declares read their keys from the Secret the
+    ## caller_keys credential publishes, each under the caller's own name as
+    ## the data key; a credential publishing no Secret name would leave the
+    ## gateway nowhere to read them from, so the build halts on it. The
+    ## Component's assertion holds that the slot is attached exactly when a
+    ## caller is declared.
+    {{- $callers := optional .infra "callers" list }}
+    {{- $callerKeySecret := "" }}
+    {{- with $callers }}
+    {{- $callerKeySecret = optional (optional (optional (default dict $.features) "caller_keys" dict) "provides" dict) "name" "" }}
+    {{- if not $callerKeySecret }}
+    {{- fail (printf "the credential attached to the caller_keys slot of %q publishes no Secret name, so the gateway cannot read its callers' keys from a Secret; attach core/referenced-secret-set, which publishes one" $.context.instance_id) }}
+    {{- end }}
+    {{- end }}
+
+    ## ── The configuration's authorization rules ────────────────
+    {{- $rules := list }}
+    {{- if $callers }}{{ $rules = append $rules .locals.empty_key_refusal }}{{ end }}
+    {{- if $maskResponse }}{{ $rules = append $rules .locals.stream_refusal }}{{ end }}
+
     ## ── Pin the chart's resource names to the rendered name ────
     ## The chart names its Deployment, Service, service account and the
     ## Service's selector after this value, and its ConfigMap after it
@@ -149,6 +279,33 @@ spec:
     ## chart's own default, which names the image by the chart's app version
     ## alone.
     image: "{{ .locals.image }}"
+
+    ## ── The store ──────────────────────────────────────────────
+    ## While an attachment needs the store, the volume claim the artifact above
+    ## emits is mounted at store_mount_path, given to the group of the image's
+    ## user so the gateway can write there, and the chart runs one replica,
+    ## replaced by stopping it before its successor starts: agentgateway keeps
+    ## one SQLite file per instance and is not to have two instances on one
+    ## file, and a successor started first could wait on a volume its
+    ## predecessor still holds. One replica and no autoscaler are the chart's
+    ## own defaults, written out so that a chart version moving them cannot
+    ## split the store.
+    {{- if $store }}
+    replicaCount: 1
+    autoscaling:
+      enabled: false
+    strategy:
+      type: Recreate
+    podSecurityContext:
+      fsGroup: {{ .locals.store_group_id }}
+    extraVolumes:
+      - name: store
+        persistentVolumeClaim:
+          claimName: "{{ .context.rendered_name }}{{ .locals.store_claim_suffix }}"
+    extraVolumeMounts:
+      - name: store
+        mountPath: "{{ .locals.store_mount_path }}"
+    {{- end }}
 
     ## ── Data plane ─────────────────────────────────────────────
     ## The client entry point, and the Service provides.host addresses. The
@@ -176,9 +333,11 @@ spec:
     ## takes the file only as its `config` value, which this mapping writes,
     ## and that Recipe delivers it as a compose config, which its artifacts
     ## write; a value mapping imports only a mapping library and an artifact
-    ## only an artifact library, so no one template reaches both. The two are
-    ## edited together, and a build of both from one Release, with the two
-    ## files compared, shows them alike.
+    ## only an artifact library, so no one template reaches both. The gateway
+    ## and the model entries are edited together, and a build of both from one
+    ## Release, with the two files compared, shows them alike; the store, the
+    ## callers and what the attachments ask for are written here alone, the
+    ## compose realization realizing none of them.
     ##
     ## One gateway, `default`, listening on infra.http_port; the model-serving
     ## routes attach to it. No `ui` section is written, so agentgateway serves
@@ -201,7 +360,37 @@ spec:
     ## from the variable delivered below, so the file names the variable and
     ## never the value. Each string a model publishes is written with every $
     ## doubled, agentgateway's spelling of a literal $, so a published string
-    ## reaches the gateway as it was published.
+    ## reaches the gateway as it was published; so is each regular expression
+    ## an attachment lists.
+    ##
+    ## While the store is needed its database is the SQLite file in
+    ## store_mount_path, and the request records it holds keep no prompt or
+    ## reply text: the access log's database mode is `metadata`. The chart
+    ## restarts the gateway when this part of the file changes.
+    ##
+    ## The policies of the model routes, written only for what asks for them:
+    ## - With callers declared, an API key for each, in the order the Release
+    ##   lists them, checked in strict mode: a model request presenting no key,
+    ##   or one no caller holds, is refused with HTTP 401, and the key is removed
+    ##   from the request forwarded. Each key is named after its caller, and its
+    ##   value is $CALLER_<NAME>_KEY. Under a period budget with scope caller,
+    ##   each key carries that budget, counted in the tokens each reply reports
+    ##   over a window of period aligned to the Unix epoch, and refusing with
+    ##   HTTP 429 once what the key has spent reaches the limit.
+    ## - The authorization rules above, each required to hold.
+    ## - Guards: core/prompt-deny-patterns as a request guard refusing a match,
+    ##   then core/data-masking as a request guard and, where replies are
+    ##   masked, a reply guard, masking each match, or refusing it under
+    ##   action refuse. Request guards read the system and developer prompts,
+    ##   every other message, the arguments of tool calls and the results of
+    ##   tool calls; masking an argument can leave its JSON invalid. A guard's
+    ##   refusal is HTTP 403. The deny guard comes first, so it reads the text
+    ##   as the caller sent it.
+    ## - A period budget with scope gateway or model as a token rate limit: a
+    ##   bucket of limit tokens, filled again to limit every period from when
+    ##   the gateway read the file, from which each reply's tokens are taken,
+    ##   refusing a model request with HTTP 429 while it is empty — one bucket
+    ##   for the gateway, or one for each model name requested.
     {{- range $alias, $edge := .context.uses }}
       {{- if eq $edge.socket "models" }}
         {{- $u := urlParse (toString $edge.provides.endpoint) }}
@@ -214,10 +403,92 @@ spec:
       {{- end }}
     {{- end }}
     config:
+      {{- if $store }}
+      config:
+        database:
+          url: {{ printf "sqlite://%s/data.db" .locals.store_mount_path | toJson }}
+      frontendPolicies:
+        accessLog:
+          database:
+            llm: metadata
+      {{- end }}
       gateways:
         default:
           port: {{ .infra.http_port }}
       llm:
+        {{- if or $callers $guard $masking $rateLimit }}
+        policies:
+          {{- with $callers }}
+          apiKey:
+            mode: strict
+            keys:
+              {{- range $caller := . }}
+              - key: {{ printf "$%s%s%s" $.locals.caller_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $caller) "_") $.locals.caller_key_variable_suffix | toJson }}
+                metadata:
+                  name: {{ $caller | toJson }}
+                {{- if eq $budgetScope "caller" }}
+                budgets:
+                  - name: {{ $budgetName | toJson }}
+                    limit:
+                      unit: Tokens
+                      amount: {{ int64 $budget.infra.limit }}
+                    window:
+                      rolling: {{ toString $budget.infra.period | toJson }}
+                    onBudgetExceeded: Block
+                {{- end }}
+              {{- end }}
+          {{- end }}
+          {{- with $rules }}
+          authorization:
+            rules:
+              {{- range $rule := . }}
+              - require: {{ $rule | toJson }}
+              {{- end }}
+          {{- end }}
+          {{- if or $guard $masking }}
+          guardrails:
+            {{- if or $guard $maskRequest }}
+            request:
+              {{- with $guard }}
+              - regex:
+                  action: reject
+                  rules:
+                    {{- range $pattern := .values.deny_patterns }}
+                    - pattern: {{ toString $pattern | toJson | replace "$" "$$" }}
+                    {{- end }}
+                scope: [systemPrompt, messages, toolInput, toolOutput]
+              {{- end }}
+              {{- if $maskRequest }}
+              - regex:
+                  action: {{ $maskAction }}
+                  rules:
+                    {{- range $pattern := (optional $masking.values "patterns" list) }}
+                    - pattern: {{ toString $pattern.regex | toJson | replace "$" "$$" }}
+                    {{- end }}
+                scope: [systemPrompt, messages, toolInput, toolOutput]
+              {{- end }}
+            {{- end }}
+            {{- if $maskResponse }}
+            response:
+              - regex:
+                  action: {{ $maskAction }}
+                  rules:
+                    {{- range $pattern := (optional $masking.values "patterns" list) }}
+                    - pattern: {{ toString $pattern.regex | toJson | replace "$" "$$" }}
+                    {{- end }}
+            {{- end }}
+          {{- end }}
+          {{- if $rateLimit }}
+          localRateLimit:
+            - type: tokens
+              maxTokens: {{ int64 $budget.infra.limit }}
+              tokensPerFill: {{ int64 $budget.infra.limit }}
+              fillInterval: {{ toString $budget.infra.period | toJson }}
+              {{- if eq $budgetScope "model" }}
+              key: llm.requestModel
+              {{- end }}
+          {{- end }}
+        {{- end }}
         {{- if not $wired }}
         models: []
         {{- else }}
@@ -239,15 +510,22 @@ spec:
           {{- end }}
         {{- end }}
 
-    ## ── Model credentials ──────────────────────────────────────
+    ## ── Model credentials and callers' keys ─────────────────────
     ## Each models connection carrying a credential delivers it as
     ## AI_PROXY_<ALIAS>_API_KEY, bound by NAME to the Secret its attachment
     ## publishes, which the connection's entry names. A credential publishing
     ## no Secret name and data key would leave the gateway nothing to read, so
-    ## the build halts on it. Kubernetes starts no container whose
+    ## the build halts on it. Each caller delivers its key as
+    ## CALLER_<NAME>_KEY, from the caller_keys Secret under the caller's name,
+    ## which the caller's API key names. Kubernetes starts no container whose
     ## secretKeyRef names a missing Secret or key, which is caught at start,
     ## not by the build; no variable carries a value in the rendered artifact.
-    {{- if $credentialed }}
+    ## A caller added or removed changes this list, so Kubernetes replaces the
+    ## pod; the running gateway also reads the changed file when it is
+    ## updated, so a removed caller's key is refused from then on. A key
+    ## changed inside the Secret moves neither, and is read when the pod next
+    ## starts.
+    {{- if or $credentialed $callers }}
     extraEnv:
       {{- range $alias := $credentialed }}
       {{- $credential := (get $.context.uses $alias).features.credential }}
@@ -260,6 +538,13 @@ spec:
           secretKeyRef:
             name: "{{ $locator.name }}"
             key: "{{ $locator.key }}"
+      {{- end }}
+      {{- range $caller := $callers }}
+      - name: {{ $.locals.caller_variable_prefix }}{{ regexReplaceAll "[^A-Z0-9]" (upper $caller) "_" }}{{ $.locals.caller_key_variable_suffix }}
+        valueFrom:
+          secretKeyRef:
+            name: "{{ $callerKeySecret }}"
+            key: "{{ $caller }}"
       {{- end }}
     {{- end }}
 

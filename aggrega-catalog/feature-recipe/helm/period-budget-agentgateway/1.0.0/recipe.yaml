@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: period-budget-agentgateway
+  version: 1.0.0
+  description: >
+    Realizes core/period-budget on the gateway core/gateway/agentgateway; a
+    Release binds it in its Manifest. It emits no file: the gateway's chart
+    Recipe, agentgateway-chart, writes the budget into the configuration,
+    counted in the total tokens each model reply reports.
+
+    Scope caller is a budget on the API key of each caller infra.callers
+    declares, each counted apart over fixed windows of period aligned to
+    the Unix epoch, a day starting at midnight UTC, and kept across a
+    restart in the gateway's store, which the chart Recipe renders, with one
+    replica. Scope gateway is a token bucket for every model request, and
+    scope model one for each model name a request asks for, filled to limit
+    every period from when the gateway read its configuration and kept in
+    its memory, so a restart, or a changed configuration, fills it again.
+    Once what was counted reaches limit, model requests are answered with
+    HTTP 429 until the window ends or the bucket is filled; the request that
+    reaches it is served, and a reply reporting no tokens counts nothing.
+
+    It refuses usd, prompt_tokens, completion_tokens, a calendar month, scope
+    caller with no caller declared and a limit that is not a whole number by
+    name, and halts on a second such attachment, with nothing wired to the
+    models socket, and on any component other than core/gateway/agentgateway.
+    The compose realization of the gateway has no realization of it.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/period-budget:1.0.0
+  # executionScope omitted -> component: evaluated once per attached component.
+  #
+  # No input kind and no pipeline: what this attachment changes is written by
+  # the gateway's chart Recipe, which reads it. What stays here is what that
+  # Recipe cannot honour.
+  #
+  # How the gateway keeps the budget, read in agentgateway's source at v1.6.0,
+  # the release the gateway's Recipes pin.
+  #
+  # Scope caller: each caller's API key carries a budget named after the
+  # attachment, its unit Tokens, its amount limit, its window period, and its
+  # action Block. Before a request the gateway refuses it with HTTP 429, and a
+  # Retry-After header naming the seconds left in the window, once the tokens
+  # charged to that key in the current window have reached the limit; after
+  # the reply it charges the total tokens the reply reports, and charges
+  # nothing for a reply reporting none. The window is a fixed length aligned
+  # to the Unix epoch — an hour on the clock hour, a day from midnight UTC, a
+  # longer one counted from 1 January 1970 — and the counts are written to the
+  # gateway's database, which agentgateway requires for such a budget, so the
+  # chart Recipe renders the store while this attachment has scope caller. The
+  # keys are the callers infra.callers declares, each checked in strict mode,
+  # so each declared caller has a count of its own and no request reaches a
+  # model without one.
+  #
+  # Scope gateway and model: a token rate limit among the policies of the
+  # model routes, a bucket holding limit tokens and filled again to limit
+  # every period, from which the total tokens each reply reports are taken
+  # once it completes, never below zero. A request finding the bucket empty is
+  # refused with HTTP 429. Under scope gateway there is one bucket; under
+  # scope model one for each model name a request asks for, the alias of a
+  # wired model. The bucket is built when the gateway reads its configuration
+  # and lives in its memory, so it is full again after a restart and after
+  # the gateway reads a changed configuration file, and its period runs from
+  # then rather than on the clock.
+  #
+  # What it does not count: agentgateway prices a request from its model cost
+  # catalog, which prices none of the models this catalog wires to it, each
+  # of them an OpenAI-compatible entry of the gateway's own, so a budget in US
+  # dollars would charge nothing and never refuse, and agentgateway reports
+  # no error when that happens; and both mechanisms count a reply's total
+  # tokens, never the prompt or the completion apart. No window is a calendar
+  # month.
+  #
+  # No assertion can read the host component's labels or infra, so what the
+  # gateway is able to do is stated in the messages, and the check of the
+  # host's type first in the list is what keeps those statements true. The
+  # callers are read from the local callers agentgateway-chart publishes, the
+  # list infra.callers declares, because this check reads the host Recipe's
+  # locals and not the host's infra.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/agentgateway and core/gateway/agentgateway:1.0.0 are the
+    # same host.
+    component_writes_the_budget: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/agentgateway" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q is bound to the agentgateway realization, which only core/gateway/agentgateway carries out: that component's chart Recipe writes the budget into the configuration it renders, and %s renders none for it, so nothing would be counted. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # A budget in US dollars charges what the model cost catalog prices, and
+    # it prices no model wired here; both mechanisms count total tokens.
+    unit_is_total_tokens: >-
+      {{- if eq .values.unit "usd" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for unit usd, but core/gateway/agentgateway prices a request from its model cost catalog, which prices none of the models wired to it here, so a budget in US dollars would charge nothing and never refuse a request, and the gateway reports no error when that happens; set unit to total_tokens" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- else if ne .values.unit "total_tokens" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for unit %s, but core/gateway/agentgateway counts the total tokens each model reply reports, prompt and completion together, and keeps no count of either apart; set unit to total_tokens" .metadata.feature_instance .metadata.instance_id .values.unit) -}}
+      {{- end -}}
+    # A key's budget counts that caller apart only where the gateway verifies
+    # its callers, which it does for the callers infra.callers declares.
+    scope_caller_needs_callers: >-
+      {{- if and (eq .values.scope "caller") (not (optional .locals "callers" "")) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for scope caller, but core/gateway/agentgateway keeps a budget for each caller on the API key that caller presents, and infra.callers of %q declares no caller, so no key is checked and there is no caller to count apart. Declare the callers in infra.callers, with their keys through the caller_keys slot, or set scope to gateway, for everything it serves, or model, for each model name requested" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # Both mechanisms take a fixed length of time; a calendar month has none.
+    period_is_one_the_gateway_keeps: >-
+      {{- if hasSuffix "mo" .infra.period -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of %s, but core/gateway/agentgateway counts a budget over a fixed length of time, and a calendar month has no fixed length; set period to a number of days, as in 30d" .metadata.feature_instance .metadata.instance_id .infra.period) -}}
+      {{- end -}}
+    # Both mechanisms take their limit as a whole number of tokens. The build
+    # carries the limit as a number exact up to 9007199254740991, so a larger
+    # one is refused too.
+    limit_is_a_whole_number_of_tokens: >-
+      {{- $limit := float64 .infra.limit -}}
+      {{- if or (ne $limit (floor $limit)) (gt $limit 9007199254740991.0) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q sets limit %v, but core/gateway/agentgateway takes its limit as a whole number of tokens; set limit to a whole number no greater than 9007199254740991" .metadata.feature_instance .metadata.instance_id .infra.limit) -}}
+      {{- end -}}
+    # The budget applies to the models the gateway serves, and with none wired
+    # it serves no model.
+    models_are_wired: >-
+      {{- if not (optional .uses "models" dict) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q needs a model request to count, but nothing is wired to the models socket of %q, so the gateway serves no model and there is nothing the budget could count; wire a model to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The chart Recipe writes one budget from one attachment, so a second
+    # attachment could not hold beside the first.
+    one_budget_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/period-budget is attached to %q more than once (%s), but core/gateway/agentgateway's chart Recipe writes one budget from one attachment, so the attachments cannot each hold; keep one attachment" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
+      {{- end -}}

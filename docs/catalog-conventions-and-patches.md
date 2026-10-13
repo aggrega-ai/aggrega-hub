@@ -239,7 +239,7 @@ The dimensions and their value sets:
 | --- | --- | --- |
 | `request-mirroring` | `full-rate`, `sampled` | The component can copy a matching request to a second destination and discard that destination's response. `full-rate` copies every matching request and offers no setting that narrows it; `sampled` offers a settable share, so a component that can sample carries `sampled` and not both. |
 | `caller-identity` | `client-certificate`, `injected-header` | The component can convey the original caller's identity to the service behind it, and the value names which mechanism does it. `client-certificate`: the client's own TLS certificate details travel to the backend. `injected-header`: the component authenticates the caller itself and composes headers naming them, which travel upstream on the forwarded request. |
-| `content-masking` | `entity-recognition` | The component can replace sensitive text in the chat and completion payload it is routing with a placeholder before the text travels further. `entity-recognition` names the fidelity: it replaces matches of patterns supplied in its configuration and also entity types that a recognizer service it calls detects. A component that could only replace pattern matches would carry a narrower value, added in the same act as the first component to carry it. |
+| `content-masking` | `entity-recognition`, `pattern-list` | The component can replace sensitive text in the chat and completion payload it is routing with a placeholder before the text travels further. The value names the fidelity. `entity-recognition`: it replaces matches of patterns supplied in its configuration and also entity types that a recognizer service it calls detects. `pattern-list`: it replaces matches of patterns supplied in its configuration and recognizes no entity types. |
 | `prompt-guard` | `pattern-list`, `classifier` | The component can inspect the chat and completion payload it is routing and refuse a request on its content. The value names the fidelity. `pattern-list`: the match is against patterns supplied in its configuration. `classifier`: the verdict is a trained text classifier's, reached through a detection service the component calls, against a threshold supplied in its configuration. The dimension is deliberately narrower than content inspection in general — a component here reads the model payload it already parses to route, and not one of them inspects an arbitrary HTTP body. |
 | `upstream-tls` | `trust-anchor` | The component can require the service it forwards to present a certificate chaining to a trust anchor the Release supplies. |
 | `upstream-pinning` | `public-key` | The component can refuse a service it forwards to unless a certificate that service presents carries one of the public keys the Release supplies for it. `public-key` names what is pinned: the key itself, so a certificate renewed over the same key still matches. |
@@ -311,6 +311,11 @@ each reply reports as Kong's AI Rate Limiting Advanced counts them,
 carries `content-masking: entity-recognition`, `prompt-guard: pattern-list`,
 `period-budget: cost`, priced from the per-model price list its Token Rate
 Limit & Quota middleware ships with, and `semantic`.
+`core/gateway/agentgateway` carries `content-masking: pattern-list` and
+`prompt-guard: pattern-list`, its regular-expression guard masking or refusing
+the matches of the patterns its configuration holds, `period-budget: cost`, the
+budgets it keeps per API key in US dollars, priced from its model cost catalog,
+or in tokens, and `semantic`.
 `core/gateway/azure-api-management`, the AI gateway of Azure API Management, a
 hosted service, carries `period-budget: tokens`, its one value in this family,
 and `semantic`: its token limit counts the prompt and completion tokens each
@@ -2199,7 +2204,10 @@ to that Secret, never as a value in a rendered file. The two names are the same
 on every gateway that declares callers. `core/gateway/apisix` declares them:
 each caller is a consumer of its routes file, authenticated by the key it
 presents as `Authorization: Bearer <key>`, and its semantic cache and period
-budget keep callers apart by it.
+budget keep callers apart by it. `core/gateway/agentgateway` declares them on
+its chart Recipe: each caller is an API key of its configuration, checked in
+strict mode and presented the same way, and its period budget and its request
+records keep callers apart by it.
 
 **A pair presented on one connection adds `credential_id`.** Where a caller
 presents an identifier and its secret together on one connection — an object
