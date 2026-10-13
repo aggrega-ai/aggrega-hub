@@ -28,7 +28,9 @@ metadata:
     While core/data-masking, core/period-budget or core/audit-logging is
     attached, it adds Higress's plugin for each onto the model routes: request
     masking, with what it cannot read refused, a token limit counted in the
-    store on the cache socket, and statistics in the access log.
+    store on the cache socket, and statistics in the access log. While
+    core/retry-policy is attached, it writes the route's own retry onto each
+    model route as Ingress annotations.
 
     The images, the plugin modules and the chart version are pinned;
     infra.source_version accepts only the chart versions this configuration
@@ -217,7 +219,15 @@ spec:
   #   does not parse as JSON is masked as plain text, the plugin's own
   #   fallback, rather than passed on.
   # - Refusing what masking cannot read: the request-validation plugin, with
-  #   HTTP 403, before the request is forwarded. While allow_unmasked_text is
+  #   HTTP 403, before the request is forwarded. In its header phase, whenever
+  #   masking or the token budget is attached, it refuses a request the body
+  #   plugins cannot read at all: one carrying a content-encoding header, whose
+  #   body is compressed, and one asking to upgrade the connection, Higress's
+  #   wasm plugins reading no body in either case; an HTTP/2 extended CONNECT
+  #   reaches the plugin already rewritten to an upgrade and is refused as one.
+  #   This header refusal is rendered under every masking relaxation, because
+  #   the pattern masking of plain-string content is kept under all of them.
+  #   In its body phase, while allow_unmasked_text is
   #   off it refuses a request with a body that is not sent as JSON, and a
   #   JSON body that is not a chat completion of plain-text messages — a
   #   message whose content is a list or null, a tool call, a tool turn, a
@@ -227,9 +237,9 @@ spec:
   #   sequences. While only allow_non_text_content is off, it refuses a
   #   request with a body that is not sent as JSON, every request but a chat
   #   completion, and a message carrying an image, a file or audio. A
-  #   request with no body passes. Validation reads a body only once it
-  #   parses as a JSON object, so a body labelled JSON that does not parse
-  #   passes it; the masking fallback above covers that body.
+  #   request with no body passes the body phase. Validation reads a body only
+  #   once it parses as a JSON object, so a body labelled JSON that does not
+  #   parse passes it; the masking fallback above covers that body.
   # - core/period-budget: the token-limit plugin, refusing a model request
   #   with HTTP 429 while the tokens counted in the current window exceed
   #   limit, one count for the whole gateway under scope gateway and one for
@@ -243,6 +253,12 @@ spec:
   # - core/audit-logging: the statistics plugin on every path of the model
   #   routes, which writes the model that answered and the tokens its reply
   #   reports into the ai_log field of the gateway's access log line.
+  # - core/retry-policy: not a plugin but the route's own retry, written as
+  #   Ingress annotations onto every alias's Ingress — proxy-next-upstream-tries
+  #   set to max_attempts less one, and proxy-next-upstream to the failures
+  #   resent (a refused or reset connection and a 5xx reply, a 429, and a POST).
+  #   max_attempts 1 writes the retry off, overriding the retry Istio gives a
+  #   route carrying no annotation. retry-policy-higress holds the refusals.
   # Every module is pinned as the locals above say and fails closed: a module
   # that fails to load fails every request it would have acted on.
   artifacts:
@@ -299,11 +315,33 @@ spec:
       {{- $budget := dict }}
       {{- $budgetName := "" }}
       {{- $audit := dict }}
+      {{- $retry := dict }}
       {{- range $name, $attachment := (default dict .features) }}
       {{- $type := first (splitList ":" (toString $attachment.type)) }}
       {{- if eq $type "core/data-masking" }}{{ $masking = $attachment }}{{ end }}
       {{- if eq $type "core/period-budget" }}{{ $budget = $attachment }}{{ $budgetName = $name }}{{ end }}
       {{- if eq $type "core/audit-logging" }}{{ $audit = $attachment }}{{ end }}
+      {{- if eq $type "core/retry-policy" }}{{ $retry = $attachment }}{{ end }}
+      {{- end }}
+      {{- /* The route retry, written as Ingress annotations onto every alias's
+             Ingress below. max_attempts is total sends including the first;
+             Higress's proxy-next-upstream-tries is the retries after the first,
+             so it is max_attempts minus one, and max_attempts 1 writes the
+             retry off (proxy-next-upstream: off, which Higress reads as zero
+             attempts) so no request is sent again — overriding the retry Istio
+             applies to a route carrying no annotation. The triggers resend a
+             refused or reset connection and a 5xx reply (error), a 429 reply
+             (http_429), and a POST (non_idempotent, which Istio's default
+             excludes). */}}
+      {{- $retryAnnotations := dict }}
+      {{- with $retry }}
+      {{- $attempts := int64 (optional (default dict .values) "max_attempts" 1) }}
+      {{- if le $attempts 1 }}
+      {{- $_ := set $retryAnnotations "higress.io/proxy-next-upstream" "off" }}
+      {{- else }}
+      {{- $_ := set $retryAnnotations "higress.io/proxy-next-upstream-tries" (toString (sub $attempts 1)) }}
+      {{- $_ := set $retryAnnotations "higress.io/proxy-next-upstream" "error http_429 non_idempotent" }}
+      {{- end }}
       {{- end }}
       {{- $maskInfra := default dict (optional $masking "infra" dict) }}
       {{- $textRelaxed := and (hasKey $maskInfra "allow_unmasked_text") (eq (toString (index $maskInfra "allow_unmasked_text")) "true") }}
@@ -390,6 +428,9 @@ spec:
         namespace: "{{ $ns }}"
         annotations:
           higress.io/destination: {{ join "\n" $lines | toJson }}
+      {{- range $k, $v := $retryAnnotations }}
+          {{ $k }}: {{ $v | toJson }}
+      {{- end }}
       spec:
         ingressClassName: "{{ $.context.rendered_name }}-{{ $ns }}"
         rules:
@@ -468,8 +509,8 @@ spec:
                   value: {{ printf "[%s]" (toString $pattern.name | replace "$" "$$") | toJson }}
       {{- end }}
       {{- end }}
-      {{- if or $textStrict $nonTextStrict $budget }}
-      {{- $refusals := list }}
+      {{- if or $masking $budget }}
+      {{- $refusals := list "This gateway reads each request's body to apply its protections, which it cannot do while the body is compressed or the connection is being upgraded, so it refuses a request carrying a content-encoding header and a request asking to upgrade the connection." }}
       {{- if $textStrict }}{{ $refusals = append $refusals "This gateway masks the text of a chat request's messages before forwarding it, and refuses a request it cannot mask: one not sent as JSON, one that is not a chat completion of plain-text messages, a tool call or tool turn, or a parameter beyond the chat completion's own." }}{{ else if $nonTextStrict }}{{ $refusals = append $refusals "This gateway refuses a request carrying content that is not text: one not sent as JSON, and every request but a chat completion of text messages." }}{{ end }}
       {{- if $budget }}{{ $refusals = append $refusals "This gateway counts the tokens each reply reports against a budget, and refuses a streamed request that turns off the usage report." }}{{ end }}
       ---
@@ -491,22 +532,49 @@ spec:
               - {{ . | toJson }}
       {{- end }}
             config:
-      {{- if or $textStrict $nonTextStrict }}
+              # The header schema runs before the body is read, in the request
+              # header phase. Its first members refuse a request whose body the
+              # masking and token-limit plugins cannot read: Higress's wasm
+              # plugins read no request body while a content-encoding header is
+              # present (the body is compressed) or the request is an upgrade,
+              # so without this refusal such a request would reach the upstream
+              # with its protections skipped. An HTTP/2 extended CONNECT reaches
+              # this plugin already rewritten to an upgrade request, so the
+              # upgrade refusal covers it; a CONNECT carrying :protocol that is
+              # not rewritten is refused by the last two members. This refusal is
+              # rendered whenever masking is attached, under every relaxation,
+              # and whenever the budget's streamed-usage refusal is, because the
+              # pattern masking of plain-string content is kept under every
+              # relaxation.
               header_schema:
                 type: object
-                if:
-                  required: [":method"]
-                  properties:
-                    ":method":
-                      enum: [GET, HEAD, DELETE, OPTIONS]
-                then: {}
-                else:
-                  required: [content-type]
-                  properties:
-                    content-type:
-                      type: string
-                      pattern: "^[Aa][Pp][Pp][Ll][Ii][Cc][Aa][Tt][Ii][Oo][Nn]/[Jj][Ss][Oo][Nn]"
+                allOf:
+                  - not:
+                      required: [content-encoding]
+                  - not:
+                      required: [upgrade]
+                  - not:
+                      required: [":protocol"]
+                  - not:
+                      required: [":method"]
+                      properties:
+                        ":method":
+                          const: CONNECT
+      {{- if or $textStrict $nonTextStrict }}
+                  - if:
+                      required: [":method"]
+                      properties:
+                        ":method":
+                          enum: [GET, HEAD, DELETE, OPTIONS]
+                    then: {}
+                    else:
+                      required: [content-type]
+                      properties:
+                        content-type:
+                          type: string
+                          pattern: "^[Aa][Pp][Pp][Ll][Ii][Cc][Aa][Tt][Ii][Oo][Nn]/[Jj][Ss][Oo][Nn]"
       {{- end }}
+      {{- if or $textStrict $nonTextStrict $budget }}
               body_schema:
                 type: object
                 allOf:
@@ -588,6 +656,7 @@ spec:
                             include_usage:
                               not:
                                 const: true
+      {{- end }}
       {{- end }}
               rejected_code: 403
               rejected_msg: {{ dict "error" (dict "message" (join " " $refusals) "type" "invalid_request_error") | toJson | toJson }}
