@@ -273,7 +273,8 @@ Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 `upstream-tls: trust-anchor`, `concurrency-cap: total`), `core/gateway/contour`
 (`request-mirroring: sampled`, `caller-identity: client-certificate`,
 `upstream-tls: trust-anchor`), `core/gateway/envoy-gateway` (the same three,
-`period-budget: tokens` and `concurrency-cap: per-target`), `core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/tyk`
+`period-budget: tokens` and `concurrency-cap: per-target`), `core/gateway/kong` (`upstream-tls: trust-anchor`,
+`prompt-guard: pattern-list`), `core/gateway/tyk`
 (`upstream-pinning: public-key`), `core/gateway/litellm`
 (`caller-identity: injected-header`, `content-masking: entity-recognition`,
 `prompt-guard: pattern-list`, `upstream-tls: trust-anchor`, `period-budget: cost`, `concurrency-cap: per-target`),
@@ -292,7 +293,13 @@ gateway carries several of them, and no amount of reading its tier would say so.
 `core/gateway/apisix` carries `period-budget: tokens`, `prompt-guard:
 pattern-list`, its `ai-prompt-guard` matching a request's messages against the
 lists its configuration holds, and `semantic`, because its AI proxy reads the
-request body of every route it serves a model on. On
+request body of every route it serves a model on. `core/gateway/kong` carries
+`prompt-guard: pattern-list` for the AI Prompt Guard of Kong 3.9.3, which matches
+the text of a model request — every message of every role, or a completion's
+prompt — against the lists its routes hold; Kong Gateway
+Enterprise documents the same plugin, but how much of a request it reads changes
+across the releases a Release may name there, so `core/gateway/kong-enterprise`
+carries no `prompt-guard` value. On
 `core/gateway/envoy-gateway`, the tokens its `period-budget` value names are the ones Envoy AI Gateway reads from each reply
 of a wired model, which Envoy Gateway's rate limit counts, and the targets its
 `concurrency-cap` value counts apart are the backends of its route rules, one

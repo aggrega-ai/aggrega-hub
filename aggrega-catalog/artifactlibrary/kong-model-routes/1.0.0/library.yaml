@@ -27,8 +27,10 @@ metadata:
     and the variable parts it shares with the bundle, which stops the build
     when one is missing or differs. The bundle is authored against Kong 3.9.3.
 
-    A Recipe running Kong Gateway Enterprise declares model_routes_edition:
-    enterprise, and the bundle then also writes what the importing component's
+    On the open-source edition it writes Kong's AI Prompt Guard on every route
+    while the importing component carries core/prompt-deny-patterns. A Recipe
+    running Kong Gateway Enterprise declares model_routes_edition: enterprise,
+    and the bundle then writes what the importing component's
     core/fallback-chain, core/period-budget and core/data-masking attachments
     ask for: AI Proxy Advanced on a chained alias's routes, AI Rate Limiting
     Advanced for the whole gateway or on each wired model's service, and the
@@ -76,10 +78,28 @@ spec:
     # With nothing wired to the models socket the template writes nothing, and
     # no file is emitted.
     #
+    # The prompt guard, on the open-source edition. While the importing
+    # component carries a core/prompt-deny-patterns attachment, at most one,
+    # every route of each wired model also carries Kong's AI Prompt Guard,
+    # which runs after the request transformer and before the AI proxy. It is
+    # written with the attachment's deny_patterns and, where it lists any, its
+    # allow_patterns, and with the widest reading of a request Kong 3.9.3
+    # offers: match_all_roles on and allow_all_conversation_history off, so
+    # the guard reads every message of every role across the whole
+    # conversation, newest first, joined into one text with a space after
+    # each message, and a completion's prompt. The body size it reads stays
+    # its default, the AI proxy's own. Kong's schema takes at most 10
+    # expressions in a list, each at most 500 bytes, and an import holding
+    # more fails, so the bundle stops the build there; the realization,
+    # prompt-deny-patterns-kong, refuses the same by name. An attachment
+    # reaching a Recipe that declares model_routes_edition stops the build:
+    # the guard is realized on the open-source gateway alone.
+    #
     # Kong Gateway Enterprise. A Recipe running it declares the local
     # model_routes_edition as enterprise; with no such local the bundle reads
-    # no attachment and writes the routes above as they are. With it, the
-    # bundle reads the importing component's attachments, at most one each:
+    # no attachment but the prompt guard's and writes the routes above as they
+    # are. With it, the bundle reads the importing component's attachments, at
+    # most one each:
     # - core/fallback-chain: each alias an entry names gets a walk — the alias,
     #   then its entry's fallbacks in order, a fallback's own entry followed
     #   while fewer than max_hops fallbacks have been counted — and its two
@@ -113,9 +133,10 @@ spec:
     # target. With compose_configs it emits one compose config, for the compose
     # target, which delivers a config as one file at the path it is mounted at.
     # Compose reads a $ in a config's content as the start of a variable of its
-    # own, so there each $ in a string a model publishes is written as $$, the
-    # compose file's spelling of a literal $; an alias carries no $, the
-    # characters an alias may hold being letters, digits, - and _. Either way
+    # own, so there each $ in a string a model publishes, and in an expression
+    # the prompt guard carries, is written as $$, the compose file's spelling of
+    # a literal $; an alias carries no $, the characters an alias may hold
+    # being letters, digits, - and _. Either way
     # the workload receives the same configuration. Any other value, or none,
     # stops the build.
     #
@@ -140,13 +161,12 @@ spec:
     #
     # The template reads the importing Recipe's context: .context.uses for the
     # models connections, .context.instance_id, .context.rendered_name with
-    # config_map, .features with the enterprise edition, and the locals listed
-    # above. It checks every local before it
-    # writes anything, because a local the importing Recipe does not declare
-    # reads as empty here rather than stopping the build, and a name or a
-    # variable that differs on the two sides would leave an import step reading
-    # a file that is not there, or a route naming a variable the gateway is not
-    # given.
+    # config_map, .features, and the locals listed above. It checks every
+    # local before it writes anything, because a local the importing Recipe
+    # does not declare reads as empty here rather than stopping the build, and
+    # a name or a variable that differs on the two sides would leave an import
+    # step reading a file that is not there, or a route naming a variable the
+    # gateway is not given.
     ModelRoutes:
       model-routes.yaml: |
         {{- /* The values this bundle shares with the Recipe importing it. Each has its home here, and the importing
@@ -233,9 +253,9 @@ spec:
         {{- end }}
         {{- /* How a literal dollar sign is written in the configuration. Compose reads a $ anywhere in the file it is
           given, a config's content included, as the start of a variable of its own, and a compose file spells a
-          literal $ as $$, while a ConfigMap carries its data as written. So each string a model publishes is written
-          through $dollar, which is $ in a ConfigMap and $$ in a compose config, and the workload receives the same
-          configuration on either delivery. An alias carries no $. */}}
+          literal $ as $$, while a ConfigMap carries its data as written. So each string a model publishes, and the
+          prompt guard's configuration, is written through $dollar, which is $ in a ConfigMap and $$ in a compose
+          config, and the workload receives the same configuration on either delivery. An alias carries no $. */}}
         {{- $dollar := "$" }}
         {{- if $compose }}{{ $dollar = "$$" }}{{ end }}
         {{- /* The models connections. With none, nothing below is written, and no file is emitted. */}}
@@ -270,6 +290,31 @@ spec:
         {{- if eq $type "core/period-budget" }}{{ if $budget }}{{ fail (printf "%s writes one period budget for %q, and core/period-budget is attached more than once; keep one attachment" $bundle $.context.instance_id) }}{{ end }}{{ $budget = $attachment }}{{ end }}
         {{- if eq $type "core/data-masking" }}{{ if $masking }}{{ fail (printf "%s writes one AI PII Sanitizer on each route of %q, and core/data-masking is attached more than once; keep one attachment" $bundle $.context.instance_id) }}{{ end }}{{ $masking = $attachment }}{{ end }}
         {{- end }}
+        {{- end }}
+        {{- /* The prompt guard, read on the open-source edition: at most one core/prompt-deny-patterns attachment, its
+          realization holding the refusals. Its configuration is written once, as one JSON object, on every route of
+          each wired model: the deny list, the allow list where it holds any expression, and every message of every
+          role read across the whole conversation. A list longer than Kong's schema takes, or an expression longer,
+          stops the build here, since an import holding it would fail and leave the gateway unstarted. */}}
+        {{- $guard := dict }}
+        {{- range $name, $attachment := (default dict .features) }}
+        {{- if eq (first (splitList ":" (toString $attachment.type))) "core/prompt-deny-patterns" }}
+        {{- if $enterprise }}{{ fail (printf "%s writes Kong's AI Prompt Guard on the open-source gateway alone, and the core/prompt-deny-patterns attachment %q on %q reaches a Recipe running Kong Gateway Enterprise, where it is not realized; remove the attachment" $bundle $name $.context.instance_id) }}{{ end }}
+        {{- if $guard }}{{ fail (printf "%s writes one AI Prompt Guard on each route of %q, and core/prompt-deny-patterns is attached more than once; keep one attachment" $bundle $.context.instance_id) }}{{ end }}
+        {{- $guard = $attachment }}
+        {{- end }}
+        {{- end }}
+        {{- $guardConfig := "" }}
+        {{- with $guard }}
+        {{- $config := dict "match_all_roles" true "allow_all_conversation_history" false }}
+        {{- range $list := list "deny_patterns" "allow_patterns" }}
+        {{- $patterns := list }}
+        {{- range $p := (optional (default dict $guard.values) $list list) }}{{ $patterns = append $patterns (toString $p) }}{{ end }}
+        {{- if gt (len $patterns) 10 }}{{ fail (printf "%s writes the prompt guard of %q, whose %s lists %d expressions, and Kong's AI Prompt Guard takes at most 10" $bundle $.context.instance_id $list (len $patterns)) }}{{ end }}
+        {{- range $p := $patterns }}{{ if gt (len $p) 500 }}{{ fail (printf "%s writes the prompt guard of %q, whose %s holds an expression of %d bytes, and Kong's AI Prompt Guard takes at most 500" $bundle $.context.instance_id $list (len $p)) }}{{ end }}{{ end }}
+        {{- if $patterns }}{{ $_ := set $config $list $patterns }}{{ end }}
+        {{- end }}
+        {{- $guardConfig = toJson $config }}
         {{- end }}
         {{- /* The walk of each alias a core/fallback-chain entry names: the alias, then its entry's fallbacks in order,
           each counting one fallback; a fallback's own entry is followed, before the rest of the list it came from,
@@ -416,6 +461,10 @@ spec:
                           remove:
                             body:
                               - model
+        {{- if $guardConfig }}
+                      - name: ai-prompt-guard
+                        config: {{ $guardConfig | replace "$" $dollar }}
+        {{- end }}
         {{- if $walk }}
         {{- /* A walked alias's route: Kong Gateway Enterprise's AI Proxy Advanced, whose balancer holds the walk as
           its targets, each in a priority group of its own by a weight falling from the number of targets to one,
