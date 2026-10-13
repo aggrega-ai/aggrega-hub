@@ -1,0 +1,148 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: period-budget-higress
+  version: 1.0.0
+  description: >
+    Realizes core/period-budget on the gateway core/gateway/higress; a Release
+    binds it in its Manifest. It emits no file: the gateway's chart Recipe,
+    higress-chart, writes Higress's ai-token-ratelimit plugin onto the model
+    routes, counting in the Redis-protocol store on the cache socket.
+
+    The gateway adds the prompt and completion tokens each reply reports once
+    the reply completes, over a fixed window of period that opens when the
+    first reply in it is counted, and answers model requests with HTTP 429
+    while the count exceeds limit, until the window ends; the request
+    crossing the limit is served. Scope gateway keeps one count for all it
+    serves, scope model one for each alias. A reply reporting no usage counts
+    nothing, and a streamed request turning the usage report off is refused
+    with HTTP 403. While the store cannot be reached, model requests are
+    served and not counted.
+
+    So it honours unit total_tokens, scope gateway or model, and a period of
+    one second, minute, hour or day, however spelt. It refuses usd,
+    prompt_tokens, completion_tokens, scope caller, since the gateway
+    verifies no caller, any other period and a limit that is not a whole
+    number by name, and halts on a second such attachment, with nothing wired
+    to the models or cache socket, and on any component other than
+    core/gateway/higress.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/period-budget:1.0.0
+  # executionScope omitted -> component: evaluated once per attached component.
+  #
+  # No input kind and no pipeline: what this attachment changes is written by
+  # the gateway's chart Recipe, which reads it. What stays here is what that
+  # Recipe cannot honour.
+  #
+  # How the gateway keeps the budget, read in Higress's source at v2.2.5, the
+  # release the gateway's Recipe pins, which its ai-token-ratelimit module
+  # 2.0.3 is built from. Before a model request is forwarded, the plugin reads
+  # the count of its rule in the store and answers HTTP 429, with a header
+  # naming the seconds left in the window, while that count exceeds limit.
+  # Once the reply completes, it adds the prompt and completion tokens the
+  # reply reports, together, to the count, but only while the count has not
+  # yet passed limit; a count created by that addition expires after period,
+  # so the window opens with the first reply counted in it and runs period
+  # from then, and the request taking the count past limit is served. Scope
+  # gateway is one rule for every alias the gateway serves, and so one count;
+  # scope model is one rule for each alias, and so one count each. The
+  # gateway's Recipe asks a streamed request's model to report its usage at
+  # the end of the stream, unless the request answers that itself; one turning
+  # the report off is refused before it is forwarded, so its tokens are not
+  # left uncounted. A reply reporting no usage adds nothing.
+  #
+  # The window is one of the plugin's four — a second, a minute, an hour or a
+  # day — each of which a period of that length takes, written in any unit the
+  # Feature takes: 60s and 1m are one window. There is no count of windows,
+  # so any other length, and a calendar month, has none here.
+  #
+  # While the store cannot be reached, or answers in a way the plugin does not
+  # read, the plugin lets the request through, served and not counted: it has
+  # no setting that refuses it then. A password reference the controller
+  # cannot read leaves the plugin presenting the reference itself, which the
+  # store refuses, with the same effect.
+  #
+  # What it does not count: the plugin prices nothing, so it keeps no budget
+  # in US dollars, and it adds a reply's prompt and completion tokens
+  # together, never one of them alone. The gateway declares no callers, so it
+  # verifies none, and a count for each caller would rest on whatever a
+  # request claimed.
+  #
+  # No assertion can read the host component's labels or infra, so what the
+  # gateway is able to do is stated in the messages, and the check of the
+  # host's type first in the list is what keeps those statements true.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/higress and core/gateway/higress:1.0.0 are the same host.
+    component_writes_the_budget: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/higress" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q is bound to the Higress realization, which only core/gateway/higress carries out: that component's chart Recipe writes the budget onto the routes it serves models on, and %s renders none for it, so nothing would be counted. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The plugin counts tokens, prompt and completion together.
+    unit_is_total_tokens: >-
+      {{- if eq .values.unit "usd" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for unit usd, but core/gateway/higress, which declares dataplane.aggrega.ai/period-budget: tokens, counts the tokens each model's reply reports and prices nothing, so it keeps no budget in US dollars; set unit to total_tokens, or attach the Feature to a gateway that counts cost" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- else if ne .values.unit "total_tokens" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for unit %s, but core/gateway/higress adds the prompt and completion tokens each reply reports together and keeps no count of either alone; set unit to total_tokens" .metadata.feature_instance .metadata.instance_id .values.unit) -}}
+      {{- end -}}
+    # The gateway verifies no caller.
+    scope_is_one_the_gateway_keeps: >-
+      {{- if eq .values.scope "caller" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for scope caller, but core/gateway/higress declares no callers and so verifies none, and a count for each caller would rest on whatever a request claims to be; set scope to gateway, for every model request it serves, or model, for each alias it serves" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+    # A period of one of the plugin's windows, written in any unit the Feature
+    # takes. The lengths, in seconds, are the ones the gateway's Recipe maps to
+    # a window; the two lists are kept apart deliberately, because an
+    # assertion cannot hand a value to the Recipe, and they are edited
+    # together: the Recipe halts on a period it cannot map, so a period
+    # admitted here and missing there stops the build rather than rendering a
+    # wrong window.
+    period_is_one_the_gateway_keeps: >-
+      {{- $count := atoi (regexFind "^[0-9]+" .infra.period) -}}
+      {{- $suffix := regexFind "[a-z]+$" .infra.period -}}
+      {{- $honoured := false -}}
+      {{- if ne $suffix "mo" -}}
+      {{- $seconds := mul $count (index (dict "s" 1 "m" 60 "h" 3600 "d" 86400) $suffix) -}}
+      {{- $honoured = has (toString $seconds) (list "1" "60" "3600" "86400") -}}
+      {{- end -}}
+      {{- if not $honoured -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of %s, but core/gateway/higress counts a budget over one of four fixed windows — a second, a minute, an hour or a day — and %s is none of them; set period to 1s, 1m, 1h or 1d" .metadata.feature_instance .metadata.instance_id .infra.period .infra.period) -}}
+      {{- end -}}
+    # The plugin takes its limit as a whole number of tokens. The build
+    # carries the limit as a number exact up to 9007199254740991, so a larger
+    # one is refused too.
+    limit_is_a_whole_number_of_tokens: >-
+      {{- $limit := float64 .infra.limit -}}
+      {{- if or (ne $limit (floor $limit)) (gt $limit 9007199254740991.0) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q sets limit %v, but core/gateway/higress takes its limit as a whole number of tokens; set limit to a whole number no greater than 9007199254740991" .metadata.feature_instance .metadata.instance_id .infra.limit) -}}
+      {{- end -}}
+    # The budget is written onto the routes serving the wired models, and with
+    # none wired the gateway renders no model route to count.
+    models_are_wired: >-
+      {{- if not (optional .uses "models" dict) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q needs a model route to count, but nothing is wired to the models socket of %q, so the gateway serves no model and there is nothing the budget could count; wire a model to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The plugin keeps the count in the store wired to the cache socket, and
+    # with none it would keep nothing.
+    counter_store_is_wired: >-
+      {{- if not (optional .uses "cache" dict) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q needs a store for its count, but nothing is wired to the cache socket of %q, and Higress's token limit keeps the count in the Redis-protocol store wired there; wire a core/datastore/redis to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The chart Recipe writes one budget from one attachment, so a second
+    # attachment could not hold beside the first.
+    one_budget_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/period-budget is attached to %q more than once (%s), but core/gateway/higress's chart Recipe writes one budget onto the routes it serves models on, so the attachments cannot each hold; keep one attachment" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
+      {{- end -}}

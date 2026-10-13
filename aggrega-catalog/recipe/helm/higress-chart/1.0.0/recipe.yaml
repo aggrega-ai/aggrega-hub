@@ -25,7 +25,12 @@ metadata:
     gateway checks an https model's certificate chain against the system's
     trust anchors, but not that the certificate names the model's host.
 
-    The images, the AI proxy module and the chart version are pinned;
+    While core/data-masking, core/period-budget or core/audit-logging is
+    attached, it adds Higress's plugin for each onto the model routes: request
+    masking, with what it cannot read refused, a token limit counted in the
+    store on the cache socket, and statistics in the access log.
+
+    The images, the plugin modules and the chart version are pinned;
     infra.source_version accepts only the chart versions this configuration
     is proven at.
   maintainers:
@@ -92,12 +97,25 @@ spec:
   # written for that module as published and proven at it, so no setting
   # moves either pin.
   #
+  # The modules the attachments add, each pinned the same way, by tag in its
+  # address and by its manifest's digest beside it: the data-masking plugin and
+  # the request-validation plugin that refuses what masking cannot read, the
+  # token-limit plugin keeping a period budget, and the statistics plugin
+  # writing the request record into the access log. Each configuration below
+  # is read off that module's own source at the release it was built from, so
+  # no setting moves a pin.
+  #
   # registry_domain_pattern is the host-name shape the gateway's registry
   # accepts for a DNS entry; an entry whose host does not match it is dropped
   # when the Higress controller reads the registry, with every request to it
   # failing, so the build halts on it instead. operation_path_pattern matches the
   # endpoint paths the AI proxy reads as the one path every request is sent
   # to, where any other path is a base to which it appends each operation.
+  # store_registry_prefix names the registry entry of the period budget's
+  # store, after the cache connection, apart from the models' entries.
+  #
+  # masking_failure_message is what a request receives, with HTTP 500, when
+  # the masking plugin fails while masking it, and is then not forwarded.
   locals:
     proven_chart_versions: "2.2.5"
     image_registry: higress-registry.cn-hangzhou.cr.aliyuncs.com
@@ -106,7 +124,17 @@ spec:
     discovery_image_tag: "2.2.5@sha256:10334ca1baf0d8e1f8a97bb47845d6c12d118eda3d330c86a7707aa9f0628aa9"
     ai_proxy_module: "oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-proxy:2.0.3"
     ai_proxy_module_sha256: "cacd268f76e245bcc1d2c05f549d514038e888d460c194e0059a0e7b92f98eec"
+    ai_data_masking_module: "oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-data-masking:2.0.3"
+    ai_data_masking_module_sha256: "f792b1a0a16c69fff36fcc199df47739fc0d4054f182e9e2b6d45e89ead1c8ee"
+    request_validation_module: "oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/request-validation:2.0.3"
+    request_validation_module_sha256: "efeb7f1786cc699918fca2c4d1ce8fb8bbd6f78b265068d87eb0532731dcd546"
+    ai_token_ratelimit_module: "oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-token-ratelimit:2.0.3"
+    ai_token_ratelimit_module_sha256: "9276a7d4cbd7afef668fd1aaf41212e663fd7fa98661c619398a7f2fb2736679"
+    ai_statistics_module: "oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-statistics:2.0.3"
+    ai_statistics_module_sha256: "c8c16f5295e14509710af9ea962ac7ebefe3b7f995bd6fd33885bbe2761c1d56"
     model_registry_prefix: "model-"
+    store_registry_prefix: "store-"
+    masking_failure_message: "The gateway could not mask this request, so it was not forwarded."
     registry_domain_pattern: '^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$'
     operation_path_pattern: '/(completions|embeddings|audio/speech|audio/transcriptions|audio/translations|images/generations|images/variations|images/edits|models|responses|fine_tuning/jobs|fine_tuning/checkpoints|realtime|videos)$'
 
@@ -173,6 +201,50 @@ spec:
   # name longer than the 63 characters a host-name label takes, and an alias
   # with more than 100 connections, which equal whole-number weights cannot
   # share.
+  #
+  # The controls the attachments ask for, each one Higress plugin applied to
+  # every alias's Ingress, written only while its attachment is present, so a
+  # gateway with none renders exactly the documents above. Each realization's
+  # FeatureRecipe refuses what the plugin cannot keep before this template
+  # renders; what it renders is:
+  # - core/data-masking: the masking plugin, which replaces each match of a
+  #   listed pattern in the text of a chat request's messages with
+  #   [<pattern name>] before the request is forwarded. Its regular
+  #   expressions are written as listed; Higress reads them as Rust
+  #   fancy-regex, with grok's %{NAME} patterns expanded. A request the
+  #   plugin fails while masking gets HTTP 500 and masking_failure_message,
+  #   and is not forwarded. While allow_unmasked_text is off, a body that
+  #   does not parse as JSON is masked as plain text, the plugin's own
+  #   fallback, rather than passed on.
+  # - Refusing what masking cannot read: the request-validation plugin, with
+  #   HTTP 403, before the request is forwarded. While allow_unmasked_text is
+  #   off it refuses a request with a body that is not sent as JSON, and a
+  #   JSON body that is not a chat completion of plain-text messages — a
+  #   message whose content is a list or null, a tool call, a tool turn, a
+  #   message's name or any other field of a message, and any parameter of
+  #   the request beyond the chat completion's own non-text ones and the
+  #   developer's own tools, tool choice, response format and stop
+  #   sequences. While only allow_non_text_content is off, it refuses a
+  #   request with a body that is not sent as JSON, every request but a chat
+  #   completion, and a message carrying an image, a file or audio. A
+  #   request with no body passes. Validation reads a body only once it
+  #   parses as a JSON object, so a body labelled JSON that does not parse
+  #   passes it; the masking fallback above covers that body.
+  # - core/period-budget: the token-limit plugin, refusing a model request
+  #   with HTTP 429 while the tokens counted in the current window exceed
+  #   limit, one count for the whole gateway under scope gateway and one for
+  #   each alias under scope model, kept in the store on the cache socket.
+  #   The store becomes a registry entry, store-<connection>, its host
+  #   qualified as a model's is, and the plugin presents the cache
+  #   connection's credential as ${secret.<Secret>.<data key>}, which the
+  #   controller replaces with the password before the gateway reads it. A
+  #   streamed request turning off the usage report the count is taken from
+  #   is refused by the request-validation plugin.
+  # - core/audit-logging: the statistics plugin on every path of the model
+  #   routes, which writes the model that answered and the tokens its reply
+  #   reports into the ai_log field of the gateway's access log line.
+  # Every module is pinned as the locals above say and fails closed: a module
+  # that fails to load fails every request it would have acted on.
   artifacts:
     model-routes.yaml: |
       {{- $ns := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default" }}
@@ -216,6 +288,63 @@ spec:
       {{- $_ := set $members $alias (append $peers $name) }}
       {{- end }}
       {{- $aliases := sortAlpha (keys $members) }}
+      {{- $ingressOf := dict }}
+      {{- $ingressNames := list }}
+      {{- range $alias := $aliases }}
+      {{- $named := printf "%s-model-%s" $.context.rendered_name (lower $alias | replace "_" "-") }}
+      {{- $_ := set $ingressOf $alias $named }}
+      {{- $ingressNames = append $ingressNames $named }}
+      {{- end }}
+      {{- $masking := dict }}
+      {{- $budget := dict }}
+      {{- $budgetName := "" }}
+      {{- $audit := dict }}
+      {{- range $name, $attachment := (default dict .features) }}
+      {{- $type := first (splitList ":" (toString $attachment.type)) }}
+      {{- if eq $type "core/data-masking" }}{{ $masking = $attachment }}{{ end }}
+      {{- if eq $type "core/period-budget" }}{{ $budget = $attachment }}{{ $budgetName = $name }}{{ end }}
+      {{- if eq $type "core/audit-logging" }}{{ $audit = $attachment }}{{ end }}
+      {{- end }}
+      {{- $maskInfra := default dict (optional $masking "infra" dict) }}
+      {{- $textRelaxed := and (hasKey $maskInfra "allow_unmasked_text") (eq (toString (index $maskInfra "allow_unmasked_text")) "true") }}
+      {{- $nonTextRelaxed := and (hasKey $maskInfra "allow_non_text_content") (eq (toString (index $maskInfra "allow_non_text_content")) "true") }}
+      {{- $textStrict := and $masking (not $textRelaxed) }}
+      {{- $nonTextStrict := and $masking (not $nonTextRelaxed) }}
+      {{- with $masking }}
+      {{- range $pattern := (optional (default dict .values) "patterns" list) }}
+      {{- if or (contains "${" (toString $pattern.regex)) (contains "${" (toString $pattern.name)) }}{{ fail (printf "the pattern %q of the core/data-masking attachment on %q holds \"${\", which Higress reads in a plugin's configuration as a reference to a Secret's value; write the expression without it, as \\$\\{ for a literal match" (toString $pattern.name) $.context.instance_id) }}{{ end }}
+      {{- end }}
+      {{- end }}
+      {{- $store := dict }}
+      {{- $budgetWindow := "" }}
+      {{- with $budget }}
+      {{- $period := toString (optional (default dict .infra) "period" "") }}
+      {{- $count := atoi (regexFind "^[0-9]+" $period) }}
+      {{- $unit := regexFind "[a-z]+$" $period }}
+      {{- $seconds := 0 }}
+      {{- if has $unit (list "s" "m" "h" "d") }}{{ $seconds = mul $count (index (dict "s" 1 "m" 60 "h" 3600 "d" 86400) $unit) }}{{ end }}
+      {{- $budgetWindow = get (dict "1" "token_per_second" "60" "token_per_minute" "3600" "token_per_hour" "86400" "token_per_day") (toString $seconds) }}
+      {{- if not $budgetWindow }}{{ fail (printf "the core/period-budget attachment on %q asks for a period of %s, which is none of the windows Higress's token limit counts over; set period to 1s, 1m, 1h or 1d" $.context.instance_id $period) }}{{ end }}
+      {{- range $name, $edge := $.context.uses }}{{ if eq $edge.socket "cache" }}
+      {{- $protocol := toString (optional (default dict $edge.provides) "protocol" "") }}
+      {{- if not (has $protocol (list "redis" "valkey")) }}{{ fail (printf "the cache socket of %q is wired to %q, whose published protocol is %q, but Higress's token limit keeps a period budget's count in a store speaking the Redis protocol, which a store publishes as redis or valkey; wire a core/datastore/redis to the cache socket instead" $.context.instance_id $edge.target $protocol) }}{{ end }}
+      {{- $registry := printf "%s%s" $.locals.store_registry_prefix (lower $name | replace "_" "-") }}
+      {{- if hasSuffix "-" $registry }}{{ fail (printf "the cache connection %s of %q ends in a hyphen or an underscore, which the gateway's registry entry named after it cannot end in; rename the connection" $name $.context.instance_id) }}{{ end }}
+      {{- if gt (len $registry) 63 }}{{ fail (printf "the cache connection %s of %q gives the gateway's registry entry the name %q, longer than the 63 characters a host-name label takes; shorten the connection's name" $name $.context.instance_id $registry) }}{{ end }}
+      {{- $storeHost := lower (toString $edge.provides.host) }}
+      {{- if not (contains "." $storeHost) }}{{ $storeHost = printf "%s.%s.svc.cluster.local" $storeHost (optional (optional (default dict $edge.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default") }}{{ end }}
+      {{- if not (regexMatch $.locals.registry_domain_pattern $storeHost) }}{{ fail (printf "the cache connection %s of %q reaches %q, whose published host %q is not a host name the gateway's registry accepts — it takes no address — so the token limit could not reach its store; publish the store's host name" $name $.context.instance_id $edge.target $storeHost) }}{{ end }}
+      {{- $storeToken := "" }}
+      {{- with optional (default dict $edge.features) "credential" dict }}
+      {{- $secret := optional (optional . "provides" dict) "name" "" }}
+      {{- $key := optional (optional . "provides" dict) "key" "" }}
+      {{- if not (and $secret $key) }}{{ fail (printf "the credential on the cache connection %s of %q publishes no Secret name and data key, so the gateway cannot name the Secret it reads the store's password from; attach core/referenced-secret, which publishes both" $name $.context.instance_id) }}{{ end }}
+      {{- if or (contains "." $secret) (contains "}" $secret) (contains "}" $key) }}{{ fail (printf "the credential on the cache connection %s of %q publishes the Secret name %q and data key %q, but Higress reads a Secret reference's name up to its first dot and both up to a closing brace, so it would read another Secret. A realization that names its own Secret after the connection and the slot writes a dot between them; realize the credential with one that names an existing Secret, k8s-existing-secret, and give that Secret a name without a dot" $name $.context.instance_id $secret $key) }}{{ end }}
+      {{- $storeToken = printf "${secret.%s.%s}" $secret $key }}
+      {{- end }}
+      {{- $store = dict "registry" $registry "host" $storeHost "port" (toString $edge.provides.port) "token" $storeToken }}
+      {{- end }}{{ end }}
+      {{- end }}
       {{- range $alias := $aliases }}
       {{- $ingress := printf "%s-model-%s" $.context.rendered_name (lower $alias | replace "_" "-") }}
       {{- if hasSuffix "-" $ingress }}{{ fail (printf "the alias %s that the models socket of %q serves ends in a hyphen or an underscore, which the gateway's Ingress named after it cannot end in; rename it" $alias $.context.instance_id) }}{{ end }}
@@ -237,6 +366,12 @@ spec:
             domain: {{ $e.host | toJson }}
             port: {{ $e.port }}
             protocol: {{ $e.protocol | toJson }}
+      {{- end }}
+      {{- with $store }}
+          - name: {{ .registry | toJson }}
+            type: dns
+            domain: {{ .host | toJson }}
+            port: {{ .port }}
       {{- end }}
       {{- range $alias := $aliases }}
       {{- $peers := get $members $alias }}
@@ -300,6 +435,222 @@ spec:
                   "*": {{ $e.model | toJson }}
       {{- end }}
       {{- end }}
+      {{- with $masking }}
+      ---
+      apiVersion: extensions.higress.io/v1alpha1
+      kind: WasmPlugin
+      metadata:
+        name: "{{ $.context.rendered_name }}-ai-data-masking"
+        namespace: "{{ $ns }}"
+      spec:
+        url: "{{ $.locals.ai_data_masking_module }}"
+        sha256: "{{ $.locals.ai_data_masking_module_sha256 }}"
+        failStrategy: FAIL_CLOSE
+        phase: AUTHN
+        priority: 991
+        defaultConfigDisable: true
+        matchRules:
+          - ingress:
+      {{- range $ingressNames }}
+              - {{ . | toJson }}
+      {{- end }}
+            config:
+              deny_openai: true
+              deny_raw: {{ not $textRelaxed }}
+              system_deny: false
+              deny_code: 500
+              deny_message: {{ $.locals.masking_failure_message | toJson }}
+              deny_raw_message: {{ dict "error" (dict "message" $.locals.masking_failure_message) | toJson | toJson }}
+              replace_roles:
+      {{- range $pattern := (optional (default dict .values) "patterns" list) }}
+                - regex: {{ toString $pattern.regex | toJson }}
+                  type: replace
+                  value: {{ printf "[%s]" (toString $pattern.name | replace "$" "$$") | toJson }}
+      {{- end }}
+      {{- end }}
+      {{- if or $textStrict $nonTextStrict $budget }}
+      {{- $refusals := list }}
+      {{- if $textStrict }}{{ $refusals = append $refusals "This gateway masks the text of a chat request's messages before forwarding it, and refuses a request it cannot mask: one not sent as JSON, one that is not a chat completion of plain-text messages, a tool call or tool turn, or a parameter beyond the chat completion's own." }}{{ else if $nonTextStrict }}{{ $refusals = append $refusals "This gateway refuses a request carrying content that is not text: one not sent as JSON, and every request but a chat completion of text messages." }}{{ end }}
+      {{- if $budget }}{{ $refusals = append $refusals "This gateway counts the tokens each reply reports against a budget, and refuses a streamed request that turns off the usage report." }}{{ end }}
+      ---
+      apiVersion: extensions.higress.io/v1alpha1
+      kind: WasmPlugin
+      metadata:
+        name: "{{ $.context.rendered_name }}-request-validation"
+        namespace: "{{ $ns }}"
+      spec:
+        url: "{{ $.locals.request_validation_module }}"
+        sha256: "{{ $.locals.request_validation_module_sha256 }}"
+        failStrategy: FAIL_CLOSE
+        phase: AUTHN
+        priority: 220
+        defaultConfigDisable: true
+        matchRules:
+          - ingress:
+      {{- range $ingressNames }}
+              - {{ . | toJson }}
+      {{- end }}
+            config:
+      {{- if or $textStrict $nonTextStrict }}
+              header_schema:
+                type: object
+                if:
+                  required: [":method"]
+                  properties:
+                    ":method":
+                      enum: [GET, HEAD, DELETE, OPTIONS]
+                then: {}
+                else:
+                  required: [content-type]
+                  properties:
+                    content-type:
+                      type: string
+                      pattern: "^[Aa][Pp][Pp][Ll][Ii][Cc][Aa][Tt][Ii][Oo][Nn]/[Jj][Ss][Oo][Nn]"
+      {{- end }}
+              body_schema:
+                type: object
+                allOf:
+      {{- if $textStrict }}
+                  - required: [messages]
+                    additionalProperties: false
+                    properties:
+                      model: {}
+                      messages:
+                        type: array
+                        items:
+                          type: object
+                          additionalProperties: false
+                          required: [role, content]
+                          properties:
+                            role:
+                              enum: [system, developer, user, assistant]
+                            content:
+                              type: string
+                            reasoning_content:
+                              type: string
+                      stream: {}
+                      stream_options: {}
+                      temperature: {}
+                      top_p: {}
+                      "n": {}
+                      max_tokens: {}
+                      max_completion_tokens: {}
+                      presence_penalty: {}
+                      frequency_penalty: {}
+                      logit_bias: {}
+                      logprobs: {}
+                      top_logprobs: {}
+                      seed: {}
+                      reasoning_effort: {}
+                      verbosity: {}
+                      service_tier: {}
+                      modalities: {}
+                      audio: {}
+                      store: {}
+                      parallel_tool_calls: {}
+                      tools: {}
+                      tool_choice: {}
+                      functions: {}
+                      function_call: {}
+                      response_format: {}
+                      stop: {}
+      {{- else if $nonTextStrict }}
+                  - required: [messages]
+                    properties:
+                      messages:
+                        type: array
+                        items:
+                          type: object
+                          not:
+                            required: [audio]
+                          properties:
+                            content:
+                              anyOf:
+                                - type: string
+                                - type: "null"
+                                - type: array
+                                  items:
+                                    type: object
+                                    required: [type]
+                                    properties:
+                                      type:
+                                        enum: [text]
+      {{- end }}
+      {{- if $budget }}
+                  - not:
+                      required: [stream, stream_options]
+                      properties:
+                        stream:
+                          const: true
+                        stream_options:
+                          required: [include_usage]
+                          properties:
+                            include_usage:
+                              not:
+                                const: true
+      {{- end }}
+              rejected_code: 403
+              rejected_msg: {{ dict "error" (dict "message" (join " " $refusals) "type" "invalid_request_error") | toJson | toJson }}
+      {{- end }}
+      {{- with $budget }}
+      {{- $rules := list }}
+      {{- if eq (toString (optional (default dict .values) "scope" "")) "model" }}
+      {{- range $alias := $aliases }}{{ $rules = append $rules (dict "ingress" (list (get $ingressOf $alias)) "name" (printf "%s/%s/%s/%s" $ns $.context.rendered_name $budgetName $alias)) }}{{ end }}
+      {{- else }}
+      {{- $rules = append $rules (dict "ingress" $ingressNames "name" (printf "%s/%s/%s" $ns $.context.rendered_name $budgetName)) }}
+      {{- end }}
+      ---
+      apiVersion: extensions.higress.io/v1alpha1
+      kind: WasmPlugin
+      metadata:
+        name: "{{ $.context.rendered_name }}-ai-token-ratelimit"
+        namespace: "{{ $ns }}"
+      spec:
+        url: "{{ $.locals.ai_token_ratelimit_module }}"
+        sha256: "{{ $.locals.ai_token_ratelimit_module_sha256 }}"
+        failStrategy: FAIL_CLOSE
+        priority: 600
+        defaultConfigDisable: true
+        matchRules:
+      {{- range $rule := $rules }}
+          - ingress:
+      {{- range $rule.ingress }}
+              - {{ . | toJson }}
+      {{- end }}
+            config:
+              rule_name: {{ $rule.name | toJson }}
+              global_threshold:
+                {{ $budgetWindow }}: {{ int64 $budget.infra.limit }}
+              rejected_code: 429
+              redis:
+                service_name: {{ printf "%s.dns" $store.registry | toJson }}
+                service_port: {{ $store.port }}
+      {{- with $store.token }}
+                password: {{ . | toJson }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- with $audit }}
+      ---
+      apiVersion: extensions.higress.io/v1alpha1
+      kind: WasmPlugin
+      metadata:
+        name: "{{ $.context.rendered_name }}-ai-statistics"
+        namespace: "{{ $ns }}"
+      spec:
+        url: "{{ $.locals.ai_statistics_module }}"
+        sha256: "{{ $.locals.ai_statistics_module_sha256 }}"
+        failStrategy: FAIL_CLOSE
+        priority: 200
+        defaultConfigDisable: true
+        matchRules:
+          - ingress:
+      {{- range $ingressNames }}
+              - {{ . | toJson }}
+      {{- end }}
+            config:
+              enable_path_suffixes: ["*"]
+      {{- end }}
       {{- end }}
 
   # This Recipe reads from infra.overrides:
@@ -324,6 +675,12 @@ spec:
   # controller writes `higress-ca-root-cert` and the registry it reads
   # `default`, whatever the release, so a namespace holds one Higress
   # gateway.
+  #
+  # While core/period-budget is attached, the controller hands the gateway
+  # every service it knows rather than only those a route names, so the
+  # token limit can reach its store. DELIBERATE NEAR-DUPLICATE: the mapping
+  # finds that attachment the way the artifact above does, since a template
+  # cannot hand a value to another; the two are edited together.
   valuesMapping: |
     ## ── The Release's namespace ────────────────────────────────
     ## The namespace the Release places the gateway in through the
@@ -332,6 +689,10 @@ spec:
     ## resources above are written into.
     {{- $ns := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default" }}
     {{- $overrides := optional .infra "overrides" dict | default dict }}
+    {{- $budgeted := false }}
+    {{- range $name, $attachment := (default dict .features) }}
+    {{- if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}{{ $budgeted = true }}{{ end }}
+    {{- end }}
 
     global:
       ## ── Image registry pin ───────────────────────────────────
@@ -358,6 +719,14 @@ spec:
       enablePluginServer: false
       o11y:
         enabled: false
+      {{- if $budgeted }}
+      ## ── The period budget's store ────────────────────────────
+      ## The controller hands the gateway only the services some route names,
+      ## and no route names the store the token limit counts in, so while a
+      ## budget is attached it hands over every service it knows: the
+      ## registry's entries and the Services of the Release's namespace.
+      onlyPushRouteCluster: false
+      {{- end }}
 
     gateway:
       ## ── The gateway, named after the rendered name ───────────

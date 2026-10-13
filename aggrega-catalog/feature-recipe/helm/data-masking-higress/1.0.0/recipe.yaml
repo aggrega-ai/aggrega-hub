@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: data-masking-higress
+  version: 1.0.0
+  description: >
+    Realizes core/data-masking on the gateway core/gateway/higress; a Release
+    binds it in its Manifest. It emits no file: the gateway's chart Recipe,
+    higress-chart, writes Higress's ai-data-masking plugin onto the model
+    routes, replacing each match of a listed pattern in the text of a chat
+    request's messages with [<pattern name>] before the request is
+    forwarded. Higress reads each pattern as Rust fancy-regex, with grok's
+    %{NAME} patterns expanded.
+
+    The plugin reads the content and reasoning of each message, of every
+    role, while every message holds plain text, and nothing else. So while
+    allow_unmasked_text is off, every other request is refused with HTTP 403
+    before it is forwarded: one not sent as JSON or not a chat completion, a
+    message whose content is a list or null, a tool call or tool turn, a
+    message's name, and any parameter beyond a chat completion's non-text
+    ones and the developer's tools, tool choice, response format and stop
+    sequences. Set on, those pass unmasked, and a request with any message
+    not holding plain text passes whole, no message of it masked. While only
+    allow_non_text_content is off, a request carrying an image, a file or
+    audio, and every request but a chat completion, is refused.
+
+    It refuses entity types, restore, refuse, scope response and both, and
+    allow_non_text_content on while allow_unmasked_text is off. It halts on a
+    second attachment, with nothing wired to the models socket, and on any
+    component other than core/gateway/higress.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/data-masking:1.0.0
+  # executionScope omitted -> component: evaluated once per attached component.
+  #
+  # No input kind and no pipeline: the configuration an attachment asks for is
+  # written by the gateway's chart Recipe, which reads the attachment. What
+  # stays here is what that Recipe cannot honour.
+  #
+  # How the gateway masks, read in Higress's source at v2.2.5, the release the
+  # gateway's Recipe pins, which its ai-data-masking module 2.0.3 is built
+  # from. The plugin parses a request's body as a chat completion: a list of
+  # messages, each with a content and a reasoning text. Where every message's
+  # content is one string, it replaces each match of each listed pattern, in
+  # list order, in the content and the reasoning of every message — system,
+  # developer, user, assistant and tool alike — with the pattern's name in
+  # brackets, and forwards the request. A pattern is a Rust fancy-regex
+  # expression, lookaround and backreferences included; %{NAME} and
+  # %{NAME:alias} in it are grok's named patterns, expanded first. An
+  # expression that does not compile stops the plugin from loading, which
+  # fails every model request; one that fails while matching, past its
+  # backtracking limit, refuses that request with HTTP 500.
+  #
+  # Where the body does not parse that way — a message whose content is a
+  # list of parts or null, as a tool-call turn writes it, any request but a
+  # chat completion, or a body that is not JSON — the plugin masks nothing and
+  # passes the request on whole. It never reads a message's tool calls or
+  # name, or any field of the request beside its messages. So the gateway's
+  # Recipe writes, with the masking, a request-validation plugin that refuses
+  # those requests before they are forwarded, as long as a protection asks
+  # for it; validation reads a body only once it parses as a JSON object, so
+  # for a body labelled JSON that does not parse, the Recipe has the masking
+  # plugin run its patterns over the whole body as plain text instead.
+  #
+  # What each relaxation lets through unmasked:
+  # - allow_unmasked_text on: a request whose messages do not all hold plain
+  #   text, whole — its every message unmasked; the arguments of tool calls
+  #   and the results of tools; a message's name; every field of a request
+  #   beside its messages, such as the user, the metadata and a predicted
+  #   output; and every request that is not a chat completion, such as a
+  #   completion's prompt or an embedding's input.
+  # - allow_non_text_content on, which needs allow_unmasked_text on as well:
+  #   a request's images, files and audio, and the addresses they are given
+  #   by. With allow_unmasked_text off, the text beside such content could not
+  #   be masked, since a message holding it is a list of parts, so that
+  #   combination is refused rather than accepted and ignored.
+  # The definitions of tools, a response format and stop sequences are the
+  # developer's own and pass as sent; the reasoning a client sends back is
+  # masked like the rest of a message.
+  #
+  # Replies are not masked: the plugin reads a reply only to put back values
+  # it was asked to restore and to refuse listed words, neither of which this
+  # realization writes. So allow_streamed_replies, mask_reasoning and
+  # allow_unmasked_reply_parts change nothing here, and scope response and
+  # both are refused.
+  #
+  # What it keeps out of the gateway's own records: the gateway's access log
+  # holds no request text, and the plugin's own log lines name no text unless
+  # the gateway logs at debug level.
+  #
+  # No build proves that a running gateway masks anything.
+  #
+  # No assertion can read the host component's labels, so what the gateway is
+  # able to do is stated in the messages, and the check of the host's type
+  # first in the list is what keeps those statements true.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/higress and core/gateway/higress:1.0.0 are the same host.
+    component_writes_the_masking: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/higress" -}}
+      {{- fail (printf "core/data-masking attachment %q on %q is bound to the Higress realization, which only core/gateway/higress carries out: that component's chart Recipe writes the masking onto the routes it serves models on, and %s renders none for it. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The plugin matches the patterns written in its configuration and
+    # recognizes no entity type; Higress's only recognizer is a guard that
+    # calls a paid outside service, which this catalog does not wire.
+    entity_types_are_refused: >-
+      {{- with optional .values "entities" list -}}
+      {{- fail (printf "core/data-masking attachment %q on %q lists the entity types %s, but core/gateway/higress, which declares dataplane.aggrega.ai/content-masking: pattern-list, masks matches of the patterns written in its configuration and recognizes no entity type; list regular expressions under patterns instead, or attach the Feature to a gateway declaring entity-recognition" $.metadata.feature_instance $.metadata.instance_id (join ", " .)) -}}
+      {{- end -}}
+    # restore puts back only entity types a recognizer detected, and the
+    # gateway recognizes none; its own restore of a pattern's matches is not
+    # reliable in a streamed reply.
+    restore_is_refused: >-
+      {{- if eq (optional .values "action" "redact") "restore" -}}
+      {{- fail (printf "core/data-masking attachment %q on %q asks for action restore, but restore puts back entity types a recognizer detected, and core/gateway/higress recognizes none; its own restore of a pattern's matches may miss a value split across the pieces of a streamed reply. Set action to redact, which replaces each match for good" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+    # The plugin refuses a request only on a word of a list it splits the text
+    # into words to find, never on a match of a regular expression.
+    refuse_is_refused: >-
+      {{- if eq (optional .values "action" "redact") "refuse" -}}
+      {{- fail (printf "core/data-masking attachment %q on %q asks for action refuse, but core/gateway/higress's masking plugin refuses a request only on a listed word it finds by splitting the text into words, never on a match of a regular expression; set action to redact, which replaces each match for good" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+    # Replies are not masked.
+    scope_is_request: >-
+      {{- $scope := optional .values "scope" "request" -}}
+      {{- if ne $scope "request" -}}
+      {{- fail (printf "core/data-masking attachment %q on %q asks for scope %s, but core/gateway/higress's masking plugin masks requests and no reply; set scope to request" .metadata.feature_instance .metadata.instance_id $scope) -}}
+      {{- end -}}
+    # The text beside an image, a file or audio sits in a message of parts,
+    # which the plugin does not read, so non-text content can reach the
+    # provider only with that text unmasked. Only true turns either on.
+    non_text_content_needs_unmasked_text: >-
+      {{- $infra := default dict .infra -}}
+      {{- $nonText := and (hasKey $infra "allow_non_text_content") (eq (toString (index $infra "allow_non_text_content")) "true") -}}
+      {{- $text := and (hasKey $infra "allow_unmasked_text") (eq (toString (index $infra "allow_unmasked_text")) "true") -}}
+      {{- if and $nonText (not $text) -}}
+      {{- fail (printf "core/data-masking attachment %q on %q sets allow_non_text_content on while allow_unmasked_text is off, but core/gateway/higress's masking plugin cannot read a message carrying an image, a file or audio, since such a message is a list of parts, so the text beside that content would reach the model provider unmasked, which allow_unmasked_text off forbids; set allow_unmasked_text to true as well on this attachment in the Release, which lets such a message through whole, or remove allow_non_text_content" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+    # The masking applies to the models the gateway serves, and with none
+    # wired it serves no model.
+    models_are_wired: >-
+      {{- if not (optional .uses "models" dict) -}}
+      {{- fail (printf "core/data-masking attachment %q on %q needs a model to mask the traffic of, but nothing is wired to the models socket of %q, so the gateway serves no model; wire a model to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The chart Recipe writes one masking plugin from one attachment, so a
+    # second attachment could not hold beside the first.
+    one_masking_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/data-masking" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/data-masking is attached to %q more than once (%s), but core/gateway/higress's chart Recipe writes one masking plugin from one attachment, so the attachments cannot each hold; merge them into one" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
+      {{- end -}}

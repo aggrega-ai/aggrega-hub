@@ -316,6 +316,11 @@ Limit & Quota middleware ships with, and `semantic`.
 the matches of the patterns its configuration holds, `period-budget: cost`, the
 budgets it keeps per API key in US dollars, priced from its model cost catalog,
 or in tokens, and `semantic`.
+`core/gateway/higress` carries `content-masking: pattern-list`, its
+`ai-data-masking` plugin masking the matches of the patterns its configuration
+holds in the text of a chat request's messages, `period-budget: tokens`, the
+prompt and completion tokens each reply reports, counted together by its
+`ai-token-ratelimit` plugin, and `semantic`.
 `core/gateway/azure-api-management`, the AI gateway of Azure API Management, a
 hosted service, carries `period-budget: tokens`, its one value in this family,
 and `semantic`: its token limit counts the prompt and completion tokens each
