@@ -434,11 +434,13 @@ Three rules bind it:
   API alone; the message names the connection and points at the gateway's
   hand-typed `values.models`, which takes such a provider in the proxy's own
   provider/model notation. The `models` sockets of `core/gateway/kong`,
-  `core/gateway/kong-enterprise`, `core/gateway/apisix` and
-  `core/gateway/envoy-gateway` select the same and each Component's assertion
-  halts the same way, because each writes a wired model's route for the OpenAI
-  API alone — the two Kongs and APISIX through their AI proxy, Envoy Gateway
-  through the Envoy AI Gateway resources its Recipe renders.
+  `core/gateway/kong-enterprise`, `core/gateway/apisix`,
+  `core/gateway/envoy-gateway` and `core/gateway/agentgateway` select the same
+  and each Component's assertion halts the same way, because each writes a
+  wired model's route, or model entry, for the OpenAI API alone — the two Kongs
+  and APISIX through their AI proxy, Envoy Gateway through the Envoy AI Gateway
+  resources its Recipe renders, agentgateway as an OpenAI-compatible provider
+  in its configuration file.
 - **A component carrying the key publishes what a model publishes:** `endpoint`
   and `model` in its `provides`, the two keys a consumer's Recipe reads off a
   model edge. One that published no `model` would hand its
@@ -463,8 +465,9 @@ Three rules bind it:
   describes.
 
 Components today: `core/gateway/litellm`, `core/gateway/kong`,
-`core/gateway/kong-enterprise`, `core/gateway/apisix`, `core/gateway/envoy-gateway`
-and `core/gateway/agentgateway` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
+`core/gateway/kong-enterprise`, `core/gateway/apisix`, `core/gateway/envoy-gateway`,
+`core/gateway/traefik-hub`, `core/gateway/agentgateway` and
+`core/gateway/higress` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
 `openai-embedding`, `nvidia-api` and `openai-compatible` — the broker, whose
 whole contract is to be pointed at a service speaking that API, and which stays
 the handle for an endpoint the catalog does not model. Every other
