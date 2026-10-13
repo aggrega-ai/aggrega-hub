@@ -24,9 +24,11 @@ metadata:
 
     Written into the file: core/data-masking and core/prompt-deny-patterns
     as agentgateway's regular-expression guards, core/period-budget as a
-    token budget, and core/audit-logging as a record of each model request.
-    The per-caller budget and the records are kept in a SQLite file on a
-    volume this Recipe renders while either needs it, with one replica.
+    token budget, core/audit-logging as a record of each model request, and
+    core/retry-policy as a retry policy on the listener model requests
+    arrive on. The per-caller budget and the records are kept in a SQLite
+    file on a volume this Recipe renders while either needs it, with one
+    replica.
 
     Reach for it on Kubernetes, where the build can reach the chart's
     registry; reach for `agentgateway` under Docker Compose. The image is
@@ -216,8 +218,9 @@ spec:
 
     ## ── What the attachments ask for ───────────────────────────
     ## One attachment of each Feature this Recipe writes: the realizations of
-    ## data masking, prompt deny patterns and the period budget halt on a
-    ## second, and a second audit-logging attachment asks for the same records.
+    ## data masking, prompt deny patterns, the period budget and the retry
+    ## policy halt on a second, and a second audit-logging attachment asks for
+    ## the same records.
     ## Its type is compared with any version it was authored with set aside. A period budget with scope caller, and audit logging,
     ## need the store; a budget with any other scope is a token rate limit.
     ## DELIBERATE NEAR-DUPLICATE of the store decision in the artifact above.
@@ -226,13 +229,20 @@ spec:
     {{- $budget := dict }}
     {{- $budgetName := "" }}
     {{- $audit := dict }}
+    {{- $retry := dict }}
+    {{- $retryName := "" }}
     {{- range $name, $attachment := (default dict .features) }}
       {{- $type := first (splitList ":" (toString $attachment.type)) }}
       {{- if eq $type "core/data-masking" }}{{ $masking = $attachment }}{{ end }}
       {{- if eq $type "core/prompt-deny-patterns" }}{{ $guard = $attachment }}{{ end }}
       {{- if eq $type "core/period-budget" }}{{ $budget = $attachment }}{{ $budgetName = $name }}{{ end }}
       {{- if eq $type "core/audit-logging" }}{{ $audit = $attachment }}{{ end }}
+      {{- if eq $type "core/retry-policy" }}{{ $retry = $attachment }}{{ $retryName = $name }}{{ end }}
     {{- end }}
+    ## The sends the retry policy allows, the first included; one send is what
+    ## the gateway makes with no retry policy at all.
+    {{- $retrySends := 1 }}
+    {{- with $retry }}{{ $retrySends = int64 .values.max_attempts }}{{ end }}
     {{- $budgetScope := "" }}
     {{- with $budget }}{{ $budgetScope = toString (optional (default dict .values) "scope" "") }}{{ end }}
     {{- $store := or $audit (eq $budgetScope "caller") }}
@@ -391,6 +401,21 @@ spec:
     ##   the gateway read the file, from which each reply's tokens are taken,
     ##   refusing a model request with HTTP 429 while it is empty — one bucket
     ##   for the gateway, or one for each model name requested.
+    ##
+    ## The retry policy is not among those policies, which hold none, but a
+    ## policy of the file's own: an entry of its policies list, attached to
+    ## the listener every model request arrives on, the gateway `default`
+    ## below, which a standalone agentgateway knows as listener `default` of
+    ## gateway `default` in namespace `default`, and applied there to every
+    ## route, the model routes being the only ones. It is written while
+    ## core/retry-policy is attached with max_attempts of two or more:
+    ## agentgateway 1.6.0 sends a request once more than the policy's
+    ## attempts, so attempts is max_attempts less one, and with max_attempts
+    ## one no policy is written and each request is sent once. A request is
+    ## sent again, at once and to the same model, after a reply of 429, 500,
+    ## 502, 503 or 504, and after a failed connection, one taking longer than
+    ## 11 seconds to open or a failed name lookup; one whose body is larger
+    ## than 64 KiB is sent once.
     {{- range $alias, $edge := .context.uses }}
       {{- if eq $edge.socket "models" }}
         {{- $u := urlParse (toString $edge.provides.endpoint) }}
@@ -415,6 +440,22 @@ spec:
       gateways:
         default:
           port: {{ .infra.http_port }}
+      {{- if gt $retrySends 1 }}
+      policies:
+        - name:
+            name: {{ $retryName | toJson }}
+            namespace: default
+          target:
+            gateway:
+              gatewayName: default
+              gatewayNamespace: default
+              listenerName: default
+          phase: route
+          policy:
+            retry:
+              attempts: {{ sub $retrySends 1 }}
+              codes: [429, 500, 502, 503, 504]
+      {{- end }}
       llm:
         {{- if or $callers $guard $masking $rateLimit }}
         policies:

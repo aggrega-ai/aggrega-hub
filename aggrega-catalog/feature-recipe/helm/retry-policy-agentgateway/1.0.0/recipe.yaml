@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: retry-policy-agentgateway
+  version: 1.0.0
+  description: >
+    Realizes core/retry-policy on the gateway core/gateway/agentgateway; a
+    Release binds it in its Manifest. It emits no file: the gateway's chart
+    Recipe, agentgateway-chart, writes a retry policy into the configuration,
+    attached to the listener every model request arrives on.
+
+    max_attempts counts every send, the first included. agentgateway 1.6.0
+    sends a request once more than its retry policy's attempts, so the
+    policy's attempts is max_attempts less one, and max_attempts 1 writes no
+    policy: each request is sent once. A request is sent again, at once and
+    to the same model, after a reply of 429, 500, 502, 503 or 504, a refused
+    or reset connection, a connection taking longer than 11 seconds to open
+    or a failed name lookup. The configuration sets no timeout, so a model
+    that accepts the connection and answers nothing is waited on and not
+    sent again. A request whose body is larger than 64 KiB is sent once, and
+    a refusal the gateway answers itself — a guard's, a budget's, a missing
+    key's — is never sent again.
+
+    It refuses max_attempts above 256, the most sends that policy holds, and
+    halts on a second such attachment, with nothing wired to the models
+    socket, and on any component other than core/gateway/agentgateway. The
+    compose realization of the gateway has no realization of it.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/retry-policy:1.0.0
+  # executionScope omitted -> component: evaluated once per attached component.
+  #
+  # No input kind and no pipeline: what this attachment changes is written by
+  # the gateway's chart Recipe, which reads it and computes the attempts
+  # there, in one place, so nothing here can disagree with what is rendered.
+  # What stays here is what that Recipe cannot honour.
+  #
+  # How the gateway retries, read in agentgateway's source at v1.6.0, the
+  # release the gateway's Recipes pin. The model-serving section of the
+  # configuration holds no retry setting. The configuration's own list of
+  # policies takes one, attached to a target, and the chart Recipe attaches
+  # it to the listener the gateway's model routes are served on, so it holds
+  # for every model request, whichever model the request names. The policy's
+  # attempts is documented as the total number of attempts, the first
+  # included, but the gateway's request loop makes attempts plus one sends,
+  # as the project's own test of a retried model request shows: attempts 1
+  # sends twice. So the Recipe writes max_attempts less one, and the policy
+  # holds at most 255, which is 256 sends.
+  #
+  # A send is repeated when the reply's status is one the policy lists —
+  # 429, 500, 502, 503 or 504 — and, whatever it lists, when the call to the
+  # model failed: a refused or reset connection, a connection that took
+  # longer than the gateway's 11-second connection timeout to open, or a
+  # failed name lookup. Each send chooses the model again from the model
+  # entry the request names, which holds the one model its connection
+  # reaches, so it is sent to that model again, at once, carrying the header
+  # x-retry-attempt with the number of the send after the first. A reply
+  # the gateway answers itself — a guard's refusal, a budget's 429, a
+  # missing or unknown key's 401 — is not a model's reply and is never sent
+  # again, and the keys, the budgets and the authorization rules are checked
+  # once, before the first send. The configuration sets no timeout, so no
+  # send has a deadline of its own beyond opening its connection. To send a
+  # request again the gateway keeps its body, up to 64 KiB, and a request
+  # whose body is larger is sent once.
+  #
+  # No build proves that a running gateway sends a request again.
+  #
+  # No assertion can read the host component's labels, so what the gateway is
+  # able to do is stated in the messages, and the check of the host's type
+  # first in the list is what keeps those statements true.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/agentgateway and core/gateway/agentgateway:1.0.0 are the
+    # same host.
+    component_writes_the_retry: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/agentgateway" -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q is bound to the agentgateway realization, which only core/gateway/agentgateway carries out: that component's chart Recipe writes the retry policy into the configuration it renders, and %s renders none for it, so no request would be sent again. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The policy holds its attempts as a number from 1 to 255, and the
+    # gateway makes one send more than that.
+    attempts_are_ones_the_gateway_keeps: >-
+      {{- if gt (int64 .values.max_attempts) 256 -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q asks for max_attempts %d, but core/gateway/agentgateway's retry policy holds at most 255 attempts, and the gateway sends a request once more than that, so it keeps at most 256 sends; set max_attempts to 256 or fewer" .metadata.feature_instance .metadata.instance_id (int64 .values.max_attempts)) -}}
+      {{- end -}}
+    # The retry applies to the models the gateway serves, and with none wired
+    # it serves no model.
+    models_are_wired: >-
+      {{- if not (optional .uses "models" dict) -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q needs a model request to send again, but nothing is wired to the models socket of %q, so the gateway serves no model and no request would be sent again; wire a model to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The chart Recipe writes one retry policy from one attachment, so a second
+    # attachment could not hold beside the first.
+    one_retry_policy_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/retry-policy" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/retry-policy is attached to %q more than once (%s), but core/gateway/agentgateway's chart Recipe writes one retry policy from one attachment, so the attachments cannot each hold; keep one attachment" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
+      {{- end -}}
