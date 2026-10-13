@@ -440,12 +440,13 @@ Three rules bind it:
   hand-typed `values.models`, which takes such a provider in the proxy's own
   provider/model notation. The `models` sockets of `core/gateway/kong`,
   `core/gateway/kong-enterprise`, `core/gateway/apisix`,
-  `core/gateway/envoy-gateway` and `core/gateway/agentgateway` select the same
-  and each Component's assertion halts the same way, because each writes a
-  wired model's route, or model entry, for the OpenAI API alone — the two Kongs
-  and APISIX through their AI proxy, Envoy Gateway through the Envoy AI Gateway
-  resources its Recipe renders, agentgateway as an OpenAI-compatible provider
-  in its configuration file.
+  `core/gateway/envoy-gateway`, `core/gateway/traefik-hub` and
+  `core/gateway/agentgateway` select the same and each Component's assertion
+  halts the same way, because each writes a wired model's route, or model
+  entry, for the OpenAI API alone — the two Kongs and APISIX through their AI
+  proxy, Envoy Gateway through the Envoy AI Gateway resources its Recipe
+  renders, Traefik Hub through its Chat Completion middleware, agentgateway as
+  an OpenAI-compatible provider in its configuration file.
 - **A component carrying the key publishes what a model publishes:** `endpoint`
   and `model` in its `provides`, the two keys a consumer's Recipe reads off a
   model edge. One that published no `model` would hand its
@@ -454,9 +455,9 @@ Three rules bind it:
   own and checked against the map by an assertion on its Component, so the order
   of the map never decides what a consumer asks for. A gateway whose every
   model is wired to a socket — `core/gateway/kong`,
-  `core/gateway/kong-enterprise`, `core/gateway/apisix`, `core/gateway/envoy-gateway`
-  and `core/gateway/agentgateway`, each of whose `values.model` names one of its
-  `models` connections — serves
+  `core/gateway/kong-enterprise`, `core/gateway/apisix`, `core/gateway/envoy-gateway`,
+  `core/gateway/traefik-hub` and `core/gateway/agentgateway`, each of whose
+  `values.model` names one of its `models` connections — serves
   none while nothing is wired there and then publishes both keys empty; it
   carries the key all the same, since the
   value names what the product serves rather than what one Release wires, so a
@@ -2215,7 +2216,12 @@ presents as `Authorization: Bearer <key>`, and its semantic cache and period
 budget keep callers apart by it. `core/gateway/agentgateway` declares them on
 its chart Recipe: each caller is an API key of its configuration, checked in
 strict mode and presented the same way, and its period budget and its request
-records keep callers apart by it.
+records keep callers apart by it. `core/gateway/traefik-hub` declares them
+too: Traefik Hub's API Key middleware heads each model route and reads the key
+presented the same way, but it checks a key against its htpasswd hash, so the
+gateway's `caller_keys` Secret holds that hash under each caller's name and is
+not the Secret a caller presents its key from; its semantic cache keeps
+callers apart by it.
 
 **A pair presented on one connection adds `credential_id`.** Where a caller
 presents an identifier and its secret together on one connection — an object

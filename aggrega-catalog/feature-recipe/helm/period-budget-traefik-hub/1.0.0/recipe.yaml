@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: period-budget-traefik-hub
+  version: 1.0.0
+  description: >
+    Realizes core/period-budget on core/gateway/traefik-hub; a Release binds it
+    in its Manifest. It emits no file: the gateway's chart Recipe,
+    traefik-hub-chart, writes it as Traefik Hub's quota middleware on the
+    route of each model wired to the gateway, counting in the Redis-protocol
+    store on its cache socket.
+
+    The quota counts the tokens each reply reports, read, written or both as
+    unit names, or, under usd, their cost in US dollars, priced from a list
+    of models the middleware ships with; a model it has no price for is
+    refused with HTTP 422. It counts over a window that slides with time:
+    what was counted at one moment frees again one period later. Once the
+    count reaches limit, model requests are refused with HTTP 429; a
+    request's count is added once its reply completes, so the request
+    crossing the limit, and any served beside it, is served, and a reply the
+    semantic cache serves counts nothing. Traefik's reference says the quota
+    serves requests uncounted while the store cannot be reached.
+
+    So it honours every unit, scope model, scope gateway while one model is
+    wired, and a period of hours or days, or minutes or seconds making whole
+    hours. It refuses scope caller, scope gateway with several models wired,
+    a calendar month and any other period by name, and halts on a limit that
+    is not a whole number of tokens, with nothing wired to the models or
+    cache socket, and on any component other than core/gateway/traefik-hub.
+    That the gateway enforces the budget is not observed by any build.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/period-budget:1.0.0
+  # executionScope omitted -> component: evaluated once per attached component.
+  #
+  # No input kind and no pipeline: what this attachment changes is written by
+  # the gateway's chart Recipe, which reads it. What stays here is what that
+  # Recipe cannot honour.
+  #
+  # How the gateway keeps the budget. The chart Recipe writes Traefik Hub's
+  # ai-quota on each wired model's route, after the Chat Completion
+  # middleware, reading the request as a chat completion: the tokens the
+  # reply reports as prompt_tokens, completion_tokens or total_tokens, which
+  # it asks a streamed reply to report as well, or under usd the cost it
+  # prices them at, are added to the count when the reply completes. The
+  # count lives in the Redis-protocol store on the cache socket, shared by
+  # every replica of the gateway. The quota keeps a count per value of a
+  # request header, which a Headers middleware placed before it sets on every
+  # request over any value the caller sent: one value for the gateway under
+  # scope gateway, one per wired model under scope model, each model then
+  # with a quota of its own. Traefik's reference does not say whether two
+  # routes naming one quota share its count, so scope gateway is kept only
+  # while the gateway serves one route.
+  #
+  # Nothing the quota offers counts per verified caller: it tells requests
+  # apart by the client's address, by a request header or by the request's
+  # host, and the caller the gateway's key check verifies is none of them.
+  # Scope caller is therefore refused rather than counted by a value a caller
+  # could write.
+  #
+  # Traefik's reference shows the quota's period in hours and days, as 1h,
+  # 24h and 7d, so the chart Recipe writes it that way: hours and days as
+  # written, minutes and seconds converted where they make whole hours. The
+  # check below refuses every other length, and the Recipe stops on one it
+  # cannot write; the two are edited together.
+  #
+  # No assertion can read the host component's labels, so what the gateway
+  # is able to do is stated in the messages, and the check of the host's type
+  # first in the list is what keeps those statements true.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/traefik-hub and core/gateway/traefik-hub:1.0.0 are the
+    # same host.
+    component_writes_the_budget: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/traefik-hub" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q is bound to the Traefik Hub realization, which only core/gateway/traefik-hub carries out: that component's chart Recipe writes the budget onto the routes it serves models on, and %s renders none for it, so nothing would be counted. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The quota tells requests apart by the client's address, a request header
+    # or the request's host, none of them the caller its key check verified;
+    # and with several routes, whether they share one count is not stated.
+    scope_is_one_the_gateway_keeps: >-
+      {{- if eq .values.scope "caller" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for scope caller, but core/gateway/traefik-hub's quota middleware counts requests apart only by the client's address, a request header or the request's host, and none of them is the caller its key check verified, so a caller could choose whose count a request lands in. Set scope to model, for each model wired to the gateway, or gateway, for everything it serves while one model is wired" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+      {{- $wired := sortAlpha (keys (optional .uses "models" dict)) -}}
+      {{- if and (eq .values.scope "gateway") (gt (len $wired) 1) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for scope gateway, but core/gateway/traefik-hub serves each of the models wired to it (%s) on a route of its own, and Traefik's reference does not say whether routes naming one quota middleware share its count, so one limit for everything it serves is not established. Set scope to model, giving each wired model a limit of its own, or wire one model" .metadata.feature_instance .metadata.instance_id (join ", " $wired)) -}}
+      {{- end -}}
+    # A window of a fixed length, written in hours or days.
+    period_is_one_the_gateway_keeps: >-
+      {{- $count := atoi (regexFind "^[0-9]+" .infra.period) -}}
+      {{- $suffix := regexFind "[a-z]+$" .infra.period -}}
+      {{- if eq $suffix "mo" -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of %s, but core/gateway/traefik-hub's quota counts over a window of one fixed length that slides with time, and a calendar month has no fixed length; set period to a number of days, as in 30d" .metadata.feature_instance .metadata.instance_id .infra.period) -}}
+      {{- end -}}
+      {{- if or (and (eq $suffix "m") (ne (mod $count 60) 0)) (and (eq $suffix "s") (ne (mod $count 3600) 0)) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q asks for a period of %s, but Traefik's reference shows core/gateway/traefik-hub's quota period in hours and days alone, and %s makes no whole number of hours; set period to a number of hours or days, as in 1h or 1d" .metadata.feature_instance .metadata.instance_id .infra.period .infra.period) -}}
+      {{- end -}}
+    # The quota takes a number of tokens as a whole number; a cost may carry
+    # cents.
+    limit_is_a_whole_number_of_tokens: >-
+      {{- $limit := float64 .infra.limit -}}
+      {{- if and (ne .values.unit "usd") (ne $limit (floor $limit)) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q sets limit %v for unit %s, but core/gateway/traefik-hub's quota takes a number of tokens as a whole number; set limit to a whole number" .metadata.feature_instance .metadata.instance_id .infra.limit .values.unit) -}}
+      {{- end -}}
+    # The budget is written onto the routes of the wired models, and with none
+    # wired the gateway renders no model route to count.
+    models_are_wired: >-
+      {{- if not (optional .uses "models" dict) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q needs a model route to count, but nothing is wired to the models socket of %q, so the gateway serves no model and there is nothing the budget could count; wire a model to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The quota keeps its count in the store wired to the cache socket, and
+    # with none it would keep nothing.
+    counter_store_is_wired: >-
+      {{- if not (optional .uses "cache" dict) -}}
+      {{- fail (printf "core/period-budget attachment %q on %q needs a store for its count, but nothing is wired to the cache socket of %q, and Traefik Hub's quota middleware keeps the count in the Redis-protocol store wired there; wire a core/datastore/redis to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
