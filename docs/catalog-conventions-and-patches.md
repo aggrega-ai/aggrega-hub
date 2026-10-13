@@ -243,7 +243,6 @@ The dimensions and their value sets:
 | `prompt-guard` | `pattern-list`, `classifier` | The component can inspect the chat and completion payload it is routing and refuse a request on its content. The value names the fidelity. `pattern-list`: the match is against patterns supplied in its configuration. `classifier`: the verdict is a trained text classifier's, reached through a detection service the component calls, against a threshold supplied in its configuration. The dimension is deliberately narrower than content inspection in general — a component here reads the model payload it already parses to route, and not one of them inspects an arbitrary HTTP body. |
 | `upstream-tls` | `trust-anchor` | The component can require the service it forwards to present a certificate chaining to a trust anchor the Release supplies. |
 | `upstream-pinning` | `public-key` | The component can refuse a service it forwards to unless a certificate that service presents carries one of the public keys the Release supplies for it. `public-key` names what is pinned: the key itself, so a certificate renewed over the same key still matches. |
-| `log-masking` | `entity-recognition` | The component can replace sensitive text with a placeholder in the copy of a call it hands to its logs, while the request it forwards and the reply it returns stay as they were sent. `entity-recognition` names the fidelity: it replaces matches of patterns supplied in its configuration and also entity types that a recognizer service it calls detects. A component that could only replace pattern matches would carry a narrower value, added in the same act as the first component to carry it. |
 | `period-budget` | `cost`, `tokens` | The component can refuse model requests once what it has counted over a period exceeds a limit set in its configuration, and the value names what it counts. `cost`: what the traffic cost, priced from a table the component keeps per model. `tokens`: the tokens each model's reply reports reading, writing or both, which the component counts and prices nothing. |
 | `concurrency-cap` | `total`, `per-target` | The component can hold or refuse a request that would take the requests it is carrying at once past a cap set in its configuration, and the value names what one cap counts. `total`: every request the component forwards, whatever it forwards it to, against one cap. `per-target`: one cap for each upstream target the component sends to, each counting the requests in flight to that target, and none on their total. |
 
@@ -276,7 +275,7 @@ Components today: `core/gateway/nginx` (`request-mirroring: full-rate`,
 `upstream-tls: trust-anchor`), `core/gateway/envoy-gateway` (the same three,
 `period-budget: tokens` and `concurrency-cap: per-target`), `core/gateway/kong` (`upstream-tls: trust-anchor`), `core/gateway/tyk`
 (`upstream-pinning: public-key`), `core/gateway/litellm`
-(`caller-identity: injected-header`, `content-masking: entity-recognition`, `log-masking: entity-recognition`,
+(`caller-identity: injected-header`, `content-masking: entity-recognition`,
 `prompt-guard: pattern-list`, `upstream-tls: trust-anchor`, `period-budget: cost`, `concurrency-cap: per-target`),
 `core/security/nemo-guardrails` and `core/security/trustyai-guardrails-gateway` (each
 `prompt-guard: classifier`). Of these, `core/gateway/litellm` and
