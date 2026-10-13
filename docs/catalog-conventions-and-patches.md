@@ -2230,7 +2230,7 @@ value rather than a credential stays a value on the connection:
 the `event_store` connection's `access_key_id` value, and only the secret half
 is its `credential`.
 
-**Two realizations constrain the secret the two ends share.**
+**Three realizations constrain the secret the two ends share.**
 
 - **KubeAI** (`helm/vllm-kubeai`). The KubeAI `Model` imports the credential's
   secret through `envFrom`, which names each variable after one of the secret's
@@ -2242,6 +2242,11 @@ is its `credential`.
   to the container of the serving runtime the cluster registered for the
   model's format, so the key takes effect only where that runtime runs vLLM's own
   server.
+- **agentgateway** (`helm/agentgateway-chart`, `compose/agentgateway`). The
+  gateway puts the key it presents to a wired model into its configuration
+  file's text before it reads the file as YAML, so the key must be a plain token
+  — letters, digits and `- . _ ~ + / =` — and other characters can load as a
+  different key or stop the gateway.
 
 The [credential chapter](https://github.com/aggrega-ai/aggrega-docs/blob/main/architecture/08-credential-model.md#a-key-both-ends-of-a-connection-hold)
 works the shape through in one Aggregate.
