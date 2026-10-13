@@ -2969,6 +2969,16 @@ counts, over which period and for whom differs from one product to the next,
 which is why `core/period-budget` declares those as values each realization
 keeps or refuses by name, and the refusal past the limit as its core.
 
+On Envoy Gateway that core holds while the count cannot be checked only under a
+setting of its control plane, `rateLimit.failClosed`, which the Recipe of
+`core/gateway/envoy-gateway` turns on while `core/period-budget` is attached:
+while the store or the rate-limit service cannot be reached, or a check takes
+longer than Envoy's rate-limit timeout, model requests are refused with HTTP
+500 rather than served and not counted, the product's default. The setting
+holds for every rate limit that install keeps, so a rate limit applied to it by
+hand fails closed too, and a request admitted just before an outage is still
+served and not counted, because its tokens are charged after the reply.
+
 **Re-measure a vendor fact before relying on it when the product has released
 since it was read.** A reading answers for the version it describes. A later
 release can add what the reading found missing, or change what it found there,
