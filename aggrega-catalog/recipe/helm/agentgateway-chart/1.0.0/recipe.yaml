@@ -1,0 +1,287 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: agentgateway-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    agentgateway on Kubernetes via the project's own standalone Helm chart,
+    fetched from the project's container registry: a Deployment, a ClusterIP
+    Service for the data plane, a service account and the ConfigMap holding
+    the configuration file the gateway reads, which this Recipe writes through
+    the chart's `config` value.
+
+    Each model wired to the models socket is one entry of that file, named by
+    the connection's alias and sent to the endpoint and model name the model
+    publishes. A connection's credential arrives as an environment variable
+    by secretKeyRef to the Secret the credential publishes, and the entry
+    names the variable, so no key is in the rendered output. The file
+    attaches no UI to the data-plane port.
+
+    Reach for it on Kubernetes, where the build can reach the chart's
+    registry; reach for `agentgateway` under Docker Compose. The image is
+    pinned by digest, and infra.source_version accepts only the chart
+    versions this configuration is proven at.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/gateway/agentgateway:1.0.0
+
+  # The chart is published by the project's own maintainers with every
+  # release, under the release's version, in the same container registry as
+  # the image, and it runs the same binary and reads the same configuration
+  # file as a container started by hand, so this Recipe maps the Component's
+  # surface into it rather than assembling the Deployment by hand.
+  source:
+    kind: helm-oci-chart
+    url: oci://cr.agentgateway.dev/charts/agentgateway-standalone
+    # Default chart version. Override via infra.source_version, which the
+    # assertion chart_version_is_proven holds to the proven versions.
+    version: "{{ optional .infra `source_version` \"v1.6.0\" }}"
+
+  # provides.host is the data-plane Service: the chart names every resource it
+  # renders after its full name, which the valuesMapping below binds to the
+  # rendered name — the release name the helm provider gives the chart, which
+  # spells the Component's name in the alphabet a Kubernetes name allows — and
+  # the Service carries that name with no suffix, read from a render of the
+  # chart. The name carries no namespace, so the recipe is independent of where
+  # it is deployed; a consumer in another namespace qualifies the host with the
+  # target namespace on its own side.
+  #
+  # endpoint is the base URL every wired model is served under, /v1 on the
+  # Service name and port; model is the alias values.model names, the model
+  # name a consumer sends. The Service name is spelled out again on purpose: a
+  # provides entry cannot read another provides entry, so the repetition is
+  # forced, and the entries are edited together. With nothing wired to the
+  # models socket values.model is omitted — the component's assertion halts on
+  # any other combination — and both are empty.
+  provides:
+    host: "{{ .context.rendered_name }}"
+    port: "{{ .infra.http_port }}"
+    protocol: "http"
+    endpoint: '{{ with optional .values "model" "" }}http://{{ $.context.rendered_name }}:{{ $.infra.http_port }}/v1{{ end }}'
+    model: '{{ optional .values "model" "" }}'
+
+  # The pins and the fixed strings the templates below share, each written
+  # once here.
+  #
+  # proven_chart_versions holds the chart versions the configuration this
+  # Recipe writes is proven at, comma-separated; the assertion below halts on
+  # any other infra.source_version, naming them. A version joins the list only
+  # once that proof has run at it.
+  #
+  # image is the gateway's image, pinned by tag and by the digest of its
+  # index, so every platform the project publishes resolves to the build read
+  # here. The chart takes a complete image reference as its image value. It is
+  # the same pin the compose realization writes: DELIBERATE NEAR-DUPLICATE of
+  # that Recipe's locals.image, since a pin sits inside the Recipe that renders
+  # it and no catalog kind holds one for two Recipes to share, so the two are
+  # moved together. No setting moves it: the configuration below is written for
+  # this release, whose provider and path rules differ from the release before
+  # it.
+  #
+  # A models connection's credential reaches the gateway under one variable
+  # named after the connection's alias in capitals, with every character other
+  # than a letter or a digit as an underscore, between the fixed parts here:
+  # the connection fast carrying a credential gives AI_PROXY_FAST_API_KEY. A
+  # locals entry cannot read a connection, so each template applies the alias
+  # rule itself, the rule the Component's assertion
+  # credential_variables_are_distinct checks.
+  locals:
+    proven_chart_versions: "v1.6.0"
+    image: "cr.agentgateway.dev/agentgateway:v1.6.0@sha256:9d3e6044ddcdc0878b1787f77bd401252b95e22684203fb5e874c4c42d2ed90c"
+    connection_variable_prefix: AI_PROXY_
+    credential_variable_suffix: _API_KEY
+
+  # The chart version decides the Deployment, the Service and the part of the
+  # configuration file the chart writes itself, so a version the configuration
+  # was not proven at halts the build rather than rendering a gateway whose
+  # file may mean something else.
+  assertions:
+    chart_version_is_proven: >-
+      {{- with optional .infra "source_version" "" -}}
+      {{- $proven := splitList "," $.locals.proven_chart_versions -}}
+      {{- if not (has . $proven) -}}
+      {{- fail (printf "infra.source_version of %q is %q, but the configuration this Recipe writes into the agentgateway standalone chart is proven at chart version %s alone; set infra.source_version to one of them, or remove it" $.metadata.instance_id . (join ", " $proven)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # This Recipe reads from infra.overrides:
+  #   service_type - string (data-plane Service type; how the gateway is exposed, default ClusterIP)
+  #   requests     - { cpu: string, memory: string } (gateway resource requests)
+  #   nodeSelector - map[string]string (pod scheduling)
+  #   tolerations  - []object (pod scheduling)
+  #
+  # The chart renders a Deployment, a Service, a service account and the
+  # ConfigMap holding the configuration file, which it mounts read-only at
+  # /config and starts the gateway on. It writes the file from its `config`
+  # value, adding one setting of its own, config.storage, which keeps the
+  # file the gateway's whole configuration. The pod keeps the chart's own
+  # probes, its read-only root file system and its writable /tmp.
+  valuesMapping: |
+    ## ── The models the gateway serves ──────────────────────────
+    ## The models connections, in alias order, and those of them carrying a
+    ## credential, whose variable each entry names.
+    {{- $wired := list }}
+    {{- $credentialed := list }}
+    {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "models" }}
+        {{- $wired = append $wired $alias }}
+        {{- if hasKey (default dict $edge.features) "credential" }}
+          {{- $credentialed = append $credentialed $alias }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+
+    ## ── Pin the chart's resource names to the rendered name ────
+    ## The chart names its Deployment, Service, service account and the
+    ## Service's selector after this value, and its ConfigMap after it
+    ## followed by -config.
+    fullnameOverride: "{{ .context.rendered_name }}"
+
+    ## ── Gateway image pin ──────────────────────────────────────
+    ## Pinned explicitly, by tag and index digest, rather than left to the
+    ## chart's own default, which names the image by the chart's app version
+    ## alone.
+    image: "{{ .locals.image }}"
+
+    ## ── Data plane ─────────────────────────────────────────────
+    ## The client entry point, and the Service provides.host addresses. The
+    ## chart default exposes the gateway through a load balancer on port 80;
+    ## the Component describes an in-cluster address, so it is a ClusterIP
+    ## unless an operator says otherwise, and infra.http_port is both the
+    ## Service port and the port the configuration's gateway listens on, so the
+    ## published address and the listener move together.
+    gateway:
+      service:
+        {{- if and .infra.overrides .infra.overrides.service_type }}
+        type: "{{ .infra.overrides.service_type }}"
+        {{- else }}
+        type: ClusterIP
+        {{- end }}
+        ports:
+          - name: http
+            port: {{ .infra.http_port }}
+            targetPort: {{ .infra.http_port }}
+            protocol: TCP
+
+    ## ── The configuration file ─────────────────────────────────
+    ## DELIBERATE NEAR-DUPLICATE of the configuration the compose realization,
+    ## recipe/compose/agentgateway, writes into its compose config. The chart
+    ## takes the file only as its `config` value, which this mapping writes,
+    ## and that Recipe delivers it as a compose config, which its artifacts
+    ## write; a value mapping imports only a mapping library and an artifact
+    ## only an artifact library, so no one template reaches both. The two are
+    ## edited together, and a build of both from one Release, with the two
+    ## files compared, shows them alike.
+    ##
+    ## One gateway, `default`, listening on infra.http_port; the model-serving
+    ## routes attach to it. No `ui` section is written, so agentgateway serves
+    ## its UI on its admin interface alone, never on the data-plane port.
+    ##
+    ## Each connection, in alias order, is one model entry named by its alias,
+    ## an OpenAI-compatible provider accepting chat completions, whose base
+    ## URL is the endpoint the model publishes, written verbatim: agentgateway
+    ## appends /chat/completions to it and takes its path as the whole base
+    ## path. The entry asks for the model name the model publishes. agentgateway
+    ## refuses a base URL that is not absolute, that names user information, a
+    ## query or a fragment, or whose scheme is neither http nor https without a
+    ## port, so the build halts on such an endpoint, naming the connection, and
+    ## on an empty model name, which would send the alias upstream as one.
+    ##
+    ## agentgateway reads $NAME and ${NAME} anywhere in the file as the value of
+    ## the environment variable NAME before it parses the file, and refuses the
+    ## file when NAME is unset. A connection carrying a credential has its
+    ## entry's apiKey name $AI_PROXY_<ALIAS>_API_KEY, which the gateway replaces
+    ## from the variable delivered below, so the file names the variable and
+    ## never the value. Each string a model publishes is written with every $
+    ## doubled, agentgateway's spelling of a literal $, so a published string
+    ## reaches the gateway as it was published.
+    {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "models" }}
+        {{- $u := urlParse (toString $edge.provides.endpoint) }}
+        {{- if not (and (has $u.scheme (list "http" "https")) $u.host (not $u.userinfo) (not $u.query) (not $u.fragment)) }}
+        {{- fail (printf "the models connection %s of %q reaches %q, whose published endpoint %q is not an absolute http or https URL free of user information, a query and a fragment, so agentgateway would refuse it as the base URL of the model entry" $alias $.context.instance_id $edge.target (toString $edge.provides.endpoint)) }}
+        {{- end }}
+        {{- if not (toString $edge.provides.model) }}
+        {{- fail (printf "the models connection %s of %q reaches %q, which publishes no model name, so the model entry would send the alias %s upstream as the model a request asks for" $alias $.context.instance_id $edge.target $alias) }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    config:
+      gateways:
+        default:
+          port: {{ .infra.http_port }}
+      llm:
+        {{- if not $wired }}
+        models: []
+        {{- else }}
+        models:
+          {{- range $alias, $edge := .context.uses }}
+          {{- if eq $edge.socket "models" }}
+          - name: {{ $alias | toJson }}
+            provider:
+              custom:
+                formats:
+                  - type: completions
+            params:
+              model: {{ toString $edge.provides.model | toJson | replace "$" "$$" }}
+              baseUrl: {{ toString $edge.provides.endpoint | toJson | replace "$" "$$" }}
+              {{- if hasKey (default dict $edge.features) "credential" }}
+              apiKey: {{ printf "$%s%s%s" $.locals.connection_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_") $.locals.credential_variable_suffix | toJson }}
+              {{- end }}
+          {{- end }}
+          {{- end }}
+        {{- end }}
+
+    ## ── Model credentials ──────────────────────────────────────
+    ## Each models connection carrying a credential delivers it as
+    ## AI_PROXY_<ALIAS>_API_KEY, bound by NAME to the Secret its attachment
+    ## publishes, which the connection's entry names. A credential publishing
+    ## no Secret name and data key would leave the gateway nothing to read, so
+    ## the build halts on it. Kubernetes starts no container whose
+    ## secretKeyRef names a missing Secret or key, which is caught at start,
+    ## not by the build; no variable carries a value in the rendered artifact.
+    {{- if $credentialed }}
+    extraEnv:
+      {{- range $alias := $credentialed }}
+      {{- $credential := (get $.context.uses $alias).features.credential }}
+      {{- $locator := optional $credential "provides" dict }}
+      {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) }}
+      {{- fail (printf "the credential on the models connection %s of %q publishes no Secret name and data key, so the gateway cannot read it from a Secret; attach a credential publishing both, such as core/referenced-secret" $alias $.context.instance_id) }}
+      {{- end }}
+      - name: {{ $.locals.connection_variable_prefix }}{{ regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}{{ $.locals.credential_variable_suffix }}
+        valueFrom:
+          secretKeyRef:
+            name: "{{ $locator.name }}"
+            key: "{{ $locator.key }}"
+      {{- end }}
+    {{- end }}
+
+    ## ── Gateway resources ──────────────────────────────────────
+    ## The operator's sizing as the container's limits, beside the chart's own
+    ## requests unless infra.overrides.requests replaces them.
+    resources:
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      {{- if and .infra.overrides .infra.overrides.requests }}
+      requests:
+        cpu: "{{ .infra.overrides.requests.cpu }}"
+        memory: "{{ .infra.overrides.requests.memory }}"
+      {{- end }}
+
+    ## ── Scheduling overrides ───────────────────────────────────
+    {{- if .infra.overrides }}
+    {{- if .infra.overrides.nodeSelector }}
+    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+    {{- end }}
+    {{- if .infra.overrides.tolerations }}
+    tolerations: {{ toJson .infra.overrides.tolerations }}
+    {{- end }}
+    {{- end }}

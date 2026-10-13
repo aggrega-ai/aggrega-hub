@@ -442,8 +442,8 @@ Three rules bind it:
   own and checked against the map by an assertion on its Component, so the order
   of the map never decides what a consumer asks for. A gateway whose every
   model is wired to a socket — `core/gateway/kong`,
-  `core/gateway/kong-enterprise`, `core/gateway/apisix` and
-  `core/gateway/envoy-gateway`, each of whose `values.model` names one of its
+  `core/gateway/kong-enterprise`, `core/gateway/apisix`, `core/gateway/envoy-gateway`
+  and `core/gateway/agentgateway`, each of whose `values.model` names one of its
   `models` connections — serves
   none while nothing is wired there and then publishes both keys empty; it
   carries the key all the same, since the
@@ -458,8 +458,8 @@ Three rules bind it:
   describes.
 
 Components today: `core/gateway/litellm`, `core/gateway/kong`,
-`core/gateway/kong-enterprise`, `core/gateway/apisix` and
-`core/gateway/envoy-gateway` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
+`core/gateway/kong-enterprise`, `core/gateway/apisix`, `core/gateway/envoy-gateway`
+and `core/gateway/agentgateway` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
 `openai-embedding`, `nvidia-api` and `openai-compatible` — the broker, whose
 whole contract is to be pointed at a service speaking that API, and which stays
 the handle for an endpoint the catalog does not model. Every other
