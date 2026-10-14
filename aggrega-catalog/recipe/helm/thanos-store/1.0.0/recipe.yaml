@@ -13,10 +13,14 @@ metadata:
     ClusterIP Service exposing the StoreAPI gRPC port and the HTTP port). The
     Store Gateway keeps only an ephemeral local cache of index data under a
     data-dir — the object store is the system of record — so it renders
-    stateless, with no persistent volume. The object-store identity resolved from
-    the `objstore` uses-edge (host, port) arrives on .context.inject.env and
-    composes the S3 endpoint in the inline object-store configuration passed on
-    the `--objstore.config` flag. That configuration selects the AWS SDK
+    stateless, with no persistent volume. The endpoint the store wired to the
+    `objstore` uses-edge publishes sets the inline object-store configuration
+    passed on the `--objstore.config` flag: its host and port are the S3
+    endpoint, and its scheme sets `insecure` — true for http, false for https.
+    A store publishing no endpoint, or one with another scheme or with a path,
+    halts the build naming the connection. The bucket is the component's own
+    value, and a store publishing a different bucket halts the build naming
+    both. That configuration selects the AWS SDK
     credential chain, so it carries no secret; the access key is a developer value
     delivered on AWS_ACCESS_KEY_ID and the secret key is delivered on
     AWS_SECRET_ACCESS_KEY — rendered as an env secretKeyRef when a credential is
@@ -50,6 +54,41 @@ spec:
     {{- $objstoreCredential = $alias -}}
     {{- end -}}
     {{- end -}}
+    {{- /*
+      The object store's address: the endpoint the store wired to objstore
+      publishes, scheme included. The S3 client takes a host and port with no
+      scheme and no path, and reaches it over plain HTTP when insecure is true
+      and over TLS otherwise, so the scheme becomes that flag. A store
+      publishing no endpoint, or one the client cannot take, halts the build
+      naming the connection.
+
+      The bucket stays this component's own value. Where the store publishes a
+      bucket too, the two must name the same one, so a difference halts the
+      build naming both; a store publishing no bucket leaves the value alone.
+    */ -}}
+    {{- $objstoreHost := "" -}}
+    {{- $objstoreInsecure := false -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- if eq $edge.socket "objstore" -}}
+    {{- $endpoint := toString (optional (default dict $edge.provides) "endpoint" "") -}}
+    {{- if not $endpoint -}}
+    {{- fail (printf "the objstore connection %s of %q is wired to %q, which publishes no endpoint, but the Store Gateway's S3 client is pointed at the address the object store publishes, scheme included; wire a store publishing endpoint, such as core/storage/minio, to the objstore socket instead" $alias $.context.instance_id $edge.target) -}}
+    {{- end -}}
+    {{- if not (or (hasPrefix "http://" $endpoint) (hasPrefix "https://" $endpoint)) -}}
+    {{- fail (printf "the objstore connection %s of %q is wired to %q, which publishes the endpoint %q, but the Store Gateway's S3 client reaches a store over http or https alone and takes the scheme from that endpoint; publish the store's address with one of the two" $alias $.context.instance_id $edge.target $endpoint) -}}
+    {{- end -}}
+    {{- $u := urlParse $endpoint -}}
+    {{- if and $u.path (ne $u.path "/") -}}
+    {{- fail (printf "the objstore connection %s of %q is wired to %q, which publishes the endpoint %q carrying the path %q, but the Store Gateway's S3 client takes a host and port alone and refuses a path; publish the store's address as scheme, host and port" $alias $.context.instance_id $edge.target $endpoint $u.path) -}}
+    {{- end -}}
+    {{- $objstoreHost = $u.host -}}
+    {{- $objstoreInsecure = hasPrefix "http://" $endpoint -}}
+    {{- $storeBucket := toString (optional (default dict $edge.provides) "bucket" "") -}}
+    {{- if and $storeBucket (ne $storeBucket (toString $.values.bucket)) -}}
+    {{- fail (printf "%q reads metric blocks from the bucket %q its bucket value names, but %q, the store its objstore connection %s is wired to, publishes the bucket %q, so the Store Gateway would read a bucket other than the one the store publishes; set bucket in the values of %q to %q" $.context.instance_id (toString $.values.bucket) $edge.target $alias $storeBucket $.context.instance_id $storeBucket) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # The Store Gateway keeps only an ephemeral local cache under its data-dir —
@@ -61,9 +100,9 @@ spec:
       main:
         image: "quay.io/thanos/thanos:{{ .infra.engine_version }}"
         # `thanos store` serves the StoreAPI on gRPC and health/metrics on HTTP.
-        # The object-store identity resolved from the `objstore` uses-edge arrives
-        # on the inject pipe (.context.inject.env) and composes the S3 endpoint in
-        # the inline object-store configuration. The final args entry is a single
+        # The host, port and scheme of the endpoint the object store publishes,
+        # resolved above, set the S3 endpoint and insecure in the inline
+        # object-store configuration. The final args entry is a single
         # `--objstore.config=<yaml>` flag whose value is the multi-line S3 stanza;
         # aws_sdk_auth selects the AWS SDK credential chain so the configuration
         # holds no secret.
@@ -79,8 +118,8 @@ spec:
             --objstore.config=type: S3
             config:
               bucket: {{ .values.bucket }}
-              endpoint: {{ .context.inject.env.THANOS_S3_HOST }}:{{ .context.inject.env.THANOS_S3_PORT }}
-              insecure: true
+              endpoint: {{ $objstoreHost }}
+              insecure: {{ $objstoreInsecure }}
               aws_sdk_auth: true
         # AWS_ACCESS_KEY_ID is a developer value. AWS_SECRET_ACCESS_KEY is the
         # optional credential on the `objstore` connection: when one is attached
