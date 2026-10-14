@@ -1,0 +1,183 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: tempo
+  version: 1.0.0
+  # The packaged Tempo server is AGPL-3.0.
+  license: AGPL-3.0
+  description: >
+    Grafana Tempo distributed-tracing server for local development via Docker
+    Compose, synthesized from the Workload kind by the compose provider: one
+    service running the same grafana/tempo image, tagged from
+    infra.engine_version, and the same single-binary configuration as the
+    workload-synthesis realization on Kubernetes, delivered as a compose config
+    mounted as the file the server reads, with the trace store on a named volume.
+
+    The OpenTelemetry receivers are on, gRPC on 4317 and HTTP on 4318, beside
+    the HTTP query API on 3200, and nothing is published to the host: a trace
+    producer on the compose network reaches the gRPC receiver at the service
+    name, provides.host, on provides.port. The developer's retention_period
+    drives the in-process compactor. Docker Compose sets no size on a volume, so
+    infra.storage.size reaches nothing here. The healthcheck asks the server's
+    readiness endpoint with the wget the image's busybox carries.
+
+    Reach for it under Docker Compose; on Kubernetes, reach for `tempo` or
+    `tempo-chart`.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/observability/tempo:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # The contract is key-for-key the one the Kubernetes realizations publish, so a
+  # trace producer reads the same keys on either target. Only the host is spelled
+  # differently: it is the name the compose provider gives the synthesized
+  # service, which is the component instance's own name, and a producer on the
+  # same compose network resolves it directly. protocol is "grpc" and the server
+  # serves the OTLP gRPC receiver on its fixed port 4317, so provides.port is
+  # that fixed value, as on Kubernetes.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "4317"
+    protocol: "grpc"
+
+  # The names the artifact and the workload share, each written once here; the
+  # two are separate templates with no binding either could dereference, so they
+  # read them from here. config_name is the compose config the artifact declares
+  # and the volume sources; config_path is the file it is mounted as and the
+  # server is started on, since a compose config carries no file name.
+  locals:
+    config_name: "{{ .context.instance_id }}-config"
+    config_path: /etc/tempo/tempo.yaml
+
+  # The single-binary Tempo configuration, as one compose config the workload
+  # mounts as one file at config_path. The developer's retention_period drives
+  # the compactor's block retention; the OTLP gRPC and HTTP receivers listen on
+  # their conventional ports on every address, so a producer elsewhere on the
+  # compose network reaches them; traces and the write-ahead log live under the
+  # data volume mounted at /var/tempo.
+  #
+  # DELIBERATE NEAR-DUPLICATE of the configuration recipe/helm/tempo writes into
+  # its ConfigMap: that Recipe wraps the text in a ConfigMap and this one in a
+  # compose config, and the text between is the same, so the server is
+  # configured alike on either target. The two are edited together, and a build
+  # of both from one Aggregate, with the two files compared, shows them alike.
+  artifacts:
+    tempo-config.compose-fragment.yaml: |
+      configs:
+        {{ .locals.config_name }}:
+          content: |
+            server:
+              http_listen_port: 3200
+            distributor:
+              receivers:
+                otlp:
+                  protocols:
+                    grpc:
+                      endpoint: "0.0.0.0:4317"
+                    http:
+                      endpoint: "0.0.0.0:4318"
+            ingester:
+              max_block_duration: 5m
+            compactor:
+              compaction:
+                block_retention: "{{ .values.retention_period }}"
+            storage:
+              trace:
+                backend: local
+                wal:
+                  path: /var/tempo/wal
+                local:
+                  path: /var/tempo/blocks
+
+  # Synthesized-mode Workload: the image, the command, the mounted configuration,
+  # the data volume, the healthcheck and the resources are translated from the
+  # Workload kind by the compose provider.
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    containers:
+      main:
+        # The image the workload-synthesis realization on Kubernetes runs, from
+        # the same infra.engine_version, so one value selects the release on
+        # either target.
+        image: "grafana/tempo:{{ .infra.engine_version }}"
+        # The single-binary server reads its whole configuration from the file
+        # mounted at config_path below.
+        command: ["/tempo", "-config.file={{ .locals.config_path }}"]
+        # docker compose up re-creates a service's container when the service's
+        # own definition changed since the container was created, and a config's
+        # content is no part of that definition. So the service carries the
+        # digest of the developer's values, which are all the configuration is
+        # written from, as CONFIG_DIGEST, a variable nothing reads: a changed
+        # retention_period changes the definition, and the next docker compose
+        # up re-creates the server with the configuration it is written into.
+        variables:
+          CONFIG_DIGEST: "{{ sha256sum (toJson .values) }}"
+        ports:
+          otlp-grpc: 4317
+          otlp-http: 4318
+          http: 3200
+        # Tempo reports readiness at /ready on its HTTP port. A compose service
+        # keeps one healthcheck, run inside the image, and this image carries no
+        # curl but does carry busybox, whose wget fails on an error answer and
+        # when nothing answers; the exec form names it by its path in the image.
+        # The timing is the readiness probe's on Kubernetes, which is the
+        # product's own chart's.
+        health:
+          ready:
+            exec:
+              - /busybox/wget
+              - "-q"
+              - "--spider"
+              - "http://127.0.0.1:3200/ready"
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+        # Each quantity is quoted because it is a string: a value with no unit
+        # suffix — a whole-core cpu count, say — would otherwise be read as a
+        # number and rejected before the target ever sees it.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        # The trace store and the write-ahead log live on the data volume. It is
+        # mounted at /var/tempo because the image creates that directory owned by
+        # the user the server runs as: Docker Compose fills an empty named volume
+        # from the image's own directory at the mount point, ownership included,
+        # where a mount point the image lacks would be created owned by root and
+        # refuse the server's writes.
+        volumeMounts:
+          - name: data
+            path: /var/tempo
+          - name: config
+            path: "{{ .locals.config_path }}"
+    volumes:
+      # Docker Compose creates and names the volume; it has no volume-size
+      # concept, so the size below reaches no emitted byte.
+      data:
+        persistent:
+          size: "{{ if .infra.storage }}{{ .infra.storage.size | default "10Gi" }}{{ else }}10Gi{{ end }}"
+      config:
+        configmap:
+          source: "{{ .locals.config_name }}"
+    # A ClusterIP service entry keeps the server on the compose network, which is
+    # where its producers and a dashboards server sit: a consumer wired to it
+    # resolves the service name and the ports straight from the edge. Nothing is
+    # published to the host.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          otlp-grpc: 4317
+          otlp-http: 4318
+          http: 3200

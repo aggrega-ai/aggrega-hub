@@ -19,12 +19,14 @@ metadata:
     the optional `chunk_cache` socket to hold decompressed chunks between
     queries; the per-connection values on that edge — batch size, parallelism,
     timeout and entry lifetime — tune how this server drives that one cache, and
-    with nothing wired the server runs without a chunk cache. Its contract to
-    consumers is that HTTP endpoint: a log shipper pushes streams to it, and a
-    dashboards server reads them back over the query API. Realized on Kubernetes via its
-    Helm Recipe, which sources the official Grafana Loki chart; helm-only. Exports
-    its in-cluster service host and port to consumers via the uses topology. The
-    packaged Loki server is AGPL-3.0.
+    with nothing wired the server runs without a chunk cache. The socket takes
+    one connection, and a second halts the build. Its contract to consumers is
+    that HTTP endpoint: a log shipper pushes streams to it, and a dashboards
+    server reads them back over the query API. Realized on helm by
+    `loki`, which sources the official Grafana Loki chart, and on compose by
+    `loki`, a compose service running the same image and publishing nothing to
+    the host. Exports its service host and port to consumers via the uses
+    topology. The packaged Loki server is AGPL-3.0.
   labels:
     component.aggrega.ai/type: stateful-server
     component.aggrega.ai/category: observability
@@ -45,7 +47,11 @@ spec:
     # values below tune how this server drives that one cache — a batch size, a
     # thread count, a timeout and an entry lifetime — and they belong to the
     # connection rather than to either component, because one memcached serving
-    # two log servers takes different numbers from each.
+    # two log servers takes different numbers from each. The socket takes one
+    # connection: the server has a single chunk-cache client, driven by one set of
+    # those values, so a second connection would configure nothing. The
+    # chunk_cache_takes_one_connection assertion at the end of this file halts
+    # the build on it instead.
     chunk_cache:
       selector: "component.aggrega.ai/category=datastore"
       inject: [env]
@@ -84,7 +90,7 @@ spec:
       # never sees this.
       source_version:
         type: string
-        description: Source artifact version (Helm chart). Overrides the Recipe's default source version. Changing from default does not guarantee value mapping compatibility.
+        description: Source artifact version (Helm chart). Overrides the helm Recipe's default source version; the compose realization pulls no source artifact and ignores it. Changing from default does not guarantee value mapping compatibility.
       compute:
         cpu:
           type: string
@@ -96,7 +102,7 @@ spec:
         size:
           type: string
           default: 10Gi
-          description: Size of the persistent volume backing the Loki single-binary chunk store.
+          description: Size of the persistent volume backing the Loki single-binary chunk store. Docker Compose sets no size on a volume, so the compose realization creates the volume without honouring it.
       overrides:
         type: object
         additionalProperties: true
@@ -107,16 +113,34 @@ spec:
         type: string
         required: true
         description: >
-          In-cluster DNS name of the Service fronting the push and query API.
-          A shipper sending log streams and a dashboard querying them both
-          dial this name.
+          Name the push and query API is reached at — the in-cluster Service
+          on helm, the service name on compose. A shipper sending log streams
+          and a dashboard querying them both dial this name.
       port:
         type: integer
         required: true
         description: >
-          TCP port that Service serves the push and query API on. The
-          realization serves the project's own default, so a consumer reads
-          this rather than hard-coding one.
+          TCP port the push and query API is served on. Each realization
+          serves the project's own default, so a consumer reads this rather
+          than hard-coding one.
       protocol:
         type: string
         description: How the published address is spoken to — `http`, so a consumer reaches both the push and the query paths with an HTTP client.
+
+  # The chunk_cache socket takes one connection. The server has a single
+  # chunk-cache client, configured from one connection's batch size,
+  # parallelism, timeout and entry lifetime, so with two connections wired all
+  # but one would be accepted and then ignored. The build halts instead, naming
+  # each connection on the socket. The rule reads only the socket's connections,
+  # all known before a Recipe binds, so it holds whichever Recipe renders this
+  # component.
+  assertions:
+    chunk_cache_takes_one_connection: >-
+      {{- $connections := optional $.uses "chunk_cache" dict -}}
+      {{- if gt (len $connections) 1 -}}
+      {{- $named := list -}}
+      {{- range $alias, $connection := $connections -}}
+      {{- $named = append $named (printf "%s reaching %q" $alias $connection.target) -}}
+      {{- end -}}
+      {{- fail (printf "the chunk_cache socket of %q holds %d connections (%s), but the server has a single chunk-cache client, driven by one connection's batch size, parallelism, timeout and entry lifetime: wire one memcached to chunk_cache and remove the other connections" $.metadata.instance_id (len $connections) (join ", " $named)) -}}
+      {{- end -}}
