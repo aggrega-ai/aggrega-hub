@@ -446,13 +446,14 @@ Three rules bind it:
   hand-typed `values.models`, which takes such a provider in the proxy's own
   provider/model notation. The `models` sockets of `core/gateway/kong`,
   `core/gateway/kong-enterprise`, `core/gateway/apisix`,
-  `core/gateway/envoy-gateway`, `core/gateway/traefik-hub` and
-  `core/gateway/agentgateway` select the same and each Component's assertion
-  halts the same way, because each writes a wired model's route, or model
-  entry, for the OpenAI API alone — the two Kongs and APISIX through their AI
-  proxy, Envoy Gateway through the Envoy AI Gateway resources its Recipe
-  renders, Traefik Hub through its Chat Completion middleware, agentgateway as
-  an OpenAI-compatible provider in its configuration file.
+  `core/gateway/envoy-gateway`, `core/gateway/traefik-hub`,
+  `core/gateway/agentgateway` and `core/gateway/higress` select the same and
+  each Component's assertion halts the same way, because each writes a wired
+  model's route, or model entry, for the OpenAI API alone — the two Kongs,
+  APISIX and Higress through their AI proxy, Envoy Gateway through the Envoy AI
+  Gateway resources its Recipe renders, Traefik Hub through its Chat Completion
+  middleware, agentgateway as an OpenAI-compatible provider in its
+  configuration file.
 - **A component carrying the key publishes what a model publishes:** `endpoint`
   and `model` in its `provides`, the two keys a consumer's Recipe reads off a
   model edge. One that published no `model` would hand its
@@ -463,8 +464,10 @@ Three rules bind it:
   model is wired to a socket — `core/gateway/kong`,
   `core/gateway/kong-enterprise`, `core/gateway/apisix`, `core/gateway/envoy-gateway`,
   `core/gateway/traefik-hub` and `core/gateway/agentgateway`, each of whose
-  `values.model` names one of its `models` connections — serves
-  none while nothing is wired there and then publishes both keys empty; it
+  `values.model` names one of its `models` connections, and
+  `core/gateway/higress`, whose `values.model` names an alias those connections
+  serve — serves none while nothing is wired there and then publishes both keys
+  empty; it
   carries the key all the same, since the
   value names what the product serves rather than what one Release wires, so a
   consumer wired to it in that state reads an empty address and model name, and
