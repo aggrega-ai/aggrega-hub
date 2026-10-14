@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: fallback-chain-traefik-hub
+  version: 1.0.0
+  description: >
+    Realizes core/fallback-chain on the gateway core/gateway/traefik-hub; a
+    Release binds it in its Manifest. It emits no file: the gateway's chart
+    Recipe, traefik-hub-chart, reads the attachment and sends the route of
+    each alias an entry names through nested failovers of Traefik's own,
+    trying the models of the alias's walk in order, each with its own model
+    name, credential, quotas and retry.
+
+    The walk is the alias, then its entry's fallbacks in order, each counting
+    one fallback; a fallback's own entry is followed in turn only while fewer
+    than max_hops have been counted, and every alias one entry lists is
+    placed whatever the count. A model's reply of 429 or of 500 to 504, after
+    any retry of that model, moves the request on to the next; any other
+    reply is returned as it came, and the last model's whatever it is. A
+    request body over 1 MiB is refused with HTTP 413. The key check, the
+    guards, the masking and the cache stay on the route, once per request.
+
+    The build halts where chains names an alias the models socket does not
+    carry, on a walk reaching an alias twice, on a second such attachment,
+    with nothing wired, on a gateway image older than Traefik Hub v3.20, and
+    on any component other than core/gateway/traefik-hub. No build proves
+    that a running gateway falls back.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/fallback-chain:1.0.0
+  # executionScope omitted -> component: evaluated once per attached component.
+  #
+  # No input kind and no pipeline: what this attachment changes is written by
+  # the gateway's chart Recipe, which reads it and computes each alias's walk
+  # there, in one place, so nothing here can disagree with what is rendered.
+  # What stays here is what that Recipe cannot honour and an assertion can
+  # see.
+  #
+  # How the gateway falls back, read in Traefik Hub's AI gateway failover
+  # guide and in the failover service of Traefik Proxy 3.7, which Traefik Hub
+  # ships from v3.20. A failover TraefikService sends a request to its
+  # service and, when the reply's status is one its errors list, sends a
+  # fresh copy of the request as it arrived to its fallback, which is another
+  # failover for every model of the walk but the last. Each model is a
+  # Service of type ExternalName with its own Middlewares on it — its
+  # upstream path, its Chat Completion middleware naming its own model and
+  # credential, its quotas and the retry — so a fallback is sent its own
+  # model name and key and never the key of the model before it. The
+  # request's body is held to replay it, up to 1 MiB, the most the AI gateway
+  # reads of a request by default; a larger one is refused with HTTP 413
+  # rather than sent. A quota's refusal of a model, 429, moves the request on
+  # like a provider's 429. Traefik Hub v3.19 ships Traefik Proxy 3.6, whose
+  # failover takes no Middlewares on a service, so the chart Recipe halts on
+  # an image older than v3.20.
+  #
+  # No assertion can read the host component's labels, so what the gateway is
+  # able to do is stated in the messages, and the check of the host's type
+  # first in the list is what keeps those statements true.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/traefik-hub and core/gateway/traefik-hub:1.0.0 are the
+    # same host.
+    component_writes_the_chain: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/traefik-hub" -}}
+      {{- fail (printf "core/fallback-chain attachment %q on %q is bound to the Traefik Hub realization, which only core/gateway/traefik-hub carries out: that component's chart Recipe writes the chain into the routes it serves models on, and %s renders none for it, so no request would fall back. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The chain is written onto the routes of the wired models, and with none
+    # wired the gateway renders no model route to fall back from.
+    models_are_wired: >-
+      {{- if not (optional .uses "models" dict) -}}
+      {{- fail (printf "core/fallback-chain attachment %q on %q needs model routes to fall back between, but nothing is wired to the models socket of %q, so the gateway serves no model; wire the models the chain names to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # An entry for an alias the socket does not carry would never be read,
+    # since the gateway serves no route for it; a fallback it does not carry
+    # has no model to be sent to. Both halt, naming the name and what the
+    # socket carries.
+    chains_name_wired_aliases: >-
+      {{- $wired := sortAlpha (keys (optional .uses "models" dict)) -}}
+      {{- range $entry := .values.chains -}}
+      {{- if not (has $entry.alias $wired) -}}
+      {{- fail (printf "core/fallback-chain attachment %q on %q gives an entry to %q, but the models socket of core/gateway/traefik-hub carries no connection under that alias, so the gateway serves no route for it and the entry would never be read; give entries only to aliases the models socket carries: %s" $.metadata.feature_instance $.metadata.instance_id $entry.alias (join ", " $wired)) -}}
+      {{- end -}}
+      {{- range $fallback := $entry.fallbacks -}}
+      {{- if not (has $fallback $wired) -}}
+      {{- fail (printf "core/fallback-chain attachment %q on %q lists %q as a fallback of %q, but the models socket of core/gateway/traefik-hub carries no connection under that alias, so there is no model to send the request to; list only aliases the models socket carries: %s" $.metadata.feature_instance $.metadata.instance_id $fallback $entry.alias (join ", " $wired)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+    # The chart Recipe writes one walk per alias from one attachment, so a
+    # second attachment could not hold beside the first.
+    one_chain_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/fallback-chain" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/fallback-chain is attached to %q more than once (%s), but core/gateway/traefik-hub writes one walk per alias from one attachment, so the attachments cannot each hold; merge them into one" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
+      {{- end -}}

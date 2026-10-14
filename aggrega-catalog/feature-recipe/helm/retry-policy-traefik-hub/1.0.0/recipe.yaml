@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: retry-policy-traefik-hub
+  version: 1.0.0
+  description: >
+    Realizes core/retry-policy on the gateway core/gateway/traefik-hub; a
+    Release binds it in its Manifest. It emits no file: the gateway's chart
+    Recipe, traefik-hub-chart, reads the attachment and writes Traefik's retry
+    middleware as the last Middleware of every model route, or of each model
+    a fallback chain tries, so a model is sent a request again before the
+    request falls back.
+
+    max_attempts counts every send, the first included, and so does the
+    middleware's attempts, so it is written as given; 1 writes nothing, and
+    each request is sent once. A request is sent again at once after a
+    connection that carried nothing to the model and after a reply of 429 or
+    of 500 to 504, a POST included; any other reply ends the retries. A reply
+    the gateway forms itself — a key, guard, masking or quota refusal — is
+    never sent again, and neither is a streamed reply once it has begun. The
+    retries are the gateway's, so a caller sees one answer.
+
+    It halts on a second such attachment, with nothing wired to the models
+    socket, on a gateway image older than Traefik Hub v3.20 while
+    max_attempts is above 1, and on any component other than
+    core/gateway/traefik-hub. No build proves that a running gateway sends a
+    request again.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/retry-policy:1.0.0
+  # executionScope omitted -> component: evaluated once per attached component.
+  #
+  # No input kind and no pipeline: what this attachment changes is written by
+  # the gateway's chart Recipe, which reads it, in one place, so nothing here
+  # can disagree with what is rendered. What stays here is what that Recipe
+  # cannot honour.
+  #
+  # How the gateway retries, read in Traefik Hub's retry reference and in the
+  # retry middleware of Traefik Proxy 3.7, which Traefik Hub ships from v3.20.
+  # The middleware counts its first send among its attempts and makes the
+  # last one when the count reaches attempts. It sends again when the
+  # connection reached the model and carried nothing to it, whatever the
+  # method; and on a reply whose status its list holds — written as 429 and
+  # 500 to 504 — for a POST only with retryNonIdempotentMethod, which is
+  # written on, since every chat completion is a POST. Any other reply is
+  # passed on and ends the retries, so a streamed reply that has begun is
+  # never sent again. No interval is written, so a send follows the last at
+  # once. The middleware is last on a route, or on each service a fallback
+  # chain tries, so what it sends again is the model's reply alone: a
+  # refusal of the key check, a guard, the masking or a quota is formed
+  # before it and passes untouched. Traefik Hub v3.19 ships Traefik Proxy
+  # 3.6, whose retry takes neither the status list nor the setting for a
+  # POST, so the chart Recipe halts on an image older than v3.20 while
+  # max_attempts is above 1.
+  #
+  # No assertion can read the host component's labels, so what the gateway is
+  # able to do is stated in the messages, and the check of the host's type
+  # first in the list is what keeps those statements true.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside:
+    # core/gateway/traefik-hub and core/gateway/traefik-hub:1.0.0 are the
+    # same host.
+    component_writes_the_retry: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/traefik-hub" -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q is bound to the Traefik Hub realization, which only core/gateway/traefik-hub carries out: that component's chart Recipe writes the retry onto the routes it serves models on, and %s renders none for it, so no request would be sent again. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # The retry is written onto the routes serving the wired models, and with
+    # none wired the gateway renders no model route to retry on.
+    models_are_wired: >-
+      {{- if not (optional .uses "models" dict) -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q needs a model route to retry on, but nothing is wired to the models socket of %q, so the gateway serves no model and no request would be sent again; wire a model to that socket" .metadata.feature_instance .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The chart Recipe writes one retry from one attachment onto every model
+    # route, so a second attachment could not hold beside the first.
+    one_retry_policy_per_gateway: >-
+      {{- $names := list -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/retry-policy" }}{{ $names = append $names $name }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $names) 1 -}}
+      {{- fail (printf "core/retry-policy is attached to %q more than once (%s), but core/gateway/traefik-hub writes one retry onto the routes serving its models, so the attachments cannot each hold; keep one attachment" .metadata.instance_id (join ", " (sortAlpha $names))) -}}
+      {{- end -}}

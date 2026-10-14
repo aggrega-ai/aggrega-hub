@@ -25,17 +25,16 @@ metadata:
 
     Each model wired to the models socket gets a route at
     /<alias>/v1/chat/completions through Traefik Hub's Chat Completion
-    middleware, written beside the chart as an IngressRoute, two Middlewares
-    and a Service of type ExternalName per model. Every route checks the key
-    of each caller infra.callers declares against its hash, read by
-    reference, and removes the key before forwarding. This is the
-    component's only realization.
+    middleware, written beside the chart as Traefik's own resources. Every
+    route checks the key of each caller infra.callers declares against its
+    hash, read by reference, and removes the key before forwarding. This is
+    the component's only realization.
 
-    The same file carries a core/period-budget, core/prompt-deny-patterns or
-    core/semantic-caching attachment, as Traefik Hub's quota, Content Guard or
-    semantic cache middleware; each halts the build until
-    infra.ai_gateway_entitled affirms the licence's AI gateway. No build
-    observes that the gateway enforces them.
+    The same file writes a core/period-budget, core/prompt-deny-patterns,
+    core/semantic-caching, core/data-masking, core/fallback-chain or
+    core/retry-policy attachment, each FeatureRecipe saying how; the first
+    four halt the build until infra.ai_gateway_entitled affirms the licence's
+    AI gateway. No build observes that the gateway enforces any of them.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -81,8 +80,19 @@ spec:
   # gateway authenticates its callers. It is written with the template
   # language's own range rather than a helper function, as apisix-chart's
   # local of the same name is.
+  #
+  # analyzer_entity_types is the list of entity types the Presidio analyzer
+  # that core/security/presidio-analyzer runs reports it recognizes in
+  # English, as a JSON list, which the realization of core/data-masking checks
+  # an attachment's entity types against. Content Guard hands the analyzer
+  # the language en, the one the analyzer's image loads a model for.
+  # DELIBERATE NEAR-DUPLICATE of the local of the same name on
+  # recipe/helm/litellm-gateway: both gateways call the same analyzer, and a
+  # Recipe's local is read by its own attachments alone, so neither can read
+  # the other's. If the analyzer's list changes, change both in the same edit.
   locals:
     callers: '{{ with optional .infra "callers" "" }}{{ range $i, $caller := . }}{{ if $i }}, {{ end }}{{ $caller }}{{ end }}{{ end }}'
+    analyzer_entity_types: '["CREDIT_CARD", "CRYPTO", "DATE_TIME", "EMAIL_ADDRESS", "IBAN_CODE", "IP_ADDRESS", "LOCATION", "MAC_ADDRESS", "MEDICAL_LICENSE", "NRP", "PERSON", "PHONE_NUMBER", "UK_NHS", "URL", "US_BANK_NUMBER", "US_DRIVER_LICENSE", "US_ITIN", "US_PASSPORT", "US_SSN"]'
 
   # The catalog names no Traefik Hub image, so the Release names the one it
   # runs; the chart's own default image is never rendered in its place. An
@@ -95,20 +105,22 @@ spec:
       {{- if not (optional .infra "image" "") -}}
       {{- fail "this realization runs the Traefik Hub image the Release supplies, because access to that image is governed by Traefik's terms and the catalog therefore names none: set infra.image to the full reference of the image the operator is entitled to pull, tag included, as in ghcr.io/traefik/traefik-hub:v3.21.2" -}}
       {{- end -}}
-    # The AI gateway entitlement, affirmed rather than hoped for. The three
+    # The AI gateway entitlement, affirmed rather than hoped for. The four
     # Features named here are kept on this gateway through middlewares of
     # Traefik Hub's AI gateway, an entitlement carried inside the licence the
     # license slot names, which the build never reads; and Traefik's reference
     # documents no behaviour for a valid token whose licence lacks the AI
     # gateway. The compiler runs ahead of time and cannot look, so it asks the
-    # operator to affirm the entitlement and halts when any of the three is
+    # operator to affirm the entitlement and halts when any of the four is
     # attached and nobody has. The list names every Feature this Recipe keeps
-    # through an AI gateway middleware, and grows with them.
+    # through an AI gateway middleware, and grows with them. core/fallback-chain
+    # and core/retry-policy are kept through Traefik's own failover service and
+    # retry middleware, which are not the AI gateway's, so they are not on it.
     ai_gateway_entitlement_affirmed: >-
       {{- $ai := list -}}
       {{- range $name, $attachment := (default dict .features) -}}
       {{- $type := first (splitList ":" (toString $attachment.type)) -}}
-      {{- if has $type (list "core/period-budget" "core/prompt-deny-patterns" "core/semantic-caching") -}}
+      {{- if has $type (list "core/period-budget" "core/prompt-deny-patterns" "core/semantic-caching" "core/data-masking") -}}
       {{- $ai = append $ai (printf "%s (%s)" $name $type) -}}
       {{- end -}}
       {{- end -}}
@@ -191,6 +203,22 @@ spec:
       {{- if eq (first (splitList ":" (toString $attachment.type))) "core/semantic-caching" }}
         {{- if not (and (regexMatch `^v?[0-9]+\.[0-9]+\.[0-9]+$` $tag) (semverCompare ">=3.19.11, <3.20.0 || >=3.20.6" $tag)) }}
         {{- fail (printf "the core/semantic-caching attachment %q on %q needs a Traefik Hub release whose semantic cache keeps each caller's stored replies apart by default, which Traefik's reference states of v3.19.11 and v3.20.6 onward, an earlier release sharing one cache among every caller of a route; but infra.image is %q, whose tag %q names no such release. Name an image of Traefik Hub v3.19.11 or a later 3.19 release, or of v3.20.6 or later" $cacheAttachment $.context.instance_id $image $tag) }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- /* A fallback chain puts each model's middlewares on the service the
+           failover tries, and a retry policy sends a POST again on a reply's
+           status; Traefik Hub ships both with Traefik Proxy 3.7, from v3.20,
+           as its release notes state, and v3.19 ships Traefik Proxy 3.6, whose
+           retry takes neither setting. So either attachment stops the build
+           here unless the image's tag names a release from v3.20.0, a tag that
+           is not a plain release version included; a retry policy of one
+           attempt writes nothing and is not held to it. */}}
+    {{- range $proxyAttachment, $attachment := (default dict .features) }}
+      {{- $proxyType := first (splitList ":" (toString $attachment.type)) }}
+      {{- if or (eq $proxyType "core/fallback-chain") (and (eq $proxyType "core/retry-policy") (gt (int64 (optional (default dict $attachment.values) "max_attempts" 1)) 1)) }}
+        {{- if not (and (regexMatch `^v?[0-9]+\.[0-9]+\.[0-9]+$` $tag) (semverCompare ">=3.20.0" $tag)) }}
+        {{- fail (printf "the %s attachment %q on %q needs a Traefik Hub release that ships Traefik Proxy 3.7, whose failover service takes middlewares on each service it tries and whose retry middleware can send a POST again on a reply's status, which Traefik Hub's release notes state of v3.20 onward; but infra.image is %q, whose tag %q names no such release. Name an image of Traefik Hub v3.20.0 or later" $proxyType $proxyAttachment $.context.instance_id $image $tag) }}
         {{- end }}
       {{- end }}
     {{- end }}
@@ -358,7 +386,9 @@ spec:
   # prompt-deny-patterns-traefik-hub realizes and checks, is written as a
   # Content Guard Middleware named after the gateway and the attachment with
   # -guard appended, shared by every route and placed after the Chat
-  # Completion middleware: its regular-expression engine reads the request as
+  # Completion middleware, or, on a route a fallback chain walks, ahead of the
+  # services the walk tries, where each model's Chat Completion middleware
+  # sits: its regular-expression engine reads the request as
   # a chat completion and refuses one a deny pattern matches, each pattern a
   # JSON string holding exactly what the attachment wrote. It reads requests
   # only, so a streamed reply passes as it streams. Several such attachments
@@ -400,6 +430,56 @@ spec:
   # written, minutes or seconds converted where they make whole hours, and
   # any other stops the build, as period-budget-traefik-hub refuses it first;
   # the two are edited together.
+  #
+  # A core/data-masking attachment, which data-masking-traefik-hub realizes
+  # and checks, is written as a Content Guard Middleware named after the
+  # gateway and the attachment with -mask appended, shared by every route and
+  # placed after the deny-pattern guards, so a guard reads a request before
+  # anything of it is masked. It reads the request and the reply as a chat
+  # completion, with one rule per direction the attachment's scope names: its
+  # regular-expression engine for patterns, each a JSON string holding exactly
+  # what the attachment wrote, or its Presidio engine for entities, calling
+  # the analyzer on the pii_analyzer connection at the address it publishes,
+  # a host with no dot qualified with the analyzer's namespace, in the
+  # language en. action redact writes a mask of the character *, so a match
+  # becomes a run of that character as long as the match; refuse writes a
+  # block, which answers HTTP 403 in place of the request or the reply. One
+  # engine is written per attachment and one masking attachment per gateway,
+  # as data-masking-traefik-hub holds.
+  #
+  # A core/fallback-chain attachment, which fallback-chain-traefik-hub
+  # realizes and checks, turns the route of each alias an entry names into a
+  # walk: the alias, then its entry's fallbacks in order, each counting one
+  # fallback; a fallback's own entry is followed, before the rest of the list
+  # it came from, only while fewer than max_hops have been counted, and every
+  # alias one entry lists is placed whatever the count. An alias reached twice
+  # stops the build. The route then sends to a TraefikService named after the
+  # connection with -fallback-0 appended: a failover whose service is the
+  # walk's first model and whose fallback is the next such TraefikService, the
+  # last one's fallback being the walk's last model. Each model of a walk is
+  # tried with its own Middlewares on its service — its upstream path, its
+  # Chat Completion middleware, its quotas and the retry — so each is sent
+  # its own model name and credential, and the route keeps the key check, the
+  # guards, the masking and the cache. A reply of 429 or of 500 to 504 moves
+  # the request on; a request body larger than 1 MiB, the most the AI gateway
+  # reads of a request by default, is refused with HTTP 413. An alias no
+  # entry names keeps its route as it is.
+  #
+  # DELIBERATE NEAR-DUPLICATE of the walk computed in
+  # artifactlibrary/kong-model-routes for core/gateway/kong-enterprise: the
+  # Feature's walk is one rule, but each gateway writes it into resources of
+  # its own and a template is a string no library kind both can read holds.
+  # If the walk changes, change both in the same edit.
+  #
+  # A core/retry-policy attachment, which retry-policy-traefik-hub realizes
+  # and checks, is written as Traefik's retry middleware, named after the
+  # gateway and the attachment with -retry appended: attempts is max_attempts,
+  # since the middleware counts the first send among its attempts; it sends
+  # a request again at once after a connection that sent nothing and after a
+  # reply of 429 or of 500 to 504, a POST included. It is the last Middleware
+  # of a model route, or of each service a walk tries, so only a reply from
+  # the model is sent again, never one the gateway forms itself. max_attempts
+  # 1 writes nothing.
   artifacts:
     models.yaml: |
       {{- $ns := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default" }}
@@ -444,11 +524,40 @@ spec:
       {{- $guards := list }}
       {{- $budgets := list }}
       {{- $cacheName := "" }}
+      {{- $masks := list }}
+      {{- $chain := dict }}
+      {{- $retryName := "" }}
       {{- range $attachmentName, $attachment := (default dict .features) }}
       {{- $type := first (splitList ":" (toString $attachment.type)) }}
       {{- if eq $type "core/prompt-deny-patterns" }}{{ $guards = append $guards $attachmentName }}{{ end }}
       {{- if eq $type "core/period-budget" }}{{ $budgets = append $budgets $attachmentName }}{{ end }}
       {{- if eq $type "core/semantic-caching" }}{{ $cacheName = $attachmentName }}{{ end }}
+      {{- if eq $type "core/data-masking" }}{{ $masks = append $masks $attachmentName }}{{ end }}
+      {{- if eq $type "core/fallback-chain" }}{{ $chain = $attachment }}{{ end }}
+      {{- if and (eq $type "core/retry-policy") (gt (int64 $attachment.values.max_attempts) 1) }}{{ $retryName = $attachmentName }}{{ end }}
+      {{- end }}
+      {{- $retry := "" }}
+      {{- with $retryName }}{{ $retry = printf "%s-%s-retry" $.context.rendered_name (lower (replace "_" "-" .)) }}{{ end }}
+      {{- /* The analyzer a masking attachment listing entities calls: the one
+             pii_analyzer connection's published endpoint, a host with no dot
+             qualified with the namespace the Release places the analyzer in. */}}
+      {{- $analyzerAddress := "" }}
+      {{- $entityMasking := false }}
+      {{- range $maskName := $masks }}{{ if optional (default dict (get $.features $maskName).values) "entities" list }}{{ $entityMasking = true }}{{ end }}{{ end }}
+      {{- if $entityMasking }}
+      {{- $analyzers := list }}
+      {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "pii_analyzer" }}{{ $analyzers = append $analyzers $edge }}{{ end }}{{ end }}
+      {{- if ne (len $analyzers) 1 }}{{ fail (printf "the pii_analyzer socket of %q holds %d connections, but the Content Guard a core/data-masking attachment listing entities is written as calls one Presidio analyzer; wire one core/security/presidio-analyzer to the pii_analyzer socket" .context.instance_id (len $analyzers)) }}{{ end }}
+      {{- $edge := first $analyzers }}
+      {{- $u := urlParse (toString $edge.provides.endpoint) }}
+      {{- if not (and (has $u.scheme (list "http" "https")) $u.host) }}{{ fail (printf "the pii_analyzer connection of %q reaches %q, whose published endpoint %q is not an absolute http or https URL, so the Content Guard could not be given the analyzer's address" .context.instance_id $edge.target (toString $edge.provides.endpoint)) }}{{ end }}
+      {{- $analyzerHost := $u.host }}
+      {{- $analyzerPort := "" }}
+      {{- with regexFind ":[0-9]+$" $analyzerHost }}{{ $analyzerPort = . }}{{ $analyzerHost = trimSuffix . $analyzerHost }}{{ end }}
+      {{- if not (contains "." $analyzerHost) }}
+      {{- $analyzerHost = printf "%s.%s.svc.cluster.local" $analyzerHost (optional (optional (default dict $edge.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default") }}
+      {{- end }}
+      {{- $analyzerAddress = printf "%s://%s%s" $u.scheme $analyzerHost $analyzerPort }}
       {{- end }}
       {{- /* The stores, read only while an attachment needs them. */}}
       {{- $counterStores := list }}
@@ -538,6 +647,47 @@ spec:
       {{- end }}
       {{- end }}
       {{- end }}
+      {{- /* The walk of each alias a core/fallback-chain entry names: the alias, then its entry's fallbacks in order,
+             each counting one fallback; a fallback's own entry is followed, before the rest of the list it came from,
+             only while fewer than max_hops have been counted, and every alias one entry lists is placed whatever the
+             count. A walk reaching an alias a second time would send the request again to a model that has already
+             failed it, which is a retry rather than a fallback, so it stops the build. Each step either places an
+             alias or finishes a list, so the walk ends within twice the number of fallbacks listed, plus two. */}}
+      {{- $walks := dict }}
+      {{- with $chain }}
+      {{- $entries := dict }}
+      {{- $listed := 0 }}
+      {{- range $entry := .values.chains }}{{ $_ := set $entries (toString $entry.alias) $entry.fallbacks }}{{ $listed = add $listed (len $entry.fallbacks) }}{{ end }}
+      {{- $maxHops := int64 .values.max_hops }}
+      {{- range $entry := .values.chains }}
+      {{- $start := toString $entry.alias }}
+      {{- if not (has $start $wired) }}{{ fail (printf "the fallback chain of %q gives an entry to %q, which names no connection on its models socket; give entries only to aliases the models socket carries: %s" $.context.instance_id $start (join ", " $wired)) }}{{ end }}
+      {{- $walk := list $start }}
+      {{- $count := 0 }}
+      {{- $stack := list $entry.fallbacks }}
+      {{- $done := false }}
+      {{- range $step := until (int (add (mul 2 $listed) 2)) }}
+      {{- if not $done }}
+      {{- if not $stack }}{{ $done = true }}
+      {{- else }}
+      {{- $top := last $stack }}
+      {{- if not $top }}{{ $stack = initial $stack }}
+      {{- else }}
+      {{- $next := toString (first $top) }}
+      {{- $stack = append (initial $stack) (rest $top) }}
+      {{- if has $next $walk }}{{ fail (printf "the fallback chain of %q has a walk from %q that reaches %q a second time, which would send the request again to a model that has already failed it, where a fallback is another model; remove %q from one of the lists leading to it" $.context.instance_id $start $next $next) }}{{ end }}
+      {{- if not (has $next $wired) }}{{ fail (printf "the fallback chain of %q has a walk from %q that reaches %q, which names no connection on its models socket; list only aliases the models socket carries: %s" $.context.instance_id $start $next (join ", " $wired)) }}{{ end }}
+      {{- $walk = append $walk $next }}
+      {{- $count = add $count 1 }}
+      {{- if and (lt $count $maxHops) (hasKey $entries $next) }}{{ $stack = append $stack (get $entries $next) }}{{ end }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- if not $done }}{{ fail (printf "the fallback chain of %q did not finish the walk from %q" $.context.instance_id $start) }}{{ end }}
+      {{- $_ := set $walks $start $walk }}
+      {{- end }}
+      {{- end }}
       {{- if $wired -}}
       apiVersion: traefik.io/v1alpha1
       kind: IngressRoute
@@ -549,30 +699,47 @@ spec:
           - web
         routes:
       {{- range $alias := $wired }}
+      {{- $walk := get $walks $alias }}
           - kind: Rule
             match: Path(`/{{ $alias }}/v1/chat/completions`)
+      {{- if or (not $walk) $callers $guards $masks $cacheName }}
             middlewares:
+      {{- end }}
       {{- if $callers }}
               - name: {{ $.context.rendered_name }}-callers
               - name: {{ $.context.rendered_name }}-callers-strip
       {{- end }}
+      {{- if not $walk }}
               - name: {{ get $names $alias }}-upstream-path
               - name: {{ get $names $alias }}-chat-completion
+      {{- end }}
       {{- range $guardName := $guards }}
               - name: {{ $.context.rendered_name }}-{{ lower (replace "_" "-" $guardName) }}-guard
+      {{- end }}
+      {{- range $maskName := $masks }}
+              - name: {{ $.context.rendered_name }}-{{ lower (replace "_" "-" $maskName) }}-mask
       {{- end }}
       {{- with $cacheName }}
               - name: {{ get $names $alias }}-{{ lower (replace "_" "-" .) }}-cache
       {{- end }}
+      {{- if $walk }}
+            services:
+              - name: {{ get $names $alias }}-fallback-0
+                kind: TraefikService
+      {{- else }}
       {{- range $quota := get $quotasOf $alias }}
               - name: {{ $quota.key }}
               - name: {{ $quota.name }}
+      {{- end }}
+      {{- with $retry }}
+              - name: {{ . }}
       {{- end }}
             services:
               - name: {{ get $names $alias }}
                 port: {{ get $ports $alias }}
                 scheme: {{ get $schemes $alias }}
                 passHostHeader: false
+      {{- end }}
       {{- end }}
       {{- if $callers }}
       ---
@@ -623,6 +790,128 @@ spec:
                   entities:
       {{- range $pattern := $guard.values.deny_patterns }}
                     - {{ $pattern | toJson }}
+      {{- end }}
+      {{- end }}
+      {{- range $maskName := $masks }}
+      {{- $mask := default dict (get $.features $maskName).values }}
+      {{- $scope := toString (optional $mask "scope" "request") }}
+      {{- $refuse := eq (toString (optional $mask "action" "redact")) "refuse" }}
+      {{- $entities := optional $mask "entities" list }}
+      ---
+      apiVersion: traefik.io/v1alpha1
+      kind: Middleware
+      metadata:
+        name: {{ $.context.rendered_name }}-{{ lower (replace "_" "-" $maskName) }}-mask
+        namespace: "{{ $ns }}"
+      spec:
+        plugin:
+          content-guard:
+            clientRequestFormat: ccr
+            engine:
+      {{- if $entities }}
+              presidio:
+                host: {{ $analyzerAddress | toJson }}
+                language: en
+      {{- else }}
+              regex: {}
+      {{- end }}
+      {{- range $direction := list "request" "response" }}
+      {{- if or (eq $scope $direction) (eq $scope "both") }}
+            {{ $direction }}:
+              rules:
+      {{- if $refuse }}
+                - block: true
+      {{- else }}
+                - mask:
+                    char: "*"
+      {{- end }}
+                  entities:
+      {{- if $entities }}
+      {{- range $entity := $entities }}
+                    - {{ $entity | toJson }}
+      {{- end }}
+      {{- else }}
+      {{- range $pattern := optional $mask "patterns" list }}
+                    - {{ $pattern.regex | toJson }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- with $retryName }}
+      {{- $retryAttachment := get $.features . }}
+      ---
+      apiVersion: traefik.io/v1alpha1
+      kind: Middleware
+      metadata:
+        name: {{ $retry }}
+        namespace: "{{ $ns }}"
+      spec:
+        retry:
+          attempts: {{ int64 $retryAttachment.values.max_attempts }}
+          retryNonIdempotentMethod: true
+          status:
+            - "429"
+            - "500-504"
+      {{- end }}
+      {{- range $alias := $wired }}
+      {{- $walk := get $walks $alias }}
+      {{- if $walk }}
+      {{- $base := get $names $alias }}
+      {{- $last := sub (len $walk) 1 }}
+      {{- range $i, $step := $walk }}
+      {{- if lt $i $last }}
+      ---
+      apiVersion: traefik.io/v1alpha1
+      kind: TraefikService
+      metadata:
+        name: {{ $base }}-fallback-{{ $i }}
+        namespace: "{{ $ns }}"
+      spec:
+        failover:
+          service:
+            name: {{ get $names $step }}
+            port: {{ get $ports $step }}
+            scheme: {{ get $schemes $step }}
+            passHostHeader: false
+            middlewares:
+              - name: {{ get $names $step }}-upstream-path
+              - name: {{ get $names $step }}-chat-completion
+      {{- range $quota := get $quotasOf $step }}
+              - name: {{ $quota.key }}
+              - name: {{ $quota.name }}
+      {{- end }}
+      {{- with $retry }}
+              - name: {{ . }}
+      {{- end }}
+          fallback:
+      {{- if lt (add $i 1) $last }}
+            name: {{ $base }}-fallback-{{ add $i 1 }}
+            kind: TraefikService
+      {{- else }}
+      {{- $final := index $walk $last }}
+            name: {{ get $names $final }}
+            port: {{ get $ports $final }}
+            scheme: {{ get $schemes $final }}
+            passHostHeader: false
+            middlewares:
+              - name: {{ get $names $final }}-upstream-path
+              - name: {{ get $names $final }}-chat-completion
+      {{- range $quota := get $quotasOf $final }}
+              - name: {{ $quota.key }}
+              - name: {{ $quota.name }}
+      {{- end }}
+      {{- with $retry }}
+              - name: {{ . }}
+      {{- end }}
+      {{- end }}
+          errors:
+            status:
+              - "429"
+              - "500-504"
+            maxRequestBodyBytes: 1048576
+      {{- end }}
+      {{- end }}
       {{- end }}
       {{- end }}
       {{- range $alias := $wired }}
