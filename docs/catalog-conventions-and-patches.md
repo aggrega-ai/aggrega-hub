@@ -341,8 +341,8 @@ component can send its traffic through: `core/gateway/litellm` and
 The selector admits both guards that carry the value, and each gateway's
 realization of the shield halts the build on any guard but
 `core/security/nemo-guardrails`, the one its two sensitivities are measured
-on — the same shape as `cache_store`, whose selector admits the key-value
-stores and whose Recipe halts on any store but `core/datastore/redis`.
+on. `cache_store`'s selector admits the key-value stores too, and its Recipe
+halts on a store that publishes no `vector_search`.
 
 ### The `security.aggrega.ai/text-anonymization` label
 
