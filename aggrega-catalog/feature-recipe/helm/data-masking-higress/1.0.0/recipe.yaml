@@ -7,33 +7,35 @@ metadata:
   name: data-masking-higress
   version: 1.0.0
   description: >
-    Realizes core/data-masking on the gateway core/gateway/higress; a Release
-    binds it in its Manifest. It emits no file: the gateway's chart Recipe,
+    Realizes core/data-masking on core/gateway/higress; a Release binds it in
+    its Manifest. It emits no file: the gateway's chart Recipe,
     higress-chart, writes Higress's ai-data-masking plugin onto the model
     routes, replacing each match of a listed pattern in the text of a chat
     request's messages with [<pattern name>] before the request is
-    forwarded. Higress reads each pattern as Rust fancy-regex, with grok's
-    %{NAME} patterns expanded.
+    forwarded. Patterns are Rust fancy-regex, grok's %{NAME} expanded.
 
-    The plugin reads the content and reasoning of each message, of every
-    role, while every message holds plain text, and nothing else. So while
-    allow_unmasked_text is off, every other request is refused with HTTP 403
-    before it is forwarded: one not sent as JSON or not a chat completion, a
-    message whose content is a list or null, a tool call or tool turn, a
-    message's name, and any parameter beyond a chat completion's non-text
-    ones and the developer's tools, tool choice, response format and stop
-    sequences. Set on, those pass unmasked, and a request with any message
-    not holding plain text passes whole, no message of it masked. While only
-    allow_non_text_content is off, a request carrying an image, a file or
-    audio, and every request but a chat completion, is refused. Whatever it
-    relaxes, a request with a compressed body, a content type containing
-    octet-stream or grpc, or an upgrade is refused with HTTP 403, and one
-    whose body exceeds 32 KiB with HTTP 413.
+    The plugin reads each message's content and reasoning while all are plain
+    text, and nothing else. So while allow_unmasked_text is off, every other
+    request is refused with HTTP 403 before it is forwarded: one not sent as
+    JSON or not a chat completion, a message whose content is a list or null,
+    a tool call or tool turn, a message's name, and any parameter but a chat
+    completion's non-text ones and the developer's tool, format and stop
+    settings. Set on, those pass unmasked, a request with any message not
+    holding plain text passing whole. With only allow_non_text_content off,
+    images, files, audio and every request but a chat completion are
+    refused. Whatever it relaxes, a compressed, binary or gRPC body, an
+    upgrade and a body holding U+FFFD, which an invalid UTF-8 byte reads as,
+    get HTTP 403, and a body over 32 KiB 413.
+
+    A client deliberately sending valid JSON the gateway's validation cannot
+    decode (a number past a double's range) gets past them: only plain
+    message text and reasoning are then masked, escaped text is not, and a
+    body also not valid UTF-8 passes unmasked.
 
     It refuses entity types, restore, refuse, scope response and both, and
     allow_non_text_content on while allow_unmasked_text is off. It halts on a
     second attachment, with nothing wired to the models socket, and on any
-    component other than core/gateway/higress.
+    other component.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -61,15 +63,40 @@ spec:
   # backtracking limit, refuses that request with HTTP 500.
   #
   # Where the body does not parse that way — a message whose content is a
-  # list of parts or null, as a tool-call turn writes it, any request but a
-  # chat completion, or a body that is not JSON — the plugin masks nothing and
-  # passes the request on whole. It never reads a message's tool calls or
-  # name, or any field of the request beside its messages. So the gateway's
-  # Recipe writes, with the masking, a request-validation plugin that refuses
-  # those requests before they are forwarded, as long as a protection asks
-  # for it; validation reads a body only once it parses as a JSON object, so
-  # for a body labelled JSON that does not parse, the Recipe has the masking
-  # plugin run its patterns over the whole body as plain text instead.
+  # list of parts or null, as a tool-call turn writes it, or any request but a
+  # chat completion — the plugin reads no message of it, and of itself passes
+  # the request on whole. It never reads a message's tool calls or name, or
+  # any field of the request beside its messages. So the gateway's Recipe
+  # writes, with the masking, a request-validation plugin that, as long as a
+  # protection asks for it, refuses those requests before they are
+  # forwarded, and with them a request of any method but GET, HEAD, DELETE
+  # and OPTIONS whose content type does not begin with application/json, in
+  # the lowercase spelling Higress's AI proxy reads; and while
+  # allow_unmasked_text is off it has the masking plugin apply its patterns
+  # to the whole text of a body it cannot read as a chat request, where the
+  # body is valid UTF-8.
+  #
+  # A body that is not valid UTF-8 the masking plugin forwards as it came,
+  # nothing of it masked. The validation reads a body with Go's JSON decoder,
+  # which takes each byte that is not valid UTF-8 for U+FFFD, the Unicode
+  # replacement character, so whatever the attachment relaxes, the Recipe
+  # refuses with HTTP 403 a body holding that character in any string or any
+  # key: a client sending its text in Latin-1 rather than UTF-8 is refused
+  # rather than passed on unmasked. A request carrying the character itself
+  # is refused too.
+  #
+  # A body a client deliberately writes as valid JSON that Go's decoder
+  # refuses — a number beyond what a double holds, for example — the
+  # validation passes without reading it. The masking plugin, reading it
+  # still as a chat request, masks only each message's text content and
+  # reasoning, so a listed value anywhere else in the body — a tool call's
+  # arguments, a name, any other field — is forwarded unmasked, as is
+  # content written with JSON escape sequences; and if such a body is also
+  # not valid UTF-8, the whole body is forwarded unmasked. No setting of
+  # either plugin refuses such a body.
+  #
+  # Both read from Higress's source at 2.2.5, not yet observed on a running
+  # gateway.
   #
   # What each relaxation lets through unmasked:
   # - allow_unmasked_text on: a request whose messages do not all hold plain
@@ -87,12 +114,13 @@ spec:
   # developer's own and pass as sent; the reasoning a client sends back is
   # masked like the rest of a message.
   #
-  # Whatever the attachment relaxes, two refusals hold:
+  # Whatever the attachment relaxes, three refusals hold:
   # - The gateway's Recipe refuses with HTTP 403, before the body is read, a
   #   request whose body Higress's plugins written in Go, the validation among
   #   them, would not read: one carrying a content-encoding header, one whose
   #   content type contains octet-stream or grpc, and one asking to upgrade
   #   the connection, as a WebSocket does.
+  # - It refuses with HTTP 403 a body holding U+FFFD, as above.
   # - The masking plugin holds a request's whole body before masking it, and
   #   it runs first on the route, before the AI proxy can raise the gateway's
   #   per-connection buffer, which the gateway's Recipe leaves at the chart's

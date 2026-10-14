@@ -27,8 +27,9 @@ metadata:
 
     While core/data-masking, core/period-budget or core/audit-logging is
     attached, it adds Higress's plugin for each onto the model routes: request
-    masking, with what it cannot read refused, a token limit counted in the
-    store on the cache socket, and statistics in the access log. While
+    masking, with what it cannot read refused unless a client crafts the body
+    to get past it, a token limit counted in the store on the cache socket,
+    and statistics in the access log. While
     core/retry-policy is attached, it writes the route's own retry onto each
     model route as Ingress annotations.
 
@@ -215,11 +216,21 @@ spec:
   #   expressions are written as listed; Higress reads them as Rust
   #   fancy-regex, with grok's %{NAME} patterns expanded. A request the
   #   plugin fails while masking gets HTTP 500 and masking_failure_message,
-  #   and is not forwarded. While allow_unmasked_text is off, a body that
-  #   does not parse as JSON is masked as plain text, the plugin's own
-  #   fallback, rather than passed on. The plugin holds a request's whole body
-  #   before it masks it, and it runs first, before the AI proxy can raise the
-  #   gateway's per-connection buffer, which this Recipe leaves at the chart's
+  #   and is not forwarded. What it masks depends on how it can read the
+  #   body. A body it reads as a chat request has each message's content and
+  #   reasoning masked. A body it cannot read as one, but which is valid
+  #   UTF-8, has every pattern applied to its whole text as plain text while
+  #   allow_unmasked_text is off, the plugin's own fallback, and is passed on
+  #   unmasked while it is on. A body that does not parse as JSON but that the
+  #   plugin still reads as a chat request — which a client can craft, with a
+  #   number beyond what a double holds in a field the plugin skips, say — has
+  #   only each message's content and reasoning masked, and content written
+  #   with JSON escape sequences there is matched but not replaced. A body
+  #   that is not valid UTF-8 is forwarded as it came, nothing of it masked;
+  #   the request-validation plugin below refuses every such body it can
+  #   decode. The plugin holds a request's whole body before it masks it, and
+  #   it runs first, before the AI proxy can raise the gateway's
+  #   per-connection buffer, which this Recipe leaves at the chart's
   #   default of 32 KiB; so while the attachment is present, whatever it
   #   relaxes, a request whose body exceeds 32 KiB is refused with HTTP 413
   #   before it is forwarded. Read from Higress's source at 2.2.5 and its
@@ -234,20 +245,37 @@ spec:
   #   as a WebSocket does. An HTTP/2 extended CONNECT reaches the plugin
   #   already rewritten to an upgrade and is refused as one. This header
   #   refusal is rendered under every masking relaxation, because the pattern
-  #   masking of plain-string content is kept under all of them.
-  #   In its body phase, while allow_unmasked_text is
-  #   off it refuses a request with a body that is not sent as JSON, and a
-  #   JSON body that is not a chat completion of plain-text messages — a
-  #   message whose content is a list or null, a tool call, a tool turn, a
-  #   message's name or any other field of a message, and any parameter of
-  #   the request beyond the chat completion's own non-text ones and the
-  #   developer's own tools, tool choice, response format and stop
-  #   sequences. While only allow_non_text_content is off, it refuses a
-  #   request with a body that is not sent as JSON, every request but a chat
-  #   completion, and a message carrying an image, a file or audio. A
-  #   request with no body passes the body phase. Validation reads a body only
-  #   once it parses as a JSON object, so a body labelled JSON that does not
-  #   parse passes it; the masking fallback above covers that body.
+  #   masking of plain-string content is kept under all of them. While
+  #   masking keeps a strict default, the header phase also refuses a request
+  #   of any method but GET, HEAD, DELETE and OPTIONS whose content type does
+  #   not begin with application/json, in the lowercase spelling the AI proxy
+  #   reads; and while the budget is attached, one whose content type neither
+  #   contains application/json nor begins with multipart/form-data, which
+  #   the AI proxy forwards without reading.
+  #   In its body phase, while allow_unmasked_text is off it refuses a JSON
+  #   body that is not a chat completion of plain-text messages — a message
+  #   whose content is a list or null, a tool call, a tool turn, a message's
+  #   name or any other field of a message, and any parameter of the request
+  #   beyond the chat completion's own non-text ones and the developer's own
+  #   tools, tool choice, response format and stop sequences. While only
+  #   allow_non_text_content is off, it refuses every request but a chat
+  #   completion, and a message carrying an image, a file or audio. Whenever
+  #   masking is attached, under every relaxation, it refuses a body holding
+  #   U+FFFD, the Unicode replacement character, in any string or any key at
+  #   any depth: it reads a body with Go's JSON decoder, which takes each byte
+  #   that is not valid UTF-8 for that character, so a body that is not valid
+  #   UTF-8, which the masking plugin forwards unmasked, is refused instead,
+  #   as is a request carrying the character itself. A request with no body
+  #   passes the body phase. Validation reads a body only once Go's decoder
+  #   accepts it as a JSON object, so a client deliberately sending valid JSON that
+  #   the decoder refuses — a number beyond what a double holds, for example
+  #   — passes every body refusal: the masking plugin then masks only each
+  #   message's text content and reasoning, so a listed value anywhere else
+  #   in the body — a tool call's arguments, a name, any other field — is
+  #   forwarded unmasked, as is content written with JSON escape sequences,
+  #   and if such a body is also not valid UTF-8, the whole body is forwarded
+  #   unmasked. Read from Higress's source at 2.2.5, not yet observed on a
+  #   running gateway.
   # - core/period-budget: the token-limit plugin, refusing a model request
   #   with HTTP 429 while the tokens counted in the current window exceed
   #   limit, one count for the whole gateway under scope gateway and one for
@@ -257,7 +285,18 @@ spec:
   #   connection's credential as ${secret.<Secret>.<data key>}, which the
   #   controller replaces with the password before the gateway reads it. A
   #   streamed request turning off the usage report the count is taken from
-  #   is refused by the request-validation plugin.
+  #   is refused by the request-validation plugin, as is a request whose
+  #   content type the AI proxy does not read, above; a body crafted so that
+  #   Go's decoder refuses it, as above, passes that refusal, and a streamed
+  #   one turning the report off goes uncounted. While the budget is attached
+  #   and masking is not, a request whose body exceeds the gateway's
+  #   per-connection buffer, 32 KiB at the chart's default, may be refused
+  #   with HTTP 413: the request-validation plugin holds the body while the
+  #   token-limit plugin waits for its store's count, and the AI proxy raises
+  #   the buffer only once the store has answered, or at once when it cannot
+  #   be reached, so whether the refusal comes depends on when the store
+  #   answers. Read from Higress's source at 2.2.5, not yet observed on a
+  #   running gateway.
   # - core/audit-logging: the statistics plugin on every path of the model
   #   routes, which writes the model that answered and the tokens its reply
   #   reports into the ai_log field of the gateway's access log line.
@@ -519,8 +558,9 @@ spec:
       {{- end }}
       {{- if or $masking $budget }}
       {{- $refusals := list "This gateway reads each request's body to apply its protections, which it cannot do while the body is compressed or sent as binary or gRPC content or the connection is being upgraded, so it refuses a request carrying a content-encoding header, a request whose content type contains octet-stream or grpc, and a request asking to upgrade the connection." }}
-      {{- if $textStrict }}{{ $refusals = append $refusals "This gateway masks the text of a chat request's messages before forwarding it, and refuses a request it cannot mask: one not sent as JSON, one that is not a chat completion of plain-text messages, a tool call or tool turn, or a parameter beyond the chat completion's own." }}{{ else if $nonTextStrict }}{{ $refusals = append $refusals "This gateway refuses a request carrying content that is not text: one not sent as JSON, and every request but a chat completion of text messages." }}{{ end }}
-      {{- if $budget }}{{ $refusals = append $refusals "This gateway counts the tokens each reply reports against a budget, and refuses a streamed request that turns off the usage report." }}{{ end }}
+      {{- if $textStrict }}{{ $refusals = append $refusals "This gateway masks the text of a chat request's messages before forwarding it, and refuses a request it cannot mask: one whose content type does not begin with application/json, one that is not a chat completion of plain-text messages, a tool call or tool turn, or a parameter beyond the chat completion's own." }}{{ else if $nonTextStrict }}{{ $refusals = append $refusals "This gateway refuses a request carrying content that is not text: one whose content type does not begin with application/json, and every request but a chat completion of text messages." }}{{ end }}
+      {{- if $masking }}{{ $refusals = append $refusals "This gateway masks requests before forwarding them, so it refuses a request whose body holds the Unicode replacement character U+FFFD, which is what it reads a byte that is not valid UTF-8 as; send the body encoded as UTF-8." }}{{ end }}
+      {{- if $budget }}{{ $refusals = append $refusals "This gateway counts the tokens each reply reports against a budget, and refuses a streamed request that turns off the usage report, and a request whose content type neither contains application/json nor begins with multipart/form-data." }}{{ end }}
       ---
       apiVersion: extensions.higress.io/v1alpha1
       kind: WasmPlugin
@@ -558,6 +598,23 @@ spec:
               # masking is attached, under every relaxation, and whenever the
               # budget's streamed-usage refusal is, because the pattern masking
               # of plain-string content is kept under every relaxation.
+              #
+              # The members after it ask what Higress's AI proxy reads. The
+              # proxy reads a request's body — and so replaces the model name
+              # and asks a streamed chat request's model for its usage report —
+              # only while the content type is absent or contains
+              # application/json in that spelling, or, on an image edit or
+              # variation, begins with multipart/form-data in any case. While
+              # masking keeps a strict default, a request of any method but
+              # GET, HEAD, DELETE and OPTIONS must carry a content type
+              # beginning with application/json, in the proxy's own lowercase
+              # spelling, so every body admitted as JSON is one the proxy
+              # reads. While the budget is attached, such a request
+              # whose content type neither contains application/json nor begins
+              # with multipart/form-data is refused, since the proxy would add
+              # no usage report to it and the budget would count nothing of a
+              # streamed one; a multipart request — an audio transcription, a
+              # file upload — still passes, as the proxy forwards it.
               header_schema:
                 type: object
                 allOf:
@@ -590,9 +647,22 @@ spec:
                       properties:
                         content-type:
                           type: string
-                          pattern: "^[Aa][Pp][Pp][Ll][Ii][Cc][Aa][Tt][Ii][Oo][Nn]/[Jj][Ss][Oo][Nn]"
+                          pattern: "^application/json"
       {{- end }}
-      {{- if or $textStrict $nonTextStrict $budget }}
+      {{- if $budget }}
+                  - not:
+                      required: [":method", content-type]
+                      properties:
+                        ":method":
+                          not:
+                            enum: [GET, HEAD, DELETE, OPTIONS]
+                        content-type:
+                          not:
+                            anyOf:
+                              - pattern: "application/json"
+                              - pattern: "^[Mm][Uu][Ll][Tt][Ii][Pp][Aa][Rr][Tt]/[Ff][Oo][Rr][Mm]-[Dd][Aa][Tt][Aa]"
+      {{- end }}
+      {{- if or $masking $budget }}
               body_schema:
                 type: object
                 allOf:
@@ -674,6 +744,37 @@ spec:
                             include_usage:
                               not:
                                 const: true
+      {{- end }}
+      {{- if $masking }}
+                  # Higress's masking plugin forwards a body that is not valid
+                  # UTF-8 as it came, masking nothing of it, while Go's JSON
+                  # decoder, which this plugin reads a body with, takes each byte
+                  # that is not valid UTF-8 for U+FFFD, the Unicode replacement
+                  # character, and would pass a plain chat completion carrying
+                  # one. So while masking is attached, under every relaxation,
+                  # this member refuses a body holding U+FFFD in any string or any
+                  # key, at any depth, through the definition below, which applies
+                  # itself to every value and every key of the body; a request
+                  # carrying the character itself is refused too. The reference
+                  # stands alone, because the plugin's schema library ignores
+                  # every keyword beside a $ref. The character is written for the
+                  # regular expression as \x{FFFD}, in single quotes, so every
+                  # stage from this file to the plugin carries plain ASCII: the
+                  # library compiles a pattern as a Go regular expression, which
+                  # reads no \u escape, and a body schema that does not compile
+                  # lets every body through.
+                  - $ref: "#/definitions/no_replacement_character"
+      {{- end }}
+      {{- if $masking }}
+                definitions:
+                  no_replacement_character:
+                    pattern: '^[^\x{FFFD}]*$'
+                    propertyNames:
+                      pattern: '^[^\x{FFFD}]*$'
+                    additionalProperties:
+                      $ref: "#/definitions/no_replacement_character"
+                    items:
+                      $ref: "#/definitions/no_replacement_character"
       {{- end }}
       {{- end }}
               rejected_code: 403
