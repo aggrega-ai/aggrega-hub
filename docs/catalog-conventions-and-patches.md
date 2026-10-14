@@ -524,6 +524,55 @@ address the selected component publishes and checks nothing about what answers
 there. As with every family on this page, a value is added in the same act as
 the first component to carry it.
 
+### The `observability.aggrega.ai/` signal labels
+
+`observability.aggrega.ai/<signal>` records that a component receives one
+telemetry signal pushed to it, and over which protocol, at the address it
+publishes. There is one key per signal — `traces`, `metrics` and `logs` —
+because a label holds one value and a backend may receive more than one signal,
+and the key is the same word as the socket that selects it. It is what an
+OpenTelemetry Collector's signal sockets select on, so each socket takes the
+backends for its signal and refuses every other.
+
+| Value | What the value asserts |
+| --- | --- |
+| `otlp-grpc` | The component receives the signal over OTLP's gRPC transport, at the `host` and `port` it publishes. |
+| `otlp-http` | The component receives the signal over OTLP's HTTP transport, at the base address it publishes as `otlp_http_endpoint`, to which an exporter appends the signal's own path, such as `/v1/logs`. |
+
+Three rules bind it:
+
+- **A collector's socket selects the key, never a value.**
+  `core/observability/otel-collector`'s `traces`, `metrics` and `logs` sockets
+  each select their key alone, so every component receiving the signal is
+  admitted whatever its protocol, and one receiving only another signal is
+  refused by the selector before anything renders. The collector's
+  configuration writes the exporter the value names — `otlp_grpc` for
+  `otlp-grpc`, `otlp_http` for `otlp-http` — and halts the build, naming the
+  connection, on a value it writes no exporter for.
+- **A component carrying `otlp-http` declares and publishes
+  `otlp_http_endpoint`.** The path a product receives OTLP at differs by
+  product — `/otlp` on Loki, `/api/v1/otlp` on Prometheus — so the component
+  publishes the address and the collector keeps no table of paths. The key is
+  declared on the Component, because a connection carries only the keys its
+  target declares, and so every Recipe of that Component publishes it. One that
+  receives the signal only on request publishes it empty while the request is
+  off, and a collector wired to it halts the build, naming what to set.
+- **A value asserts a capability, never a configured state**, as with every
+  family on this page. `core/observability/prometheus` carries
+  `metrics: otlp-http` although its OTLP receiver is off until its
+  `values.otlp_receiver` turns it on: the receiver authenticates no caller, so
+  it is a write endpoint an Aggregate opens deliberately, beside the wiring that
+  needs it.
+
+Components today: `core/observability/tempo` and `core/observability/jaeger`
+carry `traces: otlp-grpc`; `core/observability/loki` carries `logs: otlp-http`
+and publishes `http://<host>:<port>/otlp`; `core/observability/prometheus`
+carries `metrics: otlp-http` and publishes `http://<host>:<port>/api/v1/otlp`
+while `values.otlp_receiver` is true. The compiler routes the address the
+selected component publishes and checks nothing about what answers there. As
+with every family on this page, a value is added in the same act as the first
+component to carry it.
+
 ### The `component.aggrega.ai/upstream-licensing` label
 
 `component.aggrega.ai/upstream-licensing` records the licensing class of the
