@@ -1,0 +1,216 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: otel-collector-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The OpenTelemetry Collector, contrib distribution, on Kubernetes via the
+    project's own opentelemetry-collector Helm chart, served from its HTTPS
+    chart repository, as one Deployment. It renders the Deployment, a ClusterIP
+    Service publishing the OTLP gRPC and HTTP ports and no other, the
+    ServiceAccount the pod runs under, and the collector's configuration as a
+    ConfigMap emitted beside the chart.
+
+    The configuration is the OtelCollectorConfig bundle, which the compose
+    realization imports too. The chart is told to create no configuration of
+    its own and to mount that ConfigMap instead, so the receivers and ports the
+    chart configures by default are absent from the render. The image tag
+    follows infra.engine_version and the chart version is pinned; the chart
+    repository must be reachable at build time.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/observability/otel-collector:1.0.0
+
+  # The project's own chart for the collector, at the chart version whose
+  # appVersion is the release the Component's engine_version defaults to.
+  source:
+    kind: helm-https-chart
+    url: https://open-telemetry.github.io/opentelemetry-helm-charts
+    chart: opentelemetry-collector
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"0.176.0\" }}"
+
+  # provides.host is the collector's Service name. The value mapping below pins
+  # the chart's fullnameOverride to the rendered name, the release name the helm
+  # provider gives the chart, which spells the Component's name in the alphabet a
+  # Kubernetes name allows, and the chart names the Service after it with no
+  # suffix — read from a render of the chart. The name carries no namespace, so
+  # a consumer in another namespace qualifies it on its own side. port and
+  # otlp_http_port are the Service ports, which the value mapping sets to the
+  # listeners' own ports, so the published address and the listener cannot drift
+  # apart. The Service name is spelled out in each entry on purpose: a provides
+  # entry cannot read another.
+  provides:
+    host: "{{ .context.rendered_name }}"
+    port: "{{ .infra.otlp_grpc_port }}"
+    protocol: "grpc"
+    endpoint: "http://{{ .context.rendered_name }}:{{ .infra.otlp_grpc_port }}"
+    otlp_http_port: "{{ .infra.otlp_http_port }}"
+    otlp_http_endpoint: "http://{{ .context.rendered_name }}:{{ .infra.otlp_http_port }}"
+
+  # The entries below are the values the value mapping shares with the
+  # OtelCollectorConfig bundle imported for the collector's configuration. Each
+  # has its home in the bundle, which stops the build naming the local when one
+  # is missing or differs from its own; the value mapping reads them here,
+  # because a value mapping cannot read the bundle. collector_config_delivery
+  # has the bundle emit one ConfigMap. That ConfigMap is named after the
+  # rendered name followed by collector_config_map_suffix; a locals entry cannot
+  # read the rendered name, so the value mapping composes the two.
+  # health_port is the port the bundle binds the collector's health check
+  # on and the port both probes below ask.
+  locals:
+    collector_config_delivery: config_map
+    collector_config_map_suffix: "-collector-config"
+    health_port: "13133"
+
+  # The collector's configuration, from the OtelCollectorConfig bundle every
+  # Recipe of this Component imports, so the configuration has one text on
+  # either target. With collector_config_delivery set to config_map the bundle
+  # emits one ConfigMap, "<rendered_name>-collector-config", carrying the
+  # configuration under the key relay, which is the key the chart mounts as the
+  # file it starts the collector with.
+  artifacts:
+    collector-config:
+      $import: OtelCollectorConfig#/artifacts/CollectorConfig
+
+  # This Recipe reads from infra.overrides:
+  #   image        - map[string]string (image.* fields; replaces the repository and tag)
+  #   service_type - string (service.type; how the Service is exposed, default ClusterIP)
+  #   requests     - { cpu: string, memory: string } (collector resource requests)
+  #   nodeSelector - map[string]string (pod scheduling)
+  #   tolerations  - []object (pod scheduling)
+  #
+  # Under this configuration the chart renders a Deployment of one collector, a
+  # ClusterIP Service carrying the two OTLP ports, and the ServiceAccount the pod
+  # runs under. It renders no ConfigMap of its own: the configuration is the one
+  # the artifact above emits.
+  valuesMapping: |
+    ## ── Pin the chart's resource names to the rendered name ────
+    ## Names the Deployment, the Service and the ServiceAccount exactly
+    ## "<rendered_name>", matching provides.host.
+    fullnameOverride: "{{ .context.rendered_name }}"
+
+    ## ── Shape ──────────────────────────────────────────────────
+    ## The chart refuses to render without a mode. One collector as a
+    ## Deployment is the shape this Component describes: a server producers
+    ## send to, not an agent on every node.
+    mode: deployment
+    replicaCount: 1
+
+    ## ── Collector image pin ────────────────────────────────────
+    ## The chart names no image of its own and refuses to render without a
+    ## repository. The tag is set here rather than left to the chart's
+    ## appVersion, from the same infra.engine_version the compose
+    ## realization runs. Override the whole block via infra.overrides.image.
+    ## The chart starts the image's own entrypoint with the configuration it
+    ## mounts, so an override naming another distribution of the collector
+    ## starts that distribution's binary.
+    image:
+      {{- if and .infra.overrides .infra.overrides.image }}
+      {{- range $k, $v := .infra.overrides.image }}
+      {{ $k }}: "{{ $v }}"
+      {{- end }}
+      {{- else }}
+      repository: otel/opentelemetry-collector-contrib
+      tag: "{{ .infra.engine_version }}"
+      {{- end }}
+
+    ## ── The configuration ──────────────────────────────────────
+    ## The chart would otherwise write a configuration of its own, merging what
+    ## it is given into a default carrying Jaeger, Zipkin and Prometheus
+    ## receivers. It creates none here, and mounts the ConfigMap the artifact
+    ## emits, by name, as the whole configuration.
+    ##
+    ## That ConfigMap's content is no part of the chart's own templates, so the
+    ## chart's checksum annotation would hash nothing and is switched off rather
+    ## than rendered as a constant. In its place the pod carries the digest of
+    ## the Component's infra, which every listener the configuration binds is
+    ## read from, as the annotation checksum/collector-config: a changed port
+    ## changes the pod's specification, and the Deployment rolls the collector
+    ## onto the configuration that port is written into. The chart writes
+    ## podAnnotations onto the collector's pods alone.
+    configMap:
+      create: false
+      existingName: "{{ .context.rendered_name }}{{ .locals.collector_config_map_suffix }}"
+    enableConfigChecksumAnnotation: false
+    podAnnotations:
+      checksum/collector-config: "{{ sha256sum (toJson .infra) }}"
+
+    ## ── Ports ──────────────────────────────────────────────────
+    ## The Service publishes every port enabled here, whatever the
+    ## configuration listens on, and the chart enables the Jaeger and Zipkin
+    ## receivers' ports by default. Only the two OTLP ports are enabled, each
+    ## with its container port and Service port set to the listener's own port.
+    ports:
+      otlp:
+        enabled: true
+        containerPort: {{ .infra.otlp_grpc_port }}
+        servicePort: {{ .infra.otlp_grpc_port }}
+      otlp-http:
+        enabled: true
+        containerPort: {{ .infra.otlp_http_port }}
+        servicePort: {{ .infra.otlp_http_port }}
+      jaeger-compact:
+        enabled: false
+      jaeger-thrift:
+        enabled: false
+      jaeger-grpc:
+        enabled: false
+      zipkin:
+        enabled: false
+
+    ## ── Probes ─────────────────────────────────────────────────
+    ## The chart's own liveness and readiness probes ask the health check at /
+    ## on the port the configuration binds it on, with the chart's own timings.
+    livenessProbe:
+      httpGet:
+        port: {{ .locals.health_port }}
+        path: /
+    readinessProbe:
+      httpGet:
+        port: {{ .locals.health_port }}
+        path: /
+
+    ## ── Service ────────────────────────────────────────────────
+    service:
+      {{- if and .infra.overrides .infra.overrides.service_type }}
+      type: "{{ .infra.overrides.service_type }}"
+      {{- else }}
+      type: ClusterIP
+      {{- end }}
+
+    ## ── Service account ────────────────────────────────────────
+    ## The configuration reads nothing from the Kubernetes API, so the pod is
+    ## given no API token.
+    serviceAccount:
+      automountServiceAccountToken: false
+
+    ## ── Collector resources ────────────────────────────────────
+    ## The memory limit is what every pipeline's memory limiter takes its share
+    ## of, and the chart also sets the Go runtime's soft limit below it.
+    resources:
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      {{- if and .infra.overrides .infra.overrides.requests }}
+      requests:
+        cpu: "{{ .infra.overrides.requests.cpu }}"
+        memory: "{{ .infra.overrides.requests.memory }}"
+      {{- end }}
+
+    ## ── Scheduling overrides ───────────────────────────────────
+    {{- if .infra.overrides }}
+    {{- if .infra.overrides.nodeSelector }}
+    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+    {{- end }}
+    {{- if .infra.overrides.tolerations }}
+    tolerations: {{ toJson .infra.overrides.tolerations }}
+    {{- end }}
+    {{- end }}

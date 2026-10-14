@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: otel-collector
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The OpenTelemetry Collector, contrib distribution, for local development via
+    Docker Compose, synthesized from the Workload kind by the compose provider:
+    one stateless service running the same image as the Kubernetes realization
+    with the same configuration, the OtelCollectorConfig bundle, delivered as a
+    compose config mounted over the file the image starts the collector with.
+
+    The service publishes nothing to the host: a producer on the compose network
+    reaches it at the service name, on the OTLP gRPC and HTTP ports. The image
+    carries no shell and no client to ask the collector's health check from
+    inside the container, so the service declares no healthcheck.
+    provides.host is the compose service name.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/observability/otel-collector:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # The contract is key-for-key the one the Kubernetes realization publishes, so
+  # a producer reads the same keys on either target. Only the host is spelled
+  # differently: it is the name the compose provider gives the synthesized
+  # service, which is the component instance's own name. The ports are the
+  # listeners' own, which the service entry below also names. The service name is
+  # spelled out in each entry on purpose: a provides entry cannot read another.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.otlp_grpc_port }}"
+    protocol: "grpc"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.otlp_grpc_port }}"
+    otlp_http_port: "{{ .infra.otlp_http_port }}"
+    otlp_http_endpoint: "http://{{ .context.instance_id }}:{{ .infra.otlp_http_port }}"
+  # The entries below are the values the workload shares with the
+  # OtelCollectorConfig bundle imported for the collector's configuration. Each
+  # has its home in the bundle, which stops the build naming the local when one
+  # is missing or differs from its own; the workload reads them here, because a
+  # workload cannot read the bundle. collector_config_delivery has the bundle
+  # emit one compose config, named collector_config_name, which the volume
+  # below sources.
+  locals:
+    collector_config_delivery: compose_configs
+    collector_config_name: "{{ .context.instance_id }}-collector-config"
+  # The collector's configuration, from the OtelCollectorConfig bundle every
+  # Recipe of this Component imports, so the configuration has one text on
+  # either target. With collector_config_delivery set to compose_configs the
+  # bundle declares one compose config, named collector_config_name.
+  artifacts:
+    collector-config:
+      $import: OtelCollectorConfig#/artifacts/CollectorConfig
+  # Synthesized-mode Workload: the image, the ports, the configuration mount and
+  # the resources are translated from the Workload kind by the compose provider.
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # The collector keeps nothing between restarts, so the stateless form is
+    # correct and no volume is declared for data.
+    form: stateless
+    containers:
+      main:
+        image: "otel/opentelemetry-collector-contrib:{{ .infra.engine_version }}"
+        # No command or args override: the image starts the collector with
+        # --config /etc/otelcol-contrib/config.yaml, and the configuration is
+        # mounted at exactly that path below, in place of the default the image
+        # carries.
+        #
+        # docker compose up re-creates a service's container when the service's
+        # own definition changed since the container was created, and a config's
+        # content is no part of that definition. So the service carries the
+        # digest of the Component's infra, which every listener the
+        # configuration binds is read from, as COLLECTOR_CONFIG_DIGEST, a
+        # variable nothing reads: a changed port changes the definition, and the
+        # next docker compose up re-creates the collector with the configuration
+        # that port is written into.
+        variables:
+          COLLECTOR_CONFIG_DIGEST: "{{ sha256sum (toJson .infra) }}"
+        ports:
+          otlp-grpc: {{ .infra.otlp_grpc_port }}
+          otlp-http: {{ .infra.otlp_http_port }}
+        # Each quantity is quoted because it is a string: a value with no unit
+        # suffix — a whole-core cpu count, say — would otherwise be read as a
+        # number and rejected before the target ever sees it. The memory limit
+        # is what every pipeline's memory limiter takes its share of.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        volumeMounts:
+          - name: config
+            path: /etc/otelcol-contrib/config.yaml
+    volumes:
+      config:
+        configmap:
+          source: "{{ .locals.collector_config_name }}"
+    # A ClusterIP service entry keeps the collector on the compose network, which
+    # is where its producers sit: a producer wired to it resolves the service
+    # name and the ports straight from the edge. Nothing is published to the
+    # host.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          otlp-grpc: {{ .infra.otlp_grpc_port }}
+          otlp-http: {{ .infra.otlp_http_port }}
