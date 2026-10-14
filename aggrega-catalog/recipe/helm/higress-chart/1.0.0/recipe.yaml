@@ -217,16 +217,24 @@ spec:
   #   plugin fails while masking gets HTTP 500 and masking_failure_message,
   #   and is not forwarded. While allow_unmasked_text is off, a body that
   #   does not parse as JSON is masked as plain text, the plugin's own
-  #   fallback, rather than passed on.
+  #   fallback, rather than passed on. The plugin holds a request's whole body
+  #   before it masks it, and it runs first, before the AI proxy can raise the
+  #   gateway's per-connection buffer, which this Recipe leaves at the chart's
+  #   default of 32 KiB; so while the attachment is present, whatever it
+  #   relaxes, a request whose body exceeds 32 KiB is refused with HTTP 413
+  #   before it is forwarded. Read from Higress's source at 2.2.5 and its
+  #   Envoy, not yet observed on a running gateway.
   # - Refusing what masking cannot read: the request-validation plugin, with
   #   HTTP 403, before the request is forwarded. In its header phase, whenever
-  #   masking or the token budget is attached, it refuses a request the body
-  #   plugins cannot read at all: one carrying a content-encoding header, whose
-  #   body is compressed, and one asking to upgrade the connection, Higress's
-  #   wasm plugins reading no body in either case; an HTTP/2 extended CONNECT
-  #   reaches the plugin already rewritten to an upgrade and is refused as one.
-  #   This header refusal is rendered under every masking relaxation, because
-  #   the pattern masking of plain-string content is kept under all of them.
+  #   masking or the token budget is attached, it refuses a request whose body
+  #   the refusals below would never read: one carrying a content-encoding
+  #   header, whose body is compressed; one whose content type contains
+  #   octet-stream or grpc, which Higress's plugins written in Go take for a
+  #   binary body and do not read; and one asking to upgrade the connection,
+  #   as a WebSocket does. An HTTP/2 extended CONNECT reaches the plugin
+  #   already rewritten to an upgrade and is refused as one. This header
+  #   refusal is rendered under every masking relaxation, because the pattern
+  #   masking of plain-string content is kept under all of them.
   #   In its body phase, while allow_unmasked_text is
   #   off it refuses a request with a body that is not sent as JSON, and a
   #   JSON body that is not a chat completion of plain-text messages — a
@@ -510,7 +518,7 @@ spec:
       {{- end }}
       {{- end }}
       {{- if or $masking $budget }}
-      {{- $refusals := list "This gateway reads each request's body to apply its protections, which it cannot do while the body is compressed or the connection is being upgraded, so it refuses a request carrying a content-encoding header and a request asking to upgrade the connection." }}
+      {{- $refusals := list "This gateway reads each request's body to apply its protections, which it cannot do while the body is compressed or sent as binary or gRPC content or the connection is being upgraded, so it refuses a request carrying a content-encoding header, a request whose content type contains octet-stream or grpc, and a request asking to upgrade the connection." }}
       {{- if $textStrict }}{{ $refusals = append $refusals "This gateway masks the text of a chat request's messages before forwarding it, and refuses a request it cannot mask: one not sent as JSON, one that is not a chat completion of plain-text messages, a tool call or tool turn, or a parameter beyond the chat completion's own." }}{{ else if $nonTextStrict }}{{ $refusals = append $refusals "This gateway refuses a request carrying content that is not text: one not sent as JSON, and every request but a chat completion of text messages." }}{{ end }}
       {{- if $budget }}{{ $refusals = append $refusals "This gateway counts the tokens each reply reports against a budget, and refuses a streamed request that turns off the usage report." }}{{ end }}
       ---
@@ -533,24 +541,34 @@ spec:
       {{- end }}
             config:
               # The header schema runs before the body is read, in the request
-              # header phase. Its first members refuse a request whose body the
-              # masking and token-limit plugins cannot read: Higress's wasm
-              # plugins read no request body while a content-encoding header is
-              # present (the body is compressed) or the request is an upgrade,
-              # so without this refusal such a request would reach the upstream
-              # with its protections skipped. An HTTP/2 extended CONNECT reaches
-              # this plugin already rewritten to an upgrade request, so the
-              # upgrade refusal covers it; a CONNECT carrying :protocol that is
-              # not rewritten is refused by the last two members. This refusal is
-              # rendered whenever masking is attached, under every relaxation,
-              # and whenever the budget's streamed-usage refusal is, because the
-              # pattern masking of plain-string content is kept under every
-              # relaxation.
+              # header phase. Its first members refuse a request whose body this
+              # plugin's own refusals would never read: Higress's plugins written
+              # in Go, this one among them, read no request body while a
+              # content-encoding header is present (the body is compressed),
+              # while the content type contains octet-stream or grpc, in that
+              # spelling and anywhere in the value, or while the request is a
+              # WebSocket upgrade, so without this refusal such a request would
+              # reach the upstream with its protections skipped. The content-type
+              # member matches exactly the values they skip, and the gateway
+              # joins a repeated content-type into the one value both read. An
+              # HTTP/2 extended CONNECT reaches this plugin already rewritten to
+              # an upgrade request, so the upgrade refusal covers it; a CONNECT
+              # carrying :protocol that is not rewritten is refused by the
+              # :protocol and CONNECT members. This refusal is rendered whenever
+              # masking is attached, under every relaxation, and whenever the
+              # budget's streamed-usage refusal is, because the pattern masking
+              # of plain-string content is kept under every relaxation.
               header_schema:
                 type: object
                 allOf:
                   - not:
                       required: [content-encoding]
+                  - not:
+                      required: [content-type]
+                      properties:
+                        content-type:
+                          type: string
+                          pattern: "octet-stream|grpc"
                   - not:
                       required: [upgrade]
                   - not:
