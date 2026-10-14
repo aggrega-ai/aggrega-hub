@@ -13,24 +13,24 @@ metadata:
     resource; the control plane turns it into a revision, admits an inbound
     call while that revision runs no replicas, and sets the replica count from
     the concurrency it observes, so the tool occupies no compute between the
-    calls that invoke it. The replica floor and ceiling carry through as the
-    revision's own scaling bounds. The agent the tool delegates to arrives on
-    the tool's agent socket, and the recipe delivers whichever address keys
-    that agent publishes into the container alongside the developer's protocol
-    and execution mode, so the running tool reaches the agent the topology
-    resolved rather than one named in its own configuration. provides is the
-    addressable name the control plane gives the Service. The Knative Serving
-    control plane is a runtime prerequisite: the build halts unless the
-    operator affirms it is installed (infra.control_plane_present), so no
-    custom resource is emitted into a cluster that cannot reconcile it.
+    calls that invoke it. The agent the tool delegates to arrives on the tool's
+    agent socket, and the recipe delivers whichever address keys that agent
+    publishes into the container alongside the developer's protocol and
+    execution mode, so the running tool reaches the agent the topology resolved
+    rather than one named in its own configuration. The Knative Serving control
+    plane is a runtime prerequisite: the build halts unless the operator
+    affirms it is installed (infra.control_plane_present), so no custom
+    resource is emitted into a cluster that cannot reconcile it.
 
-    A credential held on the connection to the agent reaches the container as
-    a reference to the Secret it publishes, never as a value in the rendered
-    Service, beside the request header the agent publishes for it. That Secret
-    is one the namespace already holds, named through helm/k8s-existing-secret:
-    a realization that names its Secret after the tool halts the build, since
-    a Service rendered from an artifacts template gives the tool no rendered
-    name.
+    A credential or client_secret held on the connection reaches the container
+    as a reference to the Secret it publishes, never as a value in the rendered
+    Service: a credential beside the header the agent publishes, a
+    client_secret beside the client id, scopes and token or discovery URL the
+    container obtains an OAuth 2.0 token with, refreshing and presenting it
+    itself, which no build can check. Mutual TLS is not covered. Each Secret is
+    one the namespace already holds, named through helm/k8s-existing-secret: a
+    realization naming its Secret after the tool halts the build, since an
+    artifacts template gives the tool no rendered name.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -81,7 +81,8 @@ spec:
   # from the revision's annotations, and which switches an installation offers
   # belongs to the installed control-plane version rather than to this catalog.
   # The two scaling bounds are not among them: they come from infra.min_replicas
-  # and infra.max_replicas, first-class keys on the component's own surface.
+  # and infra.max_replicas, first-class keys on the component's own surface, and
+  # carry through as the revision's own scaling bounds.
   #
   # The tool's own values and the delegated agent's coordinates are both
   # delivered to the container as environment variables. The image is the
@@ -120,12 +121,41 @@ spec:
   # name and data key halts the build, since the container would then have no
   # reference to read it from.
   #
-  # The credential's own realization is evaluated against this tool as its host,
-  # and a host rendered from an artifacts template carries no
-  # .context.rendered_name: a realization naming its Secret after the host —
-  # k8s-external-secret and k8s-secret-from-parameter both do — halts the build
-  # on that key. k8s-existing-secret publishes the name of a Secret that already
-  # exists, so it is the realization that fills the slot here.
+  # The connection's client_secret slot carries the secret half of the tool's
+  # OAuth 2.0 registration, for an agent whose card requires a token obtained
+  # by the client-credentials grant, directly or through OpenID Connect
+  # discovery. AGENT_TOOL_TARGET_CLIENT_SECRET is a secretKeyRef to the Secret
+  # name and data key it publishes, read exactly as the credential is, and a
+  # client_secret publishing neither halts the build the same way. Beside it
+  # come AGENT_TOOL_TARGET_CLIENT_ID and AGENT_TOOL_TARGET_AUDIENCE from the
+  # connection's own infra, which the Release writes, and
+  # AGENT_TOOL_TARGET_TOKEN_URL, AGENT_TOOL_TARGET_OIDC_DISCOVERY_URL and
+  # AGENT_TOOL_TARGET_SCOPES from what the agent publishes — each only where
+  # it has a value, and none of them on a connection holding no client_secret,
+  # so a connection reached with a header credential, or with none, renders
+  # exactly what it renders with no such slot at all. The container obtains
+  # the token, caches it, obtains another before it expires, and presents it
+  # on each request; the build delivers the inputs and cannot observe any of
+  # that. The slot and the credential slot are independent: an agent whose card
+  # requires two schemes together is reached with both, each delivered under its
+  # own variables. The template halts, naming the connection, where the container
+  # could not run the grant or where running it would leak the secret: a
+  # client_secret with no client_id; a client_secret on a connection whose
+  # agent publishes neither token_url nor oidc_discovery_url; a client_id or
+  # audience on a connection holding no client_secret; and a token_url or
+  # oidc_discovery_url, delivered, that is not an https URL naming a host —
+  # OAuth 2.0 sends a client secret only over TLS — or that carries a user name
+  # or password, which would write a credential into the rendered Service. No
+  # message repeats an address, so a credential written into one reaches no
+  # log either.
+  #
+  # The credential's own realization, and the client_secret's, is evaluated
+  # against this tool as its host, and a host rendered from an artifacts
+  # template carries no .context.rendered_name: a realization naming its Secret
+  # after the host — k8s-external-secret and k8s-secret-from-parameter both do —
+  # halts the build on that key. k8s-existing-secret publishes the name of a
+  # Secret that already exists, so it is the realization that fills either slot
+  # here.
   artifacts:
     service.yaml: |
       {{- $wired := list -}}
@@ -148,6 +178,32 @@ spec:
       {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) -}}
       {{- fail (printf "the credential on the target_agent connection of %q publishes no Secret name and data key, so the tool's container could not be given a reference to read it from; attach a credential publishing both, such as core/referenced-secret" $.context.instance_id) -}}
       {{- end -}}
+      {{- end -}}
+      {{- $in := default dict $edge.infra -}}
+      {{- if hasKey (default dict $edge.features) "client_secret" -}}
+      {{- $locator := optional $edge.features.client_secret "provides" dict -}}
+      {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) -}}
+      {{- fail (printf "the client_secret on the target_agent connection of %q publishes no Secret name and data key, so the tool's container could not be given a reference to read it from; attach a client_secret publishing both, such as core/referenced-secret" $.context.instance_id) -}}
+      {{- end -}}
+      {{- if not (optional $in "client_id" "") -}}
+      {{- fail (printf "the target_agent connection %s of %q holds a client_secret but no client_id, so the tool's container could not obtain a token with it: set client_id in that connection's infra in the Release to the client id the agent's authorization server issued with the secret" $alias $.context.instance_id) -}}
+      {{- end -}}
+      {{- if not (or (optional $p "token_url" "") (optional $p "oidc_discovery_url" "")) -}}
+      {{- fail (printf "the target_agent connection %s of %q holds a client_secret, but the agent it reaches, %q, publishes neither token_url nor oidc_discovery_url, so the tool's container would have nowhere to obtain a token: set infra.token_url or infra.oidc_discovery_url on that agent to what its card declares, or remove the client_secret" $alias $.context.instance_id $edge.target) -}}
+      {{- end -}}
+      {{- range $key := list "token_url" "oidc_discovery_url" -}}
+      {{- with optional $p $key "" -}}
+      {{- $u := urlParse . -}}
+      {{- if $u.userinfo -}}
+      {{- fail (printf "the %s that %q publishes to the target_agent connection %s of %q carries a user name or password before its host, which would write a credential into the rendered Service: remove it from that agent's infra.%s, since the client secret is held on the connection" $key $edge.target $alias $.context.instance_id $key) -}}
+      {{- end -}}
+      {{- if not (and (eq $u.scheme "https") $u.hostname) -}}
+      {{- fail (printf "the %s that %q publishes to the target_agent connection %s of %q is not an https URL naming a host, and OAuth 2.0 sends a client secret only over TLS: set that agent's infra.%s to the https URL its card declares" $key $edge.target $alias $.context.instance_id $key) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- else if or (hasKey $in "client_id") (hasKey $in "audience") -}}
+      {{- fail (printf "the target_agent connection %s of %q sets client_id or audience in its infra but holds no client_secret, so the tool's container has nothing to obtain a token with: attach a client_secret on that connection, or remove client_id and audience" $alias $.context.instance_id) -}}
       {{- end -}}
       {{- end -}}
       {{- end -}}
@@ -216,6 +272,31 @@ spec:
                   - name: AGENT_TOOL_TARGET_CREDENTIAL_HEADER
                     value: "{{ . }}"
                   {{- end }}
+                  {{- end }}
+                  {{- if hasKey (default dict $edge.features) "client_secret" }}
+                  {{- with (optional (default dict $edge.provides) "token_url" "") }}
+                  - name: AGENT_TOOL_TARGET_TOKEN_URL
+                    value: "{{ . }}"
+                  {{- end }}
+                  {{- with (optional (default dict $edge.provides) "oidc_discovery_url" "") }}
+                  - name: AGENT_TOOL_TARGET_OIDC_DISCOVERY_URL
+                    value: "{{ . }}"
+                  {{- end }}
+                  {{- with (optional (default dict $edge.provides) "scopes" "") }}
+                  - name: AGENT_TOOL_TARGET_SCOPES
+                    value: "{{ . }}"
+                  {{- end }}
+                  {{- with (optional (default dict $edge.infra) "audience" "") }}
+                  - name: AGENT_TOOL_TARGET_AUDIENCE
+                    value: "{{ . }}"
+                  {{- end }}
+                  - name: AGENT_TOOL_TARGET_CLIENT_ID
+                    value: "{{ optional (default dict $edge.infra) "client_id" "" }}"
+                  - name: AGENT_TOOL_TARGET_CLIENT_SECRET
+                    valueFrom:
+                      secretKeyRef:
+                        name: "{{ $edge.features.client_secret.provides.name }}"
+                        key: "{{ $edge.features.client_secret.provides.key }}"
                   {{- end }}
                   {{- end }}
                   {{- end }}

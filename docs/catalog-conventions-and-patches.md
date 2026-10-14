@@ -2218,8 +2218,10 @@ connection the Release wires, so it is the same word on every socket.
   so that it holds whichever Recipe binds, and what the label means is this
   catalog's convention: the build carries the label's string, and the assertion
   decides what it means. A Component's assertions are written in the Component
-  itself, so each carries its own copy, and the copies differ only in that list
-  of sockets.
+  itself, so each carries its own copy, and the copies differ in that list of
+  sockets and in one more respect: `core/ai-tool/agent-invocation`'s copy also
+  counts a `client_secret` on the connection as its credential (below), since
+  the token obtained with it is what the target is presented.
 - **Several consumers share one credential by authoring.** Nothing cascades into
   a connection, so a shared key is one parameter every connection's credential
   reads — under `k8s-existing-secret`, the name of one Secret each connection
@@ -2260,6 +2262,47 @@ value rather than a credential stays a value on the connection:
 `core/observability/langfuse` names its object store's access-key identifier in
 the `event_store` connection's `access_key_id` value, and only the secret half
 is its `credential`.
+
+**A token the caller obtains itself takes `client_secret`.** Where the target's
+card requires OAuth 2.0 client credentials, or OpenID Connect, the caller
+presents a token it obtains from the target's authorization server rather than a
+key it already holds. It obtains the token with its own registration at that
+server, a client id and a client secret, and presents neither to the target, so
+neither is the connection's `credential`. The secret half is the slot
+`client_secret`, declared beside `credential` with the same keys and filled the
+same way. The client id is not a secret — OAuth 2.0 says so of every client
+identifier — so it is a setting the operator writes in the connection's `infra`,
+`client_id`, declared in the socket's `infraSchema` beside `audience`, the
+resource the token is requested for where the authorization server asks for
+one. Where the token is obtained, and for which scopes, is the target's, read
+from its card, so the target publishes it, as `core/ai-agent/a2a-remote`
+publishes `token_url`, `oidc_discovery_url` and `scopes` (see
+"Reference-realization Recipes" below).
+
+- **`core/ai-tool/agent-invocation` declares the shape on its `target_agent`
+  socket**, and `helm/agent-invocation-knative` delivers the secret as
+  `AGENT_TOOL_TARGET_CLIENT_SECRET`, a `secretKeyRef` to the Secret it publishes,
+  beside `AGENT_TOOL_TARGET_CLIENT_ID`, `AGENT_TOOL_TARGET_AUDIENCE`,
+  `AGENT_TOOL_TARGET_TOKEN_URL`, `AGENT_TOOL_TARGET_OIDC_DISCOVERY_URL` and
+  `AGENT_TOOL_TARGET_SCOPES`, each only where it has a value and none of them on
+  a connection holding no `client_secret`, which therefore renders exactly what
+  it renders with no such slot at all.
+- **The token is the caller's software's job.** Obtaining it, caching it,
+  obtaining another before it expires and presenting it on each request belong
+  to the image the caller runs, and no build observes any of it: the catalog
+  delivers the inputs and nothing more. OAuth 2.0 tells a server not to issue a
+  refresh token for a client-credentials grant, so obtaining another is running
+  the grant again.
+- **The Recipe refuses what the caller could not use, naming the connection**: a
+  `client_secret` with no `client_id`, or on a connection whose target publishes
+  neither `token_url` nor `oidc_discovery_url`; a `client_id` or `audience` with
+  no `client_secret`; and a delivered address that is not an `https` URL naming
+  a host — OAuth 2.0 sends a client secret only over TLS — or that carries a user
+  name or password, which would write a credential into the rendered output. No
+  message repeats the address.
+- **A target requiring two schemes together is reached with both slots filled**,
+  each delivered under its own variables. A target requiring mutual TLS is not
+  reached through either.
 
 **Three realizations constrain the secret the two ends share.**
 
@@ -2466,9 +2509,13 @@ a Model Context Protocol server someone else runs (see "Model Context Protocol
 servers" below), and `helm/a2a-remote` and `compose/a2a-remote` for an agent
 another party runs over the A2A protocol, `core/ai-agent/a2a-remote`, whose
 `credential_header` is the header the security scheme in the agent's card reads
-and which also publishes where that card is read, `agent_card_url`.
+and which also publishes where that card is read, `agent_card_url`, and, for a
+card requiring OAuth 2.0 client credentials or OpenID Connect, where a caller
+obtains a token: `token_url`, `oidc_discovery_url` and `scopes`, from infra keys
+of the same names, each optional and published empty while unset.
 `core/ai-tool/agent-invocation` holds the credential for such an agent on its
-`target_agent` connection.
+`target_agent` connection, and the client secret it obtains a token with (see
+"A key both ends of a connection hold").
 
 The credential slot is filled by a referenced credential — the
 `core/referenced-secret` Feature — rather than a provisioned one, and the

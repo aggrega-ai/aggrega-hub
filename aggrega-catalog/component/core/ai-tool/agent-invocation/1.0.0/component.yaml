@@ -27,10 +27,17 @@ metadata:
     protocol, and a consumer wires to those without naming how the tool runs.
 
     The connection to the agent may hold a credential, which the tool presents
-    under the request header the agent publishes as credential_header; that is
-    how it reaches an agent another party runs, such as
-    core/ai-agent/a2a-remote. A connection to an agent labelled managed holds a
-    credential or states unauthenticated: true, and otherwise the build halts.
+    under the request header the agent publishes as credential_header: the key
+    or token obtained beforehand that an A2A card's API-key or HTTP
+    authentication scheme reads. It may instead, or as well, hold a
+    client_secret, with a client_id and, where needed, an audience in its infra
+    in the Release, for a card requiring OAuth 2.0 client credentials or OpenID
+    Connect at the token_url or oidc_discovery_url the agent publishes, as
+    core/ai-agent/a2a-remote does. Obtaining, caching, refreshing and presenting
+    that token is the job of the Release's image, which no build can check. A
+    card requiring mutual TLS is not covered. A connection to an agent labelled
+    managed holds a credential or a client_secret, or states unauthenticated:
+    true, and otherwise the build halts.
   labels:
     component.aggrega.ai/type: function
     component.aggrega.ai/category: ai-tool
@@ -52,6 +59,19 @@ spec:
           type: boolean
           default: false
           description: Declares that the agent this connection reaches takes no credential, so a connection carrying none is intended rather than an omission. It changes nothing this component renders.
+      # The caller's registration at the agent's authorization server, which the
+      # operator sets per connection in the Release: OAuth 2.0 issues each
+      # caller a client id beside its client secret, and the client id is not a
+      # secret, so it is a plain setting rather than a slot. Both keys are read
+      # only beside client_secret: the Recipe halts on either one set on a
+      # connection holding none, and on a client_secret with no client_id.
+      infraSchema:
+        client_id:
+          type: string
+          description: The client id the agent's authorization server issued to this tool, sent with client_secret when the tool's container obtains a token. Delivered as AGENT_TOOL_TARGET_CLIENT_ID. A client_secret needs it beside it, and the build halts on one set on a connection holding no client_secret.
+        audience:
+          type: string
+          description: The audience or resource the token is requested for, where the agent's authorization server asks for one beside the scopes the agent publishes. Delivered as AGENT_TOOL_TARGET_AUDIENCE. The build halts on one set on a connection holding no client_secret.
       # The credential the tool presents to the agent is held on the connection
       # it is presented on, so each connection names its own fill. Optional (an
       # agent may take no credential: an A2A agent's card need declare no
@@ -64,6 +84,23 @@ spec:
           sensitive: true
           inject: [env]
           description: "Optional credential the tool presents to the agent this connection reaches, under the request header that agent publishes as credential_header. When attached, the Recipe delivers it to the tool's container as AGENT_TOOL_TARGET_CREDENTIAL, a Kubernetes secretKeyRef to the Secret the credential publishes, and the header as AGENT_TOOL_TARGET_CREDENTIAL_HEADER where the agent publishes one; a credential publishing no Secret name and data key halts the build. Fill it with core/referenced-secret mapped to helm/k8s-existing-secret, naming a Secret the namespace already holds: a realization that names its Secret after the tool, such as k8s-external-secret or k8s-secret-from-parameter, halts the build here, because the Recipe renders its Service from an artifacts template and gives the tool no rendered name. Unattached, the tool runs without an injected credential."
+        # The secret half of the caller's OAuth 2.0 registration. It is not
+        # presented to the agent, which is why it is not the credential slot:
+        # the tool's container sends it, with client_id, to the authorization
+        # server at the token_url the agent publishes, or at the token endpoint
+        # read from its oidc_discovery_url, runs the client-credentials grant,
+        # and presents the token it is given on each A2A request. OAuth 2.0
+        # tells a server not to issue a refresh token for this grant, so
+        # refreshing is running the grant again before the token expires. All
+        # of that is the container's, from the Release's image, and nothing in a
+        # build can observe it. An agent whose card requires two schemes
+        # together is reached with both slots filled, each delivered under its
+        # own variables.
+        client_secret:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [env]
+          description: "Optional client secret the tool's container sends, with client_id, to the agent's authorization server to obtain an access token by the OAuth 2.0 client-credentials grant, at the token_url the agent publishes or the token endpoint its oidc_discovery_url names. Delivered as AGENT_TOOL_TARGET_CLIENT_SECRET, a Kubernetes secretKeyRef to the Secret it publishes, beside AGENT_TOOL_TARGET_CLIENT_ID, AGENT_TOOL_TARGET_TOKEN_URL, AGENT_TOOL_TARGET_OIDC_DISCOVERY_URL, AGENT_TOOL_TARGET_SCOPES and AGENT_TOOL_TARGET_AUDIENCE, each where it has a value. Obtaining, caching and refreshing the token, and presenting it on each request, are the container's. The build halts on a client_secret with no client_id, on one wired to an agent publishing neither token_url nor oidc_discovery_url, and on either address when it is not an https URL naming a host or carries a user name or password. Fill it as credential is filled; it may sit beside credential on one connection."
   schema:
     # values — Developer Intent
     # Filled by the Developer in the Aggregate.
@@ -161,20 +198,23 @@ spec:
   # A connection to a target its catalog labels a managed service
   # (component.aggrega.ai/hosting: managed) carries a credential, or says on the
   # connection that its target takes none. The rule reads the target's labels,
-  # the connection's unauthenticated value and its credential slot, all known
+  # the connection's unauthenticated value and its two secret slots, all known
   # before a Recipe binds, so it holds whichever Recipe renders this component;
   # a self-hosted or external target draws nothing — an agent another party
   # runs need not check a credential, since an A2A agent's card need declare no
-  # security scheme. The list names every socket of this component that
-  # declares unauthenticated.
+  # security scheme. A client_secret counts as the connection's credential:
+  # the token the container obtains with it is what the agent is presented.
+  # The list names every socket of this component that declares
+  # unauthenticated.
   assertions:
     managed_target_needs_a_credential: >-
       {{- range $socket := list "target_agent" -}}
       {{- range $alias, $connection := (optional $.uses $socket dict) -}}
       {{- $managed := eq (optional $connection.labels "component.aggrega.ai/hosting" "") "managed" -}}
       {{- $optedOut := optional $connection.values "unauthenticated" false -}}
-      {{- if and $managed (not (hasKey $connection.features "credential")) (not $optedOut) -}}
-      {{- fail (printf "the %s connection %s of %q reaches %q, whose component.aggrega.ai/hosting label is managed, with no credential: attach one under credential on that connection, or set unauthenticated: true in its values" $socket $alias $.metadata.instance_id $connection.target) -}}
+      {{- $held := or (hasKey $connection.features "credential") (hasKey $connection.features "client_secret") -}}
+      {{- if and $managed (not $held) (not $optedOut) -}}
+      {{- fail (printf "the %s connection %s of %q reaches %q, whose component.aggrega.ai/hosting label is managed, with no credential: attach one under credential or client_secret on that connection, or set unauthenticated: true in its values" $socket $alias $.metadata.instance_id $connection.target) -}}
       {{- end -}}
       {{- end -}}
       {{- end -}}
