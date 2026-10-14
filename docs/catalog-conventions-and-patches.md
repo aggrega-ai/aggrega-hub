@@ -2459,6 +2459,70 @@ management) — is a distinct capability delivered by a FeatureRecipe transform,
 not by the hosting label. A referenced resource stays externally owned; an
 adopted resource becomes Release-managed.
 
+### Model Context Protocol servers: their credentials and the tool socket
+
+`core/ai-tool/mcp` stands for a Model Context Protocol server whose software is
+the Release's, and the Manifest chooses how it is realized: `helm/mcp` runs an
+image serving the protocol over HTTP; `helm/mcp-stdio-bridge` and
+`compose/mcp-stdio-bridge` run a package that speaks only stdio behind a pinned
+bridge serving it over HTTP; `helm/mcp-remote` and `compose/mcp-remote` reach a
+server someone else runs, as reference realizations. Every one publishes
+`host`, `port`, `endpoint`, `protocol` and `credential_header`, so a consumer
+wires to the tool the same way whichever answers it. Two kinds of credential
+meet at such a server, and each has its own holder. This is a catalog
+convention: the compiler pipes the slots, the attachments and the published
+strings, and checks none of what follows.
+
+- **A bridged server's credentials are environment variables the server
+  reads.** They are held in the Component's `server_env` slot as one Secret
+  with one data key per variable, each key named as the variable.
+  `helm/mcp-stdio-bridge` imports every data key of the Secret the attachment
+  names into the bridge's environment by reference, and the bridge starts the
+  server with that environment, so the server inherits each variable. Attach
+  `core/referenced-secret`, mapped to `helm/k8s-existing-secret`, to name a
+  Secret that already exists, and the credential stays out of every rendered
+  file; `core/referenced-secret-set`'s realization writes the values into a
+  Secret the build renders, which suits evaluation. `compose/mcp-stdio-bridge`
+  halts the build on an attachment here, because the compose target has no
+  secret reference to deliver one through, and the realizations that start no
+  server behind the bridge halt on one too.
+- **A remote server's credential is held by its consumer**, on the consumer's
+  connection to the tool, in the `credential` slot its socket declares (see "A
+  key both ends of a connection hold"), and presented under the request header
+  the tool publishes as `credential_header`. That header is `Authorization`
+  unless the Release names the one the server reads in
+  `infra.credential_header`. Under `Authorization` the credential is presented
+  as a bearer token, `Authorization: Bearer <credential>`, the form the
+  protocol's authorization specification gives a client; under another header
+  it is that header's value. The remote realizations hold no credential and
+  deliver none, as no reference realization does: they halt the build on a
+  `server_env` attachment, and on an `infra.endpoint` carrying a user name or
+  password. A server that reads its credential from its own address rather
+  than from a header — a key in the URL's path or query — cannot be reached
+  this way with the credential kept out of the rendered files, because the
+  address is published as written.
+- **A bridged server checks no caller's credential.** The bridge reads no
+  credential from a request that reaches it, so the bridge realizations publish
+  `credential_header` empty, and a consumer's connection to one carries no
+  credential.
+- **A consumer's tool socket selects `component.aggrega.ai/category=ai-tool`
+  together with the transport the consumer speaks**, which is
+  `tool.aggrega.ai/transport=http` for a consumer speaking HTTP. A tool socket
+  in this catalog takes that form:
+
+  ```yaml
+  selector: "component.aggrega.ai/category=ai-tool, tool.aggrega.ai/transport=http"
+  ```
+
+  The category admits tools and nothing else, and the transport admits only
+  the tools the consumer can reach: a selector reads labels and never the
+  content of a published value, so how a tool is reached has to be a label. A
+  socket whose connections present a credential declares the `credential` slot
+  and the `unauthenticated` value every such socket declares, and its Recipe
+  delivers the credential as every socket's credential is delivered, with
+  `credential_header` beside it, for the consumer to present the one under the
+  other.
+
 ### Gateway / operator-driven (custom-resource-emitting) Recipes
 
 The production way to run complex software on Kubernetes is often an **operator**:
