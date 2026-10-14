@@ -2498,9 +2498,77 @@ strings, and checks none of what follows.
   deliver none, as no reference realization does: they halt the build on a
   `server_env` attachment, and on an `infra.endpoint` carrying a user name or
   password. A server that reads its credential from its own address rather
-  than from a header — a key in the URL's path or query — cannot be reached
-  this way with the credential kept out of the rendered files, because the
-  address is published as written.
+  than from a header — a key in the URL's path or query — is reached as the
+  next bullet describes.
+- **A remote server that reads its key from its own address has that address
+  held by its consumer too**, as a secret on the consumer's connection to the
+  tool, because the address is published as written and would otherwise carry
+  the key into every file it reaches. The tool's `infra.endpoint` holds the
+  address without the part that carries the key — at least its scheme and
+  host, which the remote realizations read the host, port and protocol they
+  publish from, and which `helm/mcp-remote` makes the `ExternalName` it emits.
+  The whole address fills the `endpoint` slot a consumer's tool socket
+  declares beside `credential`:
+
+  ```yaml
+  featuresSchema:
+    endpoint:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+  ```
+
+  The consumer's Recipe delivers what fills the slot in place of the
+  `endpoint` the tool publishes, and keeps the `host` the tool publishes. On
+  helm the slot is filled by `core/referenced-secret` mapped to
+  `helm/k8s-existing-secret`, naming a Secret created outside the Release
+  whose data key is `value` — the Feature's default, which is the key when the
+  Release alone attaches it — so the consumer's container reads the address
+  through a `secretKeyRef` and no Secret is rendered. On compose it is
+  `core/secret-value` mapped to `compose/dotenv-secret`, with a Compose
+  variable reference as its origin, which Docker Compose substitutes when the
+  stack starts. A Release writes it this way:
+
+  ```yaml
+  components:
+    search:
+      infra:
+        endpoint: https://mcp.example.com/mcp
+    agent:
+      uses:
+        tools:
+          search:
+            features:
+              endpoint:
+                type: core/referenced-secret
+                infra:
+                  origin: search-mcp-address
+  ```
+
+  with the Secret created beside it, for example `kubectl -n agents create
+  secret generic search-mcp-address
+  --from-literal=value='https://mcp.example.com/mcp?api_key=<key>'`; on
+  compose the attachment is `type: core/secret-value` with `infra: {origin:
+  "${SEARCH_MCP_URL}"}`. Three limits come with the shape:
+
+  - On compose, two `core/secret-value` attachments the Release alone makes on
+    one consumer — two such addresses, or one beside a credential — both
+    deliver under `value`, and the build halts naming both. An Aggregate that
+    names `values.key` on one of them avoids it.
+  - Where the key sits in the address's path, `infra.endpoint` holds the
+    address with that part removed.
+  - The host is written twice, plainly on the tool and inside the Secret, and
+    nothing checks that the two match, because the compiler never reads a
+    Secret.
+
+  The address is not composed at run time from the key alone, through a
+  `$(VAR)` reference in a plain variable: Kubernetes expands such a reference
+  from the variables listed before it in the container, and the helm provider
+  lists a container's plain variables before the ones it reads from a Secret.
+  No standard-library Component declares a tool socket yet, so none reads the
+  slot;
+  [`language-reference/examples/mcp-address-from-secret/`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/examples/mcp-address-from-secret/)
+  declares one on a consumer of its own and renders both targets.
 - **A bridged server checks no caller's credential.** The bridge reads no
   credential from a request that reaches it, so the bridge realizations publish
   `credential_header` empty, and a consumer's connection to one carries no
@@ -2521,7 +2589,8 @@ strings, and checks none of what follows.
   and the `unauthenticated` value every such socket declares, and its Recipe
   delivers the credential as every socket's credential is delivered, with
   `credential_header` beside it, for the consumer to present the one under the
-  other.
+  other. A socket reaching servers that read their key from their address
+  declares the `endpoint` slot beside it, as above.
 
 ### Gateway / operator-driven (custom-resource-emitting) Recipes
 
