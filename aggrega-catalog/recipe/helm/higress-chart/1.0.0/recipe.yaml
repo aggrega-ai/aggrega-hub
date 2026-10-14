@@ -21,9 +21,11 @@ metadata:
 
     With a model wired it emits the gateway's registry of the models' hosts,
     an ingress per alias and the AI proxy, pinned by tag and digest, with one
-    rule per connection naming its credential's Secret, never the key. The
-    gateway checks an https model's certificate chain against the system's
-    trust anchors, but not that the certificate names the model's host.
+    rule per connection naming its credential's Secret, never the key; each
+    ingress drops the AI proxy's copy of a caller's key. Over https the
+    gateway checks that a model's certificate chains to the system's trust
+    anchors and names the model's host; an alias mixing http and https
+    connections halts the build.
 
     While core/data-masking, core/period-budget or core/audit-logging is
     attached, it adds Higress's plugin for each onto the model routes: request
@@ -176,7 +178,32 @@ spec:
   # alias as the entries are, on the gateway's IngressClass, at the path
   # /<alias>/v1, which the gateway sends to the entries of the alias's
   # connections in equal shares: Higress's destination annotation lists each
-  # entry with a weight, the weights summing to 100.
+  # entry with a weight, the weights summing to 100. Every alias's Ingress
+  # also removes the X-HI-ORIGINAL-AUTH header before the request leaves for
+  # the model: the AI proxy copies the Authorization header a client sends
+  # into it on every request, so without the removal a key a client presents
+  # to the gateway would reach the model beside the connection's own. The
+  # Authorization header itself is left, so a connection carrying no
+  # credential still passes on the key the client presents.
+  #
+  # The Ingress of an alias whose connections are all https also sets
+  # Higress's backend-protocol annotation to HTTPS, once. Higress then writes
+  # the TLS of its own rule for the alias's entries naming no server, and
+  # that rule takes precedence over the one it writes for each registry
+  # entry, which names the server and checks no name. With no server named,
+  # the gateway takes the server name from the host a request carries as it
+  # leaves, which the AI proxy has set to the entry's host, qualified as
+  # above, whatever host the client sent; it presents that name and, with
+  # the discovery service's setting below on, checks that the certificate the
+  # model presents names it and chains to the system's trust anchors, and
+  # otherwise sends nothing to the model and answers HTTP 503. Nothing else is
+  # rendered for the check, and it holds whatever order the resources are
+  # applied in, with no restart. An alias whose connections are all http
+  # carries no such annotation, and an alias mixing http and https
+  # connections stops the build, naming both: one annotation sets the scheme
+  # for every connection of the alias, so it would either speak TLS to the
+  # http models or leave the https models' names unchecked. Measured on a
+  # running gateway at Higress 2.2.5.
   #
   # One AI proxy for the gateway, with one rule per connection, applied to a
   # request on its alias's Ingress that the gateway sends to that
@@ -201,9 +228,9 @@ spec:
   # path every request goes to, a credential publishing no Secret name or no
   # data key, a Secret name holding a dot, two connections or two aliases
   # giving one name, a name ending in a hyphen or an underscore, an entry
-  # name longer than the 63 characters a host-name label takes, and an alias
+  # name longer than the 63 characters a host-name label takes, an alias
   # with more than 100 connections, which equal whole-number weights cannot
-  # share.
+  # share, and an alias mixing http and https connections, as above.
   #
   # The controls the attachments ask for, each one Higress plugin applied to
   # every alias's Ingress, written only while its attachment is present, so a
@@ -441,6 +468,10 @@ spec:
       {{- with get $ingressOwner $ingress }}{{ fail (printf "the aliases %s and %s that the models socket of %q serves give the gateway one Ingress name, %q, because the gateway names an alias's Ingress after it in lowercase with every underscore as a hyphen; rename one of the two" . $alias $.context.instance_id $ingress) }}{{ end }}
       {{- $_ := set $ingressOwner $ingress $alias }}
       {{- if gt (len (get $members $alias)) 100 }}{{ fail (printf "the alias %s that the models socket of %q serves has %d connections, more than the 100 equal whole-number shares of its requests the gateway's weights can give; serve fewer connections under it" $alias $.context.instance_id (len (get $members $alias))) }}{{ end }}
+      {{- $httpsMembers := list }}
+      {{- $httpMembers := list }}
+      {{- range $name := get $members $alias }}{{ if eq (get $entries $name).protocol "https" }}{{ $httpsMembers = append $httpsMembers $name }}{{ else }}{{ $httpMembers = append $httpMembers $name }}{{ end }}{{ end }}
+      {{- if and $httpsMembers $httpMembers }}{{ fail (printf "the alias %s that the models socket of %q serves has the https connections %s and the http connections %s, but the gateway checks that an https model's certificate names its host only through a setting on the alias's route that has it speak TLS to every connection the alias serves; serve the https and the http connections under two aliases, giving them different serves values" $alias $.context.instance_id (join ", " $httpsMembers) (join ", " $httpMembers)) }}{{ end }}
       {{- end -}}
       apiVersion: networking.higress.io/v1
       kind: McpBridge
@@ -467,10 +498,12 @@ spec:
       {{- $peers := get $members $alias }}
       {{- $count := len $peers }}
       {{- $lines := list }}
+      {{- $allHttps := true }}
       {{- range $i, $name := $peers }}
       {{- $e := get $entries $name }}
       {{- $weight := add (div 100 $count) (ternary 1 0 (lt $i (mod 100 $count))) }}
       {{- $lines = append $lines (printf "%d%% %s.dns:%s" $weight $e.registry $e.port) }}
+      {{- if ne $e.protocol "https" }}{{ $allHttps = false }}{{ end }}
       {{- end }}
       ---
       apiVersion: networking.k8s.io/v1
@@ -480,6 +513,10 @@ spec:
         namespace: "{{ $ns }}"
         annotations:
           higress.io/destination: {{ join "\n" $lines | toJson }}
+          higress.io/request-header-control-remove: "x-hi-original-auth"
+      {{- if $allHttps }}
+          higress.io/backend-protocol: "HTTPS"
+      {{- end }}
       {{- range $k, $v := $retryAnnotations }}
           {{ $k }}: {{ $v | toJson }}
       {{- end }}
@@ -1014,11 +1051,15 @@ spec:
       ## ── Checking an https model's certificate ────────────────
       ## The discovery service writes the gateway's connection to each
       ## registry entry. Higress leaves a server's certificate unchecked
-      ## unless this setting is on; on, the gateway checks the chain of the
-      ## certificate an https model presents against the system's trust
-      ## anchors. It does not check that the certificate names the model's
-      ## host: the registry's connection always names the server it asks
-      ## for, and Higress matches a certificate's names only where none is
-      ## named. The chart's other settings for the discovery service stay.
+      ## unless this setting is on. On, the gateway checks that the
+      ## certificate an https model presents chains to the system's trust
+      ## anchors and, where the rule for the connection names no server — as
+      ## on the route of an alias whose connections are all https, whose
+      ## Ingress the model routes above mark HTTPS — that it names the host
+      ## the request is sent to, the model's own. Higress checks a
+      ## certificate's names only where no server is named, and the rule it
+      ## writes for a registry entry names one, so without that Ingress
+      ## setting the chain alone is checked, and without this setting
+      ## neither. The chart's other settings for the discovery service stay.
       env:
         VERIFY_CERTIFICATE_AT_CLIENT: "true"
