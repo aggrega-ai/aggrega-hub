@@ -13,12 +13,12 @@ metadata:
     image (no external Helm chart). Tempo is driven in its single-binary shape:
     every subsystem — distributor, ingester, querier, compactor — runs inside
     one process backed by a local trace store, so it renders as one StatefulSet
-    with a per-replica data volume, a ConfigMap carrying the Tempo config, a
-    ClusterIP Service and a Headless Service exposing the OTLP gRPC and HTTP
-    receivers alongside the HTTP query API. The Tempo server image is pinned to a
-    resolvable tag for reproducible renders. The developer's retention_period
-    flows into the in-process compactor, which deletes stored trace blocks once
-    they age past it. provides.host is the bare, self-contained in-cluster
+    with a per-replica data volume, a ConfigMap carrying the Tempo config from
+    the TempoConfig bundle, a ClusterIP Service and a Headless Service exposing
+    the OTLP gRPC and HTTP receivers alongside the HTTP query API. The Tempo
+    server image is pinned to a resolvable tag for reproducible renders. The
+    developer's retention_period flows into the in-process compactor, which
+    deletes stored trace blocks once they age past it. provides.host is the bare, self-contained in-cluster
     service name of the synthesized ClusterIP Service — it carries no namespace,
     so the recipe is independent of where it is deployed; a consumer in another
     namespace qualifies the host with the target namespace on its own side
@@ -28,7 +28,7 @@ metadata:
     must complete with nothing fetched, or where no chart repository is reachable
     from it; reach for `tempo-chart`, which renders the community-maintained
     Tempo chart, where the server's configuration should follow the chart as it
-    moves upstream rather than the hand-written file this realization carries,
+    moves upstream rather than the hand-written file this realization imports,
     or where spans arrive in the Jaeger or Zipkin wire formats this one does not
     receive.
   maintainers:
@@ -50,42 +50,29 @@ spec:
     host: "{{ .context.rendered_name }}-default"
     port: "4317"
     protocol: "grpc"
-  # A single ConfigMap carries the single-binary Tempo configuration for the
-  # synthesized container. It mounts whole into /etc/tempo, where the server's
-  # -config.file argument reads tempo.yaml. The developer's retention_period
-  # drives the compactor's block retention; the OTLP gRPC and HTTP receivers are
-  # served on their conventional ports; traces and the write-ahead log live under
-  # the mounted data volume at /var/tempo.
+  # The entries below are the values the workload shares with the TempoConfig
+  # bundle imported for the server's configuration. Each has its home in the
+  # bundle, which stops the build naming the local when one is missing or
+  # differs from its own; the workload reads them here, because a workload
+  # cannot read the bundle. server_config_delivery has the bundle emit one
+  # ConfigMap. That ConfigMap is named after the rendered name followed by
+  # server_config_map_suffix; a locals entry cannot read the rendered name, so
+  # the workload composes the two where it mounts the ConfigMap.
+  locals:
+    server_config_delivery: config_map
+    server_config_map_suffix: "-config"
+  # The single-binary Tempo configuration, from the TempoConfig bundle every
+  # Recipe synthesizing this Component imports, so the server is configured
+  # alike on either target. With server_config_delivery set to config_map the
+  # bundle emits one ConfigMap, "<rendered_name>-config", carrying the
+  # configuration under the key tempo.yaml. It mounts whole into /etc/tempo,
+  # where the server's -config.file argument reads tempo.yaml. The developer's
+  # retention_period drives the compactor's block retention; the OTLP gRPC and
+  # HTTP receivers are served on their conventional ports; traces and the
+  # write-ahead log live under the mounted data volume at /var/tempo.
   artifacts:
-    config-configmap.yaml: |
-      apiVersion: v1
-      kind: ConfigMap
-      metadata:
-        name: {{ .context.rendered_name }}-config
-      data:
-        tempo.yaml: |
-          server:
-            http_listen_port: 3200
-          distributor:
-            receivers:
-              otlp:
-                protocols:
-                  grpc:
-                    endpoint: "0.0.0.0:4317"
-                  http:
-                    endpoint: "0.0.0.0:4318"
-          ingester:
-            max_block_duration: 5m
-          compactor:
-            compaction:
-              block_retention: "{{ .values.retention_period }}"
-          storage:
-            trace:
-              backend: local
-              wal:
-                path: /var/tempo/wal
-              local:
-                path: /var/tempo/blocks
+    server-config:
+      $import: TempoConfig#/artifacts/ServerConfig
   workload: |
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
@@ -99,8 +86,8 @@ spec:
       main:
         image: "grafana/tempo:{{ .infra.engine_version }}"
         # The single-binary server reads its whole configuration from the
-        # ConfigMap mounted at /etc/tempo; the trace store and write-ahead log
-        # live on the data volume at /var/tempo.
+        # ConfigMap the TempoConfig bundle emits, mounted at /etc/tempo; the
+        # trace store and write-ahead log live on the data volume at /var/tempo.
         command: ["/tempo", "-config.file=/etc/tempo/tempo.yaml"]
         ports:
           otlp-grpc: 4317
@@ -141,7 +128,7 @@ spec:
           size: "{{ if .infra.storage }}{{ .infra.storage.size | default "10Gi" }}{{ else }}10Gi{{ end }}"
       config:
         configmap:
-          source: "{{ .context.rendered_name }}-config"
+          source: "{{ .context.rendered_name }}{{ .locals.server_config_map_suffix }}"
     services:
       default:
         type: ClusterIP
