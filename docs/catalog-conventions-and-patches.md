@@ -308,9 +308,12 @@ model map, typed by hand or wired.
 `core/gateway/kong-enterprise` carries `period-budget: tokens`, the tokens
 each reply reports as Kong's AI Rate Limiting Advanced counts them,
 `content-masking: entity-recognition` and `semantic`. `core/gateway/traefik-hub`
-carries `content-masking: entity-recognition`, `prompt-guard: pattern-list`,
-`period-budget: cost`, priced from the per-model price list its Token Rate
-Limit & Quota middleware ships with, and `semantic`.
+carries `content-masking: entity-recognition` and `prompt-guard: pattern-list`,
+its Content Guard middleware masking the matches of the patterns its
+configuration holds or the entity types a Presidio analyzer it calls detects,
+or refusing a request a pattern matches, `period-budget: cost`, priced from the
+per-model price list its Token Rate Limit & Quota middleware ships with, which
+can count the tokens each reply reports instead, and `semantic`.
 `core/gateway/agentgateway` carries `content-masking: pattern-list` and
 `prompt-guard: pattern-list`, its regular-expression guard masking or refusing
 the matches of the patterns its configuration holds, `period-budget: cost`, the
@@ -358,8 +361,11 @@ The value names the role, not the interface. Components today:
 `core/security/presidio-analyzer` (`analyzer`) and
 `core/security/presidio-anonymizer` (`anonymizer`), which speak the Presidio HTTP
 API; `core/gateway/litellm` selects them on its `pii_analyzer` and
-`pii_anonymizer` sockets. `core/security/kong-ai-pii-service` (`sanitizer`)
-speaks Kong's AI PII service API, and `core/gateway/kong-enterprise` selects it
+`pii_anonymizer` sockets, and `core/gateway/traefik-hub` selects the analyzer
+alone, on its `pii_analyzer` socket, because Traefik Hub's Content Guard, which
+its chart Recipe writes for `core/data-masking`, replaces what the analyzer
+finds itself. `core/security/kong-ai-pii-service` (`sanitizer`) speaks Kong's AI PII
+service API, and `core/gateway/kong-enterprise` selects it
 on its `pii_sanitizer` socket. The compiler routes the address a selected
 component publishes and checks nothing about what answers there, so a component
 carrying a value here that speaks a different API is refused by nothing and
