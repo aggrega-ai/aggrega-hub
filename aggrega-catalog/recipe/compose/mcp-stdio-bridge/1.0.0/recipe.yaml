@@ -1,0 +1,197 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: mcp-stdio-bridge
+  version: 1.0.0
+  # The bridge's own licence. The server it runs is the Release's package,
+  # named in infra.stdio_command and fetched when the server starts, so this
+  # Recipe pins no server and states no licence for one.
+  license: MIT
+  description: >
+    A Model Context Protocol server published as an npm or PyPI package that
+    speaks only stdio, run for local development via Docker Compose behind
+    supergateway 4.1.0, which serves it over Streamable HTTP. The compose
+    provider synthesizes one service running the bridge image, pinned by
+    digest, for the runtime infra.stdio_runtime names. The bridge starts the
+    command line infra.stdio_command names, with each item quoted so it reaches
+    the server as written; the launcher fetches the package when the server
+    starts. One server process runs per client session, at the path /mcp on
+    infra.port, on the compose network: nothing is published to the host, and
+    provides.host is the compose service name. The healthcheck asks the
+    bridge's /healthz endpoint with the wget the image carries.
+
+    It delivers no credential to the server: an attachment on the server_env
+    slot halts the build, because this target has no secret reference to
+    deliver one through. A server that needs credentials runs under
+    helm/mcp-stdio-bridge.
+
+    Reach for this realization under Docker Compose; reach for
+    helm/mcp-stdio-bridge on Kubernetes, and for helm/mcp where the server ships
+    as an image serving HTTP. infra.image is refused here. What it renders is
+    checked by building it; the bridge's behaviour is read from its
+    documentation and source at the pinned release, and no run of this
+    realization has been observed.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/ai-tool/mcp:1.0.0
+  # The pins and the paths, each written once here and read by provides and
+  # the workload alike.
+  #
+  # npm_image and pypi_image are supergateway 4.1.0, pinned by tag and by the
+  # digest of each image index, so every platform the project publishes
+  # resolves to the build read here: the base image runs Node.js 20 with npm
+  # and npx, and the -uvx image adds Python 3, uv and uvx. The flags the
+  # workload passes are the ones this release registers, so a pin moves only
+  # together with them, and infra.image is refused rather than read.
+  # DELIBERATE NEAR-DUPLICATE of recipe/helm/mcp-stdio-bridge's locals: a pin
+  # sits inside the Recipe that renders it and no catalog kind holds one for
+  # two Recipes to share, so the two are moved together.
+  #
+  # path is where the bridge serves Streamable HTTP, and health_path the
+  # endpoint the bridge answers "ok" on while it is up — each passed to the
+  # bridge as a flag, so the address published and the address served agree.
+  locals:
+    npm_image: "ghcr.io/supercorp-ai/supergateway:4.1.0@sha256:1938c43538a5308bce07d58028e9de00b7acfecb40b39b059b2f3931800ad910"
+    pypi_image: "ghcr.io/supercorp-ai/supergateway:4.1.0-uvx@sha256:660c97d4ee58498f4654e1dc60682f4f4ccab363025c9b8b415d04b4e823025e"
+    path: /mcp
+    health_path: /healthz
+  # The contract is key-for-key the one helm/mcp-stdio-bridge publishes, so a
+  # consumer reads the same keys on either target. host is the name the
+  # compose provider gives the synthesized service, which is the component
+  # instance's own name, and a consumer on the same compose network resolves
+  # it directly.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}{{ .locals.path }}"
+    protocol: "http"
+  assertions:
+    # The server is the Release's, so the catalog holds no command line to
+    # fall back to.
+    stdio_command_supplied: >-
+      {{- if not (optional .infra "stdio_command" list) -}}
+      {{- fail "this realization runs a Model Context Protocol server published as a package speaking stdio, and the server is the Release's: set infra.stdio_command to the server's command line, one list item per argument, for example [npx, -y, \"@modelcontextprotocol/server-everything\"]" -}}
+      {{- end -}}
+    stdio_runtime_supplied: >-
+      {{- if not (optional .infra "stdio_runtime" "") -}}
+      {{- fail "this realization runs the server's command line in the bridge image carrying its launcher, and selects that image from infra.stdio_runtime: set it to npm for a command run with npx, or to pypi for one run with uvx" -}}
+      {{- end -}}
+    # A key left out of infra.compute takes the component's default, so only a
+    # value written empty reaches this check.
+    compute_group_complete: >-
+      {{- if not (optional (default dict .infra.compute) "cpu" "") -}}
+      {{- fail "this Release sets infra.compute.cpu on the tool to an empty value, so the rendered service would carry no CPU limit: set it, or remove it to take the component's default" -}}
+      {{- end -}}
+      {{- if not (optional (default dict .infra.compute) "memory" "") -}}
+      {{- fail "this Release sets infra.compute.memory on the tool to an empty value, so the rendered service would carry no memory limit: set it, or remove it to take the component's default" -}}
+      {{- end -}}
+  # This Recipe reads no infra.overrides keys, and the component declares no
+  # such block.
+  #
+  # The bridge runs the command line it is handed through /bin/sh, so the
+  # workload quotes each item of infra.stdio_command in single quotes — an
+  # embedded single quote written as '\'' — and joins them with spaces: the
+  # shell then hands the server each item exactly as written, expanding no
+  # variable and splitting no word. Docker Compose reads $NAME and ${NAME}
+  # anywhere in a compose file as its own variables, and $$ as a literal $, so
+  # every $ in what the Release and the developer wrote is doubled and reaches
+  # the container as itself.
+  #
+  # The bridge's flags, all registered by supergateway 4.1.0:
+  #   --stdio               the quoted command line;
+  #   --outputTransport     streamableHttp, the transport the component's
+  #                         tool.aggrega.ai/transport label names;
+  #   --stateful            one server process per client session, started
+  #                         when the client initializes and stopped when the
+  #                         session ends or has been idle for the bridge's
+  #                         default of thirty minutes — so a server keeping
+  #                         state between calls keeps it for its client;
+  #   --port                infra.port;
+  #   --streamableHttpPath  locals.path;
+  #   --healthEndpoint      locals.health_path.
+  # The bridge logs at its default level, which writes each message it relays.
+  #
+  # The developer's declared effect, timeout and description override reach
+  # the container under the names helm/mcp delivers them under, and from the
+  # bridge's environment the server inherits them. No product reads these
+  # names: they are there for a server's own code to read.
+  workload: |
+    {{- /* infra.image names the image helm/mcp runs. This realization runs
+           the bridge image it pins, so a Release setting the key would see it
+           dropped: the build halts naming it instead. */ -}}
+    {{- with optional .infra "image" "" -}}
+    {{- fail (printf "infra.image of %q is %q, but this realization runs the supergateway bridge image it pins for infra.stdio_runtime and reads no image from the Release; remove infra.image, or run the image on Kubernetes with helm/mcp" $.context.instance_id .) -}}
+    {{- end -}}
+    {{- /* The compose target has no secret reference: a credential attached
+           here could reach the server only as a value written into the
+           compose file, which is what server_env exists to avoid, so the
+           build halts on any attachment rather than drop it. */ -}}
+    {{- if hasKey (default dict .features) "server_env" -}}
+    {{- fail (printf "the server_env slot of %q carries an attachment, but the compose realization of the Model Context Protocol bridge delivers no credential to the server: this target has no secret reference to import the variables through; run the server under helm/mcp-stdio-bridge, which imports every key of the attachment's Secret by reference, or remove the attachment" $.context.instance_id) -}}
+    {{- end -}}
+    {{- $words := list -}}
+    {{- range .infra.stdio_command -}}
+    {{- $words = append $words (printf "'%s'" (replace "'" "'\\''" .)) -}}
+    {{- end -}}
+    {{- $line := join " " $words | replace "$" "$$" -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    containers:
+      main:
+        image: "{{ if eq .infra.stdio_runtime "pypi" }}{{ .locals.pypi_image }}{{ else }}{{ .locals.npm_image }}{{ end }}"
+        # The image's entrypoint is the bridge; these are its arguments.
+        args:
+          - --stdio
+          - {{ $line | toJson }}
+          - --outputTransport
+          - streamableHttp
+          - --stateful
+          - --port
+          - "{{ .infra.port }}"
+          - --streamableHttpPath
+          - "{{ .locals.path }}"
+          - --healthEndpoint
+          - "{{ .locals.health_path }}"
+        variables:
+          MCP_TOOL_SIDE_EFFECTS: "{{ .values.side_effects }}"
+          MCP_TOOL_TIMEOUT_SECONDS: "{{ .values.timeout_seconds }}"
+          MCP_TOOL_PORT: "{{ .infra.port }}"
+          {{- with .values.llm_description_override }}
+          MCP_TOOL_DESCRIPTION: {{ . | replace "$" "$$" | toJson }}
+          {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # A compose service carries one healthcheck, run inside the image. The
+        # image holds no curl, which an http probe would run, but its base
+        # carries busybox's wget, so the check is an exec probe fetching the
+        # bridge's health endpoint on the loopback; wget exits non-zero unless
+        # the bridge answers.
+        health:
+          ready:
+            exec: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:{{ .infra.port }}{{ .locals.health_path }}"]
+        # Each quantity is quoted because it is a string: a value with no unit
+        # suffix — a whole-core cpu count, say — would otherwise be read as a
+        # number and rejected before the target ever sees it.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    # A ClusterIP service entry keeps the bridge on the compose network, which
+    # is where its consumers sit: a consumer wired to it resolves the service
+    # name and the port straight from the edge. Nothing is published to the
+    # host.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

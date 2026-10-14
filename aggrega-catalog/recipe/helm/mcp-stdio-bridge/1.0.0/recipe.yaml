@@ -1,0 +1,191 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: mcp-stdio-bridge
+  version: 1.0.0
+  # The bridge's own licence. The server it runs is the Release's package,
+  # named in infra.stdio_command and fetched when the server starts, so this
+  # Recipe pins no server and states no licence for one.
+  license: MIT
+  description: >
+    A Model Context Protocol server published as an npm or PyPI package that
+    speaks only stdio, run on Kubernetes behind supergateway 4.1.0, which serves
+    it over Streamable HTTP. The helm provider synthesizes a Deployment running
+    the bridge image, pinned by digest, for the runtime infra.stdio_runtime
+    names, and a ClusterIP Service on infra.port. The bridge starts the command
+    line infra.stdio_command names, with each item quoted so it reaches the
+    server as written; the launcher fetches the package when the server starts,
+    so the cluster reaches the package registry then. One server process runs
+    per client session, at the path /mcp, and the bridge's /healthz endpoint is
+    the readiness probe. provides.endpoint is the Service's address with that
+    path.
+
+    Variables the server reads its credentials from arrive through the
+    server_env slot: every data key of the Secret its attachment names becomes
+    one variable in the bridge's environment, by reference, and the server
+    inherits that environment.
+
+    Reach for this realization where the server is a package speaking stdio;
+    reach for helm/mcp where it ships as an image serving HTTP, and for
+    compose/mcp-stdio-bridge under Docker Compose. infra.image is refused here.
+    What it renders is checked by building it; the bridge's behaviour is read
+    from its documentation and source at the pinned release, and no run of
+    this realization has been observed.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-tool/mcp:1.0.0
+  # The pins and the paths, each written once here and read by provides and
+  # the workload alike.
+  #
+  # npm_image and pypi_image are supergateway 4.1.0, pinned by tag and by the
+  # digest of each image index, so every platform the project publishes
+  # resolves to the build read here: the base image runs Node.js 20 with npm
+  # and npx, and the -uvx image adds Python 3, uv and uvx. The flags the
+  # workload passes are the ones this release registers, so a pin moves only
+  # together with them, and infra.image is refused rather than read.
+  # DELIBERATE NEAR-DUPLICATE of recipe/compose/mcp-stdio-bridge's locals: a
+  # pin sits inside the Recipe that renders it and no catalog kind holds one
+  # for two Recipes to share, so the two are moved together.
+  #
+  # path is where the bridge serves Streamable HTTP, and health_path the
+  # endpoint the bridge answers "ok" on while it is up — each passed to the
+  # bridge as a flag, so the address published and the address served agree.
+  locals:
+    npm_image: "ghcr.io/supercorp-ai/supergateway:4.1.0@sha256:1938c43538a5308bce07d58028e9de00b7acfecb40b39b059b2f3931800ad910"
+    pypi_image: "ghcr.io/supercorp-ai/supergateway:4.1.0-uvx@sha256:660c97d4ee58498f4654e1dc60682f4f4ccab363025c9b8b415d04b4e823025e"
+    path: /mcp
+    health_path: /healthz
+  # provides.host is the bare Service name "<rendered_name>-default" — the helm
+  # provider names the synthesized ClusterIP Service
+  # "<rendered_name>-<service-key>", and this workload's one service key is
+  # "default". It carries no namespace segment, so a consumer in another
+  # namespace qualifies it on its own side. endpoint adds the path the bridge
+  # serves Streamable HTTP at, the address a client library connects to.
+  provides:
+    host: "{{ .context.rendered_name }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.rendered_name }}-default:{{ .infra.port }}{{ .locals.path }}"
+    protocol: "http"
+  assertions:
+    # The server is the Release's, so the catalog holds no command line to
+    # fall back to.
+    stdio_command_supplied: >-
+      {{- if not (optional .infra "stdio_command" list) -}}
+      {{- fail "this realization runs a Model Context Protocol server published as a package speaking stdio, and the server is the Release's: set infra.stdio_command to the server's command line, one list item per argument, for example [npx, -y, \"@modelcontextprotocol/server-everything\"]" -}}
+      {{- end -}}
+    stdio_runtime_supplied: >-
+      {{- if not (optional .infra "stdio_runtime" "") -}}
+      {{- fail "this realization runs the server's command line in the bridge image carrying its launcher, and selects that image from infra.stdio_runtime: set it to npm for a command run with npx, or to pypi for one run with uvx" -}}
+      {{- end -}}
+    # A key left out of infra.compute takes the component's default, so only a
+    # value written empty reaches this check.
+    compute_group_complete: >-
+      {{- if not (optional (default dict .infra.compute) "cpu" "") -}}
+      {{- fail "this Release sets infra.compute.cpu on the tool to an empty value, so the rendered Deployment would carry no CPU request or limit: set it, or remove it to take the component's default" -}}
+      {{- end -}}
+      {{- if not (optional (default dict .infra.compute) "memory" "") -}}
+      {{- fail "this Release sets infra.compute.memory on the tool to an empty value, so the rendered Deployment would carry no memory request or limit: set it, or remove it to take the component's default" -}}
+      {{- end -}}
+  # This Recipe reads no infra.overrides keys, and the component declares no
+  # such block.
+  #
+  # The bridge runs the command line it is handed through /bin/sh, so the
+  # workload quotes each item of infra.stdio_command in single quotes — an
+  # embedded single quote written as '\'' — and joins them with spaces: the
+  # shell then hands the server each item exactly as written, expanding no
+  # variable and splitting no word. Kubernetes reads $(NAME) in a container's
+  # arguments and environment values as a reference to a variable of the
+  # container, and $$ as a literal $, so every $ in what the Release and the
+  # developer wrote is doubled and reaches the container as itself.
+  #
+  # The bridge's flags, all registered by supergateway 4.1.0:
+  #   --stdio               the quoted command line;
+  #   --outputTransport     streamableHttp, the transport the component's
+  #                         tool.aggrega.ai/transport label names;
+  #   --stateful            one server process per client session, started
+  #                         when the client initializes and stopped when the
+  #                         session ends or has been idle for the bridge's
+  #                         default of thirty minutes — so a server keeping
+  #                         state between calls keeps it for its client;
+  #   --port                infra.port;
+  #   --streamableHttpPath  locals.path;
+  #   --healthEndpoint      locals.health_path.
+  # The bridge logs at its default level, which writes each message it relays.
+  #
+  # The developer's declared effect, timeout and description override reach
+  # the container under the names helm/mcp delivers them under, and from the
+  # bridge's environment the server inherits them. No product reads these
+  # names: they are there for a server's own code to read.
+  workload: |
+    {{- /* infra.image names the image helm/mcp runs. This realization runs
+           the bridge image it pins, so a Release setting the key would see it
+           dropped: the build halts naming it instead. */ -}}
+    {{- with optional .infra "image" "" -}}
+    {{- fail (printf "infra.image of %q is %q, but this realization runs the supergateway bridge image it pins for infra.stdio_runtime and reads no image from the Release; remove infra.image, or map the component to helm/mcp to run that image" $.context.instance_id .) -}}
+    {{- end -}}
+    {{- $words := list -}}
+    {{- range .infra.stdio_command -}}
+    {{- $words = append $words (printf "'%s'" (replace "'" "'\\''" .)) -}}
+    {{- end -}}
+    {{- $line := join " " $words | replace "$" "$$" -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    containers:
+      main:
+        image: "{{ if eq .infra.stdio_runtime "pypi" }}{{ .locals.pypi_image }}{{ else }}{{ .locals.npm_image }}{{ end }}"
+        # The image's entrypoint is the bridge; these are its arguments.
+        args:
+          - --stdio
+          - {{ $line | toJson }}
+          - --outputTransport
+          - streamableHttp
+          - --stateful
+          - --port
+          - "{{ .infra.port }}"
+          - --streamableHttpPath
+          - "{{ .locals.path }}"
+          - --healthEndpoint
+          - "{{ .locals.health_path }}"
+        variables:
+          MCP_TOOL_SIDE_EFFECTS: "{{ .values.side_effects }}"
+          MCP_TOOL_TIMEOUT_SECONDS: "{{ .values.timeout_seconds }}"
+          MCP_TOOL_PORT: "{{ .infra.port }}"
+          {{- with .values.llm_description_override }}
+          MCP_TOOL_DESCRIPTION: {{ . | replace "$" "$$" | toJson }}
+          {{- end }}
+        {{- /* The server's credentials: every data key of the Secret the
+               server_env attachment publishes as its name, imported into the
+               container's environment by reference, one variable per key.
+               Nothing is emitted while the slot is unattached. */}}
+        {{- if hasKey (default dict .features) "server_env" }}
+        envFrom:
+          - secret: server_env
+        {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The bridge answers "ok" on its health endpoint while it is up, on
+        # the one container port. It documents no probe timings and no
+        # liveness probe, so readiness is the one probe declared: the Service
+        # sends no traffic until the bridge answers.
+        health:
+          ready:
+            http: "{{ .locals.health_path }}"
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
