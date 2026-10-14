@@ -2160,10 +2160,16 @@ connection the Release wires, so it is the same word on every socket.
   beside `from: credential`; a compose Recipe reads the value its credential
   writes on the inject pipe; a chart Recipe reads the locator it publishes, at
   `.context.uses.<alias>.features.credential.provides`, into the chart's
-  existing-secret setting. Each guards the delivery on the connection carrying
-  one — `hasKey (default dict $edge.features) "credential"` — because an entry
-  naming a connection with nothing in the slot is refused, and a connection
-  carrying no credential renders exactly what it renders with no slot at all.
+  existing-secret setting. A Recipe rendering its output from an `artifacts`
+  template reads the same locator into a `secretKeyRef` it writes itself, as
+  `helm/agent-invocation-knative` does; such a host has no
+  `.context.rendered_name`, so a realization naming its Secret after the host —
+  `k8s-external-secret`, `k8s-secret-from-parameter` — halts the build there,
+  and `k8s-existing-secret` fills the slot. Each guards the delivery on the
+  connection carrying one — `hasKey (default dict $edge.features) "credential"`
+  — because an entry naming a connection with nothing in the slot is refused,
+  and a connection carrying no credential renders exactly what it renders with
+  no slot at all.
 - **An optional socket whose unwired side reaches a provider keeps a Component
   slot for that side.** `core/datastore/cognee`'s `extraction_model` and
   `embedding_model` sockets are optional, and a socket left unwired reaches the
@@ -2436,6 +2442,23 @@ checked key with `_supplied` appended, the naming `image_supplied`,
 the database subnet group and the external base URL a Release supplies. This is a
 catalog convention, not something the compiler checks: the compiler evaluates the
 assertion's template and knows nothing of what the key means.
+
+Where the referenced service checks a credential its callers present, the
+reference realization publishes the request header the service reads it from as
+`credential_header`, from an `infra.credential_header` defaulting to
+`Authorization`, and holds no credential of its own: each consumer holds one on
+its connection, in the `credential` slot its socket declares (see "A key both
+ends of a connection hold"), and presents it under that header. An
+`infra.endpoint` carrying a user name or password is
+refused, because it would write a credential into every rendered file the
+address reaches. `helm/mcp-remote` and `compose/mcp-remote` take this shape for
+a Model Context Protocol server someone else runs (see "Model Context Protocol
+servers" below), and `helm/a2a-remote` and `compose/a2a-remote` for an agent
+another party runs over the A2A protocol, `core/ai-agent/a2a-remote`, whose
+`credential_header` is the header the security scheme in the agent's card reads
+and which also publishes where that card is read, `agent_card_url`.
+`core/ai-tool/agent-invocation` holds the credential for such an agent on its
+`target_agent` connection.
 
 The credential slot is filled by a referenced credential — the
 `core/referenced-secret` Feature — rather than a provisioned one, and the
