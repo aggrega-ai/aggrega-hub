@@ -1,0 +1,203 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: pgvector
+  version: 1.0.0
+  license: PostgreSQL
+  description: >
+    pgvector on Kubernetes via the helm provider's Workload synthesis: a
+    StatefulSet running the pgvector project's own image with a persistent
+    volume, a ClusterIP Service, and the headless Service the stateful form
+    requires. A ConfigMap carries the script that enables the extension in the
+    database the server creates on its first start. The project publishes no
+    Helm chart, so the workload is synthesized rather than sourced.
+
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service — it carries no namespace, so the recipe is independent
+    of where it is deployed. A consumer in another namespace qualifies the host
+    with the target namespace on its own side (caller-side routing).
+
+    Reach for this realization on Kubernetes: it needs no control plane and no
+    chart repository, and it builds with nothing fetched. The Compose Recipe of
+    the same name is the local-development realization.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/datastore/pgvector:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare Service name "<rendered_name>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<rendered_name>-<service-key>"
+  # (here "<rendered_name>-default"), with no namespace segment. A same-namespace
+  # consumer reaches it under this name directly; a cross-namespace consumer
+  # qualifies it with the target namespace caller-side.
+  provides:
+    host: "{{ .context.rendered_name }}-default"
+    port: "{{ .infra.port }}"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "postgres"
+  # Two ConfigMaps. The first carries the script that enables the extension and
+  # is always emitted: the image installs the extension's files and enables it in
+  # no database, so a server started from it holds a database a client cannot
+  # store a vector in until the extension is created there. The image's startup
+  # script runs every .sql file it finds under /docker-entrypoint-initdb.d once,
+  # against the database POSTGRES_DB names, when the data directory is empty, so
+  # the extension is enabled in the component's database on its first start and a
+  # database that already holds data is left as it is. IF NOT EXISTS keeps the
+  # script harmless where the extension is already there.
+  #
+  # The second carries the developer's custom server configuration and is
+  # presence-guarded: it renders empty — and is therefore skipped, emitting no
+  # file — when custom_config is unset. custom_config becomes the postgresql.conf
+  # the container's config_file argument points at.
+  artifacts:
+    initdb-configmap.yaml: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-initdb
+      data:
+        00-vector-extension.sql: |
+          CREATE EXTENSION IF NOT EXISTS vector;
+    config-configmap.yaml: |
+      {{- if .values.custom_config -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-config
+      data:
+        postgresql.conf: |
+      {{ .values.custom_config | indent 4 }}
+      {{- end }}
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # form: stateful selects a StatefulSet on the helm provider; the
+    # persistentTemplate volume and the headless Service below are companions of
+    # this form.
+    form: stateful
+    replicas: 1
+    containers:
+      main:
+        image: "pgvector/pgvector:{{ .infra.engine_version }}"
+    {{- if .values.custom_config }}
+        # custom_config renders a postgresql.conf mounted at /etc/postgresql; the
+        # config_file argument makes the server read it. The arguments are
+        # supplied as args rather than as a command, so the image's own startup
+        # script still runs: it is what creates the database on an empty data
+        # directory, reads the POSTGRES_* variables below and runs the extension
+        # script, and it passes these arguments through to the server.
+        args:
+          - postgres
+          - -c
+          - "config_file=/etc/postgresql/postgresql.conf"
+    {{- end }}
+        # POSTGRES_USER / POSTGRES_DB are developer values. POSTGRES_PASSWORD is
+        # wired through the optional `password` credential slot: when a credential
+        # is attached it renders as an env secretKeyRef; with none attached the
+        # Recipe falls back to an inline development default. POSTGRES_INITDB_ARGS
+        # is emitted only when encoding/locale are set.
+        #
+        # PGPORT carries infra.port. The server takes its listen port from it when
+        # none is configured, and so do the image's startup script, which runs a
+        # temporary server on it while the database is created, and pg_isready
+        # in the probes below — so the server, its probes, the container port and
+        # the Service all follow the one value.
+        variables:
+          POSTGRES_USER: "{{ .values.user }}"
+    {{- if not (hasKey (default dict .features) "password") }}
+          POSTGRES_PASSWORD: apppass
+    {{- end }}
+          POSTGRES_DB: "{{ .values.database }}"
+          PGPORT: "{{ .infra.port }}"
+    {{- if or .values.encoding .values.locale }}
+          POSTGRES_INITDB_ARGS: "{{ with .values.encoding }}--encoding={{ . }}{{ end }}{{ with .values.locale }} --locale={{ . }}{{ end }}"
+    {{- end }}
+    {{- if hasKey (default dict .features) "password" }}
+        attachments:
+          POSTGRES_PASSWORD:
+            from: password
+            as: env
+    {{- end }}
+        ports:
+          tcp: {{ .infra.port }}
+        # Both probes run the image's own pg_isready, which PostgreSQL documents
+        # as the check of whether a server is accepting connections. Readiness
+        # asks over TCP on the port the Service targets; liveness asks over the
+        # server's local socket. While a new database is initialized the image
+        # runs a temporary server that listens on its socket only, so the pod is
+        # reported ready only once the server accepts network connections, and a
+        # first start is not restarted while initialization is still running.
+        # The configured user and database are named so that a probe is not
+        # logged as a failed connection attempt. No start-up time is documented:
+        # the liveness probe waits 30 s and allows six misses 10 s apart, to cover
+        # initialization and the extension script.
+        health:
+          ready:
+            exec:
+              - pg_isready
+              - "--host=127.0.0.1"
+              - "--port={{ .infra.port }}"
+              - "--username={{ .values.user }}"
+              - "--dbname={{ .values.database }}"
+            periodSeconds: 10
+            timeoutSeconds: 5
+          live:
+            exec:
+              - pg_isready
+              - "--username={{ .values.user }}"
+              - "--dbname={{ .values.database }}"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        # The volume is mounted at /var/lib/postgresql, the single mount the
+        # PostgreSQL 18 and later builds are laid out for: the server keeps its
+        # data in a subdirectory named for the major version, which is also what
+        # keeps a volume's own top-level entries, such as lost+found, out of the
+        # data directory. The component refuses a tag for an earlier major, whose
+        # layout differs.
+        volumeMounts:
+          - name: data
+            path: /var/lib/postgresql
+          - name: initdb
+            path: /docker-entrypoint-initdb.d
+    {{- if .values.custom_config }}
+          - name: pgconf
+            path: /etc/postgresql
+    {{- end }}
+    volumes:
+      data:
+        persistentTemplate:
+          size: "{{ .infra.storage.size }}"
+          class: "{{ .infra.storage.type }}"
+      initdb:
+        configmap:
+          source: "{{ .context.rendered_name }}-initdb"
+    {{- if .values.custom_config }}
+      pgconf:
+        configmap:
+          source: "{{ .context.rendered_name }}-config"
+    {{- end }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          tcp: {{ .infra.port }}
+      headless:
+        type: Headless
+        ports:
+          tcp: {{ .infra.port }}

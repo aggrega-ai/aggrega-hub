@@ -1,0 +1,211 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/datastore/pgvector
+  version: 1.0.0
+  # metadata.license records the licence of the wrapped product, the pgvector
+  # extension, which is a different field from the licence of this catalog file
+  # itself (the SPDX header above) and from the upstream-licensing class label
+  # below. The PostgreSQL server the image runs the extension in is published
+  # under the same terms.
+  license: PostgreSQL
+  description: >
+    A vector database on the PostgreSQL engine: PostgreSQL with the pgvector
+    extension, which adds a vector column type, distance operators and
+    approximate nearest-neighbour indexes, so embeddings are stored beside
+    ordinary rows and queried by similarity in SQL. The server runs the pgvector
+    project's own image, which carries the extension, and the database the
+    component creates has it enabled.
+
+    Wire here when an application retrieves by similarity and keeps its vectors
+    in PostgreSQL; core/datastore/postgres is the general-purpose relational
+    store, and core/datastore/qdrant, core/datastore/weaviate and
+    core/datastore/chroma are vector stores with APIs of their own. It presents
+    the standard PostgreSQL wire contract (POSTGRES_USER / POSTGRES_PASSWORD /
+    POSTGRES_DB) and exports its host, port, user, database and protocol, so a
+    socket selecting vector stores admits it and a consumer reaches it with a
+    PostgreSQL client.
+
+    Realized two ways, both self-hosted and both fetching nothing: reach for the
+    Helm Recipe on Kubernetes, which synthesizes a StatefulSet with a persistent
+    volume, and for the Compose Recipe for local development. Its Recipes are
+    verified by their rendered output, not by a started server storing and
+    querying vectors.
+  labels:
+    component.aggrega.ai/type: stateful-server
+    component.aggrega.ai/category: datastore
+    # The engine value is a fact about the artifact this component pins rather
+    # than about a setting: the image every Recipe runs carries the extension,
+    # and every Recipe enables it in the database the component creates, so no
+    # value supplied makes it something other than a vector store. That is why
+    # it sits on the component itself, as it does on core/datastore/qdrant.
+    datastore.aggrega.ai/engine: vector
+    # Both Recipes run the server as a container in the Release's own boundary,
+    # so a single posture is this component's identity. Selector-only: never
+    # stamped onto rendered output.
+    component.aggrega.ai/hosting: self-hosted
+    component.aggrega.ai/upstream-licensing: osi-approved
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  # Self-inject allowlist: the component may inject its own provides keys into
+  # the env delivery mechanism.
+  inject: ["env"]
+  featuresSchema:
+    # Optional password credential slot. When a credential is attached here, the
+    # Recipe wires the database password through the credential subsystem; when
+    # unattached, the Recipe falls back to its inline development default.
+    # `required` omitted → optional, so a bare `vectors: {}` still loads.
+    # Transparent (inject: [env]) so a synthesized Workload may reference it as
+    # an env secret; the selector is secret-kind-pinned but family-agnostic so
+    # either an inject-value or a referenceable credential may fill it.
+    # To replace the Recipe's development default, attach core/random-password:
+    # the cluster generates it, and slots sharing it take it by
+    # core/referenced-secret.
+    password:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Optional database password credential. When attached, supplies POSTGRES_PASSWORD via the credential subsystem; unattached, the Recipe uses its inline development default."
+  # engine_version names an image tag, and every tag the pgvector image
+  # publishes pairs an extension version with the PostgreSQL major it is built
+  # for, as 0.8.7-pg18-trixie does: there is no tag for a bare major version. The
+  # Recipes also lay the data volume out the way the PostgreSQL 18 and later
+  # builds expect, one mount at /var/lib/postgresql with the data in a
+  # subdirectory named for the major version. An earlier build keeps its data at
+  # /var/lib/postgresql/data and declares that path as a volume of the image; a
+  # container runtime that honours an image's declared volumes — Docker, and
+  # containerd as it ships — mounts a volume of its own there, over the Recipe's,
+  # so the data would not be kept on the volume the Recipe sizes. The build
+  # therefore halts, naming the key, on a value that carries no PostgreSQL major
+  # and on one naming a major below 18, rather than rendering an image reference
+  # no registry serves or a volume the data does not land on. It holds
+  # whichever Recipe binds, so it is stated once, here.
+  assertions:
+    engine_version_names_a_supported_build: >-
+      {{- $tag := optional .infra "engine_version" "" -}}
+      {{- if not (regexMatch "(^|-)pg[0-9]+(-|$)" $tag) -}}
+      {{- fail (printf "infra.engine_version is %q, which names no pgvector image: each tag pairs the extension version with the PostgreSQL major it is built for, as in 0.8.7-pg18-trixie, so set a value of that shape" $tag) -}}
+      {{- end -}}
+      {{- $major := regexFind "pg[0-9]+" $tag | trimPrefix "pg" | atoi -}}
+      {{- if lt $major 18 -}}
+      {{- fail (printf "infra.engine_version is %q, a build for PostgreSQL %d: the Recipes keep the data where the PostgreSQL 18 and later builds place it, so set a tag for PostgreSQL 18 or later, as in 0.8.7-pg18-trixie" $tag $major) -}}
+      {{- end -}}
+  schema:
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate. Every key
+      # carries a default where the engine has one, so a bare Release renders
+      # without the developer choosing anything.
+      database:
+        type: string
+        default: appdb
+        description: Logical database name created on startup (POSTGRES_DB), with the vector extension enabled in it.
+      user:
+        type: string
+        default: appuser
+        description: Bootstrap superuser role created on startup (POSTGRES_USER), owner of the initial database.
+      encoding:
+        type: string
+        description: Database encoding passed to initdb (e.g. UTF8). Omit to use the image default.
+      locale:
+        type: string
+        description: Database locale passed to initdb (e.g. en_US.utf8). Omit to use the image default.
+      custom_config:
+        type: string
+        description: >
+          Raw server configuration block (postgresql.conf format), applied as the
+          server's configuration file in place of the image's own, so a setting
+          it omits takes the server's built-in default. listen_addresses is the
+          one worth naming: its built-in default accepts local connections only,
+          so a block for a server other workloads reach sets it, for example
+          listen_addresses = '*'. The listen port comes from infra.port; a port
+          setting here takes precedence and moves the server off the port the
+          component publishes.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 5432
+        description: >
+          Server listen port. Most operators should omit this and let the Recipe
+          assign the default (5432). Every Recipe hands it to the server as its
+          own port, so the server, its health checks and the published address
+          all follow it.
+      engine_version:
+        type: string
+        default: "0.8.7-pg18-trixie"
+        description: >
+          Tag of the pgvector/pgvector image the Recipes run. One compound
+          coordinate carries three parts: the extension version, the PostgreSQL
+          major version it is built for, and the Debian release it is built on —
+          so an operator supplies a value shaped like 0.8.7-pg18-trixie rather
+          than a bare major version, for which the image publishes no tag. The
+          build halts on a value naming no PostgreSQL major, or a major below 18,
+          because the Recipes keep the data where the PostgreSQL 18 and later
+          builds place it.
+      compute:
+        cpu:
+          type: string
+          default: 250m
+        memory:
+          type: string
+          default: 512Mi
+      storage:
+        type: object
+        properties:
+          size:
+            type: string
+            default: 10Gi
+            description: >
+              Size of the database volume on Kubernetes. The Compose Recipe
+              creates the volume and honors no size, the target having no
+              volume-size concept.
+          type:
+            type: string
+            description: >
+              Storage class the database volume is provisioned from on
+              Kubernetes. Leave it unset to take the cluster's default storage
+              class; set it to name another class the cluster offers. The Compose
+              Recipe names no class.
+      overrides:
+        type: object
+        additionalProperties: true
+        description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      host:
+        type: string
+        required: true
+        description: Address a client opens its database connection to. On Kubernetes it is the Service's DNS name, and on Compose the service name.
+      port:
+        type: integer
+        required: true
+        description: >
+          TCP port the server accepts connections on. It follows the port an
+          operator set in the Release, so a consumer reads it rather than
+          assuming 5432.
+      user:
+        type: string
+        description: >
+          Name of the login role a consumer authenticates as. The matching
+          password arrives through the credential attached to the component,
+          never through this contract.
+      database:
+        type: string
+        description: >
+          Name of the logical database created at startup, the one the vector
+          extension is enabled in. A consumer names it in its connection string
+          to land in the right database rather than the server's default.
+      protocol:
+        type: string
+        description: >
+          Wire protocol the published address speaks — `postgres`, so a
+          consumer stores and queries vectors with an ordinary PostgreSQL
+          driver.

@@ -140,10 +140,14 @@ multi-valued category: an entity is `category: datastore` plus whatever
 `datastore.aggrega.ai/engine` value its own product identity carries,
 discoverable from both axes. A component carries an engine label on its base
 where the product's identity is that engine, as `core/datastore/qdrant` carries
-`vector` and `core/datastore/redis` carries `kv`. A capability whose truth
-depends on what the Aggregate declares carries no label anywhere in the
-catalog — it is injected at compile time by the governance socket's
-`label-transform` role, which reads the developer's declared `values`.
+`vector` and `core/datastore/redis` carries `kv`. An extension counts as
+identity when the component pins an image that carries it and every Recipe
+enables it: `core/datastore/pgvector` runs the pgvector project's own PostgreSQL
+image and creates the extension in the database it starts, so it carries
+`vector` on its base, while `core/datastore/postgres` carries no engine value. A
+capability whose truth depends on what the Aggregate declares carries no label
+anywhere in the catalog — it is injected at compile time by the governance
+socket's `label-transform` role, which reads the developer's declared `values`.
 There is no stored "is-AI" boolean — tooling derives AI-relevance from any
 `ai-`-prefixed category or AI-relevant capability value.
 
@@ -683,7 +687,13 @@ Its identity is not "the base plus something", so inheritance would misdescribe
 it, however drop-in the replacement is at the wire. `core/datastore/valkey`
 sits beside `core/datastore/redis` rather than extending it: each is its own
 product with its own pillars, and both are reachable by a consumer selecting on
-`datastore.aggrega.ai/engine: kv`.
+`datastore.aggrega.ai/engine: kv`. A product that is an existing engine plus an
+extension usually lands here too, sent by the pillar question rather than the
+identity one: `core/datastore/timescaledb` and `core/datastore/pgvector` each
+run an image of their own that carries the extension, addressed by a compound
+tag — the extension's version beside the PostgreSQL major — so
+`core/datastore/postgres`'s `engine_version`, a bare major version, would not
+hold word for word, and each is authored standalone, with Recipes of its own.
 
 **A product needing several cooperating roles — author a fleet.** No amount of
 shared protocol makes several roles one component. Each role is its own entity
