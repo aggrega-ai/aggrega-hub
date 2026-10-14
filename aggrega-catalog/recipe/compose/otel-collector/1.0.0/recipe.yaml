@@ -13,6 +13,9 @@ metadata:
     one stateless service running the same image as the Kubernetes realization
     with the same configuration, the OtelCollectorConfig bundle, delivered as a
     compose config mounted over the file the image starts the collector with.
+    The bundle writes one exporter for each backend wired to the traces,
+    metrics and logs sockets, and the service carries a digest of the infra and
+    those backends, so a changed address re-creates it.
 
     The service publishes nothing to the host: a producer on the compose network
     reaches it at the service name, on the OTLP gRPC and HTTP ports. The image
@@ -60,6 +63,13 @@ spec:
   # Synthesized-mode Workload: the image, the ports, the configuration mount and
   # the resources are translated from the Workload kind by the compose provider.
   workload: |
+    {{- /* What each connection wired to a signal socket contributes to the
+           configuration — its alias, its socket, its target's labels and what
+           the target publishes — read here for the digest below. */ -}}
+    {{- $wired := list -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $wired = append $wired (list $alias $edge.socket (optional $edge "labels" dict) $edge.provides) -}}
+    {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # The collector keeps nothing between restarts, so the stateless form is
@@ -76,13 +86,17 @@ spec:
         # docker compose up re-creates a service's container when the service's
         # own definition changed since the container was created, and a config's
         # content is no part of that definition. So the service carries the
-        # digest of the Component's infra, which every listener the
-        # configuration binds is read from, as COLLECTOR_CONFIG_DIGEST, a
-        # variable nothing reads: a changed port changes the definition, and the
-        # next docker compose up re-creates the collector with the configuration
-        # that port is written into.
+        # digest of what the configuration is written from, as
+        # COLLECTOR_CONFIG_DIGEST, a variable nothing reads: the Component's
+        # infra, which every listener is read from, and, for each connection
+        # wired to a signal socket, its alias, its socket, its target's labels
+        # and what the target publishes, which every exporter is read from. A
+        # changed port or a backend's changed address changes the definition,
+        # and the next docker compose up re-creates the collector with the
+        # configuration it is written into. With nothing wired the digest is
+        # over the infra alone.
         variables:
-          COLLECTOR_CONFIG_DIGEST: "{{ sha256sum (toJson .infra) }}"
+          COLLECTOR_CONFIG_DIGEST: "{{ if $wired }}{{ sha256sum (toJson (list .infra $wired)) }}{{ else }}{{ sha256sum (toJson .infra) }}{{ end }}"
         ports:
           otlp-grpc: {{ .infra.otlp_grpc_port }}
           otlp-http: {{ .infra.otlp_http_port }}

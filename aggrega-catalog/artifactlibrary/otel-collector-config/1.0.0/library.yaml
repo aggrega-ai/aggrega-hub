@@ -16,10 +16,12 @@ metadata:
     receiver on the gRPC and HTTP ports the importing Component declares as
     infra.otlp_grpc_port and infra.otlp_http_port, the health check on port
     13133, and one pipeline each for traces, metrics and logs, fed by the OTLP
-    receiver through a memory limiter and a batch processor and ending in the
-    debug exporter at basic verbosity, which summarises what arrives in the
-    collector's own log and sends it nowhere else. It stops the build when two
-    of those three listeners share a port.
+    receiver through a memory limiter and a batch processor. Each backend wired
+    to the signal's socket adds one exporter to that pipeline, written for the
+    protocol its observability.aggrega.ai label names: otlp_grpc to its host and
+    port, or otlp_http to its otlp_http_endpoint. A signal with nothing wired
+    ends in the debug exporter at basic verbosity. It stops the build when two
+    listeners share a port, or when a backend publishes no address.
 
     The importing Recipe picks the delivery with the local
     collector_config_delivery — config_map, one ConfigMap holding the
@@ -46,14 +48,45 @@ spec:
     # receiver. Each passes what arrives through the memory_limiter processor,
     # which refuses data once the collector's memory use nears its limit,
     # before the batch processor groups it; that is the pair, in that order,
-    # the project's own Helm chart runs by default. Each pipeline ends in the
-    # debug exporter at basic verbosity: the collector writes one line per batch
-    # to its own log, saying which signal arrived and how many records, and
-    # sends the data nowhere else. So a producer wired to the collector is not
-    # refused for want of a backend, and what it sends is visible in the
-    # collector's log rather than dropped unseen. The configuration is the whole
-    # configuration: no receiver, extension or port the collector's own default
-    # configuration or its chart's carries is in it.
+    # the project's own Helm chart runs by default. The configuration is the
+    # whole configuration: no receiver, extension or port the collector's own
+    # default configuration or its chart's carries is in it.
+    #
+    # Where each pipeline ends. The importing Component's traces, metrics and
+    # logs sockets each take the backends for their signal, and every
+    # connection on one of them adds one exporter to that signal's pipeline.
+    # The target of each carries the label observability.aggrega.ai/<signal>
+    # its socket selects, and the label's value names the protocol the target
+    # receives the signal on, so it decides the exporter:
+    #   otlp-grpc  an otlp_grpc exporter to the host and port the target
+    #              publishes, with transport security off, because the
+    #              receivers the catalog renders serve no TLS;
+    #   otlp-http  an otlp_http exporter to the base address the target
+    #              publishes as otlp_http_endpoint, to which the exporter
+    #              appends the signal's own path, such as /v1/logs.
+    # otlp_grpc and otlp_http are the exporters' names in the collector release
+    # this bundle is written for; the shorter otlp and otlphttp it also accepts
+    # are its deprecated aliases. Each exporter is named after its type and the
+    # connection's alias, otlp_grpc/<alias> or otlp_http/<alias>, so no two
+    # connections share a name and each reads back to the connection it was
+    # written for. An alias holds letters, digits, underscores and hyphens, the
+    # alphabet the Aggregate and the Release hold it to, all of which the
+    # collector takes in a name and YAML reads as written. A pipeline lists its
+    # exporters in the order a template ranges the connections, which is by
+    # alias. A signal with nothing wired ends in the debug exporter at basic
+    # verbosity instead: the collector writes one line per batch to its own log,
+    # saying which signal arrived and how many records, and sends the data
+    # nowhere else. So a producer wired to the collector is not refused for want
+    # of a backend, and what it sends is visible in the collector's log rather
+    # than dropped unseen. The debug exporter is written only while some signal
+    # still ends in it.
+    #
+    # A connection the collector could not export through stops the build,
+    # naming it: a target whose label carries another value; an otlp-grpc
+    # target publishing no host or port; an otlp-http target publishing no
+    # otlp_http_endpoint — on core/observability/prometheus, which publishes it
+    # only while its OTLP receiver is on, the message names the line to write,
+    # values.otlp_receiver: true on that Prometheus in the Aggregate.
     #
     # The memory limiter takes its limit as a share of the memory limit the
     # container runs under, which each importing Recipe sets from
@@ -90,12 +123,16 @@ spec:
     #
     # The template reads the importing Recipe's context: .infra.otlp_grpc_port
     # and .infra.otlp_http_port from the Component, .context.instance_id,
-    # .context.rendered_name with config_map, and the locals listed above. It
-    # checks every local before it writes anything, because a local the
-    # importing Recipe does not declare reads as empty here rather than stopping
-    # the build, and a name or a port that differs on the two sides would leave
-    # a collector with no configuration, or probes asking a port nothing
-    # answers on.
+    # .context.rendered_name with config_map, the locals listed above, and, for
+    # each connection on the three signal sockets, its alias, its socket, its
+    # target's labels and component, and what the target publishes. It checks
+    # every local before it writes anything, because a local the importing
+    # Recipe does not declare reads as empty here rather than stopping the
+    # build, and a name or a port that differs on the two sides would leave a
+    # collector with no configuration, or probes asking a port nothing answers
+    # on. Since the configuration changes with what a connection publishes, an
+    # importing Recipe's digest of it covers those connections as well as its
+    # infra.
     CollectorConfig:
       collector-config.yaml: |
         {{- /* The values this bundle shares with the Recipe importing it. Each has its home here, and the importing
@@ -159,6 +196,51 @@ spec:
         {{- fail (printf "%q sets infra.%s to %s, the port the collector's health check listens on, but the collector cannot bind two listeners on one port; set infra.%s to another port" $.context.instance_id $setting $healthPort $setting) }}
         {{- end }}
         {{- end }}
+        {{- /* The backends wired to the three signal sockets, each connection read in the order a template ranges
+          them, by alias. The target's observability.aggrega.ai/<signal> label names the protocol it receives the
+          signal on, and that decides the exporter written for it: otlp_grpc to its host and port, or otlp_http to
+          its otlp_http_endpoint. Each exporter is named after its type and the connection's alias. $routes holds
+          each signal's exporter names; a signal holding none ends in debug. */}}
+        {{- $signals := list "traces" "metrics" "logs" }}
+        {{- $routes := dict "traces" (list) "metrics" (list) "logs" (list) }}
+        {{- $exporters := list }}
+        {{- range $alias, $edge := .context.uses }}
+        {{- if has $edge.socket $signals }}
+        {{- $label := printf "observability.aggrega.ai/%s" $edge.socket }}
+        {{- $protocol := toString (optional (optional $edge "labels" dict) $label "") }}
+        {{- if eq $protocol "otlp-grpc" }}
+        {{- $host := toString (optional $edge.provides "host" "") }}
+        {{- $port := toString (optional $edge.provides "port" "") }}
+        {{- if not (and $host $port) }}
+        {{- fail (printf "%q exports %s through its %s connection %q to %q, which carries %s: otlp-grpc but publishes no host and port to send them to; bind %q in the Manifest to a Recipe that publishes both" $.context.instance_id $edge.socket $edge.socket $alias $edge.target $label $edge.target) }}
+        {{- end }}
+        {{- $name := printf "otlp_grpc/%s" $alias }}
+        {{- $exporters = append $exporters (dict "name" $name "endpoint" (printf "%s:%s" $host $port) "insecure" true) }}
+        {{- $_ := set $routes $edge.socket (append (get $routes $edge.socket) $name) }}
+        {{- else if eq $protocol "otlp-http" }}
+        {{- $endpoint := toString (optional $edge.provides "otlp_http_endpoint" "") }}
+        {{- if not $endpoint }}
+        {{- $type := first (splitList ":" (toString (optional $edge "component" ""))) }}
+        {{- if eq $type "core/observability/prometheus" }}
+        {{- fail (printf "%q exports %s through its %s connection %q to %q, but %q publishes no otlp_http_endpoint: a Prometheus receives OTLP only while its OTLP receiver is on, and it is off by default; set values.otlp_receiver: true on %q in the Aggregate" $.context.instance_id $edge.socket $edge.socket $alias $edge.target $edge.target $edge.target) }}
+        {{- end }}
+        {{- fail (printf "%q exports %s through its %s connection %q to %q, which carries %s: otlp-http but publishes no otlp_http_endpoint, the base address an OTLP HTTP exporter sends to; bind %q in the Manifest to a Recipe that publishes one" $.context.instance_id $edge.socket $edge.socket $alias $edge.target $label $edge.target) }}
+        {{- end }}
+        {{- $name := printf "otlp_http/%s" $alias }}
+        {{- $exporters = append $exporters (dict "name" $name "endpoint" $endpoint "insecure" false) }}
+        {{- $_ := set $routes $edge.socket (append (get $routes $edge.socket) $name) }}
+        {{- else }}
+        {{- fail (printf "%q wires %q to its %s socket, and %q carries %s: %q, but the collector writes an exporter for otlp-grpc and otlp-http alone; wire a target that receives %s over one of the two" $.context.instance_id $edge.target $edge.socket $edge.target $label $protocol $edge.socket) }}
+        {{- end }}
+        {{- end }}
+        {{- end }}
+        {{- $debug := false }}
+        {{- range $signal := $signals }}
+        {{- if not (get $routes $signal) }}
+        {{- $debug = true }}
+        {{- $_ := set $routes $signal (list "debug") }}
+        {{- end }}
+        {{- end }}
         {{- /* The envelope. The configuration below is written once and wrapped by the envelope the importing Recipe
           chose: a compose config's content or a ConfigMap key. Both are block scalars holding it at one indentation,
           so in the compose fragment the config's content key sits one column deeper than its name, the shallowest
@@ -190,8 +272,18 @@ spec:
                 spike_limit_percentage: 25
               batch: {}
             exporters:
+        {{- if $debug }}
               debug:
                 verbosity: basic
+        {{- end }}
+        {{- range $exporter := $exporters }}
+              {{ $exporter.name }}:
+                endpoint: {{ toJson $exporter.endpoint }}
+        {{- if $exporter.insecure }}
+                tls:
+                  insecure: true
+        {{- end }}
+        {{- end }}
             extensions:
               health_check:
                 endpoint: "0.0.0.0:{{ $healthPort }}"
@@ -201,12 +293,12 @@ spec:
                 traces:
                   receivers: [otlp]
                   processors: [memory_limiter, batch]
-                  exporters: [debug]
+                  exporters: [{{ join ", " (get $routes "traces") }}]
                 metrics:
                   receivers: [otlp]
                   processors: [memory_limiter, batch]
-                  exporters: [debug]
+                  exporters: [{{ join ", " (get $routes "metrics") }}]
                 logs:
                   receivers: [otlp]
                   processors: [memory_limiter, batch]
-                  exporters: [debug]
+                  exporters: [{{ join ", " (get $routes "logs") }}]
