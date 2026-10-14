@@ -424,14 +424,15 @@ does not overlap it.
 | Value | What the value asserts |
 | --- | --- |
 | `openai` | The OpenAI model API answers at the published endpoint — OpenAI's own, or a server's implementation of it — so a consumer speaks to it as it would to OpenAI. |
-| `native` | The product's own model API answers there, and it is not the OpenAI API, so a consumer speaks that product's API, through its client or its request shape. |
+| `anthropic` | Anthropic's Messages API answers at the published endpoint — Anthropic's own, or a server's implementation of it — so a consumer speaks to it as it would to Anthropic. |
+| `native` | The product's own model API answers there, and it is neither the OpenAI API nor Anthropic's Messages API, so a consumer speaks that product's API, through its client or its request shape. |
 
 Three rules bind it:
 
-- **A model socket selects the key, never a value.** The catalog's model
-  sockets — every agent's `model`, `core/ai-tool/model-invocation`'s
-  `target_model`, and `core/datastore/cognee`'s `extraction_model` and
-  `embedding_model` — select
+- **A model socket selects the key unless it needs one API.** The catalog's model
+  sockets that take any model API — every agent's `model` but the two named below,
+  `core/ai-tool/model-invocation`'s `target_model`, and `core/datastore/cognee`'s
+  `extraction_model` and `embedding_model` — select
   `component.aggrega.ai/category in (ai-model, gateway), model.aggrega.ai/api`.
   The category requirement admits the two categories and the key requirement
   admits only the components among them carrying the label, so every model is
@@ -440,7 +441,10 @@ Three rules bind it:
   hold and its alternatives live inside one key's set, so no selector can admit
   an unlabelled model and a labelled gateway while refusing an unlabelled
   gateway — which is why every `ai-model` Component carries the key. A socket
-  that needs one particular API names its value — or, where a model it cannot
+  that needs one particular API names its value
+  (`core/ai-agent/openai-agents-sdk`'s `model` selects `model.aggrega.ai/api=openai`
+  and `core/ai-agent/claude-agent-sdk`'s selects `model.aggrega.ai/api=anthropic`,
+  each SDK speaking that API alone) — or, where a model it cannot
   use has somewhere else to go, admits the whole category and refuses the value
   in an assertion that says where. `core/gateway/litellm`'s `models` socket
   selects `component.aggrega.ai/category=ai-model`, and its Component's
@@ -489,8 +493,9 @@ Components today: `core/gateway/litellm`, `core/gateway/kong`,
 `core/gateway/higress` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
 `openai-embedding`, `nvidia-api` and `openai-compatible` — the broker, whose
 whole contract is to be pointed at a service speaking that API, and which stays
-the handle for an endpoint the catalog does not model. Every other
-`core/ai-model/*` Component carries `native`. Each label's comment says, in its
+the handle for an endpoint the catalog does not model.
+`core/ai-model/anthropic` carries `anthropic`. Every other `core/ai-model/*`
+Component carries `native`. Each label's comment says, in its
 product's terms, what answers at its endpoint. The compiler matches the string
 and checks nothing about what answers at the address, so a component carrying a
 value its endpoint does not speak is refused by nothing and fails when it is

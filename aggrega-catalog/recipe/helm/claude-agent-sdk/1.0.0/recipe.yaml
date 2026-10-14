@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: claude-agent-sdk
+  version: 1.0.0
+  description: >
+    An application built on the Claude Agent SDK, on Kubernetes, rendered
+    offline as plain manifests by the helm provider's Workload synthesis. The
+    Workload becomes a Deployment running the image the Release supplies. The
+    model wired into the `model` socket reaches the command line each session
+    runs in as the variables it reads: its endpoint as ANTHROPIC_BASE_URL, its
+    model name as ANTHROPIC_MODEL, and the connection's credential as
+    ANTHROPIC_API_KEY through a secretKeyRef, so the key never renders into
+    the manifest.
+
+    Each tool wired into the `tools` socket reaches the application under
+    variables named for the connection's alias, upper-cased with hyphens as
+    underscores: its address as AGGREGA_TOOL_<ALIAS>_URL, and, where the
+    connection carries a credential, that credential as
+    AGGREGA_TOOL_<ALIAS>_CREDENTIAL through a secretKeyRef, with the header the
+    tool publishes for it as AGGREGA_TOOL_<ALIAS>_CREDENTIAL_HEADER. A
+    connection holding the tool's whole address as a secret, for a server that
+    reads its key from its address, delivers that secret as
+    AGGREGA_TOOL_<ALIAS>_URL through a secretKeyRef instead.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/claude-agent-sdk:1.0.0
+  # The model arrives on the `model` uses-edge, addressed by the
+  # developer-chosen alias, so the recipe ranges the outbound edges and matches
+  # on the socket name to find it, then reads the model's published endpoint
+  # and model name. The SDK starts the command line as a process of the
+  # application, which inherits the application's environment, and the command
+  # line reads ANTHROPIC_BASE_URL, ANTHROPIC_MODEL and ANTHROPIC_API_KEY from
+  # it, so the application picks up all three with no code of its own. The
+  # published endpoint is the base address the command line appends the
+  # Messages API's path to.
+  #
+  # The credential, when one is attached on the `model` connection, is
+  # delivered as ANTHROPIC_API_KEY through a secretKeyRef naming that
+  # connection; a connection carrying none emits no key variable.
+  #
+  # Each `tools` connection's variables are named for its alias, upper-cased,
+  # with every character other than a letter or a digit an underscore; the
+  # alias grammar admits only a hyphen and an underscore besides, so a hyphen
+  # becomes an underscore. AGGREGA_TOOL_<ALIAS>_URL is the endpoint the tool
+  # publishes, unless the connection carries an endpoint secret: then it is
+  # that secret, referenced by connection and slot, and the published address
+  # is not delivered. The credential is delivered only where the connection
+  # carries one, and the header beside it only where the tool publishes one;
+  # a tool behind a bridge publishes none, because the bridge checks no
+  # caller's credential.
+  #
+  # Every secret on every connection sits under one attachments key, so the
+  # block is opened once, and only where one connection carries a secret.
+  workload: |
+    {{- $secrets := false -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if and (eq $edge.socket "model") (hasKey $features "credential") -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- if and (eq $edge.socket "tools") (or (hasKey $features "credential") (hasKey $features "endpoint")) -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        variables:
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "model" }}
+          ANTHROPIC_BASE_URL: "{{ $edge.provides.endpoint }}"
+          ANTHROPIC_MODEL: "{{ $edge.provides.model }}"
+    {{- end }}
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "tools" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- $features := default dict $edge.features }}
+    {{- if not (hasKey $features "endpoint") }}
+          AGGREGA_TOOL_{{ $name }}_URL: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- if and (hasKey $features "credential") (optional $edge.provides "credential_header" "") }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL_HEADER: "{{ $edge.provides.credential_header }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if $secrets }}
+        attachments:
+    {{- range $alias, $edge := .context.uses }}
+    {{- $features := default dict $edge.features }}
+    {{- if and (eq $edge.socket "model") (hasKey $features "credential") }}
+          ANTHROPIC_API_KEY:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- if eq $edge.socket "tools" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- if hasKey $features "endpoint" }}
+          AGGREGA_TOOL_{{ $name }}_URL:
+            connection: "{{ $alias }}"
+            from: endpoint
+            as: env
+    {{- end }}
+    {{- if hasKey $features "credential" }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
