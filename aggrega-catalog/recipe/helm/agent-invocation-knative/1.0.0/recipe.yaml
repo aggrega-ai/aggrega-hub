@@ -26,11 +26,14 @@ metadata:
     as a reference to the Secret it publishes, never as a value in the rendered
     Service: a credential beside the header the agent publishes, a
     client_secret beside the client id, scopes and token or discovery URL the
-    container obtains an OAuth 2.0 token with, refreshing and presenting it
-    itself, which no build can check. Mutual TLS is not covered. Each Secret is
-    one the namespace already holds, named through helm/k8s-existing-secret: a
-    realization naming its Secret after the tool halts the build, since an
-    artifacts template gives the tool no rendered name.
+    container obtains an OAuth 2.0 or OpenID Connect token with. A
+    client_certificate, for mutual TLS, and a server_ca are each mounted
+    read-only from their Secret, with variables naming the files. The container
+    presents the token and the certificate itself, which no build can check.
+    Each Secret is one the namespace already holds, named through
+    helm/k8s-existing-secret: a realization naming its Secret after the tool
+    halts the build, since an artifacts template gives the tool no rendered
+    name.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -149,15 +152,47 @@ spec:
   # message repeats an address, so a credential written into one reaches no
   # log either.
   #
-  # The credential's own realization, and the client_secret's, is evaluated
+  # The connection's client_certificate slot carries the certificate and key
+  # the container presents in the TLS handshake to an agent whose card requires
+  # mutual TLS, and its server_ca slot the authority the container checks the
+  # agent's server certificate against. Each filled slot becomes a volume of the
+  # whole Secret its attachment publishes by name, and a read-only mount of that
+  # volume, which Knative Serving requires of a Secret volume. The volume lists
+  # no items, so every data key becomes a file named by the key, and Kubernetes
+  # updates the files in place when the Secret changes, as on a renewal, which
+  # it does not do for a subPath mount. The data key the attachment publishes is
+  # not read: the file names are tls.crt and tls.key for the client
+  # certificate, as a kubernetes.io/tls Secret holds them, and ca.crt for the
+  # authority. AGENT_TOOL_TARGET_CLIENT_CERT_FILE and
+  # AGENT_TOOL_TARGET_CLIENT_KEY_FILE name the two client files, and
+  # AGENT_TOOL_TARGET_SERVER_CA_FILE the authority's, each only where its slot
+  # is filled, so a connection holding neither slot renders exactly what it
+  # renders with no such slot at all. The mount directories are fixed because
+  # the tool delegates to one agent. The rendered Service names each Secret and
+  # never its content, so neither the certificate nor its key reaches a
+  # rendered file. Presenting the certificate, checking the agent
+  # with the authority, and reading the files again after a renewal are the
+  # container's; the build cannot see that the Secret exists, holds those keys,
+  # or holds a certificate the agent accepts. Either slot sits beside credential
+  # and client_secret, each delivered under its own variables. The template
+  # halts, naming the connection, on either slot whose attachment publishes no
+  # Secret name, since nothing could be mounted, and on either slot on a
+  # connection whose agent publishes protocol http, since no TLS handshake would
+  # take place to present or check a certificate in.
+  #
+  # The realization of each of the connection's attachments is evaluated
   # against this tool as its host, and a host rendered from an artifacts
   # template carries no .context.rendered_name: a realization naming its Secret
   # after the host — k8s-external-secret and k8s-secret-from-parameter both do —
   # halts the build on that key. k8s-existing-secret publishes the name of a
-  # Secret that already exists, so it is the realization that fills either slot
-  # here.
+  # Secret that already exists, so it is the realization that fills any of the
+  # four slots here.
   artifacts:
     service.yaml: |
+      {{- $clientCertificateVolume := "target-agent-client-certificate" -}}
+      {{- $clientCertificateDir := "/var/run/secrets/agent-tool/target-agent/client-certificate" -}}
+      {{- $serverCaVolume := "target-agent-server-ca" -}}
+      {{- $serverCaDir := "/var/run/secrets/agent-tool/target-agent/server-ca" -}}
       {{- $wired := list -}}
       {{- range $alias, $edge := .context.uses -}}
       {{- if eq $edge.socket "target_agent" -}}
@@ -204,6 +239,17 @@ spec:
       {{- end -}}
       {{- else if or (hasKey $in "client_id") (hasKey $in "audience") -}}
       {{- fail (printf "the target_agent connection %s of %q sets client_id or audience in its infra but holds no client_secret, so the tool's container has nothing to obtain a token with: attach a client_secret on that connection, or remove client_id and audience" $alias $.context.instance_id) -}}
+      {{- end -}}
+      {{- range $slot := list "client_certificate" "server_ca" -}}
+      {{- if hasKey (default dict $edge.features) $slot -}}
+      {{- $locator := optional (optional (default dict $edge.features) $slot dict) "provides" dict -}}
+      {{- if not (optional $locator "name" "") -}}
+      {{- fail (printf "the %s on the target_agent connection %s of %q publishes no Secret name, so no Secret could be mounted into the tool's container: attach a %s publishing one, such as core/referenced-secret" $slot $alias $.context.instance_id $slot) -}}
+      {{- end -}}
+      {{- if eq (optional $p "protocol" "") "http" -}}
+      {{- fail (printf "the target_agent connection %s of %q holds a %s, but the agent it reaches, %q, publishes protocol http, so no TLS handshake would take place to present or check a certificate in: reach that agent over https, or remove the %s" $alias $.context.instance_id $slot $edge.target $slot) -}}
+      {{- end -}}
+      {{- end -}}
       {{- end -}}
       {{- end -}}
       {{- end -}}
@@ -298,6 +344,16 @@ spec:
                         name: "{{ $edge.features.client_secret.provides.name }}"
                         key: "{{ $edge.features.client_secret.provides.key }}"
                   {{- end }}
+                  {{- if hasKey (default dict $edge.features) "client_certificate" }}
+                  - name: AGENT_TOOL_TARGET_CLIENT_CERT_FILE
+                    value: "{{ $clientCertificateDir }}/tls.crt"
+                  - name: AGENT_TOOL_TARGET_CLIENT_KEY_FILE
+                    value: "{{ $clientCertificateDir }}/tls.key"
+                  {{- end }}
+                  {{- if hasKey (default dict $edge.features) "server_ca" }}
+                  - name: AGENT_TOOL_TARGET_SERVER_CA_FILE
+                    value: "{{ $serverCaDir }}/ca.crt"
+                  {{- end }}
                   {{- end }}
                   {{- end }}
                 resources:
@@ -307,3 +363,39 @@ spec:
                   limits:
                     cpu: "{{ .infra.compute.cpu }}"
                     memory: "{{ .infra.compute.memory }}"
+                {{- range $alias, $edge := .context.uses }}
+                {{- if eq $edge.socket "target_agent" }}
+                {{- $f := default dict $edge.features }}
+                {{- if or (hasKey $f "client_certificate") (hasKey $f "server_ca") }}
+                volumeMounts:
+                  {{- if hasKey $f "client_certificate" }}
+                  - name: {{ $clientCertificateVolume }}
+                    mountPath: "{{ $clientCertificateDir }}"
+                    readOnly: true
+                  {{- end }}
+                  {{- if hasKey $f "server_ca" }}
+                  - name: {{ $serverCaVolume }}
+                    mountPath: "{{ $serverCaDir }}"
+                    readOnly: true
+                  {{- end }}
+                {{- end }}
+                {{- end }}
+                {{- end }}
+            {{- range $alias, $edge := .context.uses }}
+            {{- if eq $edge.socket "target_agent" }}
+            {{- $f := default dict $edge.features }}
+            {{- if or (hasKey $f "client_certificate") (hasKey $f "server_ca") }}
+            volumes:
+              {{- if hasKey $f "client_certificate" }}
+              - name: {{ $clientCertificateVolume }}
+                secret:
+                  secretName: "{{ $f.client_certificate.provides.name }}"
+              {{- end }}
+              {{- if hasKey $f "server_ca" }}
+              - name: {{ $serverCaVolume }}
+                secret:
+                  secretName: "{{ $f.server_ca.provides.name }}"
+              {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}

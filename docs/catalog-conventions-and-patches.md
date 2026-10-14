@@ -1874,6 +1874,15 @@ For a runnable end-to-end walkthrough, see the worked example
 and its Recipe
 [`recipe/helm/gcp-credentialed-service/`](../aggrega-catalog/recipe/helm/gcp-credentialed-service/1.0.0/recipe.yaml).
 
+A Recipe that renders its resource from an `artifacts` template rather than a
+Workload writes the Secret volume and its mount itself, and the slot's
+`inject: [file]` still states how the material is delivered. On a Knative
+Service the mount is `readOnly: true`, which Knative Serving requires of a
+Secret volume. A slot on a connection is delivered the same way:
+`helm/agent-invocation-knative` mounts a `target_agent` connection's
+`client_certificate` and `server_ca` (see "A key both ends of a connection
+hold").
+
 ### A credential the target generates
 
 Where a Release supplies no credential, a self-managed datastore's Recipe falls
@@ -2220,8 +2229,9 @@ connection the Release wires, so it is the same word on every socket.
   decides what it means. A Component's assertions are written in the Component
   itself, so each carries its own copy, and the copies differ in that list of
   sockets and in one more respect: `core/ai-tool/agent-invocation`'s copy also
-  counts a `client_secret` on the connection as its credential (below), since
-  the token obtained with it is what the target is presented.
+  counts a `client_secret` or a `client_certificate` on the connection as its
+  credential (below), since the token obtained with the one, and the
+  certificate the other holds, are what the target is presented.
 - **Several consumers share one credential by authoring.** Nothing cascades into
   a connection, so a shared key is one parameter every connection's credential
   reads — under `k8s-existing-secret`, the name of one Secret each connection
@@ -2301,8 +2311,60 @@ publishes `token_url`, `oidc_discovery_url` and `scopes` (see
   name or password, which would write a credential into the rendered output. No
   message repeats the address.
 - **A target requiring two schemes together is reached with both slots filled**,
-  each delivered under its own variables. A target requiring mutual TLS is not
-  reached through either.
+  each delivered under its own variables.
+
+**A certificate the caller presents in the TLS handshake takes
+`client_certificate`.** Where the target's card requires mutual TLS, the caller
+proves who it is by the certificate it presents as the connection is set up,
+not by anything a request carries. A2A's mutual TLS scheme carries only a
+description: the card names no certificate, issuer or authority, so the
+caller's certificate is agreed with the target's party out of band, and the
+target publishes nothing for it. The certificate and its private key are the
+slot `client_certificate`, declared beside `credential` with the same selector
+and `sensitive: true`, and with `inject: [file]`, since the material reaches
+the caller's container as files rather than as a variable's value — a
+realization delivering it through a Workload entry is held to `as: file`. Its
+Secret holds `tls.crt` and `tls.key`, the two keys a `kubernetes.io/tls` Secret
+holds. The authority the caller checks the target's server certificate
+against, where the caller's image does not already trust the one that signs
+it, is a second slot, `server_ca`, whose Secret holds `ca.crt`, declared with
+the same keys: `sensitive: true` because a secret-kind Feature fills it, though
+an authority's certificate is not itself secret.
+
+- **`core/ai-tool/agent-invocation` declares both on its `target_agent`
+  socket**, and `helm/agent-invocation-knative` mounts the whole Secret each
+  filled slot's attachment names — no `items`, no `subPath` — read-only, which
+  Knative Serving requires of a Secret volume, at
+  `/var/run/secrets/agent-tool/target-agent/client-certificate` and
+  `/var/run/secrets/agent-tool/target-agent/server-ca`, and delivers
+  `AGENT_TOOL_TARGET_CLIENT_CERT_FILE`, `AGENT_TOOL_TARGET_CLIENT_KEY_FILE` and
+  `AGENT_TOOL_TARGET_SERVER_CA_FILE` naming the files, each only where its slot
+  is filled, so a connection holding neither renders exactly what it renders
+  with no such slot at all. The data key the attachment publishes is not read,
+  since the whole Secret is mounted, and the rendered Service names only the
+  Secret.
+- **The target's authority is kept apart from the client's issuer.** A
+  certificate issuer that writes `ca.crt` beside a client certificate writes
+  the authority that signed that certificate, which need not be the one that
+  signs the target's server certificate; the target's authority sits in
+  `server_ca`'s own Secret, so the caller never trusts the client's issuer in
+  its place. `server_ca` serves a connection holding any credential, or none.
+- **Presenting the certificate is the caller's software's job.** Presenting it
+  in the handshake, checking the target against the authority, and reading the
+  files again when Kubernetes updates them after the Secret changes belong to
+  the image the caller runs. The build cannot see that the Secret exists, holds
+  those keys, or holds a certificate the target accepts.
+- **The Recipe refuses, naming the connection**, either slot whose attachment
+  publishes no Secret name, since nothing could be mounted, and either slot on
+  a connection whose target publishes `protocol` `http`, since no TLS handshake
+  takes place there.
+- **The slots compose.** A card requiring mutual TLS together with a key or a
+  token is reached with `client_certificate` beside `credential` or
+  `client_secret`, each delivered under its own variables. Between them the
+  three slots meet each kind of security scheme an A2A card can declare: an API
+  key or HTTP authentication through `credential`, OAuth 2.0 or OpenID Connect
+  through `client_secret` where the token is obtained by the client-credentials
+  grant, and mutual TLS through `client_certificate`.
 
 **Three realizations constrain the secret the two ends share.**
 
@@ -2514,8 +2576,10 @@ card requiring OAuth 2.0 client credentials or OpenID Connect, where a caller
 obtains a token: `token_url`, `oidc_discovery_url` and `scopes`, from infra keys
 of the same names, each optional and published empty while unset.
 `core/ai-tool/agent-invocation` holds the credential for such an agent on its
-`target_agent` connection, and the client secret it obtains a token with (see
-"A key both ends of a connection hold").
+`target_agent` connection, the client secret it obtains a token with, and the
+client certificate it presents for a card requiring mutual TLS, which names no
+certificate for the reference to publish (see "A key both ends of a connection
+hold").
 
 The credential slot is filled by a referenced credential — the
 `core/referenced-secret` Feature — rather than a provisioned one, and the
