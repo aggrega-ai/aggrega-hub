@@ -2766,10 +2766,10 @@ strings, and checks none of what follows.
   `$(VAR)` reference in a plain variable: Kubernetes expands such a reference
   from the variables listed before it in the container, and the helm provider
   lists a container's plain variables before the ones it reads from a Secret.
-  No standard-library Component declares a tool socket yet, so none reads the
-  slot;
+  `core/ai-agent/openai-agents-sdk` and `core/ai-agent/claude-agent-sdk`
+  declare the slot on their `tools` socket and read it on both targets;
   [`language-reference/examples/mcp-address-from-secret/`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/examples/mcp-address-from-secret/)
-  declares one on a consumer of its own and renders both targets.
+  declares one on a consumer of its own and renders both targets too.
 - **A bridged server checks no caller's credential.** The bridge reads no
   credential from a request that reaches it, so the bridge realizations publish
   `credential_header` empty, and a consumer's connection to one carries no
