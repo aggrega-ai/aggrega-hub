@@ -30,6 +30,12 @@ metadata:
 
     provides.host is the bare in-cluster Service name, with no namespace; a
     consumer in another namespace qualifies it on its own side.
+
+    An app_definition, when set, is carried in a ConfigMap and imported by a
+    one-shot Job running the server's image: it performs Dify's first-time
+    setup if needed as infra.owner_email, with the owner_password credential
+    read by secretKeyRef, signs in, and imports the application unless one of
+    that name is present. With no definition, neither is rendered.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -48,6 +54,196 @@ spec:
     host: "{{ .context.rendered_name }}-default"
     port: "{{ .infra.port }}"
     protocol: "http"
+  # Importing values.app_definition needs an account to import it as. On a fresh
+  # installation every console call is refused until Dify's first-time setup has
+  # run, and that setup creates the owner account, so the import step performs
+  # it as infra.owner_email with the password attached to owner_password, then
+  # signs in as that account. Neither has a default: both name who owns the
+  # installation. So a definition with either one missing halts here, where the
+  # fix is one line of authored YAML, rather than as a step that fails in the
+  # cluster. With no definition nothing is read and nothing halts.
+  assertions:
+    app_definition_needs_an_owner: >-
+      {{- if optional .values "app_definition" "" -}}
+      {{- if not (optional .infra "owner_email" "") -}}
+      {{- fail (printf "the Dify server %q is given values.app_definition to import but no infra.owner_email: set infra.owner_email in the Release to the email address of the account that owns the installation, or remove app_definition" .metadata.instance_id) -}}
+      {{- end -}}
+      {{- if not (hasKey (default dict .features) "owner_password") -}}
+      {{- fail (printf "the Dify server %q is given values.app_definition to import but nothing fills its owner_password slot: attach a secret credential to owner_password holding the password of the account infra.owner_email names, or remove app_definition" .metadata.instance_id) -}}
+      {{- end -}}
+      {{- end -}}
+  # When values.app_definition is set, a ConfigMap carries the definition
+  # verbatim beside the script that imports it, and a one-shot Job runs that
+  # script once the server answers. With no definition both render empty and
+  # neither is emitted, so the output is what it is without the value.
+  #
+  # The step, in order: it waits for GET /console/api/setup to answer; if setup
+  # has not run, it posts the owner account to /console/api/setup; it signs in
+  # at /console/api/login, which takes the password Base64-encoded; it lists the
+  # applications named like the definition's app.name and stops, leaving it as
+  # it is, when one carries exactly that name; otherwise it posts the definition
+  # to /console/api/apps/imports and, when Dify holds the import for
+  # confirmation, as it does for a DSL version newer than the installation's,
+  # confirms it. Every call after
+  # signing in carries the session cookies the sign-in set, in an explicit
+  # Cookie header and under the names the server gave them, with the CSRF token
+  # repeated in X-CSRF-Token: the server marks those cookies secure when its
+  # external address is https, and a client would then withhold them from the
+  # in-cluster http address. Nothing the step prints repeats the password.
+  #
+  # The Job runs the server's own image, whose Python environment carries the
+  # HTTP and YAML libraries the script uses, so the step adds no image. It has
+  # the form the provider gives a run-to-completion workload — restartPolicy
+  # Never, and no deadline or retry count, so the cluster's defaults apply — and
+  # each attempt stops waiting for the server after about ten minutes. The
+  # definition sits in the ConfigMap rather than in the Job, so editing it leaves
+  # the Job's pod template unchanged. A Job's pod template cannot be changed once
+  # created, so a Release changing anything else the Job's pod carries — the
+  # owner's email, the image tag, the port — deletes the completed Job before
+  # applying.
+  #
+  # The owner password reaches the step by reference: OWNER_PASSWORD is a
+  # secretKeyRef to the Secret name and data key the owner_password credential
+  # publishes, so no file this Recipe renders carries the password, and a
+  # credential publishing neither halts the build.
+  artifacts:
+    dify-app.configmap.yaml: |
+      {{- if .values.app_definition -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-app
+      data:
+        app.yml: |
+      {{ .values.app_definition | indent 4 }}
+        import.py: |
+          import base64
+          import os
+          import sys
+          import time
+
+          import httpx
+          import yaml
+
+          API = os.environ["DIFY_API_URL"].rstrip("/") + "/console/api"
+          EMAIL = os.environ["OWNER_EMAIL"]
+          PASSWORD = os.environ["OWNER_PASSWORD"]
+
+
+          def fail(message):
+              print(message, file=sys.stderr)
+              sys.exit(1)
+
+
+          def read_json(response):
+              try:
+                  return response.json()
+              except ValueError:
+                  return {}
+
+
+          def setup_step(client):
+              deadline = time.monotonic() + 600
+              while time.monotonic() < deadline:
+                  try:
+                      response = client.get(API + "/setup")
+                      if response.status_code == 200:
+                          return read_json(response).get("step")
+                  except httpx.HTTPError:
+                      pass
+                  time.sleep(5)
+              fail("the Dify API server did not answer within ten minutes")
+
+
+          def main():
+              with open("/seed/app.yml", encoding="utf-8") as handle:
+                  definition = handle.read()
+              app = (yaml.safe_load(definition) or {}).get("app") or {}
+              name = app.get("name") or ""
+              if not name:
+                  fail("the definition names no application under app.name")
+              with httpx.Client(timeout=60) as client:
+                  if setup_step(client) != "finished":
+                      owner = {"email": EMAIL, "name": EMAIL.split("@")[0][:30], "password": PASSWORD}
+                      response = client.post(API + "/setup", json=owner)
+                      if response.status_code != 201:
+                          fail(f"first-time setup was refused with HTTP {response.status_code}")
+                      print(f"first-time setup done: owner account {EMAIL}")
+                  encoded = base64.b64encode(PASSWORD.encode("utf-8")).decode("ascii")
+                  response = client.post(API + "/login", json={"email": EMAIL, "password": encoded})
+                  if response.status_code != 200 or read_json(response).get("result") != "success":
+                      fail(f"signing in as {EMAIL} was refused with HTTP {response.status_code}")
+                  session = {cookie.name: cookie.value for cookie in response.cookies.jar}
+                  client.cookies.clear()
+                  csrf = next((value for key, value in session.items() if key.endswith("csrf_token")), "")
+                  headers = {
+                      "Cookie": "; ".join(f"{key}={value}" for key, value in session.items()),
+                      "X-CSRF-Token": csrf,
+                  }
+                  page = 1
+                  while True:
+                      query = {"page": page, "limit": 100, "name": name}
+                      response = client.get(API + "/apps", params=query, headers=headers)
+                      if response.status_code != 200:
+                          fail(f"listing the applications was refused with HTTP {response.status_code}")
+                      listing = read_json(response)
+                      if any(item.get("name") == name for item in listing.get("data", [])):
+                          print(f"an application named {name!r} is already present; leaving it as it is")
+                          return
+                      if not listing.get("has_more"):
+                          break
+                      page += 1
+                  body = {"mode": "yaml-content", "yaml_content": definition}
+                  response = client.post(API + "/apps/imports", json=body, headers=headers)
+                  result = read_json(response)
+                  if result.get("status") == "pending":
+                      response = client.post(API + "/apps/imports/" + result.get("id", "") + "/confirm", headers=headers)
+                      result = read_json(response)
+                  if result.get("status") not in ("completed", "completed-with-warnings"):
+                      reason = result.get("error") or f"HTTP {response.status_code}"
+                      fail(f"importing {name!r} failed: {reason}")
+                  print(f"imported {name!r} as application {result.get('app_id')}")
+
+
+          main()
+      {{- end }}
+    dify-app-import.job.yaml: |
+      {{- if .values.app_definition }}
+      {{- $locator := optional (optional (default dict .features) "owner_password" dict) "provides" dict }}
+      {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) }}
+      {{- fail (printf "the owner_password credential of the Dify server %q publishes no Secret name and data key, so the step importing values.app_definition could not be given a reference to read it from: attach an owner_password credential publishing both, such as core/referenced-secret" .context.instance_id) }}
+      {{- end -}}
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ .context.rendered_name }}-app-import
+      spec:
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: import
+                image: "langgenius/dify-api:{{ .infra.engine_version }}"
+                command: ["python", "/seed/import.py"]
+                env:
+                  - name: DIFY_API_URL
+                    value: "http://{{ .context.rendered_name }}-default:{{ .infra.port }}"
+                  - name: OWNER_EMAIL
+                    value: "{{ .infra.owner_email }}"
+                  - name: OWNER_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: "{{ .features.owner_password.provides.name }}"
+                        key: "{{ .features.owner_password.provides.key }}"
+                volumeMounts:
+                  - name: seed
+                    mountPath: /seed
+                    readOnly: true
+            volumes:
+              - name: seed
+                configMap:
+                  name: {{ .context.rendered_name }}-app
+      {{- end }}
   # The backend identity resolved from the backend uses-edge (host, port,
   # username, database) and the cache, vector-store, sandbox, plugin-runtime
   # and proxy identities resolved from their edges arrive on
