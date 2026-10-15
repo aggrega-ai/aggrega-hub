@@ -83,6 +83,31 @@ spec:
   #   nodeSelector - map[string]string (pod scheduling)
   #   tolerations  - []object (pod scheduling)
   valuesMapping: |
+    {{- /*
+      The connection variables this Recipe reads off the inject pipe, under the
+      socket whose edge delivers them, each beside the provides key the edge's
+      inject block names it from. The pipe is read as a map, and every read of
+      these variables below goes through it, so a variable nothing delivered is
+      told apart from one delivered empty: an edge on one of these sockets
+      leaving any of its variables missing halts the build, naming the edge, the
+      variables and the inject block to write, rather than rendering a
+      connection setting with an empty value. A socket in $required is read
+      whether or not anything is wired to it, so leaving it empty halts too.
+    */ -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $reads := dict "forward_target" (dict "FLUENT_FORWARD_HOST" "host" "FLUENT_FORWARD_PORT" "port") -}}
+    {{- $required := list -}}
+    {{- $gaps := list }}{{ $wired := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ with get $reads $edge.socket -}}
+    {{- $wired = append $wired $edge.socket }}{{ $missing := list }}{{ $shape := list -}}
+    {{- range $var, $from := . }}{{ if not (hasKey $env $var) }}{{ $missing = append $missing $var }}{{ end }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- if $missing }}{{ $gaps = append $gaps (printf "the edge %q on its %s socket delivers no %s, so give that edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $alias $edge.socket (join " or " $missing) (join ", " $shape)) }}{{ end -}}
+    {{- end }}{{ end -}}
+    {{- range $socket := $required }}{{ if not (has $socket $wired) -}}
+    {{- $vars := list }}{{ $shape := list }}{{ range $var, $from := get $reads $socket }}{{ $vars = append $vars $var }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
+    {{- end }}{{ end -}}
+    {{- if $gaps }}{{ fail (printf "core/observability/fluent-bit %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
     ## ── Pin the chart's resource names to the rendered name ────
     ## Names the monitoring Service exactly "<rendered_name>", matching
     ## provides.host. This chart's fullname helper reads the top-level override
@@ -160,20 +185,21 @@ spec:
 
     ## ── Output pipeline ────────────────────────────────────────
     ## The component wired on the `forward_target` socket becomes the forward
-    ## output: its resolved host and port from the enriched topology pipe are the
-    ## output's Host and Port, and the developer's forward_match value selects
-    ## which records are shipped. Only `outputs` is authored here — the chart's
-    ## own service, input and filter sections are what encode the node-collector
-    ## shape and the metadata enrichment, and re-deriving them by hand is exactly
-    ## what this realization exists not to do.
+    ## output: its host and port arrive on the inject pipe under the two
+    ## variables the edge's inject block names, exactly as the workload-synthesis
+    ## realization reads them, and become the output's Host and Port; the
+    ## developer's forward_match value selects which records are shipped. One
+    ## output is written, as the pipe carries one host and one port. With nothing
+    ## wired to the socket no output is written. Only `outputs` is authored here
+    ## — the chart's own service, input and filter sections are what encode the
+    ## node-collector shape and the metadata enrichment, and re-deriving them by
+    ## hand is exactly what this realization exists not to do.
     config:
       outputs: |
-      {{- range $alias, $edge := .context.uses }}
-      {{- if eq $edge.socket "forward_target" }}
+      {{- if has "forward_target" $wired }}
         [OUTPUT]
             Name   forward
             Match  {{ $.values.forward_match }}
-            Host   {{ $edge.provides.host }}
-            Port   {{ $edge.provides.port }}
-      {{- end }}
+            Host   {{ $env.FLUENT_FORWARD_HOST }}
+            Port   {{ $env.FLUENT_FORWARD_PORT }}
       {{- end }}

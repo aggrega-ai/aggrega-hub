@@ -120,6 +120,31 @@ spec:
   #   nodeSelector - map[string]string (pod scheduling, both Deployments)
   #   tolerations  - []object (pod scheduling, both Deployments)
   valuesMapping: |
+    {{- /*
+      The connection variables this Recipe reads off the inject pipe, under the
+      socket whose edge delivers them, each beside the provides key the edge's
+      inject block names it from. The pipe is read as a map, and every read of
+      these variables below goes through it, so a variable nothing delivered is
+      told apart from one delivered empty: an edge on one of these sockets
+      leaving any of its variables missing halts the build, naming the edge, the
+      variables and the inject block to write, rather than rendering a
+      connection setting with an empty value. A socket in $required is read
+      whether or not anything is wired to it, so leaving it empty halts too.
+    */ -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $reads := dict "backend" (dict "DATABASE_HOST" "host" "DATABASE_PORT" "port" "DATABASE_USERNAME" "user" "DATABASE_NAME" "database") "cache" (dict "REDIS_HOST" "host" "REDIS_PORT" "port") -}}
+    {{- $required := list "backend" "cache" -}}
+    {{- $gaps := list }}{{ $wired := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ with get $reads $edge.socket -}}
+    {{- $wired = append $wired $edge.socket }}{{ $missing := list }}{{ $shape := list -}}
+    {{- range $var, $from := . }}{{ if not (hasKey $env $var) }}{{ $missing = append $missing $var }}{{ end }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- if $missing }}{{ $gaps = append $gaps (printf "the edge %q on its %s socket delivers no %s, so give that edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $alias $edge.socket (join " or " $missing) (join ", " $shape)) }}{{ end -}}
+    {{- end }}{{ end -}}
+    {{- range $socket := $required }}{{ if not (has $socket $wired) -}}
+    {{- $vars := list }}{{ $shape := list }}{{ range $var, $from := get $reads $socket }}{{ $vars = append $vars $var }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
+    {{- end }}{{ end -}}
+    {{- if $gaps }}{{ fail (printf "core/observability/langfuse %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
     ## ── The three backing systems wired as edges ───────────────
     ## All three are required sockets, so each is resolved by the time this
     ## template runs. The analytics store is deliberately not among them: it is
@@ -322,7 +347,9 @@ spec:
           value: "{{ .values.media_upload_enabled }}"
 
     ## ── The relational backend ─────────────────────────────────
-    ## Composed from the resolved `backend` edge. The chart's own bundled
+    ## Composed from the `backend` edge's host, port, user and database, which
+    ## arrive on the inject pipe under the variables the workload-synthesis
+    ## realization reads too. The chart's own bundled
     ## database is switched off: the backend is a component the Aggregate
     ## declares and the topology wires, not one this realization brings with it.
     ## The password is the one place the two credential shapes differ: with a
@@ -333,11 +360,11 @@ spec:
     ## does.
     postgresql:
       deploy: false
-      host: "{{ $backend.provides.host }}"
-      port: {{ $backend.provides.port }}
+      host: "{{ $env.DATABASE_HOST }}"
+      port: {{ $env.DATABASE_PORT }}
       auth:
-        username: "{{ $backend.provides.user }}"
-        database: "{{ $backend.provides.database }}"
+        username: "{{ $env.DATABASE_USERNAME }}"
+        database: "{{ $env.DATABASE_NAME }}"
         {{- if hasKey (default dict $backend.features) "credential" }}
         existingSecret: "{{ $backend.features.credential.provides.name }}"
         secretKeys:
@@ -347,7 +374,8 @@ spec:
         {{- end }}
 
     ## ── The ingestion queue ────────────────────────────────────
-    ## Composed from the resolved `cache` edge, with the chart's own bundled
+    ## Composed from the `cache` edge's host and port, which arrive on the inject
+    ## pipe the same way, with the chart's own bundled
     ## cache switched off for the same reason. The username is deliberately
     ## emptied: the chart composes a connection string and puts a username in it
     ## whenever one is set, and presenting credentials to a cache that wants none
@@ -357,8 +385,8 @@ spec:
     ## cache Recipes.
     redis:
       deploy: false
-      host: "{{ $cache.provides.host }}"
-      port: {{ $cache.provides.port }}
+      host: "{{ $env.REDIS_HOST }}"
+      port: {{ $env.REDIS_PORT }}
       auth:
         username: ""
         {{- if hasKey (default dict $cache.features) "credential" }}

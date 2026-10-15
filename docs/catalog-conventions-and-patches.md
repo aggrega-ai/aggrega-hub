@@ -1706,6 +1706,31 @@ value with a named consumer is not an inert declaration, even when the framework
 itself is not the consumer; what makes it inert is nothing reading it, and that is
 the claim a Recipe's comment has to get right.
 
+### A connection variable is read off the inject pipe as a map, and an absent one halts
+
+Many Recipes read a connection's values — a backend's host and port, a sibling's
+endpoint — from variables the edge's `inject:` block delivers, under names the
+Recipe expects and the Aggregate writes on the edge. The render reads a variable
+nothing delivered as an empty string wherever any other variable reached the pipe,
+so a Recipe reading one directly as `.context.inject.env.<NAME>` builds green and
+ships an address with nothing in it when the Aggregate leaves that name out.
+
+So such a Recipe reads the pipe as a map,
+`{{ $env := optional (default dict .context.inject) "env" dict }}`, and before it
+uses any of those variables it halts when one is absent, naming the component
+instance, the edge and its socket, every variable that edge leaves missing, and the
+inject block that delivers them, in the form the Aggregate writes — for example
+`inject: { env: [ { in: KONG_PG_HOST, from: host }, { in: KONG_PG_PORT, from: port } ] }`.
+A socket whose variables the Recipe reads whether or not anything is wired to it
+halts the same way when nothing is. Every read of those variables then goes through
+that map, never through a dotted path: a template that also reads a name as
+`.context.inject.env.<NAME>` finds it present and empty, and the check passes over
+the very gap it exists to catch. Reading the map is also what tells a variable
+delivered empty apart from one never delivered; whether an empty value is usable is
+the Recipe's own judgement about its product. The `helm/nginx` and `helm/kong`
+Recipes are worked examples. This is a catalog convention: the compiler pipes what
+the edge delivers and knows nothing of which names a Recipe expects.
+
 ### Managed-service credentials
 
 For Recipes targeting cloud-managed services (AWS RDS, Azure Database, GCP

@@ -61,7 +61,8 @@ spec:
   # range carries client traffic only where the pod uses the node's own network.
   #
   # When the state_store uses-edge is bound, the resolved host and port compose
-  # the server's store address so several replicas coordinate through it;
+  # the server's store address so several replicas coordinate through it, and a
+  # bound edge leaving either missing from the inject pipe halts the build;
   # unbound, no store address is emitted.
   #
   # The token-signing secret arrives from the api_secret credential slot as an
@@ -74,6 +75,31 @@ spec:
   # route to would hand clients an unreachable candidate — reaching clients
   # outside the cluster is the ingress tier's concern.
   workload: |
+    {{- /*
+      The connection variables this Recipe reads off the inject pipe, under the
+      socket whose edge delivers them, each beside the provides key the edge's
+      inject block names it from. The pipe is read as a map, and every read of
+      these variables below goes through it, so a variable nothing delivered is
+      told apart from one delivered empty: an edge on one of these sockets
+      leaving any of its variables missing halts the build, naming the edge, the
+      variables and the inject block to write, rather than rendering a
+      connection setting with an empty value. A socket in $required is read
+      whether or not anything is wired to it, so leaving it empty halts too.
+    */ -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $reads := dict "state_store" (dict "LIVEKIT_STATE_STORE_HOST" "host" "LIVEKIT_STATE_STORE_PORT" "port") -}}
+    {{- $required := list -}}
+    {{- $gaps := list }}{{ $wired := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ with get $reads $edge.socket -}}
+    {{- $wired = append $wired $edge.socket }}{{ $missing := list }}{{ $shape := list -}}
+    {{- range $var, $from := . }}{{ if not (hasKey $env $var) }}{{ $missing = append $missing $var }}{{ end }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- if $missing }}{{ $gaps = append $gaps (printf "the edge %q on its %s socket delivers no %s, so give that edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $alias $edge.socket (join " or " $missing) (join ", " $shape)) }}{{ end -}}
+    {{- end }}{{ end -}}
+    {{- range $socket := $required }}{{ if not (has $socket $wired) -}}
+    {{- $vars := list }}{{ $shape := list }}{{ range $var, $from := get $reads $socket }}{{ $vars = append $vars $var }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
+    {{- end }}{{ end -}}
+    {{- if $gaps }}{{ fail (printf "core/messaging/livekit-server %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     {{- /* The media path: a contiguous UDP range when both bounds carry a
@@ -126,9 +152,9 @@ spec:
               udp_port: {{ .infra.rtc_udp_port }}
     {{- end }}
               use_external_ip: false
-    {{- if hasKey (default dict .context.inject.env) "LIVEKIT_STATE_STORE_HOST" }}
+    {{- if has "state_store" $wired }}
             redis:
-              address: "{{ .context.inject.env.LIVEKIT_STATE_STORE_HOST }}:{{ .context.inject.env.LIVEKIT_STATE_STORE_PORT }}"
+              address: "{{ $env.LIVEKIT_STATE_STORE_HOST }}:{{ $env.LIVEKIT_STATE_STORE_PORT }}"
     {{- end }}
         attachments:
           LIVEKIT_API_SECRET:
