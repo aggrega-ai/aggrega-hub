@@ -2429,6 +2429,17 @@ an authority's certificate is not itself secret.
   client-credentials grant; and mutual TLS through `client_certificate`. A key
   in the query string, an HTTP scheme whose value answers a challenge, such as
   Digest, and any other OAuth 2.0 grant are not reached.
+- **A credential is not sent to an external target over plain HTTP.** A
+  `credential` or `client_secret` on a connection to a target labelled
+  `component.aggrega.ai/hosting: external` that publishes `protocol` `http`
+  halts the build, naming the connection, since the credential, or the token
+  obtained with the secret, would travel to that target unencrypted. A target
+  with another hosting label, or none, stays reachable over `http` with either,
+  and one running inside the Release, such as `core/ai-agent/mastra`, then
+  receives the credential unencrypted on the cluster network. The rule sits in
+  `helm/agent-invocation-knative`'s template rather than in a Component
+  assertion, because the protocol is a value the target publishes, which no
+  assertion sees.
 
 **Three realizations constrain the secret the two ends share.**
 
