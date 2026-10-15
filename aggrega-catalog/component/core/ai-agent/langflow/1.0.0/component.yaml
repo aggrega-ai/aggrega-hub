@@ -22,6 +22,17 @@ metadata:
     no image for it: which Langflow build to run is named by the Release, and
     until that Release sets `infra.image` the build halts naming the container
     image and renders nothing.
+
+    Each vector store wired into the optional `vector_store` socket, such as
+    core/datastore/qdrant, reaches the platform under variables named for the
+    connection's alias: its address as AGGREGA_VECTOR_STORE_<ALIAS>_URL, and
+    the connection's credential, by reference, as
+    AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL. A flow reads each through a
+    field that names a global variable of the same name, which Langflow
+    resolves from the environment where no stored variable carries that name.
+    There is no tool socket: Langflow's MCP Tools component takes a server's
+    address only from the servers stored in its settings or the flow itself,
+    never from a variable.
   labels:
     component.aggrega.ai/type: server
     component.aggrega.ai/category: ai-agent
@@ -62,6 +73,50 @@ spec:
           sensitive: true
           inject: [env]
           description: "Optional credential the platform presents to the model this connection reaches. When attached, the Recipe delivers it to the platform as OPENAI_API_KEY (a Kubernetes secretKeyRef on helm, the inject pipe on compose); unattached, the platform runs without an injected key."
+    # A vector-store socket, in the catalog's idiom: the selector admits a
+    # store whose engine label says it indexes vectors, or keeps a semantic
+    # memory, rather than one product. Optional, and it takes one connection
+    # per store the Aggregate wires. A Langflow field that accepts a global
+    # variable, such as the Qdrant component's URL and API key, resolves a
+    # variable name no stored variable carries from the environment variable
+    # of that name, a fallback Langflow keeps on unless its own setting turns
+    # it off. So the Recipe delivers each connection under variables named for
+    # its alias, upper-cased with every hyphen an underscore: a store wired
+    # under the alias kb arrives as AGGREGA_VECTOR_STORE_KB_URL. Two aliases
+    # that differ only in letter case, or in a hyphen against an underscore,
+    # would deliver one variable twice, and the component's assertion halts
+    # the build naming both. The
+    # address is the endpoint the store publishes where it publishes one, and
+    # is otherwise composed from the protocol, host and port it publishes,
+    # since a store such as core/datastore/qdrant publishes its address in
+    # those parts alone.
+    #
+    # The component declares no tool socket. Langflow's MCP Tools component
+    # takes a server by its name among the MCP servers stored in Langflow's
+    # settings, or from the server configuration written into the flow, and
+    # uses the address found there as written; its headers resolve only
+    # against stored global variables. A wired tool's address delivered to
+    # the environment could therefore reach no flow.
+    vector_store:
+      selector: "datastore.aggrega.ai/engine in (vector, semantic-memory)"
+      # A statement about this connection's target, authored on the
+      # connection: the store it reaches takes no credential. It changes
+      # nothing this component renders.
+      valueSchema:
+        unauthenticated:
+          type: boolean
+          default: false
+          description: Declares that the vector store this connection reaches takes no credential, so a connection carrying none is intended rather than an omission. It changes nothing this component renders.
+      # The store's key is held on the connection it is presented on, so each
+      # connection names its own fill. Optional and transparent (inject: [env]),
+      # so a synthesized Workload references it as an environment secret on
+      # helm, and a compose Recipe reads it from the inject pipe.
+      featuresSchema:
+        credential:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [env]
+          description: Optional credential the platform presents to the vector store this connection reaches, such as the API key the store checks. When attached, the Recipe delivers it as AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL (a Kubernetes secretKeyRef on helm, the inject pipe on compose); unattached, no credential is delivered for the store.
   featuresSchema:
     admin_password:
       selector: "feature.aggrega.ai/kind=secret"
@@ -103,9 +158,15 @@ spec:
   # before a Recipe binds, so it holds whichever Recipe renders this component;
   # a self-hosted target draws nothing. The list names every socket of this
   # component that declares unauthenticated.
+  #
+  # The Recipes deliver a vector_store connection under its alias upper-cased
+  # with every character other than a letter or a digit an underscore, so two
+  # aliases that differ only in letter case, or in a hyphen against an
+  # underscore, would deliver one variable twice. The build halts here on
+  # them, naming both connections, whichever Recipe binds.
   assertions:
     managed_target_needs_a_credential: >-
-      {{- range $socket := list "model" -}}
+      {{- range $socket := list "model" "vector_store" -}}
       {{- range $alias, $connection := (optional $.uses $socket dict) -}}
       {{- $managed := eq (optional $connection.labels "component.aggrega.ai/hosting" "") "managed" -}}
       {{- $optedOut := optional $connection.values "unauthenticated" false -}}
@@ -113,4 +174,13 @@ spec:
       {{- fail (printf "the %s connection %s of %q reaches %q, whose component.aggrega.ai/hosting label is managed, with no credential: attach one under credential on that connection, or set unauthenticated: true in its values" $socket $alias $.metadata.instance_id $connection.target) -}}
       {{- end -}}
       {{- end -}}
+      {{- end -}}
+    connection_aliases_deliver_apart: >-
+      {{- $seen := dict -}}
+      {{- range $alias, $connection := (optional $.uses "vector_store" dict) -}}
+      {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" -}}
+      {{- if hasKey $seen $name -}}
+      {{- fail (printf "the vector_store connections %s and %s of %q would both be delivered as AGGREGA_VECTOR_STORE_%s_URL, because a connection's variables are named for its alias upper-cased with every character other than a letter or a digit an underscore: rename one of the two" (index $seen $name) $alias $.metadata.instance_id $name) -}}
+      {{- end -}}
+      {{- $_ := set $seen $name $alias -}}
       {{- end -}}

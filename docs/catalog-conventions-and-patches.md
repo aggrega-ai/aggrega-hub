@@ -2771,7 +2771,8 @@ strings, and checks none of what follows.
   from the variables listed before it in the container, and the helm provider
   lists a container's plain variables before the ones it reads from a Secret.
   `core/ai-agent/openai-agents-sdk`, `core/ai-agent/claude-agent-sdk`,
-  `core/ai-agent/google-adk` and `core/ai-agent/mastra` declare the slot on their
+  `core/ai-agent/google-adk` and `core/ai-agent/mastra`, and the platforms
+  `core/ai-agent/flowise` and `core/ai-agent/n8n`, declare the slot on their
   `tools` socket and read it on both targets;
   [`language-reference/examples/mcp-address-from-secret/`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/examples/mcp-address-from-secret/)
   declares one on a consumer of its own and renders both targets too.
@@ -2797,6 +2798,32 @@ strings, and checks none of what follows.
   `credential_header` beside it, for the consumer to present the one under the
   other. A socket reaching servers that read their key from their address
   declares the `endpoint` slot beside it, as above.
+- **A tool connection reaches the consumer under variables named for its
+  alias**, the alias in capitals with every character other than a letter or
+  a digit an underscore. The agent runtimes named above and the platforms
+  `core/ai-agent/flowise` and `core/ai-agent/n8n` deliver the address as
+  `AGGREGA_TOOL_<ALIAS>_URL`, the `endpoint` slot's secret in its place where
+  the connection holds one, the `credential` as
+  `AGGREGA_TOOL_<ALIAS>_CREDENTIAL` and the `credential_header` the tool
+  publishes as `AGGREGA_TOOL_<ALIAS>_CREDENTIAL_HEADER`, each secret by
+  reference on helm and from the inject pipe on compose. Those two platforms
+  and `core/ai-agent/langflow` also declare `vector_store`, selecting
+  `datastore.aggrega.ai/engine in (vector, semantic-memory)`, delivered the
+  same way: the store's address as `AGGREGA_VECTOR_STORE_<ALIAS>_URL` — the
+  `endpoint` it publishes, or `<protocol>://<host>:<port>` composed from what
+  it publishes where it publishes no `endpoint` — and the connection's
+  `credential` as `AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL`. Two aliases of
+  one socket that fold to one name would deliver one variable twice, and each
+  of the three platforms carries an assertion, `connection_aliases_deliver_apart`,
+  that halts the build on them, naming both connections. A flow reads each
+  in the platform's own way: on `langflow` through a field naming a global
+  variable of the same name, which Langflow reads from the environment where
+  no stored variable carries that name; on `flowise` through a Runtime
+  variable of the same name created on Flowise's Variables page; on `n8n`
+  through `$env`, which its Recipes leave blocked unless the Aggregate sets
+  `allow_env_access_in_nodes`. `langflow` declares no `tools` socket, because
+  its MCP Tools component takes a server's address only from Langflow's own
+  settings or the flow.
 
 ### Gateway / operator-driven (custom-resource-emitting) Recipes
 

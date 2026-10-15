@@ -23,6 +23,16 @@ metadata:
     on the node takes precedence, and the model is chosen in the node, not in
     the environment.
 
+    Each tool wired into the `tools` socket and each vector store wired into
+    the `vector_store` socket reach the platform under variables named for the
+    connection's alias, upper-cased with hyphens as underscores: the address
+    as AGGREGA_TOOL_<ALIAS>_URL or AGGREGA_VECTOR_STORE_<ALIAS>_URL, and the
+    connection's credential as AGGREGA_TOOL_<ALIAS>_CREDENTIAL, with the header
+    the tool publishes as AGGREGA_TOOL_<ALIAS>_CREDENTIAL_HEADER, or as
+    AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL, through a secretKeyRef. A chatflow
+    reads each through a Runtime variable of the same name created on
+    Flowise's Variables page.
+
     Chatflows are authored or imported through the editor or its REST API:
     Flowise has no startup flow-load path, so this Recipe seeds none. The
     environment-variable contract is authored against Flowise 3.1.3.
@@ -59,8 +69,44 @@ spec:
   # Chatflows are authored or imported through the Flowise editor or its REST
   # API; Flowise has no startup flow-load path, so seeding is not declarative on
   # this platform.
+  #
+  # Each `tools` and `vector_store` connection's variables are named for its
+  # alias, upper-cased, with every character other than a letter or a digit an
+  # underscore; the alias grammar admits only a hyphen and an underscore
+  # besides, so a hyphen becomes an underscore. A chatflow reads none of them
+  # until a Runtime variable of the same name exists on Flowise's Variables
+  # page: Flowise resolves a Runtime variable from the environment variable of
+  # its name, and a chatflow reads it as $vars.<name>.
+  #
+  # AGGREGA_TOOL_<ALIAS>_URL is the endpoint the tool publishes, unless the
+  # connection carries an endpoint secret: then it is that secret, referenced
+  # by connection and slot, and the published address is not delivered. The
+  # credential is delivered only where the connection carries one, and the
+  # header beside it only where the tool publishes one; a tool behind a bridge
+  # publishes none, because the bridge checks no caller's credential.
+  #
+  # AGGREGA_VECTOR_STORE_<ALIAS>_URL is the endpoint the store publishes, or,
+  # for a store publishing none, the address composed from the protocol, host
+  # and port it publishes. Its credential is delivered only where the
+  # connection carries one.
+  #
+  # Every secret on every connection sits under one attachments key, so the
+  # block is opened once, and only where one connection carries a secret.
   workload: |
     {{- $dataPath := "/app/flowise-data" -}}
+    {{- $secrets := false -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if and (eq $edge.socket "model") (hasKey $features "credential") -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- if and (eq $edge.socket "tools") (or (hasKey $features "credential") (hasKey $features "endpoint")) -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- if and (eq $edge.socket "vector_store") (hasKey $features "credential") -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     form: stateless
@@ -88,17 +134,63 @@ spec:
           OPENAI_BASE_URL: "{{ $edge.provides.endpoint }}"
     {{- end }}
     {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "tools" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- $features := default dict $edge.features }}
+    {{- if not (hasKey $features "endpoint") }}
+          AGGREGA_TOOL_{{ $name }}_URL: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- if and (hasKey $features "credential") (optional $edge.provides "credential_header" "") }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL_HEADER: "{{ $edge.provides.credential_header }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "vector_store" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- $url := optional $edge.provides "endpoint" "" }}
+    {{- if not $url }}
+    {{- $url = printf "%v://%v:%v" $edge.provides.protocol $edge.provides.host $edge.provides.port }}
+    {{- end }}
+          AGGREGA_VECTOR_STORE_{{ $name }}_URL: "{{ $url }}"
+    {{- end }}
+    {{- end }}
         # Fallback for the no-credential authoring state: the client library
         # reads this only when the node's Connect Credential is left empty. A
         # chatflow node with its own credential attached uses that instead — so
         # this delivery is not how the key is supplied.
-    {{- range $alias, $edge := .context.uses }}
-    {{- if and (eq $edge.socket "model") (hasKey (default dict $edge.features) "credential") }}
+    {{- if $secrets }}
         attachments:
+    {{- range $alias, $edge := .context.uses }}
+    {{- $features := default dict $edge.features }}
+    {{- if and (eq $edge.socket "model") (hasKey $features "credential") }}
           OPENAI_API_KEY:
             connection: "{{ $alias }}"
             from: credential
             as: env
+    {{- end }}
+    {{- if eq $edge.socket "tools" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- if hasKey $features "endpoint" }}
+          AGGREGA_TOOL_{{ $name }}_URL:
+            connection: "{{ $alias }}"
+            from: endpoint
+            as: env
+    {{- end }}
+    {{- if hasKey $features "credential" }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- end }}
+    {{- if and (eq $edge.socket "vector_store") (hasKey $features "credential") }}
+          AGGREGA_VECTOR_STORE_{{ regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}_CREDENTIAL:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
     {{- end }}
     {{- end }}
         ports:
