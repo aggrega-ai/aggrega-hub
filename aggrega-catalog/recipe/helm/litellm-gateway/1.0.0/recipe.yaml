@@ -11,10 +11,8 @@ metadata:
     An AI gateway on Kubernetes via the helm provider's Workload synthesis,
     running the official upstream proxy image directly (no external Helm chart).
     Renders a Deployment, a ClusterIP Service and a ConfigMap carrying the
-    routing table — each alias of values.models and of a models connection,
-    and its upstream — so the rendered artifact shows which models the gateway
-    serves. Every credential reaches the gateway as an env secretKeyRef, so no
-    credential value appears in its own resources.
+    routing table. Every credential reaches the gateway as an env
+    secretKeyRef, so no credential value appears in its own resources.
     It is proven at LiteLLM v1.103.1 and halts on any other engine_version.
 
     On every Release a second ConfigMap carries a request guard, which
@@ -28,14 +26,17 @@ metadata:
 
     A core/context-propagation attachment, a core/data-masking one listing
     what to mask, or values.log_masking listing it, adds the module each
-    relies on; a masking attachment's refusals are a policy the request guard
-    applies. A core/prompt-injection-shield attachment sends every map entry
+    relies on. A core/prompt-injection-shield attachment sends every map entry
     to the guard on the guard socket.
     PROXY_BASE_URL and the Presidio and cache store addresses appear only when
-    infra.external_base_url and their sockets are set; the build halts on an
-    address carrying a path, on one recognizer socket wired alone, on a store
-    publishing no vector_search, and on two models aliases naming one
-    variable.
+    infra.external_base_url and their sockets are set.
+
+    With `values.metrics_enabled` true the gateway serves its Prometheus
+    metrics on its loopback address, and the path allowlist forwards a GET of
+    /metrics alone there from port 9090, on the ClusterIP Service, published
+    as provides.metrics_endpoint; false leaves that key empty. The port checks
+    no caller, and the metrics name the hashed keys, key aliases and user
+    emails the gateway attributes spend to.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -128,6 +129,16 @@ spec:
     # collides with the port callers reach and adds no rule on infra.port.
     gateway_address: 127.0.0.1
     gateway_port: '{{ if eq (int .infra.port) 65535 }}65534{{ else }}{{ add1 (int .infra.port) }}{{ end }}'
+    # The gateway's metrics, while values.metrics_enabled is true. The gateway
+    # serves them on a listener of its own bound to its own address, the
+    # loopback one, on gateway_metrics_port, which its listen arguments read;
+    # the path allowlist serves them on metrics_port, on every interface,
+    # forwarding a GET of /metrics alone to that listener, and its container
+    # port, the Service and the published metrics address read it. The bundle
+    # holds both ports as well, checks these locals against them, and stops the
+    # build when infra.port or gateway_port is one of them.
+    metrics_port: "9090"
+    gateway_metrics_port: "9091"
     # The reverse proxy's configuration: the file the bundle carries it as and
     # the file the reverse proxy is pointed at both read this name, which the
     # bundle holds as well and checks this local against.
@@ -292,12 +303,19 @@ spec:
   #
   # model is the alias a component wired to the gateway sends as its model
   # name, held once in the published_model local above.
+  #
+  # metrics_endpoint is the address the path allowlist serves the gateway's
+  # own metrics at while values.metrics_enabled is true: /metrics on the
+  # metrics_port local above, of the same ClusterIP Service, which carries that
+  # port only then. It is empty while the value is false, when the gateway runs
+  # no metrics listener.
   provides:
     host: "{{ .context.rendered_name }}-default"
     port: "{{ .infra.port }}"
     endpoint: "http://{{ .context.rendered_name }}-default:{{ .infra.port }}/v1"
     model: "{{ .locals.published_model }}"
     protocol: "http"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-default:{{ .locals.metrics_port }}/metrics{{ end }}"
   # The gateway takes its public address as an origin — scheme, host and port —
   # and joins its own routes onto it, so an address carrying a path would give
   # it links that point somewhere it is not served. Halt on one here, where the
@@ -606,6 +624,12 @@ spec:
     # names the module by the full path of its file there. The proxy loads a
     # module named by a full path from that path, and one named without a
     # directory, as the other hooks below are, from beside the configuration.
+    #
+    # While values.metrics_enabled is true the body also registers the
+    # gateway's Prometheus callback, last, after the guard and the hooks above,
+    # so the guard still runs first and the log-masking failure callback still
+    # precedes it; it records the metrics the gateway's own metrics listener
+    # serves.
     litellm-gateway-config.configmap.yaml: |
       {{- $identity := false }}
       {{- $listed := list }}
@@ -688,6 +712,9 @@ spec:
       {{- end }}
       {{- if $identity }}
               - {{ .locals.caller_identity_module }}.hook
+      {{- end }}
+      {{- if .values.metrics_enabled }}
+              - prometheus
       {{- end }}
       {{- if $logMasking }}
             redact_messages_in_exceptions: true
@@ -2244,6 +2271,15 @@ spec:
     # it records a request, so the guard would serve some alias names and refuse
     # others. The allowlist's configuration is the other file of that second
     # ConfigMap.
+    #
+    # While values.metrics_enabled is true the allowlist also listens on
+    # metrics_port and forwards a GET of /metrics alone to the gateway's own
+    # metrics listener on gateway_metrics_port of the loopback address,
+    # answering every other request on that port 403, the metrics listener's
+    # health route included. Neither port asks a caller for a key, and the
+    # metrics name the hashed keys, key aliases and user emails the gateway
+    # attributes spend to, so whatever reaches the Service's metrics port reads
+    # them.
     request-guard:
       $import: LiteLLMGuard#/artifacts/RequestGuard
   # The workload: the gateway's Deployment, with the path allowlist as its
@@ -2311,7 +2347,10 @@ spec:
         # rather than inherited, each dereferencing its single authored home.
         # The proxy listens on the pod's loopback address only: callers reach it
         # through the path allowlist below, which listens on infra.port, and
-        # nothing outside the pod can reach the proxy past it.
+        # nothing outside the pod can reach the proxy past it. While
+        # values.metrics_enabled is true the proxy also starts its own metrics
+        # listener on gateway_metrics_port, which binds to the same loopback
+        # address, so the allowlist's metrics port is the one way to it.
         args:
           - "--config"
           - "{{ $configDir }}/{{ .locals.config_file }}"
@@ -2319,6 +2358,10 @@ spec:
           - "{{ .locals.gateway_address }}"
           - "--port"
           - "{{ .locals.gateway_port }}"
+    {{- if .values.metrics_enabled }}
+          - "--prometheus_metrics_port"
+          - "{{ .locals.gateway_metrics_port }}"
+    {{- end }}
         # With infra.external_base_url set, PROXY_BASE_URL carries it: the
         # origin the gateway composes its sign-in callback, its admin-console
         # redirect and the address in its alerts from. Unset, it is not emitted
@@ -2475,6 +2518,9 @@ spec:
       # resources are sized for its one worker process relaying requests over
       # the loopback address, and set as both request and limit, as the proxy's
       # are, so the pod keeps the same resource class it has with the proxy alone.
+      # While values.metrics_enabled is true it also listens on metrics_port,
+      # declared here and on the Service; http still sorts first, so the
+      # readiness probe stays on it.
       path-allowlist:
         image: "nginx:{{ .locals.path_allowlist_image_tag }}"
         command:
@@ -2485,6 +2531,9 @@ spec:
           - "daemon off;"
         ports:
           http: {{ .infra.port }}
+    {{- if .values.metrics_enabled }}
+          metrics: {{ .locals.metrics_port }}
+    {{- end }}
         health:
           ready:
             http: /health/readiness
@@ -2514,3 +2563,6 @@ spec:
         type: ClusterIP
         ports:
           http: {{ .infra.port }}
+    {{- if .values.metrics_enabled }}
+          metrics: {{ .locals.metrics_port }}
+    {{- end }}

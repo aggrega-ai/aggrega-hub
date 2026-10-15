@@ -11,31 +11,32 @@ metadata:
     LiteLLM as a self-hosted, OpenAI-compatible model proxy for local
     development via Docker Compose, synthesized from the Workload kind by the
     compose provider. A compose config carries the proxy's configuration,
-    which publishes the alias in values.model, and no other name, pointed at
+    which publishes the alias in values.model and points it at
     values.upstream_model. The configuration contract is authored against
     LiteLLM v1.103.1.
 
     Compose has no env-from-secret primitive, so an attached credential is
-    rendered as a plain environment variable: the administrative key under the
-    variable the proxy reads at startup, the bookkeeping database's connection
-    string as DATABASE_URL, and the upstream credential under the variable
-    named in values.provider_key_variable. Each variable is also the key the
-    attached credential must publish under, and a credential written as a
+    rendered as a plain environment variable, and a credential written as a
     Compose variable reference lands as that reference rather than its value.
 
     On every Release two further configs carry a request guard, which forwards
     only the request fields the proxy declares for the route, plus any the
     Release admits in infra.admitted_request_fields, and refuses the rest
-    naming the field, so a caller cannot send a request-body model list, an
-    upstream header, an unrecognised field or a provider key of its own; and a
-    path allowlist, a service of its own running the official nginx image
-    (BSD-2-Clause) in the proxy's network namespace on infra.port, which
-    answers 403 to every path but the model routes, the model listing, the
-    health routes and key management. Both come from the LiteLLMGuard bundle.
+    naming the field; and a path allowlist, a service of its own running the
+    official nginx image (BSD-2-Clause) in the proxy's network namespace on
+    infra.port, which answers 403 to every path but the model routes, the
+    model listing, the health routes and key management. Both come from the
+    LiteLLMGuard bundle.
 
-    With no database_url attached the proxy runs stateless. PROXY_BASE_URL is
-    emitted only when infra.external_base_url is set, the build halting on one
-    carrying a path.
+    PROXY_BASE_URL is emitted only when infra.external_base_url is set, the
+    build halting on one carrying a path.
+
+    With `values.metrics_enabled` true the proxy serves its Prometheus metrics
+    on its loopback address, and the path allowlist forwards a GET of /metrics
+    alone there from port 9090, which every peer on the compose network
+    reaches, published as provides.metrics_endpoint; false leaves that key
+    empty. The port checks no caller, and the metrics name the hashed keys,
+    key aliases and user emails the proxy attributes spend to.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -77,6 +78,17 @@ spec:
     # infra.port.
     gateway_address: 127.0.0.1
     gateway_port: '{{ if eq (int .infra.port) 65535 }}65534{{ else }}{{ add1 (int .infra.port) }}{{ end }}'
+    # The proxy's metrics, while values.metrics_enabled is true. The proxy
+    # serves them on a listener of its own bound to its own address, the
+    # loopback one, on gateway_metrics_port, which its listen arguments read;
+    # the path allowlist serves them on metrics_port, on every interface of the
+    # shared network namespace, forwarding a GET of /metrics alone to that
+    # listener, and its container port, the service entry and the published
+    # metrics address read it. The bundle holds both ports as well, checks
+    # these locals against them, and stops the build when infra.port or
+    # gateway_port is one of them.
+    metrics_port: "9090"
+    gateway_metrics_port: "9091"
     # The file the reverse proxy's configuration is mounted as and the file the
     # reverse proxy is pointed at both read this name. A compose config carries
     # no file name of its own, so the name is this Recipe's alone here.
@@ -121,12 +133,19 @@ spec:
   # endpoint spell it out twice on purpose: a provides entry cannot read another
   # provides entry, so there is no home either could dereference instead — the
   # repetition is forced, not a choice, and the two must be edited together.
+  #
+  # metrics_endpoint is the address the path allowlist serves the proxy's own
+  # metrics at while values.metrics_enabled is true: /metrics on the
+  # metrics_port local above, of the service name, which every peer on the
+  # compose network reaches. It is empty while the value is false, when the
+  # proxy runs no metrics listener and the allowlist does not listen there.
   provides:
     host: "{{ .context.instance_id }}"
     port: "{{ .infra.port }}"
     endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}/v1"
     model: "{{ .values.model }}"
     protocol: "http"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.instance_id }}:{{ .locals.metrics_port }}/metrics{{ end }}"
   # The proxy takes its public address as an origin — scheme, host and port —
   # and joins its own routes onto it, so an address carrying a path would give
   # it links that point somewhere it is not served. Halt on one here, where the
@@ -164,6 +183,10 @@ spec:
     # request_guard_dir, so the registration names the module by the full path of
     # its file there, and the proxy loads a module named by a full path from that
     # path.
+    #
+    # While values.metrics_enabled is true the body also registers the proxy's
+    # Prometheus callback, after the guard, which records the metrics the
+    # proxy's own metrics listener serves.
     litellm-config.compose-fragment.yaml: |
       configs:
         {{ .locals.config_name }}:
@@ -178,6 +201,9 @@ spec:
             litellm_settings:
               callbacks:
                 - {{ .locals.request_guard_dir }}/{{ .locals.request_filter_module }}.filter
+      {{- if .values.metrics_enabled }}
+                - prometheus
+      {{- end }}
     # The request guard and the path allowlist, from the bundle every Recipe
     # running this proxy imports, so the line they draw — which request fields a
     # caller may send and which paths it may reach — has one text wherever the
@@ -225,6 +251,14 @@ spec:
     # on them the proxy reads words in the path, the alias included, to decide
     # how it records a request, so the guard would serve some alias names and
     # refuse others.
+    #
+    # While values.metrics_enabled is true the allowlist also listens on
+    # metrics_port and forwards a GET of /metrics alone to the proxy's own
+    # metrics listener on gateway_metrics_port of the loopback address,
+    # answering every other request on that port 403, the metrics listener's
+    # health route included. Neither port asks a caller for a key, and the
+    # metrics name the hashed keys, key aliases and user emails the proxy
+    # attributes spend to, so every peer on the compose network can read them.
     request-guard:
       $import: LiteLLMGuard#/artifacts/RequestGuard
   # The workload, a synthesized-mode Workload: image, command line,
@@ -277,7 +311,10 @@ spec:
         # single authored home. The proxy listens on the loopback address only:
         # callers reach it through the path allowlist below, which listens on
         # infra.port, and nothing outside the shared network namespace can reach
-        # the proxy past it.
+        # the proxy past it. While values.metrics_enabled is true the proxy also
+        # starts its own metrics listener on gateway_metrics_port, which binds to
+        # the same loopback address, so the allowlist's metrics port is the one
+        # way to it.
         args:
           - "--config"
           - "{{ $configDir }}/{{ .locals.config_file }}"
@@ -285,6 +322,10 @@ spec:
           - "{{ .locals.gateway_address }}"
           - "--port"
           - "{{ .locals.gateway_port }}"
+    {{- if .values.metrics_enabled }}
+          - "--prometheus_metrics_port"
+          - "{{ .locals.gateway_metrics_port }}"
+    {{- end }}
         # $apiKeyVar, $providerKeyVar and $databaseUrlVar are each bound
         # once, so the variable a value is rendered under and the inject-pipe
         # entry it is read from cannot drift apart; $apiKeyVar is
@@ -356,7 +397,10 @@ spec:
       # through it, with the curl the image carries and the product's own Compose
       # file's timing, so it reports healthy only once the proxy and the
       # allowlist both answer. The resources are sized for its one worker
-      # process relaying requests over the loopback address.
+      # process relaying requests over the loopback address. While
+      # values.metrics_enabled is true it also listens on metrics_port, declared
+      # here and on the service entry, which every peer on the compose network
+      # reaches.
       path-allowlist:
         image: "nginx:{{ .locals.path_allowlist_image_tag }}"
         command:
@@ -367,6 +411,9 @@ spec:
           - "daemon off;"
         ports:
           http: {{ .infra.port }}
+    {{- if .values.metrics_enabled }}
+          metrics: {{ .locals.metrics_port }}
+    {{- end }}
         health:
           ready:
             http: /health/readiness
@@ -403,3 +450,6 @@ spec:
         type: ClusterIP
         ports:
           http: {{ .infra.port }}
+    {{- if .values.metrics_enabled }}
+          metrics: {{ .locals.metrics_port }}
+    {{- end }}

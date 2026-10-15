@@ -18,19 +18,18 @@ metadata:
     infra.admitted_request_fields, and refuses every other field with an error
     naming it; the fields that would re-target or re-key a call are refused even
     where the proxy declares them, and a Release admitting one stops the build.
-    It refuses as well a request naming user_api_key, the hash of the key the
-    proxy verified, in metadata the proxy keeps apart from its own, as on the
-    responses and messages routes; elsewhere the proxy overwrites the
-    caller's, and it removes its other identity fields wherever a caller
-    writes them. An nginx configuration on infra.port forwards only the routes
-    the module checks, the model listing, the health routes, key management
-    and, where the importing Recipe turns them on, the organization routes,
-    and answers every other path 403.
+    An nginx configuration on infra.port forwards only the routes the module
+    checks, the model listing, the health routes, key management and, where
+    the importing Recipe turns them on, the organization routes, and answers
+    every other path 403. With the Component's values.metrics_enabled true it
+    also listens on port 9090, forwarding a GET of /metrics alone to the
+    proxy's own metrics listener on its loopback address, port 9091, with no
+    caller check.
 
     The importing Recipe picks the delivery with the local
     request_guard_delivery — config_map, one ConfigMap for a Kubernetes target,
     or compose_configs, two compose configs — and declares as locals the names,
-    the address and the port it shares with the bundle, which stops the build
+    the address and the ports it shares with the bundle, which stops the build
     when one is missing or differs. A Feature's realization can make the module
     refuse more by writing a policy into the proxy's callback settings; a
     policy only tightens. The bundle is authored against LiteLLM v1.103.1.
@@ -78,6 +77,22 @@ spec:
     # them on, the routes that create, read, update and delete an organization;
     # every other path is answered 403 with nothing forwarded.
     #
+    # The proxy's metrics. With the importing Component's values.metrics_enabled
+    # true, the importing Recipe starts the proxy with its Prometheus callback
+    # and its own metrics listener, which binds to the proxy's address, the
+    # loopback one, on gateway_metrics_port (9091) and checks no key. The nginx
+    # configuration then carries a second server, on metrics_port (9090) on
+    # every interface, that forwards a GET of /metrics, matched exactly as the
+    # caller sent it, to that listener as /metrics/, the path it answers
+    # without redirecting; every other request, the listener's health route
+    # included, is answered 403 with nothing forwarded. So the proxy stays on
+    # the loopback address and the allowlist stays the one way in. A caller
+    # reaching the metrics port is asked for no key, and the metrics name the
+    # hashed keys, key aliases and user emails the proxy attributes spend to.
+    # The bundle stops the build, naming infra.port, when infra.port or the
+    # gateway port after it is one of the two metrics ports, since no two
+    # listeners share a port. With the value false nothing of this is written.
+    #
     # The module reads each route's field list, and the identity fields, from
     # the proxy when it loads, so a list that cannot be read stops the proxy
     # from starting. The bundle is authored against LiteLLM v1.103.1.
@@ -101,8 +116,12 @@ spec:
     # they share with this bundle, and the bundle stops the build, naming the
     # local, when one is missing or differs from its own. Every importing
     # Recipe declares request_filter_module (request_field_filter),
-    # gateway_address (127.0.0.1) and gateway_port (the port after infra.port,
-    # or the one before it when infra.port is 65535). With config_map it also
+    # gateway_address (127.0.0.1), gateway_port (the port after infra.port,
+    # or the one before it when infra.port is 65535), metrics_port (9090), the
+    # port its published metrics address, the allowlist's container port and
+    # its Service read, and gateway_metrics_port (9091), the port its proxy's
+    # metrics listener is started on; it declares the two metrics ports
+    # whatever values.metrics_enabled says. With config_map it also
     # declares path_allowlist_file (path-allowlist.conf), the file the
     # ConfigMap carries the reverse proxy's configuration as, and
     # request_guard_config_map_name (the instance name followed by
@@ -119,10 +138,11 @@ spec:
     # importing Component declares infra.port, and
     # infra.admitted_request_fields where a Release may admit further fields.
     #
-    # The template reads the importing Recipe's context: .infra.port and
-    # .infra.admitted_request_fields from the Component, .context.instance_id,
-    # and the locals listed above. It checks every local before
-    # it writes anything, because a local the importing Recipe does not declare
+    # The template reads the importing Recipe's context: .infra.port,
+    # .infra.admitted_request_fields and .values.metrics_enabled from the
+    # Component, .context.instance_id, and the locals listed above. It checks
+    # every local before it writes anything, because a local the importing
+    # Recipe does not declare
     # reads as empty here rather than stopping the build, and a module name, a
     # file name, a config name or a port that differs on the two sides would
     # leave a proxy that loads no guard, a reverse proxy with no configuration,
@@ -168,6 +188,11 @@ spec:
         {{- $address := "127.0.0.1" }}
         {{- $port := add1 (int .infra.port) }}
         {{- if eq (int .infra.port) 65535 }}{{ $port = 65534 }}{{ end }}
+        {{- /* The two ports of the proxy's metrics, used while the importing Component's values.metrics_enabled is
+          true: the one the path allowlist serves them on, on every interface, and the one the proxy serves them on, on
+          its loopback address, where the allowlist forwards a scrape. */}}
+        {{- $metricsPort := "9090" }}
+        {{- $gatewayMetricsPort := "9091" }}
         {{- $configMapName := printf "%s-request-guard" .context.instance_id }}
         {{- $moduleConfigName := printf "%s-request-guard-module" .context.instance_id }}
         {{- $allowlistConfigName := printf "%s-request-guard-allowlist" .context.instance_id }}
@@ -210,6 +235,30 @@ spec:
         {{- fail (printf "the Recipe importing %s does not declare the local gateway_port, which is the port its gateway listens on and the path allowlist forwards to, the one after infra.port or the one before it when infra.port is 65535; declare it as %q" $bundle (toString $port)) }}
         {{- else if ne $have (toString $port) }}
         {{- fail (printf "the Recipe importing %s declares the local gateway_port as %q, but that local is the port its gateway listens on and the path allowlist forwards to, the one after infra.port or the one before it when infra.port is 65535, and this bundle's side of it is %q; declare it as %q" $bundle $have (toString $port) (toString $port)) }}
+        {{- end }}
+        {{- /* The two metrics ports. The importing Recipe's provides, container ports and Service read the first, and its
+          gateway's listen arguments the second, so both are declared whatever values.metrics_enabled says. */}}
+        {{- $have = optional .locals "metrics_port" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local metrics_port, which is the port its path allowlist serves the gateway's metrics on while values.metrics_enabled is true, the port its published metrics address names; declare it as %q" $bundle $metricsPort) }}
+        {{- else if ne $have $metricsPort }}
+        {{- fail (printf "the Recipe importing %s declares the local metrics_port as %q, but that local is the port its path allowlist serves the gateway's metrics on while values.metrics_enabled is true, the port its published metrics address names, and this bundle's side of it is %q; declare it as %q" $bundle $have $metricsPort $metricsPort) }}
+        {{- end }}
+        {{- $have = optional .locals "gateway_metrics_port" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local gateway_metrics_port, which is the port its gateway serves its metrics on, on its loopback address, while values.metrics_enabled is true, and the path allowlist forwards a scrape to; declare it as %q" $bundle $gatewayMetricsPort) }}
+        {{- else if ne $have $gatewayMetricsPort }}
+        {{- fail (printf "the Recipe importing %s declares the local gateway_metrics_port as %q, but that local is the port its gateway serves its metrics on, on its loopback address, while values.metrics_enabled is true, and the path allowlist forwards a scrape to, and this bundle's side of it is %q; declare it as %q" $bundle $have $gatewayMetricsPort $gatewayMetricsPort) }}
+        {{- end }}
+        {{- /* While values.metrics_enabled is true the two metrics ports are listeners beside infra.port and the gateway's
+          port after it, and no two listeners share a port: so a Release whose infra.port, or the port after it, is
+          one of them stops the build here, naming infra.port. */}}
+        {{- $metrics := optional .values "metrics_enabled" false }}
+        {{- if $metrics }}
+        {{- $metricsPorts := list $metricsPort $gatewayMetricsPort }}
+        {{- if or (has (toString (int .infra.port)) $metricsPorts) (has (toString $port) $metricsPorts) }}
+        {{- fail (printf "%q sets infra.port to %s and values.metrics_enabled to true, but the gateway's metrics are served on ports %s and %s, and infra.port or the port the gateway listens on beside it, %s, would be one of them, while no two listeners can share a port; set infra.port to another port" .context.instance_id (toString (int .infra.port)) $metricsPort $gatewayMetricsPort (toString $port)) }}
+        {{- end }}
         {{- end }}
         {{- /* The names the importing Recipe's workload mounts what this bundle emits by: the ConfigMap's, or the two
           compose configs'. */}}
@@ -891,6 +940,15 @@ spec:
                     # The health routes the pod's readiness probe and its operators read.
                     "~^(GET|OPTIONS) /health/(readiness|liveliness)(\?|{{ $dollar }})" 1;
                 }
+            {{- if $metrics }}
+                # The one request the metrics listener below forwards: a GET of
+                # /metrics, with or without a query, matched exactly as the
+                # caller sent it, as the routes above are.
+                map "{{ $dollar }}request_method {{ $dollar }}request_uri" {{ $dollar }}metrics_route {
+                    default 0;
+                    "~^GET /metrics(\?|{{ $dollar }})" 1;
+                }
+            {{- end }}
                 server {
                     listen {{ .infra.port }};
                     # What is forwarded passes as it arrived: header names carrying an
@@ -918,4 +976,28 @@ spec:
                         proxy_send_timeout 6000s;
                     }
                 }
+            {{- if $metrics }}
+                # The gateway's metrics. The gateway serves them on a listener of
+                # its own on its loopback address, which checks no caller. This
+                # server listens on the metrics port on every interface and
+                # forwards a GET of /metrics to that listener, as /metrics/, the
+                # path it answers without redirecting, and nothing else: every
+                # other request, its health route included, is answered 403 with
+                # nothing forwarded. No key is asked of a caller here, and the
+                # metrics name the hashed keys, key aliases and user emails the
+                # gateway attributes its spend to.
+                server {
+                    listen {{ $metricsPort }};
+                    default_type application/json;
+                    location / {
+                        if ({{ $dollar }}metrics_route = 0) {
+                            return 403 '{"error": {"message": "This port serves the metrics of the gateway behind it, to a GET of /metrics, and refuses every other request without forwarding it.", "type": "invalid_request_error", "param": null, "code": "path_not_served"} }';
+                        }
+                        rewrite ^ /metrics/ break;
+                        proxy_pass http://{{ $address }}:{{ $gatewayMetricsPort }};
+                        proxy_http_version 1.1;
+                        proxy_redirect off;
+                    }
+                }
+            {{- end }}
             }
