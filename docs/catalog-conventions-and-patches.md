@@ -2421,10 +2421,12 @@ an authority's certificate is not itself secret.
 - **The slots compose.** A card requiring mutual TLS together with a key or a
   token is reached with `client_certificate` beside `credential` or
   `client_secret`, each delivered under its own variables. Between them the
-  three slots meet each kind of security scheme an A2A card can declare: an API
-  key or HTTP authentication through `credential`, OAuth 2.0 or OpenID Connect
-  through `client_secret` where the token is obtained by the client-credentials
-  grant, and mutual TLS through `client_certificate`.
+  three slots reach an API key in a header or a cookie, and an HTTP scheme whose
+  value is fixed, such as Bearer or Basic, through `credential`; OAuth 2.0 or
+  OpenID Connect through `client_secret` where the token is obtained by the
+  client-credentials grant; and mutual TLS through `client_certificate`. A key
+  in the query string, an HTTP scheme whose value answers a challenge, such as
+  Digest, and any other OAuth 2.0 grant are not reached.
 
 **Three realizations constrain the secret the two ends share.**
 
