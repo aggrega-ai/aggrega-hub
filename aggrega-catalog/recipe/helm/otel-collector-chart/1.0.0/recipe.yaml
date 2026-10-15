@@ -24,6 +24,12 @@ metadata:
     changed address rolls it. The image tag follows infra.engine_version and the
     chart version is pinned; the chart repository must be reachable at build
     time.
+
+    With `values.metrics_enabled` true the collector serves its own telemetry
+    metrics at port 8888 on every interface, which checks no caller, the chart
+    puts that port on the Service, and provides.metrics_endpoint publishes the
+    address; false, that key is empty. The build then halts on a Service type
+    other than ClusterIP.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -50,6 +56,13 @@ spec:
   # listeners' own ports, so the published address and the listener cannot drift
   # apart. The Service name is spelled out in each entry on purpose: a provides
   # entry cannot read another.
+  #
+  # metrics_endpoint is the address the collector serves its own telemetry
+  # metrics at while values.metrics_enabled is true: /metrics on the
+  # metrics_port local below, which the configuration bundle binds on every
+  # interface then and the value mapping puts on the same Service. It is empty
+  # while the value is false, when that listener stays on the collector's
+  # loopback address and no Service carries it.
   provides:
     host: "{{ .context.rendered_name }}"
     port: "{{ .infra.otlp_grpc_port }}"
@@ -57,6 +70,20 @@ spec:
     endpoint: "http://{{ .context.rendered_name }}:{{ .infra.otlp_grpc_port }}"
     otlp_http_port: "{{ .infra.otlp_http_port }}"
     otlp_http_endpoint: "http://{{ .context.rendered_name }}:{{ .infra.otlp_http_port }}"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}:{{ .locals.metrics_port }}/metrics{{ end }}"
+
+  # The chart has one Service, and every port it enables joins it, so while
+  # values.metrics_enabled is true the metrics port sits beside the OTLP ports
+  # on a Service whose type infra.overrides.service_type may change. The
+  # metrics are kept on a ClusterIP Service, reachable inside the cluster
+  # alone, so the build halts here when that value is true and the override
+  # names another type: the chart offers the metrics port no Service of its
+  # own. With the value false, or no override, or ClusterIP, nothing halts.
+  assertions:
+    metrics_service_stays_in_cluster: >-
+      {{- if and (optional .values "metrics_enabled" false) .infra.overrides .infra.overrides.service_type (ne (toString .infra.overrides.service_type) "ClusterIP") -}}
+      {{- fail (printf "values.metrics_enabled is true on %q, which puts the collector's own metrics port, 8888, on its Service, but infra.overrides.service_type sets that Service to %q, which would make the metrics reachable from outside the cluster, while this realization keeps them on a ClusterIP Service; leave service_type unset or set it to ClusterIP, or set values.metrics_enabled to false" .context.instance_id (toString .infra.overrides.service_type)) -}}
+      {{- end -}}
 
   # The entries below are the values the value mapping shares with the
   # OtelCollectorConfig bundle imported for the collector's configuration. Each
@@ -67,11 +94,14 @@ spec:
   # rendered name followed by collector_config_map_suffix; a locals entry cannot
   # read the rendered name, so the value mapping composes the two.
   # health_port is the port the bundle binds the collector's health check
-  # on and the port both probes below ask.
+  # on and the port both probes below ask. metrics_port is the port the bundle
+  # serves the collector's own telemetry metrics on, which the value mapping
+  # puts on the Service and provides.metrics_endpoint names.
   locals:
     collector_config_delivery: config_map
     collector_config_map_suffix: "-collector-config"
     health_port: "13133"
+    metrics_port: "8888"
 
   # The collector's configuration, from the OtelCollectorConfig bundle every
   # Recipe of this Component imports, so the configuration has one text on
@@ -94,6 +124,14 @@ spec:
   # ClusterIP Service carrying the two OTLP ports, and the ServiceAccount the pod
   # runs under. It renders no ConfigMap of its own: the configuration is the one
   # the artifact above emits.
+  #
+  # While values.metrics_enabled is true the value mapping also enables the
+  # chart's own metrics port, set to metrics_port, on the container and on that
+  # Service, where the configuration then serves the collector's own telemetry
+  # metrics on every interface, the metrics and nothing else; and the pod's
+  # digest below covers that value too, which adds the listener to the
+  # configuration. While it is false neither is rendered and the digest is the
+  # one described below.
   valuesMapping: |
     ## ── Pin the chart's resource names to the rendered name ────
     ## Names the Deployment, the Service and the ServiceAccount exactly
@@ -152,7 +190,7 @@ spec:
       existingName: "{{ .context.rendered_name }}{{ .locals.collector_config_map_suffix }}"
     enableConfigChecksumAnnotation: false
     podAnnotations:
-      checksum/collector-config: "{{ if $wired }}{{ sha256sum (toJson (list .infra $wired)) }}{{ else }}{{ sha256sum (toJson .infra) }}{{ end }}"
+      checksum/collector-config: "{{ if .values.metrics_enabled }}{{ sha256sum (toJson (list .infra $wired .values.metrics_enabled)) }}{{ else if $wired }}{{ sha256sum (toJson (list .infra $wired)) }}{{ else }}{{ sha256sum (toJson .infra) }}{{ end }}"
 
     ## ── Ports ──────────────────────────────────────────────────
     ## The Service publishes every port enabled here, whatever the
@@ -168,6 +206,12 @@ spec:
         enabled: true
         containerPort: {{ .infra.otlp_http_port }}
         servicePort: {{ .infra.otlp_http_port }}
+      {{- if .values.metrics_enabled }}
+      metrics:
+        enabled: true
+        containerPort: {{ .locals.metrics_port }}
+        servicePort: {{ .locals.metrics_port }}
+      {{- end }}
       jaeger-compact:
         enabled: false
       jaeger-thrift:

@@ -24,6 +24,11 @@ metadata:
     so the recipe is independent of where it is deployed. A consumer in another
     namespace qualifies the host with the target namespace on its own side
     (caller-side routing).
+
+    With `values.metrics_enabled` true the config has Jaeger serve its own
+    metrics at port 8888 on every interface, which checks no caller and joins
+    the ClusterIP Service, and provides.metrics_endpoint publishes the address;
+    false, that key is empty.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -36,10 +41,17 @@ spec:
   # provider names the synthesized ClusterIP Service "<rendered_name>-<service-key>"
   # (here "<rendered_name>-default"), with no namespace segment. provides.port is
   # the OTLP gRPC receiver port trace producers push to; protocol is "grpc".
+  #
+  # metrics_endpoint is the address Jaeger serves its own metrics at while
+  # values.metrics_enabled is true: /metrics on the metrics_port local below,
+  # of the same ClusterIP Service, which carries that port only then. It is
+  # empty while the value is false, when that listener stays on Jaeger's
+  # loopback address.
   provides:
     host: "{{ .context.rendered_name }}-default"
     port: "{{ .infra.otlp_grpc_port }}"
     protocol: "grpc"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-default:{{ .locals.metrics_port }}/metrics{{ end }}"
   # The Jaeger v2 config is delivered as a file: this ConfigMap carries the
   # full config under config.yaml and is mounted into the container at
   # /etc/jaeger by the configmap volume below. The ConfigMap name matches the
@@ -53,8 +65,21 @@ spec:
   # health_port is the single authored home for that port: the configuration
   # below binds it and the workload declares it as the container port the
   # probes reach, and the two are separate templates.
+  #
+  # Jaeger serves its own metrics at /metrics on port 8888 of its loopback
+  # address unless the configuration says otherwise. With values.metrics_enabled
+  # true the configuration carries a service.telemetry block with one pull
+  # reader: the same Prometheus exporter on the same port, with the same three
+  # settings that keep the default's metric names, bound on every address
+  # instead. A reader written in the configuration replaces the default one
+  # whole, which is why the three settings are written out. That listener
+  # serves /metrics and nothing else, and checks no caller. metrics_port is the
+  # single authored home for its port, which the configuration binds, the
+  # workload declares on the container and the Service, and provides publishes.
+  # With the value false nothing of it is rendered.
   locals:
     health_port: "13133"
+    metrics_port: "8888"
   artifacts:
     jaeger-config.yaml: |
       apiVersion: v1
@@ -70,6 +95,19 @@ spec:
                 receivers: [otlp]
                 processors: [batch]
                 exporters: [jaeger_storage_exporter]
+      {{- if .values.metrics_enabled }}
+            telemetry:
+              metrics:
+                readers:
+                  - pull:
+                      exporter:
+                        prometheus:
+                          host: "0.0.0.0"
+                          port: {{ .locals.metrics_port }}
+                          without_scope_info: true
+                          without_units: true
+                          without_type_suffix: true
+      {{- end }}
           extensions:
             healthcheckv2:
               use_v2: true
@@ -124,6 +162,9 @@ spec:
           otlp-grpc: {{ .infra.otlp_grpc_port }}
           otlp-http: {{ .infra.otlp_http_port }}
           query: {{ .infra.query_port }}
+    {{- if .values.metrics_enabled }}
+          metrics: {{ .locals.metrics_port }}
+    {{- end }}
         # The health-check extension reports the collector's status at /status.
         # Both probes ask it, with the timings Jaeger's own chart gives them.
         health:
@@ -165,6 +206,9 @@ spec:
           otlp-grpc: {{ .infra.otlp_grpc_port }}
           otlp-http: {{ .infra.otlp_http_port }}
           query: {{ .infra.query_port }}
+    {{- if .values.metrics_enabled }}
+          metrics: {{ .locals.metrics_port }}
+    {{- end }}
       headless:
         type: Headless
         ports:

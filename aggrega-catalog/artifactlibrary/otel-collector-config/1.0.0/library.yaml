@@ -21,13 +21,15 @@ metadata:
     protocol its observability.aggrega.ai label names: otlp_grpc to its host and
     port, or otlp_http to its otlp_http_endpoint. A signal with nothing wired
     ends in the debug exporter at basic verbosity. It stops the build when two
-    listeners share a port, or when a backend publishes no address.
+    listeners share a port, or when a backend publishes no address. With the
+    Component's values.metrics_enabled true it also has the collector serve its
+    own telemetry metrics on every interface, port 8888.
 
     The importing Recipe picks the delivery with the local
     collector_config_delivery — config_map, one ConfigMap holding the
     configuration under the key relay, for a Kubernetes target, or
     compose_configs, one compose config — and declares as locals the names and
-    the port it shares with the bundle, which stops the build when one is
+    the ports it shares with the bundle, which stops the build when one is
     missing or differs. The bundle is authored against the collector's contrib
     distribution at 0.162.0.
 spec:
@@ -96,6 +98,18 @@ spec:
     # stops the build when infra.otlp_grpc_port and infra.otlp_http_port are
     # equal, or when either is 13133, naming the setting to change.
     #
+    # The collector's own telemetry metrics. With no service.telemetry block the
+    # collector serves them at /metrics on port 8888 of its loopback address
+    # alone. With the importing Component's values.metrics_enabled true the
+    # configuration carries that block, with one pull reader: the same
+    # Prometheus exporter on the same port, with the same three settings that
+    # keep the default's metric names, bound on every address instead, so a
+    # Prometheus elsewhere reaches it. That listener serves /metrics and nothing
+    # else, and checks no caller. A reader written in the configuration replaces
+    # the default one whole, which is why the three settings are written out.
+    # The port is then a fourth listener, so the bundle also stops the build when
+    # either OTLP port is 8888. With the value false nothing of this is written.
+    #
     # How the configuration reaches the workload. The importing Recipe chooses
     # through the local collector_config_delivery. With config_map the bundle
     # emits one ConfigMap carrying the configuration under the key relay, which
@@ -119,20 +133,22 @@ spec:
     # declares health_port (13133), the port its probes ask. With
     # compose_configs it declares collector_config_name instead, the config's
     # name (the instance name followed by -collector-config); the file it is
-    # mounted as is the Recipe's own.
+    # mounted as is the Recipe's own. With either it declares metrics_port
+    # (8888), the port of the telemetry listener above, which its published
+    # metrics address and, on Kubernetes, its Service read.
     #
-    # The template reads the importing Recipe's context: .infra.otlp_grpc_port
-    # and .infra.otlp_http_port from the Component, .context.instance_id,
-    # .context.rendered_name with config_map, the locals listed above, and, for
-    # each connection on the three signal sockets, its alias, its socket, its
-    # target's labels and component, and what the target publishes. It checks
-    # every local before it writes anything, because a local the importing
-    # Recipe does not declare reads as empty here rather than stopping the
-    # build, and a name or a port that differs on the two sides would leave a
-    # collector with no configuration, or probes asking a port nothing answers
-    # on. Since the configuration changes with what a connection publishes, an
-    # importing Recipe's digest of it covers those connections as well as its
-    # infra.
+    # The template reads the importing Recipe's context: .infra.otlp_grpc_port,
+    # .infra.otlp_http_port and .values.metrics_enabled from the Component,
+    # .context.instance_id, .context.rendered_name with config_map, the locals
+    # listed above, and, for each connection on the three signal sockets, its
+    # alias, its socket, its target's labels and component, and what the target
+    # publishes. It checks every local before it writes anything, because a
+    # local the importing Recipe does not declare reads as empty here rather
+    # than stopping the build, and a name or a port that differs on the two
+    # sides would leave a collector with no configuration, or probes asking a
+    # port nothing answers on. Since the configuration changes with what a
+    # connection publishes, an importing Recipe's digest of it covers those
+    # connections as well as its infra, and the value while it is true.
     CollectorConfig:
       collector-config.yaml: |
         {{- /* The values this bundle shares with the Recipe importing it. Each has its home here, and the importing
@@ -143,6 +159,7 @@ spec:
         {{- $mapSuffix := "-collector-config" }}
         {{- $configName := printf "%s-collector-config" .context.instance_id }}
         {{- $healthPort := "13133" }}
+        {{- $metricsPort := "8888" }}
         {{- $have := "" }}
         {{- /* How the configuration reaches the importing Recipe's workload, which that Recipe chooses because its
           workload mounts it: "config_map", one ConfigMap carrying it under the key relay, for a Kubernetes target; or
@@ -155,6 +172,14 @@ spec:
         {{- fail (printf "the Recipe importing %s declares the local collector_config_delivery as %q, but it takes \"config_map\" or \"compose_configs\": whether this bundle delivers the collector's configuration as a ConfigMap, for a Kubernetes target, or as a compose config, for the compose target; declare it as one of the two" $bundle $have) }}
         {{- end }}
         {{- $compose := eq $have "compose_configs" }}
+        {{- /* The port the collector serves its own telemetry metrics on, which the importing Recipe publishes in its
+          metrics address and, on Kubernetes, puts on its Service; shared with either delivery. */}}
+        {{- $have = optional .locals "metrics_port" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local metrics_port, which is the port its published metrics address names and this bundle binds the collector's own telemetry metrics on; declare it as %q" $bundle $metricsPort) }}
+        {{- else if ne $have $metricsPort }}
+        {{- fail (printf "the Recipe importing %s declares the local metrics_port as %q, but that local is the port its published metrics address names and this bundle binds the collector's own telemetry metrics on, and this bundle's side of it is %q; declare it as %q" $bundle $have $metricsPort $metricsPort) }}
+        {{- end }}
         {{- /* The names the importing Recipe's workload mounts what this bundle emits by: the compose config's, or the
           ConfigMap's. The ConfigMap is named after the name the Recipe's provider gives the component, which a local
           cannot read, so the Recipe declares the part after it and composes the two where it names the ConfigMap. The
@@ -194,6 +219,16 @@ spec:
         {{- range $setting := list "otlp_grpc_port" "otlp_http_port" }}
         {{- if eq (toString (index $.infra $setting)) $healthPort }}
         {{- fail (printf "%q sets infra.%s to %s, the port the collector's health check listens on, but the collector cannot bind two listeners on one port; set infra.%s to another port" $.context.instance_id $setting $healthPort $setting) }}
+        {{- end }}
+        {{- end }}
+        {{- /* The collector's own telemetry metrics, served on every address while values.metrics_enabled is true, which
+          makes their port a fourth listener. */}}
+        {{- $metrics := optional .values "metrics_enabled" false }}
+        {{- if $metrics }}
+        {{- range $setting := list "otlp_grpc_port" "otlp_http_port" }}
+        {{- if eq (toString (index $.infra $setting)) $metricsPort }}
+        {{- fail (printf "%q sets infra.%s to %s and values.metrics_enabled to true, but %s is the port the collector serves its own metrics on, and the collector cannot bind two listeners on one port; set infra.%s to another port" $.context.instance_id $setting $metricsPort $metricsPort $setting) }}
+        {{- end }}
         {{- end }}
         {{- end }}
         {{- /* The backends wired to the three signal sockets, each connection read in the order a template ranges
@@ -302,3 +337,16 @@ spec:
                   receivers: [otlp]
                   processors: [memory_limiter, batch]
                   exporters: [{{ join ", " (get $routes "logs") }}]
+        {{- if $metrics }}
+              telemetry:
+                metrics:
+                  readers:
+                    - pull:
+                        exporter:
+                          prometheus:
+                            host: "0.0.0.0"
+                            port: {{ $metricsPort }}
+                            without_scope_info: true
+                            without_units: true
+                            without_type_suffix: true
+        {{- end }}
