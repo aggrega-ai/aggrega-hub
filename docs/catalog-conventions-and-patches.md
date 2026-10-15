@@ -2817,7 +2817,15 @@ strings, and checks none of what follows.
   same way: the store's address as `AGGREGA_VECTOR_STORE_<ALIAS>_URL` — the
   `endpoint` it publishes, or `<protocol>://<host>:<port>` composed from what
   it publishes where it publishes no `endpoint` — and the connection's
-  `credential` as `AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL`. Two aliases of
+  `credential` as `AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL`. A store that
+  also publishes a `database` and a `user`, as `core/datastore/pgvector`
+  does, reaches `flowise` and `n8n` in parts as well, as
+  `AGGREGA_VECTOR_STORE_<ALIAS>_HOST`, `_PORT`, `_DATABASE` and `_USER`,
+  because neither platform's PostgreSQL vector node takes a connection
+  string: Flowise's takes the host, the port and the database in fields of
+  its own and the user and the password from a credential Flowise stores,
+  and n8n's reads a Postgres credential with a field for each. A store
+  publishing no `database` or no `user` gets no parts. Two aliases of
   one socket that fold to one name would deliver one variable twice — on
   Kubernetes one of them may be a plain variable and the other read from a
   Secret, which the rendered Workload holds in two different maps — so the
@@ -3176,7 +3184,11 @@ copying whichever sibling happens to be nearest.
 - **`provides`** — `host` and `port` are required; `user`, `database` and
   `protocol` are declared **only where the engine has the concept**. Redis, Valkey
   and Memcached have no user or database — do not invent them to make the family
-  look uniform.
+  look uniform. A member whose consumers take one address also publishes
+  `endpoint`, joined from those parts and carrying no credential:
+  `core/datastore/pgvector` publishes
+  `postgresql://<user>@<host>:<port>/<database>`, its password staying the
+  credential attached to the component.
 - **`featuresSchema`** — an optional transparent `password` slot carrying an inline
   development default when nothing is attached, so an unattached slot stays
   byte-identical to its pre-slot output; plus an optional `app_user_password` where
