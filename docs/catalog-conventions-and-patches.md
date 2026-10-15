@@ -425,12 +425,13 @@ does not overlap it.
 | --- | --- |
 | `openai` | The OpenAI model API answers at the published endpoint — OpenAI's own, or a server's implementation of it — so a consumer speaks to it as it would to OpenAI. |
 | `anthropic` | Anthropic's Messages API answers at the published endpoint — Anthropic's own, or a server's implementation of it — so a consumer speaks to it as it would to Anthropic. |
-| `native` | The product's own model API answers there, and it is neither the OpenAI API nor Anthropic's Messages API, so a consumer speaks that product's API, through its client or its request shape. |
+| `gemini` | Google's Gemini API answers at the published endpoint, so a consumer speaks to it through Google's Gen AI client or that API's request shape. |
+| `native` | The product's own model API answers there, and it is none of the APIs the values above name, so a consumer speaks that product's API, through its client or its request shape. |
 
 Three rules bind it:
 
 - **A model socket selects the key unless it needs one API.** The catalog's model
-  sockets that take any model API — every agent's `model` but the four named below,
+  sockets that take any model API — every agent's `model` but the five named below,
   `core/ai-tool/model-invocation`'s `target_model`, and `core/datastore/cognee`'s
   `extraction_model` and `embedding_model` — select
   `component.aggrega.ai/category in (ai-model, gateway), model.aggrega.ai/api`.
@@ -444,11 +445,11 @@ Three rules bind it:
   that needs one particular API names its value
   (`core/ai-agent/openai-agents-sdk`'s `model` selects `model.aggrega.ai/api=openai`
   and `core/ai-agent/claude-agent-sdk`'s selects `model.aggrega.ai/api=anthropic`,
-  each SDK speaking that API alone, and `core/ai-agent/mastra`'s selects
-  `model.aggrega.ai/api=openai`, the API whose variables its Recipes deliver;
-  `core/ai-agent/google-adk`'s selects `model.aggrega.ai/api=native` and its
-  Recipes refuse every wired model but `core/ai-model/gemini`, since no value
-  names the Gemini API alone) — or, where a model it cannot
+  each SDK speaking that API alone; `core/ai-agent/mastra`'s and
+  `core/ai-agent/agent-framework`'s select `model.aggrega.ai/api=openai`, the API
+  whose variables their Recipes deliver; and `core/ai-agent/google-adk`'s selects
+  `model.aggrega.ai/api=gemini`, the API whose key its Recipes deliver) — or,
+  where a model it cannot
   use has somewhere else to go, admits the whole category and refuses the value
   in an assertion that says where. `core/gateway/litellm`'s `models` socket
   selects `component.aggrega.ai/category=ai-model`, and its Component's
@@ -498,7 +499,8 @@ Components today: `core/gateway/litellm`, `core/gateway/kong`,
 `openai-embedding`, `nvidia-api` and `openai-compatible` — the broker, whose
 whole contract is to be pointed at a service speaking that API, and which stays
 the handle for an endpoint the catalog does not model.
-`core/ai-model/anthropic` carries `anthropic`. Every other `core/ai-model/*`
+`core/ai-model/anthropic` carries `anthropic`, and `core/ai-model/gemini`
+carries `gemini`. Every other `core/ai-model/*`
 Component carries `native`. Each label's comment says, in its
 product's terms, what answers at its endpoint. The compiler matches the string
 and checks nothing about what answers at the address, so a component carrying a
@@ -2771,7 +2773,8 @@ strings, and checks none of what follows.
   from the variables listed before it in the container, and the helm provider
   lists a container's plain variables before the ones it reads from a Secret.
   `core/ai-agent/openai-agents-sdk`, `core/ai-agent/claude-agent-sdk`,
-  `core/ai-agent/google-adk` and `core/ai-agent/mastra`, and the platforms
+  `core/ai-agent/agent-framework`, `core/ai-agent/google-adk` and
+  `core/ai-agent/mastra`, and the platforms
   `core/ai-agent/flowise` and `core/ai-agent/n8n`, declare the slot on their
   `tools` socket and read it on both targets;
   [`language-reference/examples/mcp-address-from-secret/`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/examples/mcp-address-from-secret/)
