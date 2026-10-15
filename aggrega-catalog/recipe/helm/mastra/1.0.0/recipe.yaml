@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: mastra
+  version: 1.0.0
+  description: >
+    A server built by Mastra, on Kubernetes, rendered offline as plain
+    manifests by the helm provider's Workload synthesis. The Workload becomes a
+    Deployment running the image the Release supplies, and a ClusterIP Service
+    fronting infra.port, which the server receives as PORT beside MASTRA_HOST
+    set to 0.0.0.0. A readiness probe reads Mastra's /health route, so the
+    Service sends no traffic until the server answers; provides is that
+    Service's host, port, endpoint and protocol, and, where values.agent_id is
+    set, the address of that agent's Agent2Agent card.
+
+    The model wired into the `model` socket reaches the server as the
+    variables Mastra reads for an openai/ model: its endpoint as
+    OPENAI_BASE_URL, and the connection's credential as OPENAI_API_KEY through
+    a secretKeyRef, so the key never renders into the manifest.
+
+    Each tool wired into the `tools` socket reaches the server under variables
+    named for the connection's alias, upper-cased with hyphens as underscores:
+    its address as AGGREGA_TOOL_<ALIAS>_URL, and, where the connection carries
+    a credential, that credential as AGGREGA_TOOL_<ALIAS>_CREDENTIAL through a
+    secretKeyRef, with the header the tool publishes for it as
+    AGGREGA_TOOL_<ALIAS>_CREDENTIAL_HEADER. A connection holding the tool's
+    whole address as a secret, for a server that reads its key from its
+    address, delivers that secret as AGGREGA_TOOL_<ALIAS>_URL through a
+    secretKeyRef instead.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/mastra:1.0.0
+  # provides.host is the bare Service name "<rendered_name>-default" — the helm
+  # provider names the synthesized ClusterIP Service
+  # "<rendered_name>-<service-key>", and this workload's one service key is
+  # "default". It carries no namespace segment, so the recipe is independent of
+  # where it is deployed and a consumer in another namespace qualifies it on
+  # its own side. A caller reaches this Service directly, so the port is the
+  # one the server listens on.
+  #
+  # Mastra serves the card of a registered agent at
+  # /.well-known/<agentId>/agent-card.json under its API prefix, /api unless
+  # the application's code sets another, so agent_card_url is composed on the
+  # published endpoint from values.agent_id, and is empty while it is unset.
+  # The card lists the address a caller sends requests to, formed from the
+  # address the caller fetched the card at.
+  provides:
+    host: "{{ .context.rendered_name }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.rendered_name }}-default:{{ .infra.port }}"
+    protocol: "http"
+    agent_card_url: "{{ with optional .values \"agent_id\" \"\" }}http://{{ $.context.rendered_name }}-default:{{ $.infra.port }}/api/.well-known/{{ . }}/agent-card.json{{ end }}"
+  # The model arrives on the `model` uses-edge, addressed by the
+  # developer-chosen alias, so the recipe ranges the outbound edges and matches
+  # on the socket name to find it, then reads the model's published endpoint.
+  # Mastra's model router reads an openai/ model's address from
+  # OPENAI_BASE_URL and hands it to its OpenAI client as that client's base,
+  # the version path included, which is the form a model serving the OpenAI
+  # API publishes; it reads the key from OPENAI_API_KEY. The agent's code
+  # names the model, so no model name is delivered.
+  #
+  # The credential, when one is attached on the `model` connection, is
+  # delivered as OPENAI_API_KEY through a secretKeyRef naming that connection;
+  # a connection carrying none emits no key variable.
+  #
+  # PORT is infra.port, and MASTRA_HOST is 0.0.0.0, every interface: Mastra's
+  # server reads both, and its documented default host is localhost, which the
+  # Service could not reach. A port or a host the application's code sets in
+  # its server configuration takes precedence over either.
+  #
+  # Mastra documents /health as its health check, returning 200 OK, and serves
+  # it before any authentication the application configures, so the readiness
+  # probe reads it on the one container port. No liveness probe is declared:
+  # Mastra documents none, and a start-up time cannot be known for an image
+  # this realization does not name.
+  #
+  # Each `tools` connection's variables are named for its alias, upper-cased,
+  # with every character other than a letter or a digit an underscore; the
+  # alias grammar admits only a hyphen and an underscore besides, so a hyphen
+  # becomes an underscore. AGGREGA_TOOL_<ALIAS>_URL is the endpoint the tool
+  # publishes, unless the connection carries an endpoint secret: then it is
+  # that secret, referenced by connection and slot, and the published address
+  # is not delivered. The credential is delivered only where the connection
+  # carries one, and the header beside it only where the tool publishes one;
+  # a tool behind a bridge publishes none, because the bridge checks no
+  # caller's credential.
+  #
+  # Every secret on every connection sits under one attachments key, so the
+  # block is opened once, and only where one connection carries a secret.
+  workload: |
+    {{- $secrets := false -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if and (eq $edge.socket "model") (hasKey $features "credential") -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- if and (eq $edge.socket "tools") (or (hasKey $features "credential") (hasKey $features "endpoint")) -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        variables:
+          PORT: "{{ .infra.port }}"
+          MASTRA_HOST: "0.0.0.0"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "model" }}
+          OPENAI_BASE_URL: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "tools" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- $features := default dict $edge.features }}
+    {{- if not (hasKey $features "endpoint") }}
+          AGGREGA_TOOL_{{ $name }}_URL: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- if and (hasKey $features "credential") (optional $edge.provides "credential_header" "") }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL_HEADER: "{{ $edge.provides.credential_header }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if $secrets }}
+        attachments:
+    {{- range $alias, $edge := .context.uses }}
+    {{- $features := default dict $edge.features }}
+    {{- if and (eq $edge.socket "model") (hasKey $features "credential") }}
+          OPENAI_API_KEY:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- if eq $edge.socket "tools" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- if hasKey $features "endpoint" }}
+          AGGREGA_TOOL_{{ $name }}_URL:
+            connection: "{{ $alias }}"
+            from: endpoint
+            as: env
+    {{- end }}
+    {{- if hasKey $features "credential" }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        health:
+          ready:
+            http: /health
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

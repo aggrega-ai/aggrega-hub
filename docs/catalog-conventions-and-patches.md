@@ -430,7 +430,7 @@ does not overlap it.
 Three rules bind it:
 
 - **A model socket selects the key unless it needs one API.** The catalog's model
-  sockets that take any model API — every agent's `model` but the two named below,
+  sockets that take any model API — every agent's `model` but the four named below,
   `core/ai-tool/model-invocation`'s `target_model`, and `core/datastore/cognee`'s
   `extraction_model` and `embedding_model` — select
   `component.aggrega.ai/category in (ai-model, gateway), model.aggrega.ai/api`.
@@ -444,7 +444,11 @@ Three rules bind it:
   that needs one particular API names its value
   (`core/ai-agent/openai-agents-sdk`'s `model` selects `model.aggrega.ai/api=openai`
   and `core/ai-agent/claude-agent-sdk`'s selects `model.aggrega.ai/api=anthropic`,
-  each SDK speaking that API alone) — or, where a model it cannot
+  each SDK speaking that API alone, and `core/ai-agent/mastra`'s selects
+  `model.aggrega.ai/api=openai`, the API whose variables its Recipes deliver;
+  `core/ai-agent/google-adk`'s selects `model.aggrega.ai/api=native` and its
+  Recipes refuse every wired model but `core/ai-model/gemini`, since no value
+  names the Gemini API alone) — or, where a model it cannot
   use has somewhere else to go, admits the whole category and refuses the value
   in an assertion that says where. `core/gateway/litellm`'s `models` socket
   selects `component.aggrega.ai/category=ai-model`, and its Component's
@@ -2766,8 +2770,9 @@ strings, and checks none of what follows.
   `$(VAR)` reference in a plain variable: Kubernetes expands such a reference
   from the variables listed before it in the container, and the helm provider
   lists a container's plain variables before the ones it reads from a Secret.
-  `core/ai-agent/openai-agents-sdk` and `core/ai-agent/claude-agent-sdk`
-  declare the slot on their `tools` socket and read it on both targets;
+  `core/ai-agent/openai-agents-sdk`, `core/ai-agent/claude-agent-sdk`,
+  `core/ai-agent/google-adk` and `core/ai-agent/mastra` declare the slot on their
+  `tools` socket and read it on both targets;
   [`language-reference/examples/mcp-address-from-secret/`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/examples/mcp-address-from-secret/)
   declares one on a consumer of its own and renders both targets too.
 - **A bridged server checks no caller's credential.** The bridge reads no

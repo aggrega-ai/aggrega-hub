@@ -1,0 +1,162 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: google-adk
+  version: 1.0.0
+  description: >
+    An application built on Google's Agent Development Kit (ADK), on
+    Kubernetes, rendered offline as plain manifests by the helm provider's
+    Workload synthesis. The Workload becomes a Deployment running the image
+    the Release supplies, and a ClusterIP Service fronting infra.port, which
+    the application receives as PORT. A readiness probe opens a TCP connection
+    to that port, so the Service sends no traffic until the server accepts
+    one; provides is that Service's host, port, endpoint and protocol.
+
+    The credential on the `model` connection reaches the application as
+    GOOGLE_API_KEY through a secretKeyRef, so the key never renders into the
+    manifest. A wired model other than core/ai-model/gemini halts the build,
+    naming it.
+
+    Each tool wired into the `tools` socket reaches the application under
+    variables named for the connection's alias, upper-cased with hyphens as
+    underscores: its address as AGGREGA_TOOL_<ALIAS>_URL, and, where the
+    connection carries a credential, that credential as
+    AGGREGA_TOOL_<ALIAS>_CREDENTIAL through a secretKeyRef, with the header the
+    tool publishes for it as AGGREGA_TOOL_<ALIAS>_CREDENTIAL_HEADER. A
+    connection holding the tool's whole address as a secret, for a server that
+    reads its key from its address, delivers that secret as
+    AGGREGA_TOOL_<ALIAS>_URL through a secretKeyRef instead.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/google-adk:1.0.0
+  # provides.host is the bare Service name "<rendered_name>-default" — the helm
+  # provider names the synthesized ClusterIP Service
+  # "<rendered_name>-<service-key>", and this workload's one service key is
+  # "default". It carries no namespace segment, so the recipe is independent of
+  # where it is deployed and a consumer in another namespace qualifies it on
+  # its own side. A caller reaches this Service directly, so the port is the
+  # one the server listens on.
+  provides:
+    host: "{{ .context.rendered_name }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.rendered_name }}-default:{{ .infra.port }}"
+    protocol: "http"
+  # The model arrives on the `model` uses-edge, addressed by the
+  # developer-chosen alias, so the recipe ranges the outbound edges and matches
+  # on the socket name to find it. ADK's Gemini client reads the key it sends
+  # to the Gemini API as GOOGLE_API_KEY, so the credential, when one is
+  # attached on the `model` connection, is delivered under that name through a
+  # secretKeyRef naming that connection; a connection carrying none emits no
+  # key variable. The client reads no address and no model name from its
+  # environment: it reaches the Gemini API's own address, the one
+  # core/ai-model/gemini publishes, and the agent's code names the model.
+  #
+  # The socket's selector admits every model carrying native, and only the
+  # Gemini API is reached with what this Recipe delivers: Vertex AI needs the
+  # Google Cloud project and location the client reads as GOOGLE_CLOUD_PROJECT
+  # and GOOGLE_CLOUD_LOCATION, which core/ai-model/vertex-ai does not publish,
+  # and the other native APIs are not the client's. So any other wired model
+  # halts the build, naming the connection and the component it reaches.
+  #
+  # PORT is infra.port. ADK's container guide starts its server on the port
+  # that variable names; an image running `adk api_server` passes `--port`
+  # itself, and listens on 8000, the component's default, when it passes none.
+  #
+  # ADK documents no health endpoint, so the readiness probe opens a TCP
+  # connection to the declared port. No liveness probe is declared: ADK
+  # documents none, and a start-up time cannot be known for an image this
+  # realization does not name.
+  #
+  # Each `tools` connection's variables are named for its alias, upper-cased,
+  # with every character other than a letter or a digit an underscore; the
+  # alias grammar admits only a hyphen and an underscore besides, so a hyphen
+  # becomes an underscore. AGGREGA_TOOL_<ALIAS>_URL is the endpoint the tool
+  # publishes, unless the connection carries an endpoint secret: then it is
+  # that secret, referenced by connection and slot, and the published address
+  # is not delivered. The credential is delivered only where the connection
+  # carries one, and the header beside it only where the tool publishes one;
+  # a tool behind a bridge publishes none, because the bridge checks no
+  # caller's credential.
+  #
+  # Every secret on every connection sits under one attachments key, so the
+  # block is opened once, and only where one connection carries a secret.
+  workload: |
+    {{- $secrets := false -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if eq $edge.socket "model" -}}
+    {{- if ne $edge.component "core/ai-model/gemini" -}}
+    {{- fail (printf "the model connection %s of %q reaches %q, a %s, but this realization delivers only the key ADK's Gemini client sends to the Gemini API: wire the model socket to a core/ai-model/gemini component" $alias $.context.instance_id $edge.target $edge.component) -}}
+    {{- end -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if and (eq $edge.socket "tools") (or (hasKey $features "credential") (hasKey $features "endpoint")) -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        variables:
+          PORT: "{{ .infra.port }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "tools" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- $features := default dict $edge.features }}
+    {{- if not (hasKey $features "endpoint") }}
+          AGGREGA_TOOL_{{ $name }}_URL: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- if and (hasKey $features "credential") (optional $edge.provides "credential_header" "") }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL_HEADER: "{{ $edge.provides.credential_header }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if $secrets }}
+        attachments:
+    {{- range $alias, $edge := .context.uses }}
+    {{- $features := default dict $edge.features }}
+    {{- if and (eq $edge.socket "model") (hasKey $features "credential") }}
+          GOOGLE_API_KEY:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- if eq $edge.socket "tools" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- if hasKey $features "endpoint" }}
+          AGGREGA_TOOL_{{ $name }}_URL:
+            connection: "{{ $alias }}"
+            from: endpoint
+            as: env
+    {{- end }}
+    {{- if hasKey $features "credential" }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        health:
+          ready:
+            tcp: {{ .infra.port }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
