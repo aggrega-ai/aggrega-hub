@@ -12,8 +12,6 @@ metadata:
     stateless Deployment plus a ClusterIP Service on the proxy port), running
     the official upstream image with no Helm chart. APISIX holds no local
     state — the etcd store is the system of record — so it renders stateless.
-    Its config.yaml, carrying the connection composed from the `etcd`
-    uses-edge and the Admin API port, is mounted from a ConfigMap.
 
     The Admin API is reachable only from inside the cluster — no Service
     publishes its port — and is authenticated by the key the `admin_key`
@@ -30,12 +28,15 @@ metadata:
     on a core/period-budget, core/semantic-caching or core/prompt-deny-patterns
     attachment, and on infra.callers, which only a routes file declares.
 
+    With `values.metrics_enabled` true, the gateway's metrics server moves off
+    the loopback address and its port, 9091, which checks no caller, joins the
+    Service, its address published as provides.metrics_endpoint; false, that
+    key is empty.
+
     Reach for this realization where the build must complete with nothing
     fetched; reach for `apisix-chart`, which renders the project's own chart
     from named settings, where the configuration is expected to follow the
     product or a model is served.
-    provides.host is the bare in-cluster Service name; a consumer in another
-    namespace qualifies it on its own side.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -55,12 +56,20 @@ spec:
   # so it serves no model, and the assertion below halts on a models
   # connection. A consumer wired to it over a model socket reads both empty,
   # as from a gateway with nothing wired to that socket.
+  #
+  # metrics_endpoint is the address the gateway serves its own metrics at while
+  # values.metrics_enabled is true: the prometheus plugin's export server, on
+  # port 9091 of the same Service, at /apisix/prometheus/metrics. It is empty
+  # while the value is false, when that server listens on the loopback address
+  # only. It is spelled out in full on purpose: a provides entry cannot read
+  # another.
   provides:
     host: "{{ .context.rendered_name }}-default"
     port: "{{ .infra.http_port }}"
     protocol: "http"
     endpoint: ""
     model: ""
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-default:9091/apisix/prometheus/metrics{{ end }}"
   # The gateway keeps its routes in etcd, written through the Admin API at run
   # time, and nothing this realization renders writes one, so a model wired to
   # the models socket would never be served. It halts instead, naming the
@@ -116,6 +125,15 @@ spec:
   # (.context.inject.env). It is emitted as a ConfigMap and mounted as a single
   # file into the container's conf directory via subPath, so it does not mask
   # the files APISIX writes alongside it at startup.
+  #
+  # With values.metrics_enabled true it also moves the prometheus plugin's
+  # export server, which APISIX runs on 127.0.0.1:9091 by default, to every
+  # interface on the same port, so a scraper outside the pod reaches it. APISIX
+  # merges this file's keys into its defaults one by one, so the server keeps
+  # its default path, /apisix/prometheus/metrics, and every other setting. On
+  # that port it serves the metrics, and its status page answers the loopback
+  # address only. False writes nothing, and the server stays on the loopback
+  # address.
   artifacts:
     config-configmap.yaml: |
       {{- /*
@@ -188,6 +206,13 @@ spec:
                 - "http://{{ $env.APISIX_ETCD_HOST }}:{{ $env.APISIX_ETCD_PORT }}"
               prefix: "/apisix"
               timeout: 30
+          {{- if .values.metrics_enabled }}
+          plugin_attr:
+            prometheus:
+              export_addr:
+                ip: 0.0.0.0
+                port: 9091
+          {{- end }}
   workload: |
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
@@ -213,9 +238,14 @@ spec:
           {{ .locals.admin_key_variable }}:
             from: admin_key
             as: env
+        # With values.metrics_enabled true the export server's port is declared
+        # too, so the Service below can carry it.
         ports:
           http: {{ .infra.http_port }}
           admin: {{ .infra.admin_port }}
+    {{- if .values.metrics_enabled }}
+          metrics: 9091
+    {{- end }}
         # APISIX reports readiness at /status/ready on a separate status server,
         # which listens on loopback only unless configured otherwise. An http
         # probe is sent to the container port whose name sorts first, which here
@@ -251,3 +281,6 @@ spec:
         type: ClusterIP
         ports:
           http: {{ .infra.http_port }}
+    {{- if .values.metrics_enabled }}
+          metrics: 9091
+    {{- end }}
