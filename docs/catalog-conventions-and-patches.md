@@ -2808,10 +2808,12 @@ strings, and checks none of what follows.
     nothing checks that the two match, because the compiler never reads a
     Secret.
 
-  The address is not composed at run time from the key alone, through a
-  `$(VAR)` reference in a plain variable: Kubernetes expands such a reference
-  from the variables listed before it in the container, and the helm provider
-  lists a container's plain variables before the ones it reads from a Secret.
+  Composing the address at run time from the key alone, through a `$(VAR)`
+  reference in a plain variable, works on Kubernetes only: Kubernetes expands
+  such a reference from the entries listed before it in the container, and the
+  helm provider lists the entries it reads from a Secret before the plain
+  variables, while Docker Compose expands no `$(VAR)` reference between a
+  service's environment entries.
   `core/ai-agent/openai-agents-sdk`, `core/ai-agent/claude-agent-sdk`,
   `core/ai-agent/agent-framework`, `core/ai-agent/google-adk` and
   `core/ai-agent/mastra`, and the platforms
@@ -2862,9 +2864,19 @@ strings, and checks none of what follows.
   because neither platform's PostgreSQL vector node takes a connection
   string: Flowise's takes the host, the port and the database in fields of
   its own and the user and the password from a credential Flowise stores,
-  and n8n's reads a Postgres credential with a field for each. A store
-  publishing no `database` or no `user` gets no parts. Two aliases of
-  one socket that fold to one name would deliver one variable twice — on
+  and n8n's reads a Postgres credential with a field for each. `langflow`,
+  whose PGVector component takes one connection string, receives such a store
+  as `AGGREGA_VECTOR_STORE_<ALIAS>_CONNECTION_STRING`,
+  `postgresql://<user>:<password>@<host>:<port>/<database>`, the connection's
+  `credential` its password: on Kubernetes the reference
+  `$(AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL)`, which expands from the
+  Secret-read entry the helm provider lists ahead of the plain variables, and
+  on compose the credential as delivered, a Compose variable reference staying
+  one. The password is written unencoded, because Langflow percent-encodes it
+  itself, and a connection with no `credential` gets the string without one. A
+  store publishing no `database` or no `user` gets no parts and no string. Two
+  aliases of one socket that fold to one name would deliver one variable
+  twice — on
   Kubernetes one of them may be a plain variable and the other read from a
   Secret, which the rendered Workload holds in two different maps — so the
   agent runtimes and the three platforms each carry an assertion,
