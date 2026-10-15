@@ -785,8 +785,10 @@ left it empty.
 
 **A credential the components of a module share is a module parameter.** An
 Aggregate importing a module hands it `type`, `active` and `parameters` and
-nothing else, so an attachment the module does not make itself never reaches a
-component inside it. The module declares one parameter per distinct credential,
+nothing else, so an attachment the module does not make itself reaches a
+component inside it only from the Release, which can attach it there through
+the routing entry that places the module, one component at a time. The module
+declares one parameter per distinct credential,
 with a pinned development default its description says is for evaluation, and
 attaches `core/referenced-secret` on every slot that shares it — on a
 component's own slot where the component verifies the credential or uses it
