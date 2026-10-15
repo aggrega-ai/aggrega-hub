@@ -2816,9 +2816,12 @@ strings, and checks none of what follows.
   `endpoint` it publishes, or `<protocol>://<host>:<port>` composed from what
   it publishes where it publishes no `endpoint` — and the connection's
   `credential` as `AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL`. Two aliases of
-  one socket that fold to one name would deliver one variable twice, and each
-  of the three platforms carries an assertion, `connection_aliases_deliver_apart`,
-  that halts the build on them, naming both connections. A flow reads each
+  one socket that fold to one name would deliver one variable twice — on
+  Kubernetes one of them may be a plain variable and the other read from a
+  Secret, which the rendered Workload holds in two different maps — so the
+  agent runtimes and the three platforms each carry an assertion,
+  `connection_aliases_deliver_apart`, that halts the build on them, naming
+  both connections. A flow reads each
   in the platform's own way: on `langflow` through a field naming a global
   variable of the same name, which Langflow reads from the environment where
   no stored variable carries that name; on `flowise` through a Runtime
