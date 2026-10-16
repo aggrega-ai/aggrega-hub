@@ -145,8 +145,14 @@ identity when the component pins an image that carries it and every Recipe
 enables it: `core/datastore/pgvector` runs the pgvector project's own PostgreSQL
 image and creates the extension in the database it starts, so it carries
 `vector` on its base, while `core/datastore/postgres` carries no engine value. A
-capability whose truth depends on what the Aggregate declares carries no label
-anywhere in the catalog — it is injected at compile time by the governance
+search and analytics engine that also indexes vectors carries `search`: its
+identity is search over the documents it indexes, which `vector` would
+misdescribe, and every vector-store socket in the standard library admits it
+beside `vector` and `semantic-memory` by selecting
+`datastore.aggrega.ai/engine in (vector, semantic-memory, search)`. A socket
+that must admit only vector stores selects `datastore.aggrega.ai/engine=vector`
+instead. A capability whose truth depends on what the Aggregate declares carries
+no label anywhere in the catalog — it is injected at compile time by the governance
 socket's `label-transform` role, which reads the developer's declared `values`.
 There is no stored "is-AI" boolean — tooling derives AI-relevance from any
 `ai-`-prefixed category or AI-relevant capability value.
@@ -2853,8 +2859,8 @@ strings, and checks none of what follows.
   publishes as `AGGREGA_TOOL_<ALIAS>_CREDENTIAL_HEADER`, each secret by
   reference on helm and from the inject pipe on compose. Those two platforms
   and `core/ai-agent/langflow` also declare `vector_store`, selecting
-  `datastore.aggrega.ai/engine in (vector, semantic-memory)`, delivered the
-  same way: the store's address as `AGGREGA_VECTOR_STORE_<ALIAS>_URL` — the
+  `datastore.aggrega.ai/engine in (vector, semantic-memory, search)`, delivered
+  the same way: the store's address as `AGGREGA_VECTOR_STORE_<ALIAS>_URL` — the
   `endpoint` it publishes, or `<protocol>://<host>:<port>` composed from what
   it publishes where it publishes no `endpoint` — and the connection's
   `credential` as `AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL`. A store that
