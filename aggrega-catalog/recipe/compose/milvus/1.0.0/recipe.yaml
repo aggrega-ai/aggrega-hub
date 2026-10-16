@@ -1,0 +1,179 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: milvus
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Milvus for local development via Docker Compose. Synthesized-mode Workload:
+    one service running the product's own image in its single-container mode,
+    with the metadata store inside the server process and the data on a named
+    volume, so no etcd or object-store service is deployed beside it.
+    provides.host is the bare service name, resolved on the compose network; the
+    port is published on no host interface, so only the stack's own services
+    reach the server.
+
+    Authentication is off unless a password is attached; attached, it is
+    switched on and the password is the value the credential delivers, written
+    into the compose file as delivered — a Compose variable reference such as
+    ${MILVUS_ROOT_PASSWORD} keeps the material out of the file.
+
+    Reach for this realization for local development; on Kubernetes the
+    component is realized by the Helm Recipe milvus-chart.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/datastore/milvus:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # protocol is "http", the scheme Milvus's own clients compose its address with,
+  # and endpoint joins the parts into that address, carrying no credential. user
+  # is `root`, the account the server creates at its first start, the one the
+  # password slot's credential belongs to.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    user: "root"
+    protocol: "http"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}"
+  # Two compose configs, each mounted as one file. The first carries the
+  # in-process metadata store's own settings and is always emitted: the storage
+  # quota and the revision-based compaction the product's single-container
+  # installation gives it, without which its history grows until it reaches the
+  # quota. It names no listen address, so the store keeps its default and
+  # answers on the container's loopback interface only; the server reaches it
+  # in-process.
+  #
+  # The second carries the developer's custom_config as the server's user.yaml,
+  # which it reads over its built-in settings, and is presence-guarded: an
+  # Aggregate that leaves custom_config unset emits no config and no mount.
+  # Docker Compose substitutes a variable reference inside a config's content,
+  # so every $ the block carries is doubled, and the server reads the block as
+  # it was authored.
+  #
+  # Each config's name is spelled here and again on the volume that mounts it
+  # below. The artifact and the workload are separate template strings with no
+  # binding either could dereference, so the repetition is forced rather than
+  # chosen — the two must be edited together.
+  artifacts:
+    milvus-embed-etcd.compose-fragment.yaml: |
+      configs:
+        {{ .context.instance_id }}-embed-etcd:
+          content: |
+            quota-backend-bytes: 4294967296
+            auto-compaction-mode: revision
+            auto-compaction-retention: "1000"
+    milvus-user-config.compose-fragment.yaml: |
+      {{- if .values.custom_config }}
+      configs:
+        {{ .context.instance_id }}-user-config:
+          content: |
+      {{ replace "$" "$$" .values.custom_config | indent 6 }}
+      {{- end }}
+  workload: |
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $bound := hasKey (default dict .features) "password" -}}
+    {{- if and $bound (not (hasKey $env "COMMON_SECURITY_DEFAULTROOTPASSWORD")) -}}
+    {{- fail (printf "the password credential of the Milvus server %q delivers no COMMON_SECURITY_DEFAULTROOTPASSWORD variable, the name this Recipe reads the root account's password under: deliver it under that name, for example by setting values.key: COMMON_SECURITY_DEFAULTROOTPASSWORD on a core/secret-value attachment" .context.instance_id) -}}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    containers:
+      main:
+        image: "milvusdb/milvus:{{ .infra.engine_version }}"
+        # The image's entrypoint is its process supervisor and it names no
+        # command, so the server is started as the product's own installations
+        # start it.
+        args: ["milvus", "run", "standalone"]
+        # The single-container mode, set as the product's own single-container
+        # installation sets it: each variable names a setting of the server's
+        # configuration, and an environment value takes precedence over every
+        # configuration file. The metadata store runs in-process with its data
+        # under the volume, the data is kept on local storage under the volume,
+        # and the message queue is the one a standalone server picks when none is
+        # named, whose files also sit there. PROXY_PORT moves the API onto
+        # infra.port.
+        #
+        # 🔴 AUTHENTICATION FOLLOWS THE PASSWORD SLOT AND NOTHING ELSE. Attached,
+        # it is switched on and the root account's password is the value the
+        # credential delivered on the inject pipe, read from it as a map so a
+        # credential delivering another name halts above rather than rendering an
+        # empty password. Unattached, it is switched off explicitly, so the
+        # server's built-in root password is never the one in force.
+        variables:
+          DEPLOY_MODE: STANDALONE
+          ETCD_USE_EMBED: "true"
+          ETCD_DATA_DIR: /var/lib/milvus/etcd
+          ETCD_CONFIG_PATH: /milvus/configs/embedEtcd.yaml
+          COMMON_STORAGETYPE: local
+          PROXY_PORT: "{{ .infra.port }}"
+    {{- if $bound }}
+          COMMON_SECURITY_AUTHORIZATIONENABLED: "true"
+          COMMON_SECURITY_DEFAULTROOTPASSWORD: "{{ get $env "COMMON_SECURITY_DEFAULTROOTPASSWORD" }}"
+    {{- else }}
+          COMMON_SECURITY_AUTHORIZATIONENABLED: "false"
+    {{- end }}
+        ports:
+          milvus: {{ .infra.port }}
+          metrics: 9091
+        # The server reports its health at /healthz on its metrics port, the
+        # check the product's own Compose file and single-container installation
+        # run, with their timing; the image carries curl. An http check is sent
+        # to the port whose name sorts first, which here is `metrics`. The
+        # endpoint stays open whether or not authentication is on. A service
+        # keeps one healthcheck, so one probe is declared.
+        health:
+          ready:
+            http: /healthz
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            timeoutSeconds: 20
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        # One volume holds the metadata store, the data and the message queue's
+        # files. A named volume starts out with the ownership of the image's own
+        # copy of that directory, the unprivileged user the server runs as.
+        volumeMounts:
+          - name: data
+            path: /var/lib/milvus
+          - name: embed-etcd
+            path: /milvus/configs/embedEtcd.yaml
+    {{- if .values.custom_config }}
+          - name: user-config
+            path: /milvus/configs/user.yaml
+    {{- end }}
+    # The server owns a durable volume on this target too. A datastore whose data
+    # vanished with its container would be a different thing from the one the
+    # Kubernetes target deploys. The declared size is read from the operator's
+    # own sizing knob so one Release configures either target.
+    volumes:
+      data:
+        persistent:
+          size: "{{ .infra.storage.size }}"
+      embed-etcd:
+        configmap:
+          source: "{{ .context.instance_id }}-embed-etcd"
+    {{- if .values.custom_config }}
+      user-config:
+        configmap:
+          source: "{{ .context.instance_id }}-user-config"
+    {{- end }}
+    # ClusterIP publishes the port on no host interface: the stack's own services
+    # reach the server, and nothing outside it does — the server checks no
+    # credential unless a password is attached.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          milvus: {{ .infra.port }}

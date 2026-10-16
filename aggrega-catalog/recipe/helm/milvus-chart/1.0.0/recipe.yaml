@@ -1,0 +1,289 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: milvus-chart
+  version: 1.0.0
+  # The packaged Milvus server is Apache-2.0.
+  license: Apache-2.0
+  description: >
+    Milvus vector database on Kubernetes via the product's own Helm chart,
+    published by Milvus's maintainers in their HTTPS chart repository. The chart
+    is configured for one standalone server that holds its metadata store and
+    its data on its own volume, so it runs one image and deploys no etcd, object
+    store or message-queue service. It renders a Deployment, a ClusterIP Service
+    publishing the API and the metrics port, a PersistentVolumeClaim and a
+    ConfigMap.
+
+    Authentication is off unless a password is attached; attached, it is
+    switched on and the password is read from the attached credential's Secret
+    by name, so it never appears in the rendered files. A credential that names
+    no Secret halts the build.
+
+    Reach for this realization on Kubernetes where a chart repository is
+    reachable at build time; for local development reach for the Compose Recipe
+    milvus, which runs the same image in the same single-server mode.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/datastore/milvus:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://zilliztech.github.io/milvus-helm/
+    chart: milvus
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"5.0.31\" }}"
+
+  # provides.host is the server's Service name, which is what the Component's
+  # provides contract promises. The valuesMapping below pins the chart's
+  # fullnameOverride to the rendered name, the release name the helm provider
+  # gives the chart, which spells the Component's name in the alphabet a
+  # Kubernetes name allows. This chart names that Service by the pinned name with
+  # no suffix — read from a render of the chart, not assumed; the Deployment is
+  # the one name that carries a suffix.
+  #
+  # port follows the port the operator set: it is the Service port, which
+  # forwards to the container port the chart names `milvus`. protocol is "http",
+  # the scheme Milvus's own clients compose its address with, and endpoint joins
+  # the parts into that address. user is `root`, the account the server creates
+  # at its first start, the one the password slot's credential belongs to.
+  #
+  # A same-namespace consumer reaches the server under this name directly; a
+  # cross-namespace consumer qualifies it caller-side. The host is the bare,
+  # self-contained in-cluster Service name: it carries no namespace, so the
+  # Recipe is independent of where it is deployed.
+  provides:
+    host: "{{ .context.rendered_name }}"
+    port: "{{ .infra.port }}"
+    user: "root"
+    protocol: "http"
+    endpoint: "http://{{ .context.rendered_name }}:{{ .infra.port }}"
+
+  # A Release may write a key of an infra group as an empty string —
+  # `compute.cpu: ""`, or `storage.size: ""` — and a key written that way
+  # replaces the Component's default rather than falling back to it. Rendered,
+  # that would emit a workload with no CPU or memory limit, or a volume that
+  # requests no size: a Release materially different from the one the
+  # Component's declared defaults describe, with nothing in the output saying so.
+  # The build halts here instead, naming the key and the group it belongs to, so
+  # the fix is one line in the Release. A key the Release leaves out takes the
+  # Component's default. The storage class is not checked: left unset, the
+  # volume is provisioned from the cluster's default storage class.
+  assertions:
+    compute_group_complete: >-
+      {{- if not (optional (default dict .infra.compute) "cpu" "") -}}
+      {{- fail "this Release sets part of infra.compute on the Milvus server but leaves compute.cpu empty, so the rendered workload would carry no CPU request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+      {{- if not (optional (default dict .infra.compute) "memory" "") -}}
+      {{- fail "this Release sets part of infra.compute on the Milvus server but leaves compute.memory empty, so the rendered workload would carry no memory request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+    storage_group_complete: >-
+      {{- if not (optional (default dict .infra.storage) "size" "") -}}
+      {{- fail "this Release leaves storage.size empty on the Milvus server, so the rendered volume would request no size: set storage.size to the size the volume needs, or leave it out of the Release to take the component's default" -}}
+      {{- end -}}
+
+  # This Recipe reads from infra.overrides:
+  #   image          - map[string]string (image.all.* fields; overrides the version pin)
+  #   service_type   - string (service.type; how the endpoint is exposed, default ClusterIP)
+  #   requests       - { cpu: string, memory: string } (server resource requests)
+  #   nodeSelector   - map[string]string (pod scheduling)
+  #   tolerations    - []object (pod scheduling)
+  #
+  # The chart is run in Milvus's single-server mode — the mode the product's own
+  # single-container installation uses: the metadata store runs inside the
+  # server process, and the data is kept on the server's own volume rather than
+  # in an object store. So the chart's etcd, MinIO and Pulsar subcharts are left
+  # off, and the chart renders a Deployment, the ClusterIP Service, the
+  # PersistentVolumeClaim and the ConfigMap holding the server's configuration
+  # files. Its Ingress, Prometheus-operator monitor, web console and
+  # change-data-capture service stay at their own off-by-default setting.
+  #
+  # The chart writes the namespace the helm provider gives it into each resource:
+  # the one the Release declares, and `default` where it declares none.
+  #
+  # The server image is the one image this realization emits; it is pinned by
+  # the Component's engine_version, whose default names it by tag and by digest.
+  # The chart's own readiness and liveness probes are kept: readiness asks the
+  # server's /healthz on its metrics port, which stays open whether or not
+  # authentication is on.
+  valuesMapping: |
+    ## ── Pin the chart's resource names to the rendered name ────
+    ## Names the server's Service and its volume claim exactly "<rendered_name>",
+    ## matching provides.host, and the Deployment "<rendered_name>-standalone".
+    ## Every object this chart emits derives its name from this key, read from a
+    ## render rather than assumed.
+    fullnameOverride: "{{ .context.rendered_name }}"
+
+    ## ── One standalone server ──────────────────────────────────
+    cluster:
+      enabled: false
+
+    ## ── Server image pin ───────────────────────────────────────
+    ## The chart's own default tag is its application version, so leaving it to
+    ## the chart makes the render move whenever the chart moves. The tag comes
+    ## from engine_version, which carries the image's digest by default.
+    ## Override the whole block via infra.overrides.image.
+    image:
+      all:
+        {{- if and .infra.overrides .infra.overrides.image }}
+        {{- range $k, $v := .infra.overrides.image }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+        {{- else }}
+        repository: milvusdb/milvus
+        tag: "{{ .infra.engine_version }}"
+        {{- end }}
+
+    ## ── No separate metadata store, object store or message queue ──
+    ## The subcharts stay off. The chart still writes an etcd address list, an
+    ## object-store block and a block for a message queue this server does not
+    ## run into the server's configuration file whatever is enabled; the
+    ## environment below tells the server to run its metadata store in-process and
+    ## keep its data on local storage, and the queue is named below, so none of
+    ## the three is read.
+    ## The address list is pointed at the embedded store's own default address,
+    ## so the file names nothing that does not exist. The object-store keys are
+    ## set empty, so the chart's default object-store credential is written
+    ## nowhere; and the object store's transport setting is supplied because the
+    ## chart reads it even with that subchart off.
+    etcd:
+      enabled: false
+    externalEtcd:
+      enabled: true
+      endpoints:
+        - localhost:2379
+    minio:
+      enabled: false
+      accessKey: ""
+      secretKey: ""
+      tls:
+        enabled: false
+    pulsarv3:
+      enabled: false
+
+    ## ── The standalone server ──────────────────────────────────
+    ## rocksmq is the message queue a standalone server picks when none is named,
+    ## and the one the product's single-container installation runs; its files
+    ## sit on the server's volume. The chart's separate disk volume is switched
+    ## off because it would mount a scratch volume over the directory local
+    ## storage keeps the data in — the data must stay on the claim. That also
+    ## leaves disk-index search off, the server's own default.
+    ##
+    ## The environment carries the single-server mode, read the way the product's
+    ## own single-container installation sets it: each variable names a setting
+    ## of the server's configuration, and an environment value takes precedence
+    ## over every configuration file. PROXY_PORT holds the server on the port the
+    ## chart's container declares, whatever a custom configuration block says.
+    ##
+    ## 🔴 AUTHENTICATION FOLLOWS THE PASSWORD SLOT AND NOTHING ELSE. Attached, it
+    ## is switched on and the root account's password is read from the attached
+    ## credential's Secret BY NAME, so the material never appears in the rendered
+    ## artifact; unattached, it is switched off explicitly, so the server's
+    ## built-in root password is never the one in force.
+    {{- $password := hasKey (default dict .features) "password" }}
+    {{- if $password }}
+    {{- $locator := optional (optional (default dict .features) "password" dict) "provides" dict }}
+    {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) }}
+    {{- fail (printf "the password credential of the Milvus server %q publishes no Secret name and data key, so the server could not be given a reference to read it from: attach a credential publishing both, such as core/referenced-secret or core/random-password" .context.instance_id) }}
+    {{- end }}
+    {{- end }}
+    standalone:
+      messageQueue: rocksmq
+      disk:
+        enabled: false
+      extraEnv:
+        - name: DEPLOY_MODE
+          value: STANDALONE
+        - name: ETCD_USE_EMBED
+          value: "true"
+        - name: ETCD_DATA_DIR
+          value: /var/lib/milvus/etcd
+        - name: ETCD_CONFIG_PATH
+          value: /milvus/configs/embedEtcd.yaml
+        - name: COMMON_STORAGETYPE
+          value: local
+        - name: PROXY_PORT
+          value: "19530"
+        {{- if $password }}
+        - name: COMMON_SECURITY_AUTHORIZATIONENABLED
+          value: "true"
+        - name: COMMON_SECURITY_DEFAULTROOTPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: "{{ .features.password.provides.name }}"
+              key: "{{ .features.password.provides.key }}"
+        {{- else }}
+        - name: COMMON_SECURITY_AUTHORIZATIONENABLED
+          value: "false"
+        {{- end }}
+      ## The image runs as the unprivileged user it creates, group 999, which
+      ## owns the image's own copy of the data directory. A claim mounted there is
+      ## given to that group, so the server can write to it; the product's own
+      ## installations change the volume's owner before the server starts for the
+      ## same reason.
+      securityContext:
+        fsGroup: 999
+      persistence:
+        persistentVolumeClaim:
+          size: "{{ .infra.storage.size }}"
+          {{- with .infra.storage.type }}
+          storageClass: "{{ . }}"
+          {{- end }}
+      resources:
+        limits:
+          cpu: "{{ .infra.compute.cpu }}"
+          memory: "{{ .infra.compute.memory }}"
+        {{- if and .infra.overrides .infra.overrides.requests }}
+        requests:
+          cpu: "{{ .infra.overrides.requests.cpu }}"
+          memory: "{{ .infra.overrides.requests.memory }}"
+        {{- end }}
+      {{- if .infra.overrides }}
+      {{- if .infra.overrides.nodeSelector }}
+      nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+      {{- end }}
+      {{- if .infra.overrides.tolerations }}
+      tolerations: {{ toJson .infra.overrides.tolerations }}
+      {{- end }}
+      {{- end }}
+
+    ## ── The server's configuration files ───────────────────────
+    ## The chart writes each key here into its ConfigMap. embedEtcd.yaml is the
+    ## in-process metadata store's own settings — the storage quota and the
+    ## revision-based compaction the product's single-container installation
+    ## gives it, without which its history grows until it reaches the quota. It
+    ## names no listen address, so the store keeps its default and answers on the
+    ## pod's loopback interface only; the server reaches it in-process.
+    ## user.yaml, which the chart always mounts, carries the developer's
+    ## custom_config when there is one and keeps the chart's own commented
+    ## placeholder otherwise.
+    extraConfigFiles:
+      embedEtcd.yaml: |
+        quota-backend-bytes: 4294967296
+        auto-compaction-mode: revision
+        auto-compaction-retention: "1000"
+      {{- with .values.custom_config }}
+      user.yaml: |
+    {{ . | indent 4 }}
+      {{- end }}
+    volumeMounts:
+      - name: milvus-config
+        mountPath: /milvus/configs/embedEtcd.yaml
+        subPath: embedEtcd.yaml
+        readOnly: true
+
+    ## ── The Service ────────────────────────────────────────────
+    ## infra.port sets the Service port; it forwards to the container port the
+    ## chart names `milvus`. The chart also publishes the metrics port, 9091.
+    service:
+      {{- if and .infra.overrides .infra.overrides.service_type }}
+      type: "{{ .infra.overrides.service_type }}"
+      {{- else }}
+      type: ClusterIP
+      {{- end }}
+      port: {{ .infra.port }}
