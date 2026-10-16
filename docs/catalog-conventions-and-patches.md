@@ -3926,6 +3926,108 @@ workload dials or edges, wherever a control earns a Feature; a control only one
 product in the field has is a value on that product's own Component, as "What
 earns a Feature" sets out.
 
+### Network policy: who may connect to a component, and where it may connect
+
+The catalog's network-policy family is two Features, one per direction of a
+connection, reading the same `uses` edges from opposite ends.
+`core/caller-allowlist` restricts who may connect to the component it is
+attached to: the components whose `uses` edges point at it.
+`core/egress-allowlist` restricts where the component it is attached to may
+connect: the components its own `uses` edges point at. One edge from a gateway
+to a model server is read by both — the model server's caller allowlist admits
+the gateway's pods, and the gateway's egress allowlist admits the model
+server's pods — so, with both attached, a connection the Aggregate declares
+stays open at both ends, and one it does not declare can be refused at either.
+Every input of both is `infra`, so the operator attaches them in the Release,
+under `components.<id>.features`, as "Who writes each input, and where a
+Feature is attached" sets out. caller-allowlist applies to `server` and
+`stateful-server`, the types that serve connections; egress-allowlist to every
+type that runs pods: `server`, `stateful-server`, `worker`, `task` and
+`function`.
+
+**Pods are selected from what each render emitted, never restated by hand.**
+`helm/caller-allowlist` sets `readsCallerRenderFacts: true` and reads each
+caller's render facts on `.context.used_by`; `helm/egress-allowlist` sets
+`readsTargetRenderFacts: true` and reads each target's at
+`.context.uses.<alias>.render_facts`. Both read the host's own at
+`.context.render_facts`, and either key makes the attachment render after
+every component, so every render it reads is complete. From the helm
+provider's `pod_template_labels`, `controller_selectors` and `container_ports`,
+each workload's pods are named by one peer carrying two selectors that must
+both match: its namespace, by the `kubernetes.io/metadata.name` label, and its
+pods, by the selector its controller writes or, where it writes none, by the
+identity labels the build stamps, taken only from a template carrying
+`aggrega.ai/component-id` and less the two carrying a version. A chart's pod
+templates carry none of those labels, so a chart-rendered component is selected
+by its controller's selector. A workload with neither, one emitted into no
+namespace, and two controllers sharing one workload's kind, name and namespace
+each halt the build. Each Feature writes one NetworkPolicy per workload its host
+renders, in that workload's namespace, named from the workload's name and kind
+and the attachment name, so a caller allowlist and an egress allowlist on one
+workload write two policies.
+
+**Ports are what containers declare.** caller-allowlist admits its peers on the
+ports the host's containers declare; egress-allowlist admits each target on the
+ports that target's own containers declare, never the port the target provides
+to its callers, which is usually a Service port mapped onto a container's. A
+port a workload serves on but does not declare is not admitted, and the build
+cannot tell, so a Recipe declares on its containers every port they serve on.
+That is why `helm/caller-allowlist-higress` refuses caller-allowlist on
+`core/gateway/higress`: in a cluster layout its gateway container declares only
+its telemetry ports, and its control plane programs the port that serves model
+traffic.
+
+**Own pods, and what each admits beyond the Aggregate.** Both admit the
+attached component's own pods, on the ports their containers declare, so a
+clustered server keeps reaching its peers. Beyond that, the ingress side names
+sources and the egress side names destinations:
+
+- caller-allowlist's `admitted_sources` lists sources outside the Aggregate —
+  an ingress controller, a monitoring agent — each entry an address range
+  (`cidr`) or pods (`namespace`, `pod_labels`, or both), admitted on the
+  declared callers' ports. An entry naming a range together with pods, or
+  naming nothing, halts.
+- egress-allowlist admits the cluster's DNS on UDP and TCP port 53, to the pods
+  `dns_pods` names with the same `namespace` and `pod_labels` fields. Left
+  unset, they are the pods labelled `k8s-app: kube-dns` in `kube-system`; the
+  helm FeatureRecipe applies that default, and a value the Release writes
+  replaces it whole. A value naming neither field halts.
+- egress-allowlist's `admitted_destinations` lists address ranges, each entry
+  naming one connection by its `target`, the target's instance ID, and one
+  `cidr`; a target reached at several ranges takes one entry per range. An
+  entry with no target, a target the component has no connection to, or an
+  empty range halts, naming the entry.
+
+**A target whose render emits no pods is admitted only by address range.** A
+target the cluster does not run — a hosted model API, a remote agent — renders
+no pod template, and neither does a component another provider renders or one
+whose pods a controller creates at runtime; a network policy cannot name such a
+destination by its pods, nor any destination by its host name. egress-allowlist
+recognises such a connection by its target's render emitting no pods, never by
+a label, and admits it only through the `admitted_destinations` entries naming
+its target; without one, the build halts, naming every such connection in one
+message. A range carries no port and no connection: it admits its addresses on
+any port, for every connection of the component. The build is ahead-of-time
+and resolves no host name, so nothing checks that a range covers the address
+the target is reached at. Every other outbound connection is refused, the
+cluster's API server included. The ingress side has no such opening: a caller
+whose render emits no pods halts the build, naming it, whatever
+`admitted_sources` lists.
+
+**The runtime prerequisite is affirmed, not assumed.** A network policy
+restricts nothing unless the cluster's network plugin enforces it, and the
+compiler cannot inspect the cluster, so `helm/caller-allowlist` and
+`helm/egress-allowlist` halt the build unless the Release sets
+`infra.control_plane_present: true` on the attachment. Network policies add up:
+where another policy selects the same pods in the same direction, a connection
+either of them admits is admitted.
+
+**Compose.** Neither Feature restricts anything on compose, and both halt
+there. caller-allowlist has no compose FeatureRecipe, so binding it on compose
+halts for want of a realization. egress-allowlist has one,
+`compose/egress-allowlist`, whose single assertion halts every attachment,
+naming the Feature and saying compose has no network policy.
+
 ### Name an emitted resource for the scope that carries it
 
 A Feature is authored once and attached many times. So a resource name a
