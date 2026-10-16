@@ -1,0 +1,221 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: opensearch
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    OpenSearch for local development via Docker Compose. Synthesized-mode
+    Workload: one service running the product's own image as one node, with its
+    indexes on a named volume. provides.host is the bare service name, resolved
+    on the compose network; the port is published on no host interface, so only
+    the stack's own services reach the server.
+
+    The security plugin stays on. The image's demonstration setup is replaced
+    by one account, admin, whose password is the value the attached credential
+    delivers, written into the compose file as delivered — a Compose variable
+    reference such as ${OPENSEARCH_ADMIN_PASSWORD} keeps the material out of the
+    file; with none attached it is a development default. The service generates
+    its transport key each time it starts. The REST API is served over plain
+    HTTP, not encrypted, and is reachable only inside the Release.
+
+    Reach for this realization for local development; on Kubernetes the
+    component is realized by the Helm Recipe opensearch-chart.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/datastore/opensearch:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # protocol is "http", the scheme the REST API is served over, and endpoint
+  # joins the parts into that address, carrying no credential. user is `admin`,
+  # the one account the server holds, the one the password slot's credential
+  # belongs to.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    user: "admin"
+    protocol: "http"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}"
+  # Three compose configs, each mounted as one file over the image's file of the
+  # same name.
+  #
+  # The first is the server's configuration file. 🔴 THE SECURITY PLUGIN STAYS
+  # ON, AND NOTHING OF THE IMAGE'S DEMONSTRATION SETUP IS USED. The node's
+  # transport layer is encrypted with a key the service generates each time it
+  # starts (the command below), so no key is known to any reader of the catalog;
+  # the plugin refuses to start if a demonstration certificate is present in its
+  # configuration directory, and this configuration does not allow one. The REST
+  # API is served over HTTP: a certificate generated inside the container gives a
+  # client nothing to verify it against. On first start the plugin initialises
+  # its security index from its security configuration files, the other two
+  # among them.
+  #
+  # The other two replace the image's own security files, which hold its
+  # demonstration accounts: the internal user database holds one account, admin,
+  # and the role mapping gives it every permission. The administrator's hash is
+  # not written here: the plugin computes it each time it loads its
+  # configuration from the OPENSEARCH_INITIAL_ADMIN_PASSWORD variable, so the
+  # file holds no secret. Docker Compose substitutes a variable reference inside
+  # a config's content, so the reference the plugin reads is written with its $
+  # doubled, and reaches the server as one $.
+  #
+  # Each config's name is spelled here and again on the volume that mounts it
+  # below. The artifact and the workload are separate template strings with no
+  # binding either could dereference, so the repetition is forced rather than
+  # chosen — the two must be edited together.
+  artifacts:
+    opensearch-config.compose-fragment.yaml: |
+      configs:
+        {{ .context.instance_id }}-opensearch-yml:
+          content: |
+            network.host: 0.0.0.0
+            discovery.type: single-node
+            http.port: {{ .infra.port }}
+            plugins.security.ssl.transport.keystore_type: PKCS12
+            plugins.security.ssl.transport.keystore_filepath: tls/node.p12
+            plugins.security.ssl.transport.truststore_type: PKCS12
+            plugins.security.ssl.transport.truststore_filepath: tls/truststore.p12
+            transport.ssl.enforce_hostname_verification: false
+            plugins.security.ssl.http.enabled: false
+            plugins.security.allow_default_init_securityindex: true
+            plugins.security.nodes_dn:
+              - "CN=opensearch-node"
+            plugins.security.restapi.roles_enabled: ["all_access", "security_rest_api_access"]
+        {{ .context.instance_id }}-internal-users:
+          content: |
+            _meta:
+              type: "internalusers"
+              config_version: 2
+            admin:
+              hash: "$${envbc.OPENSEARCH_INITIAL_ADMIN_PASSWORD}"
+              reserved: true
+              backend_roles:
+                - "admin"
+              description: "The administrator; its password is read from the server's environment"
+        {{ .context.instance_id }}-roles-mapping:
+          content: |
+            _meta:
+              type: "rolesmapping"
+              config_version: 2
+            all_access:
+              reserved: false
+              backend_roles:
+                - "admin"
+              description: "Gives the administrator every permission"
+  workload: |
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $bound := hasKey (default dict .features) "password" -}}
+    {{- if and $bound (not (hasKey $env "OPENSEARCH_INITIAL_ADMIN_PASSWORD")) -}}
+    {{- fail (printf "the password credential of the OpenSearch server %q delivers no OPENSEARCH_INITIAL_ADMIN_PASSWORD variable, the name this Recipe reads the administrator's password under: deliver it under that name, for example by setting values.key: OPENSEARCH_INITIAL_ADMIN_PASSWORD on a core/secret-value attachment" .context.instance_id) -}}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    containers:
+      main:
+        image: "opensearchproject/opensearch:{{ .infra.engine_version }}"
+        # The node's transport key, generated by the JDK the image carries each
+        # time the container starts: a key pair and its self-signed certificate
+        # in a keystore, and the certificate alone in a truststore, under the
+        # configuration directory. The key exists nowhere outside the container.
+        # The stores' password is `changeit`, the one the security plugin assumes
+        # when its configuration names none; it guards files that never leave the
+        # container. The command then hands over to the image's own start-up
+        # script, which starts the server. It carries no $, which Docker Compose
+        # would read as a variable reference.
+        args:
+          - bash
+          - -c
+          - >-
+            set -eu &&
+            mkdir -p config/tls && cd config/tls &&
+            rm -f node.p12 truststore.p12 node.crt &&
+            /usr/share/opensearch/jdk/bin/keytool -genkeypair -noprompt -alias node -keyalg RSA -keysize 3072 -validity 3650 -dname "CN=opensearch-node" -ext "eku=serverAuth,clientAuth" -keystore node.p12 -storetype PKCS12 -storepass changeit &&
+            /usr/share/opensearch/jdk/bin/keytool -exportcert -noprompt -alias node -keystore node.p12 -storetype PKCS12 -storepass changeit -file node.crt &&
+            /usr/share/opensearch/jdk/bin/keytool -importcert -noprompt -alias node -file node.crt -keystore truststore.p12 -storetype PKCS12 -storepass changeit &&
+            rm -f node.crt && chmod 600 node.p12 truststore.p12 &&
+            cd /usr/share/opensearch &&
+            exec ./opensearch-docker-entrypoint.sh opensearch
+        # DISABLE_INSTALL_DEMO_CONFIG stops the image's start-up script
+        # installing its demonstration setup. OPENSEARCH_INITIAL_ADMIN_PASSWORD
+        # is the variable the product documents for the administrator's password;
+        # here the security configuration above reads it.
+        #
+        # 🔴 THE PASSWORD FOLLOWS THE PASSWORD SLOT. Attached, it is the value
+        # the credential delivered on the inject pipe, read from it as a map so a
+        # credential delivering another name halts above rather than rendering an
+        # empty password. Unattached, it is the development default `apppass`,
+        # the same for every reader of the catalog, which attaching a credential
+        # replaces.
+        variables:
+          DISABLE_INSTALL_DEMO_CONFIG: "true"
+    {{- if $bound }}
+          OPENSEARCH_INITIAL_ADMIN_PASSWORD: "{{ get $env "OPENSEARCH_INITIAL_ADMIN_PASSWORD" }}"
+    {{- else }}
+          OPENSEARCH_INITIAL_ADMIN_PASSWORD: apppass
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+          metrics: 9600
+        # The product's own chart checks the server by opening a connection to
+        # its REST port, and this check does the same with the curl the image
+        # carries (it carries no nc): any HTTP answer passes, because the server
+        # answers a request that carries no credential with 401. The timing is
+        # the chart's readiness probe, and its startup probe's allowance — 5
+        # seconds, then 30 tries 10 seconds apart — is the start-up period. A
+        # service keeps one healthcheck, so one probe is declared.
+        health:
+          ready:
+            exec: ["curl", "-s", "-o", "/dev/null", "http://localhost:{{ .infra.port }}/"]
+            initialDelaySeconds: 305
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        # The indexes live on one volume. A named volume starts out with the
+        # ownership of the image's own copy of that directory, the unprivileged
+        # user the server runs as.
+        volumeMounts:
+          - name: data
+            path: /usr/share/opensearch/data
+          - name: opensearch-yml
+            path: /usr/share/opensearch/config/opensearch.yml
+          - name: internal-users
+            path: /usr/share/opensearch/config/opensearch-security/internal_users.yml
+          - name: roles-mapping
+            path: /usr/share/opensearch/config/opensearch-security/roles_mapping.yml
+    # The server owns a durable volume on this target too. A datastore whose data
+    # vanished with its container would be a different thing from the one the
+    # Kubernetes target deploys. The declared size is read from the operator's
+    # own sizing knob so one Release configures either target.
+    volumes:
+      data:
+        persistent:
+          size: "{{ .infra.storage.size }}"
+      opensearch-yml:
+        configmap:
+          source: "{{ .context.instance_id }}-opensearch-yml"
+      internal-users:
+        configmap:
+          source: "{{ .context.instance_id }}-internal-users"
+      roles-mapping:
+        configmap:
+          source: "{{ .context.instance_id }}-roles-mapping"
+    # ClusterIP publishes the port on no host interface: the stack's own services
+    # reach the server, and nothing outside it does.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

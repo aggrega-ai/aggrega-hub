@@ -1,0 +1,352 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: opensearch-chart
+  version: 1.0.0
+  # The packaged OpenSearch server is Apache-2.0.
+  license: Apache-2.0
+  description: >
+    OpenSearch on Kubernetes via the product's own Helm chart, published by
+    OpenSearch's maintainers in their HTTPS chart repository. The chart is
+    configured for one node with its indexes on its own volume. It renders a
+    StatefulSet, a ClusterIP Service publishing the REST API, the transport and
+    the metrics ports, a headless Service, a ConfigMap, a Secret holding the
+    security configuration and a PodDisruptionBudget.
+
+    The security plugin stays on. The image's demonstration setup is replaced
+    by one account, admin, whose password is read from the attached
+    credential's Secret by name, so it never appears in the rendered files; with
+    none attached it is a development default. A credential that names no Secret
+    halts the build. An init container generates the node's transport key each
+    time the pod starts. The REST API is served over plain HTTP, not encrypted,
+    and is reachable only inside the Release.
+
+    Reach for this realization on Kubernetes where a chart repository is
+    reachable at build time; for local development reach for the Compose Recipe
+    opensearch, which runs the same image with the same security setup.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/datastore/opensearch:1.0.0
+
+  source:
+    kind: helm-https-chart
+    url: https://opensearch-project.github.io/helm-charts/
+    chart: opensearch
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"3.9.0\" }}"
+
+  # provides.host is the server's Service name, which is what the Component's
+  # provides contract promises. The valuesMapping below pins the chart's
+  # fullnameOverride to the rendered name, the release name the helm provider
+  # gives the chart, which spells the Component's name in the alphabet a
+  # Kubernetes name allows. This chart names the Service from a second knob of
+  # its own, masterService, rather than from fullnameOverride — read from a
+  # render of the chart, not assumed — so that knob is pinned to the same name.
+  # The StatefulSet, the ConfigMap, the security Secret and the disruption budget
+  # take the pinned name too; the headless Service adds "-headless".
+  #
+  # port follows the port the operator set: the server listens on it and the
+  # Service publishes it. protocol is "http", the scheme the REST API is served
+  # over, and endpoint joins the parts into that address. user is `admin`, the
+  # one account the server holds, the one the password slot's credential
+  # belongs to.
+  #
+  # A same-namespace consumer reaches the server under this name directly; a
+  # cross-namespace consumer qualifies it caller-side. The host is the bare,
+  # self-contained in-cluster Service name: it carries no namespace, so the
+  # Recipe is independent of where it is deployed.
+  provides:
+    host: "{{ .context.rendered_name }}"
+    port: "{{ .infra.port }}"
+    user: "admin"
+    protocol: "http"
+    endpoint: "http://{{ .context.rendered_name }}:{{ .infra.port }}"
+
+  # A Release may write a key of an infra group as an empty string —
+  # `compute.cpu: ""`, or `storage.size: ""` — and a key written that way
+  # replaces the Component's default rather than falling back to it. Rendered,
+  # that would emit a workload with no CPU or memory limit, or a volume that
+  # requests no size: a Release materially different from the one the
+  # Component's declared defaults describe, with nothing in the output saying so.
+  # The build halts here instead, naming the key and the group it belongs to, so
+  # the fix is one line in the Release. A key the Release leaves out takes the
+  # Component's default. The storage class is not checked: left unset, the
+  # volume is provisioned from the cluster's default storage class.
+  assertions:
+    compute_group_complete: >-
+      {{- if not (optional (default dict .infra.compute) "cpu" "") -}}
+      {{- fail "this Release sets part of infra.compute on the OpenSearch server but leaves compute.cpu empty, so the rendered workload would carry no CPU request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+      {{- if not (optional (default dict .infra.compute) "memory" "") -}}
+      {{- fail "this Release sets part of infra.compute on the OpenSearch server but leaves compute.memory empty, so the rendered workload would carry no memory request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+    storage_group_complete: >-
+      {{- if not (optional (default dict .infra.storage) "size" "") -}}
+      {{- fail "this Release leaves storage.size empty on the OpenSearch server, so the rendered volume would request no size: set storage.size to the size the volume needs, or leave it out of the Release to take the component's default" -}}
+      {{- end -}}
+
+  # This Recipe reads from infra.overrides:
+  #   image          - { repository: string, tag: string } (image.repository and
+  #                    image.tag; overrides the version pin, and the init
+  #                    container generating the transport key runs the same image)
+  #   service_type   - string (service.type; how the endpoint is exposed, default ClusterIP)
+  #   requests       - { cpu: string, memory: string } (server resource requests;
+  #                    without it the requests equal the limits)
+  #   nodeSelector   - map[string]string (pod scheduling)
+  #   tolerations    - []object (pod scheduling)
+  #
+  # The chart is run as one node: singleNode makes it a single replica with the
+  # single-node discovery the product documents for one server. Its Ingress,
+  # NetworkPolicy, Prometheus-operator monitor, service account and plugin
+  # installer stay at their own off-by-default setting, and so does its
+  # privileged kernel-tuning init container: single-node discovery leaves the
+  # product's start-up checks off. The chart's ownership-fixing init container is
+  # switched off: the image runs as the unprivileged user 1000, which owns the
+  # image's own data directory, and the chart gives the volume to group 1000
+  # through the pod's fsGroup, so the server can write to it without a second
+  # image running as root.
+  #
+  # The chart writes the namespace the helm provider gives it into the security
+  # Secret: the one the Release declares, and `default` where it declares none.
+  #
+  # The server image is pinned by the Component's engine_version, whose default
+  # names it by tag and by digest; the chart's own configuration-copying init
+  # container and this Recipe's transport-key init container run the same image.
+  # The chart's own startup and readiness probes are kept — each opens a TCP
+  # connection to the REST port — and follow the port the operator set.
+  valuesMapping: |
+    {{- $repo := "opensearchproject/opensearch" }}
+    {{- $tag := .infra.engine_version }}
+    {{- if and .infra.overrides .infra.overrides.image }}
+    {{- $repo = optional .infra.overrides.image "repository" $repo }}
+    {{- $tag = optional .infra.overrides.image "tag" $tag }}
+    {{- end }}
+    ## ── Pin the chart's resource names to the rendered name ────
+    ## fullnameOverride names the StatefulSet, its pod and claim, the ConfigMap,
+    ## the security Secret and the disruption budget; masterService names the
+    ## Service, "<rendered_name>", matching provides.host, and the headless
+    ## Service "<rendered_name>-headless". Both read from a render rather than
+    ## assumed.
+    fullnameOverride: "{{ .context.rendered_name }}"
+    masterService: "{{ .context.rendered_name }}"
+
+    ## ── One node ───────────────────────────────────────────────
+    singleNode: true
+
+    ## ── Server image pin ───────────────────────────────────────
+    ## The chart's own default tag is the server version it was released with,
+    ## so leaving it to the chart makes the render move whenever the chart
+    ## moves. The tag comes from engine_version, which carries the image's digest
+    ## by default. The chart derives a major-version annotation from the tag,
+    ## which it cannot read once a digest follows the version, so the major
+    ## version is given here, read from the tag's leading number.
+    image:
+      repository: "{{ $repo }}"
+      tag: "{{ $tag }}"
+    majorVersion: "{{ regexFind "^[0-9]+" $tag | default "3" }}"
+
+    ## ── The server's heap ──────────────────────────────────────
+    ## Left empty, so the server keeps the image's own heap of 1 GB, half the
+    ## Component's default memory, on both targets; the chart's own default
+    ## would set 512 MB instead.
+    opensearchJavaOpts: ""
+
+    ## ── The REST port ──────────────────────────────────────────
+    ## httpPort is the container port and the Service port; the server is held
+    ## on the same port by http.port in its configuration file below. The REST
+    ## API is served over HTTP, which the chart's own scheme value records.
+    httpPort: {{ .infra.port }}
+    protocol: http
+
+    ## ── The server's configuration file ────────────────────────
+    ## Replaces the chart's own opensearch.yml, whose only settings are the ones
+    ## the chart also passes in the environment (cluster name, bind address,
+    ## discovery), which keep applying.
+    ##
+    ## 🔴 THE SECURITY PLUGIN STAYS ON, AND NOTHING OF THE IMAGE'S DEMONSTRATION
+    ## SETUP IS USED. The node's transport layer is encrypted with a key the init
+    ## container below generates each time the pod starts, so no key is known to
+    ## any reader of the catalog; the plugin refuses to start if a demonstration
+    ## certificate is present in its configuration directory, and this
+    ## configuration does not allow one. The REST API is served over HTTP: a
+    ## certificate generated inside the pod gives a client nothing to verify it
+    ## against. On first start the plugin initialises its security index from its
+    ## security configuration files, the two below among them.
+    config:
+      opensearch.yml: |
+        http.port: {{ .infra.port }}
+        plugins.security.ssl.transport.keystore_type: PKCS12
+        plugins.security.ssl.transport.keystore_filepath: tls/node.p12
+        plugins.security.ssl.transport.truststore_type: PKCS12
+        plugins.security.ssl.transport.truststore_filepath: tls/truststore.p12
+        transport.ssl.enforce_hostname_verification: false
+        plugins.security.ssl.http.enabled: false
+        plugins.security.allow_default_init_securityindex: true
+        plugins.security.nodes_dn:
+          - "CN=opensearch-node"
+        plugins.security.restapi.roles_enabled: ["all_access", "security_rest_api_access"]
+
+    ## ── The security configuration ─────────────────────────────
+    ## Two files replace the image's own, which hold its demonstration accounts:
+    ## the internal user database holds one account, admin, and the role mapping
+    ## gives it every permission. The administrator's hash is not written here:
+    ## the plugin computes it each time it loads its configuration from the
+    ## OPENSEARCH_INITIAL_ADMIN_PASSWORD variable below, so the file holds no
+    ## secret and the password in force is the one that variable carries.
+    ## The other files of the security configuration stay the product's own.
+    ## The chart writes the files into a Secret and mounts each one over the
+    ## image's file of the same name.
+    securityConfig:
+      enabled: true
+      config:
+        dataComplete: false
+        data:
+          internal_users.yml: |
+            _meta:
+              type: "internalusers"
+              config_version: 2
+            admin:
+              hash: "${envbc.OPENSEARCH_INITIAL_ADMIN_PASSWORD}"
+              reserved: true
+              backend_roles:
+                - "admin"
+              description: "The administrator; its password is read from the server's environment"
+          roles_mapping.yml: |
+            _meta:
+              type: "rolesmapping"
+              config_version: 2
+            all_access:
+              reserved: false
+              backend_roles:
+                - "admin"
+              description: "Gives the administrator every permission"
+
+    ## ── The environment ────────────────────────────────────────
+    ## DISABLE_INSTALL_DEMO_CONFIG stops the image's start-up script installing
+    ## its demonstration setup. OPENSEARCH_INITIAL_ADMIN_PASSWORD is the variable
+    ## the product documents for the administrator's password; here the security
+    ## configuration above reads it.
+    ##
+    ## 🔴 THE PASSWORD FOLLOWS THE PASSWORD SLOT. Attached, it is read from the
+    ## attached credential's Secret BY NAME, so the material never appears in the
+    ## rendered artifact; unattached, it is the development default `apppass`,
+    ## the same for every reader of the catalog, which attaching a credential
+    ## replaces.
+    {{- $password := hasKey (default dict .features) "password" }}
+    {{- if $password }}
+    {{- $locator := optional (optional (default dict .features) "password" dict) "provides" dict }}
+    {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) }}
+    {{- fail (printf "the password credential of the OpenSearch server %q publishes no Secret name and data key, so the server could not be given a reference to read it from: attach a credential publishing both, such as core/referenced-secret or core/random-password" .context.instance_id) }}
+    {{- end }}
+    {{- end }}
+    extraEnvs:
+      - name: DISABLE_INSTALL_DEMO_CONFIG
+        value: "true"
+      {{- if $password }}
+      - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .features.password.provides.name }}"
+            key: "{{ .features.password.provides.key }}"
+      {{- else }}
+      - name: OPENSEARCH_INITIAL_ADMIN_PASSWORD
+        value: apppass
+      {{- end }}
+
+    ## ── The node's transport key ───────────────────────────────
+    ## Generated at deploy time, inside the pod, by the JDK the image carries: a
+    ## key pair and its self-signed certificate in a keystore, and the
+    ## certificate alone in a truststore, written to a scratch volume the server
+    ## mounts under its configuration directory. The build renders only the
+    ## commands; the key exists nowhere outside the pod and is made anew each
+    ## time the pod starts. The stores' password is `changeit`, the one the
+    ## security plugin assumes when its configuration names none; it guards
+    ## files that never leave the pod.
+    extraVolumes:
+      - name: transport-tls
+        emptyDir: {}
+    extraVolumeMounts:
+      - name: transport-tls
+        mountPath: /usr/share/opensearch/config/tls
+        readOnly: true
+    extraInitContainers:
+      - name: transport-key
+        image: "{{ $repo }}:{{ $tag }}"
+        imagePullPolicy: IfNotPresent
+        command:
+          - bash
+          - -c
+          - |
+            set -eu
+            cd /tls
+            rm -f node.p12 truststore.p12 node.crt
+            /usr/share/opensearch/jdk/bin/keytool -genkeypair -noprompt -alias node -keyalg RSA -keysize 3072 -validity 3650 -dname "CN=opensearch-node" -ext "eku=serverAuth,clientAuth" -keystore node.p12 -storetype PKCS12 -storepass changeit
+            /usr/share/opensearch/jdk/bin/keytool -exportcert -noprompt -alias node -keystore node.p12 -storetype PKCS12 -storepass changeit -file node.crt
+            /usr/share/opensearch/jdk/bin/keytool -importcert -noprompt -alias node -file node.crt -keystore truststore.p12 -storetype PKCS12 -storepass changeit
+            rm -f node.crt
+            chmod 600 node.p12 truststore.p12
+        securityContext:
+          capabilities:
+            drop:
+              - ALL
+          runAsNonRoot: true
+          runAsUser: 1000
+        volumeMounts:
+          - name: transport-tls
+            mountPath: /tls
+
+    ## ── The node's volume ──────────────────────────────────────
+    persistence:
+      enableInitChown: false
+      size: "{{ .infra.storage.size }}"
+      {{- with .infra.storage.type }}
+      storageClass: "{{ . }}"
+      {{- end }}
+
+    ## ── Resources ──────────────────────────────────────────────
+    resources:
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      requests:
+        {{- if and .infra.overrides .infra.overrides.requests }}
+        cpu: "{{ .infra.overrides.requests.cpu }}"
+        memory: "{{ .infra.overrides.requests.memory }}"
+        {{- else }}
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+        {{- end }}
+    {{- if .infra.overrides }}
+    {{- if .infra.overrides.nodeSelector }}
+    nodeSelector: {{ toJson .infra.overrides.nodeSelector }}
+    {{- end }}
+    {{- if .infra.overrides.tolerations }}
+    tolerations: {{ toJson .infra.overrides.tolerations }}
+    {{- end }}
+    {{- end }}
+
+    ## ── Probes ─────────────────────────────────────────────────
+    ## The chart's own startup and readiness probes, a TCP connection to the
+    ## REST port, moved onto the port the operator set.
+    startupProbe:
+      tcpSocket:
+        port: {{ .infra.port }}
+    readinessProbe:
+      tcpSocket:
+        port: {{ .infra.port }}
+
+    ## ── The Service ────────────────────────────────────────────
+    ## The chart publishes the REST port, 9300 for the transport and 9600 for
+    ## the performance metrics.
+    service:
+      {{- if and .infra.overrides .infra.overrides.service_type }}
+      type: "{{ .infra.overrides.service_type }}"
+      {{- else }}
+      type: ClusterIP
+      {{- end }}
