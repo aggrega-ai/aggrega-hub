@@ -42,37 +42,35 @@ metadata:
 spec:
   capability: helm
   implements: core/ai-agent/flowise:1.0.0
-  # When values.flow_definition is set, a ConfigMap carries the definition
-  # verbatim beside the script that seeds it, and a one-shot Job runs that
-  # script once the platform answers. With no definition both render empty and
-  # neither is emitted, so the output is what it is without the value. The
-  # Component's assertions have already halted a definition with no
+  # The entries below are the values the seeding Job shares with the
+  # FlowiseFlowSeed bundle imported for the definition and the script that
+  # seeds it. Each has its home in the bundle, which stops the build naming the
+  # local when one is missing or differs from its own; the Job reads them
+  # here, because an artifact of this Recipe cannot read the bundle.
+  # flow_seed_delivery has the bundle emit one ConfigMap, named after the
+  # rendered name followed by flow_seed_config_map_suffix; a locals entry
+  # cannot read the rendered name, so the Job composes the two.
+  # flow_seed_directory is where the Job mounts that ConfigMap and runs the
+  # script, and where the script reads the definition.
+  locals:
+    flow_seed_delivery: config_map
+    flow_seed_config_map_suffix: "-flow"
+    flow_seed_directory: /seed
+  # When values.flow_definition is set, the FlowiseFlowSeed bundle emits a
+  # ConfigMap carrying the definition verbatim beside the script that seeds
+  # it, and a one-shot Job runs that script once the platform answers. With no
+  # definition neither renders, so the output is what it is without the
+  # value. The Component's assertions have already halted a definition with no
   # infra.owner_email, no owner_password credential or a chatflow_id that is
   # not a UUID.
   #
-  # The step, in order: it checks the definition parses as JSON; it waits for
-  # GET /api/v1/ping to answer; it asks POST /api/v1/auth/resolve whether the
-  # instance has an owner, and while it has none, registers infra.owner_email
-  # with the owner password at POST /api/v1/account/register, which makes the
-  # first account the owner; it signs in at POST /api/v1/auth/login; then, with
-  # the session the sign-in set — the token cookie and the session cookie, sent
-  # back explicitly with x-request-from: internal — it reads
-  # GET /api/v1/chatflows/<chatflow_id> and, where the chatflow exists,
-  # replaces its nodes and edges with PUT, keeping its id, name and settings, or,
-  # where it does not, imports the definition at that id through
-  # POST /api/v1/export-import/import, named after values.display_name or the
-  # id. Creating a chatflow through POST /api/v1/chatflows is not used, because
-  # it discards a supplied id, so running it twice would add a second chatflow;
-  # the import keeps the id. Signing in, registering, reading, updating and
-  # importing each halt the step with the platform's own status and message
-  # when refused, and nothing the step prints repeats the password. Running it
+  # The script is the bundle's, the one compose/flowise imports too, so both
+  # targets run one text; the bundle says what it does, in order. In short, it
+  # registers infra.owner_email as the owner on a fresh instance, signs in,
+  # and updates the chatflow at chatflow_id or imports the definition at that
+  # id, named after values.display_name or the id, halting with the
+  # platform's own status and message when a call is refused; running it
   # again updates the same chatflow, so a retried or repeated run converges.
-  #
-  # The script is the same text as the one compose/flowise carries in its
-  # compose config: the two Recipes are separate files with no shared template
-  # either could import, so the two copies are edited together. It holds no $
-  # and no doubled braces, so it reaches the container as written on both
-  # targets.
   #
   # The Job runs the platform's own image, whose Node.js runtime carries the
   # HTTP client the script uses, so the step adds no image; the command
@@ -100,107 +98,8 @@ spec:
   # publishes, so no file this Recipe renders carries the password, and a
   # credential publishing neither halts the build.
   artifacts:
-    flowise-flow.configmap.yaml: |
-      {{- if .values.flow_definition -}}
-      apiVersion: v1
-      kind: ConfigMap
-      metadata:
-        name: {{ .context.rendered_name }}-flow
-        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
-        namespace: "{{ . }}"
-        {{- end }}
-      data:
-        flow.json: |
-      {{ .values.flow_definition | indent 4 }}
-        seed.js: |
-          const fs = require("fs");
-
-          const API = process.env.FLOWISE_URL + "/api/v1";
-          const EMAIL = process.env.OWNER_EMAIL;
-          const PASSWORD = process.env.OWNER_PASSWORD;
-          const ID = process.env.CHATFLOW_ID;
-          const NAME = process.env.CHATFLOW_NAME;
-
-          function fail(message) {
-            console.error(message);
-            process.exit(1);
-          }
-
-          async function call(method, path, body, headers) {
-            const init = {
-              method: method,
-              headers: Object.assign({ "Content-Type": "application/json" }, headers || {}),
-              signal: AbortSignal.timeout(60000)
-            };
-            if (body !== undefined) init.body = JSON.stringify(body);
-            const response = await fetch(API + path, init);
-            const text = await response.text();
-            let json = {};
-            try {
-              json = JSON.parse(text);
-            } catch (error) {
-              json = {};
-            }
-            return { status: response.status, json: json || {}, cookies: response.headers.getSetCookie() };
-          }
-
-          function cause(result) {
-            const message = result.json && result.json.message;
-            return "HTTP " + result.status + (message ? ": " + message : "");
-          }
-
-          async function waitForPlatform() {
-            const deadline = Date.now() + 600000;
-            while (Date.now() < deadline) {
-              try {
-                const response = await fetch(API + "/ping", { signal: AbortSignal.timeout(10000) });
-                if (response.ok) return;
-              } catch (error) {
-                // not answering yet
-              }
-              await new Promise((resolve) => setTimeout(resolve, 5000));
-            }
-            fail("Flowise did not answer " + API + "/ping within ten minutes");
-          }
-
-          async function main() {
-            const definition = fs.readFileSync("/seed/flow.json", "utf8");
-            try {
-              JSON.parse(definition);
-            } catch (error) {
-              fail("the chatflow definition is not JSON: " + error.message);
-            }
-            await waitForPlatform();
-            const setup = await call("POST", "/auth/resolve");
-            if (setup.status !== 200) fail("asking Flowise whether it has an owner was refused with " + cause(setup));
-            if (setup.json.redirectUrl === "/organization-setup") {
-              const owner = { user: { name: EMAIL.split("@")[0].slice(0, 100), email: EMAIL, credential: PASSWORD } };
-              const registered = await call("POST", "/account/register", owner);
-              if (registered.status !== 201) fail("registering the owner account " + EMAIL + " was refused with " + cause(registered));
-              console.log("registered the owner account " + EMAIL);
-            }
-            const login = await call("POST", "/auth/login", { email: EMAIL, password: PASSWORD });
-            if (login.status !== 200) fail("signing in to Flowise as " + EMAIL + " was refused with " + cause(login));
-            const session = {
-              "x-request-from": "internal",
-              Cookie: login.cookies.map((cookie) => cookie.split(";")[0]).join("; ")
-            };
-            const current = await call("GET", "/chatflows/" + ID, undefined, session);
-            if (current.status === 200) {
-              const updated = await call("PUT", "/chatflows/" + ID, { flowData: definition }, session);
-              if (updated.status !== 200) fail("updating chatflow " + ID + " was refused with " + cause(updated));
-              console.log("updated chatflow " + ID + " from the definition");
-              return;
-            }
-            if (current.status !== 404) fail("reading chatflow " + ID + " was refused with " + cause(current));
-            const payload = { ChatFlow: [{ id: ID, name: NAME, flowData: definition, type: "CHATFLOW" }] };
-            const imported = await call("POST", "/export-import/import", payload, session);
-            if (imported.status !== 200) fail("importing chatflow " + ID + " was refused with " + cause(imported));
-            console.log("imported chatflow " + ID + " as " + JSON.stringify(NAME));
-          }
-
-          main().catch((error) => fail("seeding chatflow " + ID + " failed: " + error.message));
-      {{- end }}
+    flowise-flow:
+      $import: FlowiseFlowSeed#/artifacts/SeedScript
     flowise-flow-seed.job.yaml: |
       {{- if .values.flow_definition }}
       {{- $locator := optional (optional (default dict .features) "owner_password" dict) "provides" dict }}
@@ -221,7 +120,7 @@ spec:
             containers:
               - name: seed
                 image: "{{ .infra.image }}"
-                command: ["node", "/seed/seed.js"]
+                command: ["node", "{{ .locals.flow_seed_directory }}/seed.js"]
                 env:
                   - name: FLOWISE_URL
                     value: "http://{{ .context.rendered_name }}-default:3000"
@@ -238,12 +137,12 @@ spec:
                     value: {{ optional .values "display_name" "" | default .values.chatflow_id | toJson }}
                 volumeMounts:
                   - name: seed
-                    mountPath: /seed
+                    mountPath: {{ .locals.flow_seed_directory }}
                     readOnly: true
             volumes:
               - name: seed
                 configMap:
-                  name: {{ .context.rendered_name }}-flow
+                  name: {{ .context.rendered_name }}{{ .locals.flow_seed_config_map_suffix }}
       {{- end }}
   # The Workload becomes a Deployment serving the Flowise editor on a ClusterIP
   # Service, backed by a persistent volume. Two pieces of durable state land on

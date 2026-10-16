@@ -1,0 +1,278 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: ArtifactLibrary
+metadata:
+  name: FlowiseFlowSeed
+  version: 1.0.0
+  description: >
+    The chatflow a Flowise platform is seeded with and the script that seeds
+    it, as one bundle every Recipe running core/ai-agent/flowise imports, so
+    the steps that create the owner account or sign in as it, then update or
+    import the chatflow, are written once, whichever target the platform runs
+    on.
+
+    SeedScript writes nothing unless the Component's values.flow_definition is
+    set. Then it carries the definition verbatim, as flow.json, beside a
+    Node.js script, seed.js. The script waits for the platform to answer,
+    registers infra.owner_email as the owner on a fresh instance, signs in,
+    and updates the chatflow at values.chatflow_id or imports the definition
+    at that id, halting with the platform's own status and message when a
+    call is refused. It reads the platform's address, the owner's email and
+    password and the chatflow's id and name from the environment the
+    importing Recipe's step gives it, and the definition from the directory
+    that step mounts the two files in.
+
+    The importing Recipe picks the delivery with the local
+    flow_seed_delivery — config_map, one ConfigMap holding both files, for a
+    Kubernetes target, or compose_configs, two compose configs, with every $
+    of the definition doubled — and declares as locals the names and the
+    directory it shares with the bundle, which stops the build when one is
+    missing or differs. The bundle is authored against Flowise 3.1.3.
+spec:
+  artifacts:
+    # The bundle. The definition a Flowise platform is seeded with, carried as
+    # written, and the script that seeds it, as one bundle every Recipe running
+    # core/ai-agent/flowise imports. The script is logic rather than
+    # configuration, so it lives here once rather than as a copy in each Recipe
+    # that a later edit could leave behind.
+    #
+    # What the script does, in order: it checks the definition parses as JSON;
+    # it waits for GET /api/v1/ping to answer, for about ten minutes; it asks
+    # POST /api/v1/auth/resolve whether the instance has an owner, and while it
+    # has none, registers OWNER_EMAIL with OWNER_PASSWORD at
+    # POST /api/v1/account/register, which makes the first account the owner; it
+    # signs in at POST /api/v1/auth/login; then, with the session the sign-in
+    # set — the token cookie and the session cookie, sent back explicitly with
+    # x-request-from: internal — it reads GET /api/v1/chatflows/<CHATFLOW_ID>
+    # and, where the chatflow exists, replaces its nodes and edges with PUT,
+    # keeping its id, name and settings, or, where it does not, imports the
+    # definition at that id through POST /api/v1/export-import/import, named
+    # CHATFLOW_NAME. Creating a chatflow through POST /api/v1/chatflows is not
+    # used, because it discards a supplied id, so running it twice would add a
+    # second chatflow; the import keeps the id. Each call halts the script with
+    # the platform's own status and message when refused, and nothing it
+    # prints repeats the password. Running it again updates the same chatflow,
+    # so a retried or repeated run converges.
+    #
+    # What the importing Recipe's step gives the script. It runs it with node,
+    # from the directory the two files are mounted in, in an image carrying a
+    # Node.js runtime whose fetch the script uses — the platform's own image
+    # does — and sets FLOWISE_URL, the platform's address with no path,
+    # OWNER_EMAIL and OWNER_PASSWORD, the owner account's, CHATFLOW_ID, the
+    # Component's values.chatflow_id, and CHATFLOW_NAME, the name an imported
+    # chatflow takes. The script holds no $, no doubled brace and no backtick,
+    # so it reaches the container as written through either delivery.
+    #
+    # How the two files reach the step. The importing Recipe chooses through
+    # the local flow_seed_delivery. With config_map the bundle emits one
+    # ConfigMap carrying the definition under the key flow.json and the script
+    # under seed.js, which a step mounting the ConfigMap as a directory reads as
+    # two files. With compose_configs it emits two compose configs, the
+    # definition and the script, which the compose target delivers each as one
+    # file at the path it is mounted at. Compose reads a $ in a config's content
+    # as the start of a variable of its own, so there every $ of the definition
+    # is written as $$, the compose file's spelling of a literal $, and the step
+    # reads the definition as authored. Any other value, or none, stops the
+    # build. The ConfigMap carries the namespace the Release declares for the
+    # component through the aggrega.ai/namespace annotation, as the component's
+    # own workload does, and none where it declares none, so a step beside the
+    # workload mounts it.
+    #
+    # What the importing Recipe declares. Its step is its own workload, which a
+    # bundle cannot write, so it declares as locals the values that step shares
+    # with this bundle, and the bundle stops the build, naming the local, when
+    # one is missing or differs from its own. Every importing Recipe declares
+    # flow_seed_directory (/seed), the directory the script reads flow.json
+    # from, where the step mounts the files and runs seed.js. With config_map
+    # it declares flow_seed_config_map_suffix (-flow): the ConfigMap is named
+    # after the name the Recipe's provider gives the component, followed by
+    # that suffix, and since a local cannot read that name, the Recipe composes
+    # the two where it names the ConfigMap. With compose_configs it declares
+    # flow_definition_config_name and seed_script_config_name instead, the two
+    # configs' names (the instance name followed by -flow and by -flow-seed).
+    #
+    # The template reads the importing Recipe's context: .values.flow_definition
+    # from the Component, .context.instance_id, .context.rendered_name and
+    # .context.annotations.release with config_map, and the locals listed
+    # above. It checks every local before it writes anything, whether or not a
+    # definition is set, because a local the importing Recipe does not declare
+    # reads as empty here rather than stopping the build, and a name or a
+    # directory that differs on the two sides would leave a step that finds no
+    # script or no definition.
+    SeedScript:
+      flowise-flow.yaml: |
+        {{- /* The values this bundle shares with the Recipe importing it. Each has its home here, and the importing
+          Recipe restates it as a local because its own step, which this bundle cannot write, reads it too. A local
+          the Recipe does not declare reads as empty here, so each is checked before anything is written: absent, or
+          not the value below, and the build stops naming it. */}}
+        {{- $bundle := "FlowiseFlowSeed#/artifacts/SeedScript" }}
+        {{- $directory := "/seed" }}
+        {{- $mapSuffix := "-flow" }}
+        {{- $definitionName := printf "%s-flow" .context.instance_id }}
+        {{- $scriptName := printf "%s-flow-seed" .context.instance_id }}
+        {{- $have := "" }}
+        {{- /* How the two files reach the importing Recipe's step, which that Recipe chooses because its step mounts
+          them: "config_map", one ConfigMap carrying both, for a Kubernetes target; or "compose_configs", two compose
+          configs, for the compose target. Any other value stops the build. */}}
+        {{- $have = optional .locals "flow_seed_delivery" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local flow_seed_delivery, which takes \"config_map\" or \"compose_configs\": whether this bundle delivers the chatflow definition and the script seeding it as one ConfigMap, for a Kubernetes target, or as two compose configs, for the compose target; declare it as one of the two" $bundle) }}
+        {{- else if not (has $have (list "config_map" "compose_configs")) }}
+        {{- fail (printf "the Recipe importing %s declares the local flow_seed_delivery as %q, but it takes \"config_map\" or \"compose_configs\": whether this bundle delivers the chatflow definition and the script seeding it as one ConfigMap, for a Kubernetes target, or as two compose configs, for the compose target; declare it as one of the two" $bundle $have) }}
+        {{- end }}
+        {{- $compose := eq $have "compose_configs" }}
+        {{- /* The directory the script reads the definition from, which the importing Recipe's step mounts the two
+          files in and runs the script from; shared with either delivery. */}}
+        {{- $have = optional .locals "flow_seed_directory" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local flow_seed_directory, which is the directory its step mounts the chatflow definition and the script in and this bundle's script reads the definition from; declare it as %q" $bundle $directory) }}
+        {{- else if ne $have $directory }}
+        {{- fail (printf "the Recipe importing %s declares the local flow_seed_directory as %q, but that local is the directory its step mounts the chatflow definition and the script in and this bundle's script reads the definition from, and this bundle's side of it is %q; declare it as %q" $bundle $have $directory $directory) }}
+        {{- end }}
+        {{- /* The names the importing Recipe's step mounts what this bundle emits by: the two compose configs', or the
+          ConfigMap's. The ConfigMap is named after the name the Recipe's provider gives the component, which a local
+          cannot read, so the Recipe declares the part after it and composes the two where it names the ConfigMap. */}}
+        {{- if $compose }}
+        {{- $have = optional .locals "flow_definition_config_name" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local flow_definition_config_name, which is the name of the compose config its step mounts the chatflow definition from, which this bundle emits; declare it as %q" $bundle $definitionName) }}
+        {{- else if ne $have $definitionName }}
+        {{- fail (printf "the Recipe importing %s declares the local flow_definition_config_name as %q, but that local is the name of the compose config its step mounts the chatflow definition from, which this bundle emits, and this bundle's side of it is %q; declare it as %q" $bundle $have $definitionName $definitionName) }}
+        {{- end }}
+        {{- $have = optional .locals "seed_script_config_name" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local seed_script_config_name, which is the name of the compose config its step mounts the seeding script from, which this bundle emits; declare it as %q" $bundle $scriptName) }}
+        {{- else if ne $have $scriptName }}
+        {{- fail (printf "the Recipe importing %s declares the local seed_script_config_name as %q, but that local is the name of the compose config its step mounts the seeding script from, which this bundle emits, and this bundle's side of it is %q; declare it as %q" $bundle $have $scriptName $scriptName) }}
+        {{- end }}
+        {{- else }}
+        {{- $have = optional .locals "flow_seed_config_map_suffix" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local flow_seed_config_map_suffix, which follows the component's rendered name in the name of the ConfigMap its step mounts, which this bundle emits; declare it as %q" $bundle $mapSuffix) }}
+        {{- else if ne $have $mapSuffix }}
+        {{- fail (printf "the Recipe importing %s declares the local flow_seed_config_map_suffix as %q, but that local follows the component's rendered name in the name of the ConfigMap its step mounts, which this bundle emits, and this bundle's side of it is %q; declare it as %q" $bundle $have $mapSuffix $mapSuffix) }}
+        {{- end }}
+        {{- if not .context.rendered_name }}
+        {{- fail (printf "the Recipe importing %s declares the local flow_seed_delivery as \"config_map\", but its provider reports no rendered name for %q, and the ConfigMap is named after it; declare \"compose_configs\" on the compose target, or import this bundle from a Recipe whose provider names the component" $bundle .context.instance_id) }}
+        {{- end }}
+        {{- end }}
+        {{- if .values.flow_definition }}
+        {{- /* The definition as the step reads it: as written in a ConfigMap, and with every $ doubled in a compose
+          config, which the compose target reads back as one literal $ each. */}}
+        {{- $definition := .values.flow_definition }}
+        {{- if $compose }}{{ $definition = replace "$" "$$" $definition }}{{ end }}
+        {{- /* The envelope. The script below is written once and wrapped by the envelope the importing Recipe chose: a
+          compose config's content or a ConfigMap key. Both are block scalars holding it at one indentation, so in the
+          compose fragment each config's content key sits one column deeper than its name, the shallowest place a
+          block scalar of that indentation can hang from; the compose target reads the fragment's configs and writes
+          them into the compose file, so that column reaches no emitted byte. */}}
+        {{- if $compose -}}
+        configs:
+          {{ $definitionName }}:
+           content: |
+        {{ $definition | indent 4 }}
+          {{ $scriptName }}:
+           content: |
+        {{- else -}}
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: {{ .context.rendered_name }}{{ $mapSuffix }}
+          {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+          namespace: "{{ . }}"
+          {{- end }}
+        data:
+          flow.json: |
+        {{ $definition | indent 4 }}
+          seed.js: |
+        {{- end }}
+            const fs = require("fs");
+
+            const API = process.env.FLOWISE_URL + "/api/v1";
+            const EMAIL = process.env.OWNER_EMAIL;
+            const PASSWORD = process.env.OWNER_PASSWORD;
+            const ID = process.env.CHATFLOW_ID;
+            const NAME = process.env.CHATFLOW_NAME;
+
+            function fail(message) {
+              console.error(message);
+              process.exit(1);
+            }
+
+            async function call(method, path, body, headers) {
+              const init = {
+                method: method,
+                headers: Object.assign({ "Content-Type": "application/json" }, headers || {}),
+                signal: AbortSignal.timeout(60000)
+              };
+              if (body !== undefined) init.body = JSON.stringify(body);
+              const response = await fetch(API + path, init);
+              const text = await response.text();
+              let json = {};
+              try {
+                json = JSON.parse(text);
+              } catch (error) {
+                json = {};
+              }
+              return { status: response.status, json: json || {}, cookies: response.headers.getSetCookie() };
+            }
+
+            function cause(result) {
+              const message = result.json && result.json.message;
+              return "HTTP " + result.status + (message ? ": " + message : "");
+            }
+
+            async function waitForPlatform() {
+              const deadline = Date.now() + 600000;
+              while (Date.now() < deadline) {
+                try {
+                  const response = await fetch(API + "/ping", { signal: AbortSignal.timeout(10000) });
+                  if (response.ok) return;
+                } catch (error) {
+                  // not answering yet
+                }
+                await new Promise((resolve) => setTimeout(resolve, 5000));
+              }
+              fail("Flowise did not answer " + API + "/ping within ten minutes");
+            }
+
+            async function main() {
+              const definition = fs.readFileSync("/seed/flow.json", "utf8");
+              try {
+                JSON.parse(definition);
+              } catch (error) {
+                fail("the chatflow definition is not JSON: " + error.message);
+              }
+              await waitForPlatform();
+              const setup = await call("POST", "/auth/resolve");
+              if (setup.status !== 200) fail("asking Flowise whether it has an owner was refused with " + cause(setup));
+              if (setup.json.redirectUrl === "/organization-setup") {
+                const owner = { user: { name: EMAIL.split("@")[0].slice(0, 100), email: EMAIL, credential: PASSWORD } };
+                const registered = await call("POST", "/account/register", owner);
+                if (registered.status !== 201) fail("registering the owner account " + EMAIL + " was refused with " + cause(registered));
+                console.log("registered the owner account " + EMAIL);
+              }
+              const login = await call("POST", "/auth/login", { email: EMAIL, password: PASSWORD });
+              if (login.status !== 200) fail("signing in to Flowise as " + EMAIL + " was refused with " + cause(login));
+              const session = {
+                "x-request-from": "internal",
+                Cookie: login.cookies.map((cookie) => cookie.split(";")[0]).join("; ")
+              };
+              const current = await call("GET", "/chatflows/" + ID, undefined, session);
+              if (current.status === 200) {
+                const updated = await call("PUT", "/chatflows/" + ID, { flowData: definition }, session);
+                if (updated.status !== 200) fail("updating chatflow " + ID + " was refused with " + cause(updated));
+                console.log("updated chatflow " + ID + " from the definition");
+                return;
+              }
+              if (current.status !== 404) fail("reading chatflow " + ID + " was refused with " + cause(current));
+              const payload = { ChatFlow: [{ id: ID, name: NAME, flowData: definition, type: "CHATFLOW" }] };
+              const imported = await call("POST", "/export-import/import", payload, session);
+              if (imported.status !== 200) fail("importing chatflow " + ID + " was refused with " + cause(imported));
+              console.log("imported chatflow " + ID + " as " + JSON.stringify(NAME));
+            }
+
+            main().catch((error) => fail("seeding chatflow " + ID + " failed: " + error.message));
+        {{- end }}
