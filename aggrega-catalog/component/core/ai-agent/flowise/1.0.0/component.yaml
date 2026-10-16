@@ -9,16 +9,19 @@ metadata:
   description: >
     The Flowise visual agent-builder, run in-cluster as the image a Release
     names. Flowise is a browser editor in which a chatflow is assembled from
-    nodes and then served over HTTP, so deploying it gives the editor and the
+    nodes and served over HTTP, so deploying it gives the editor and the
     endpoint together, backed by a volume holding the chatflow database and
-    the key that encrypts the credentials created in the editor. What this
-    component exposes is the chatflow a caller invokes and the per-request
-    overrides that call may carry; the model wired into the `model` socket
-    arrives as the endpoint an OpenAI-compatible client reads, while which
-    model a chatflow actually calls is chosen inside the chatflow's own node.
+    the key encrypting the editor's credentials. What this component exposes
+    is the chatflow a caller invokes and the per-request overrides that call
+    may carry; the model wired into the `model` socket arrives as the endpoint
+    an OpenAI-compatible client reads, while the chatflow's own node chooses
+    the model it calls.
     The catalog pins no image for it: which Flowise build to run is named by
     the Release, and until that Release sets `infra.image` the build halts
-    naming the container image and renders nothing.
+    naming the container image.
+
+    A chatflow set as flow_definition is seeded at deploy, on both targets,
+    under the owner account the operator names.
 
     Each tool wired into the optional `tools` socket, such as a Model Context
     Protocol server reached over HTTP, and each vector store wired into the
@@ -162,6 +165,20 @@ spec:
           sensitive: true
           inject: [env]
           description: Optional credential the platform presents to the vector store this connection reaches, such as the API key the store checks. When attached, the Recipe delivers it as AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL (a Kubernetes secretKeyRef on helm, the inject pipe on compose); unattached, no credential is delivered for the store.
+  featuresSchema:
+    # The password of the platform's owner account, read only when
+    # values.flow_definition is set. Flowise holds its accounts in its own
+    # database, and the first account registered on a fresh instance becomes
+    # the owner, so the step that seeds the chatflow registers that account
+    # with this password, or signs in with it where the owner already exists.
+    # Unlike a connection's credential it has no development literal to fall
+    # back on: an owner password every reader of the catalog knows would hand
+    # the platform to anyone who reads it, so the build halts instead.
+    owner_password:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Password of the owner account named by infra.owner_email, read only when values.flow_definition is set: the step that seeds the chatflow registers that account with it on a fresh instance, and signs in with it. Required then, and the build halts when nothing fills this slot; there is no development default. On helm the step receives it by reference, as a Kubernetes secretKeyRef to the Secret the credential publishes, so the password appears in no file the Recipe renders, and a credential publishing no Secret name and data key halts the build; on compose it is read from the inject pipe and written as it was delivered, so a Compose variable reference such as ${FLOWISE_OWNER_PASSWORD} lands as that reference. Flowise accepts a password of 8 to 128 characters holding a lower-case and an upper-case letter, a digit and a character that is neither."
   schema:
     values:
       $ref: "BaseComponents#/schemas/BaseAgentParameter"
@@ -172,6 +189,15 @@ spec:
             type: object
             additionalProperties:
               type: [string, integer, boolean]
+        # A chatflow carried verbatim, as Flowise's editor exports it. Flowise
+        # loads no chatflow from a file or a variable at start-up, so both
+        # Recipes seed it through the platform's own API after the platform
+        # answers: a one-shot step signs in as the owner and writes the
+        # chatflow at chatflow_id, which therefore names it in Flowise. Seeding
+        # again updates that chatflow in place rather than adding a second.
+        flow_definition:
+          type: string
+          description: "A chatflow in the JSON Flowise's editor exports for it, the nodes and edges of the canvas, carried verbatim. Realized by both targets: when set, a one-shot step running the platform's own image seeds it once the platform answers — a Job on helm, carrying the definition in a ConfigMap, and a service that runs once on compose, carrying it in a compose config with every $ written $$ and starting once the platform reports healthy. The step registers the owner account named by infra.owner_email with the password attached to the owner_password slot when the instance has no owner yet, and otherwise signs in as that account, halting with the cause when signing in is refused; then it updates the chatflow whose id is chatflow_id, replacing its nodes and edges, or imports the definition at that id where no such chatflow exists, named after display_name or, without one, after chatflow_id. So chatflow_id must be a UUID, which Flowise requires of a chatflow's id, and an edit made to the chatflow's canvas in the editor is replaced the next time the step runs, while its name and settings are kept. When set, infra.owner_email and the owner_password slot are required and the build halts without them. When unset, nothing is seeded and no step is rendered. An Aggregate's text is evaluated as a template before it is read, so a definition carrying Flowise's own {{...}} variable references halts the build when written into an Aggregate as it stands; supply it as a parameter the Release fills, written into this value through toJson, and it arrives as written."
       required: [chatflow_id]
     infra:
       image:
@@ -182,6 +208,11 @@ spec:
           type: string
           default: "2Gi"
           description: Size of the persistent volume backing the platform's chatflow database.
+      # Who owns the platform is the operator's choice, so this carries no
+      # default: a default would name an identity nobody chose.
+      owner_email:
+        type: string
+        description: "Email address of the platform's owner account, read only when values.flow_definition is set. The step that seeds the chatflow registers this account when the instance has no owner yet, which makes it the owner, and signs in as it; on an instance that already has one, it names an account allowed to import chatflows, and the password attached to the owner_password slot is that account's. Required when values.flow_definition is set: the build halts when it is empty. It has no default."
 
   # A connection to a target its catalog labels a managed service
   # (component.aggrega.ai/hosting: managed) carries a credential, or says on the
@@ -199,7 +230,34 @@ spec:
   # other's a reference to a Secret, the container would carry the name twice
   # and keep the later, so the build halts here instead, naming both
   # connections, whichever Recipe binds.
+  #
+  # Seeding values.flow_definition needs an account to seed it as. A fresh
+  # Flowise has none, and its first registered account becomes the owner, so
+  # the seeding step registers infra.owner_email with the password attached
+  # to owner_password, or signs in as that account where an owner exists.
+  # Neither has a default: both name who owns the platform. And Flowise reads
+  # and imports a chatflow only under an id its UUID check accepts, the check
+  # written below as a pattern. Both Recipes seed the definition, so a
+  # definition missing either account fact, or carrying a chatflow_id that is
+  # not a UUID, halts here, whichever Recipe binds, where the fix is one line
+  # of authored YAML, rather than as a step that fails once deployed. With no
+  # definition nothing is read and nothing halts.
   assertions:
+    flow_definition_needs_an_owner: >-
+      {{- if optional .values "flow_definition" "" -}}
+      {{- if not (optional .infra "owner_email" "") -}}
+      {{- fail (printf "the Flowise platform %q is given values.flow_definition to seed but no infra.owner_email: set infra.owner_email in the Release to the email address of the platform's owner account, or remove flow_definition" .metadata.instance_id) -}}
+      {{- end -}}
+      {{- if not (hasKey (default dict .features) "owner_password") -}}
+      {{- fail (printf "the Flowise platform %q is given values.flow_definition to seed but nothing fills its owner_password slot: attach a secret credential to owner_password holding the password of the account infra.owner_email names, or remove flow_definition" .metadata.instance_id) -}}
+      {{- end -}}
+      {{- end -}}
+    flow_definition_needs_a_uuid: >-
+      {{- if optional .values "flow_definition" "" -}}
+      {{- if not (regexMatch "^(?i:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$" .values.chatflow_id) -}}
+      {{- fail (printf "the Flowise platform %q is given values.flow_definition to seed under values.chatflow_id %q, which is not a UUID, and Flowise reads and imports a chatflow only under a UUID: set chatflow_id to one, such as the id the chatflow already carries in Flowise, or remove flow_definition" .metadata.instance_id .values.chatflow_id) -}}
+      {{- end -}}
+      {{- end -}}
     managed_target_needs_a_credential: >-
       {{- range $socket := list "model" "tools" "vector_store" -}}
       {{- range $alias, $connection := (optional $.uses $socket dict) -}}

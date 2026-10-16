@@ -9,40 +9,201 @@ metadata:
   description: >
     The Flowise visual agent-builder for local development via Docker Compose,
     synthesized from the Workload kind by the compose provider. The chatflow
-    database and the encryption key protecting the credentials created in the
-    editor both live on the named data volume and survive a restart; state
-    written anywhere else in the container does not.
+    database and the key encrypting the editor's credentials live on the named
+    data volume and survive a restart; nothing else in the container does.
 
     The model endpoint wired into the `model` socket is rendered as
-    OPENAI_BASE_URL and a model API key attached on that connection as
-    OPENAI_API_KEY. A chatflow's OpenAI node reads them only while its Connect
-    Credential and
-    Base Path fields are left empty, through the client library's environment
-    fallback rather than a documented Flowise feature; a credential selected
-    on the node takes precedence, and the model is chosen in the node, not in
-    the environment.
+    OPENAI_BASE_URL and a key attached on that connection as OPENAI_API_KEY,
+    which a chatflow's OpenAI node reads only while its Connect Credential and
+    Base Path fields are empty, through the client library's environment
+    fallback, as on helm/flowise.
 
     Each tool and store wired into the `tools` and `vector_store` sockets
-    reaches the platform under the variables helm/flowise names, a store's
-    host, port, database and user included: the address as
-    AGGREGA_TOOL_<ALIAS>_URL, or the whole
-    address the connection holds as a secret in its place, or
-    AGGREGA_VECTOR_STORE_<ALIAS>_URL, and the connection's credential as
+    reaches the platform under the variables helm/flowise names: the address
+    as AGGREGA_TOOL_<ALIAS>_URL, or the whole address the connection holds as
+    a secret in its place, or AGGREGA_VECTOR_STORE_<ALIAS>_URL, a store's host,
+    port, database and user, and the credential as
     AGGREGA_TOOL_<ALIAS>_CREDENTIAL, beside the header the tool publishes, or
-    AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL. A chatflow reads each through a
-    Runtime variable of the same name created on Flowise's Variables page.
-    Compose has no secret reference, so a secret held on a connection is
-    written into the file as it was delivered, a Compose variable reference
-    such as ${STORE_API_KEY} as that reference.
+    AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL, read by a chatflow through a
+    Runtime variable of the same name. Compose has no secret reference, so a
+    secret is written into the file as it was delivered, a Compose variable
+    reference such as ${STORE_API_KEY} as that reference.
 
-    Chatflows are authored through the editor or its REST API. The
-    environment-variable contract is authored against Flowise 3.1.3.
+    A flow_definition, when set, is carried in a compose config and seeded by
+    a service that runs once, in the platform's image, after the platform
+    reports healthy: it registers infra.owner_email as the owner on a fresh
+    instance, with the owner_password credential as delivered, signs in, and
+    updates the chatflow at chatflow_id or imports it there. With none,
+    neither is rendered. The contract is authored against Flowise 3.1.3.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
 spec:
   capability: compose
   implements: core/ai-agent/flowise:1.0.0
+  # When values.flow_definition is set, a compose fragment adds a service that
+  # runs once and seeds the definition, and two compose configs: the
+  # definition, verbatim, and the script that seeds it. With no definition the
+  # fragment renders empty, so the output is what it is without the value. The
+  # Component's assertions have already halted a definition with no
+  # infra.owner_email, no owner_password credential or a chatflow_id that is
+  # not a UUID.
+  #
+  # The step is the one helm/flowise runs as a Job, in the same order and with
+  # the same script text: the two Recipes are separate files with no shared
+  # template either could import, so the two copies are edited together. It
+  # registers the owner on a fresh instance or signs in, then updates the
+  # chatflow at chatflow_id or imports the definition at that id, halting with
+  # the platform's own status and message when a call is refused, and running
+  # it again updates the same chatflow.
+  #
+  # A Workload's init container runs before the main service starts, and the
+  # seeding has to wait for the platform to answer, so the step is a service
+  # of the fragment's own rather than part of the Workload: it waits on the
+  # main service with service_healthy, which the Workload's readiness check on
+  # GET /api/v1/ping becomes, and carries restart "no", so it runs once at each
+  # start of the stack and its exit status is what a reader inspects. It shares
+  # the main service's network namespace, the way a sidecar does, so it reaches
+  # the platform at 127.0.0.1 on the port the Workload serves, 3000, whatever
+  # network the boundary is given. It runs the platform's own image, whose
+  # Node.js runtime carries the HTTP client the script uses, with the image's
+  # entrypoint replaced so it does not start a second platform. Its name
+  # carries -flow-seed after the instance, apart from the names the Workload's
+  # services take.
+  #
+  # The owner password is read from the inject pipe under the key its
+  # attachment delivered it under, values.key, which is value unless the
+  # Aggregate names another; an attachment naming no key is read under
+  # OWNER_PASSWORD. Compose has no secret reference, so it is written into the
+  # file as it was delivered, a Compose variable reference such as
+  # ${FLOWISE_OWNER_PASSWORD} as that reference, which Docker Compose
+  # substitutes when the stack starts.
+  #
+  # Docker Compose substitutes a variable reference, $NAME or ${NAME},
+  # anywhere in the file's values, a config's content included, and reads $$
+  # as one literal $. So the definition and the chatflow's name are written
+  # with every $ doubled and reach the step as authored; the script holds no
+  # $. The configs' names are spelled once each, here. Inline config content
+  # needs Docker Compose 2.23.1 or later, so supplying a definition raises the
+  # compose output's floor to it.
+  artifacts:
+    flowise-flow.compose-fragment.yaml: |
+      {{- if .values.flow_definition }}
+      {{- $passwordKey := optional .features.owner_password.values "key" "" }}
+      services:
+        {{ .context.instance_id }}-flow-seed:
+          image: "{{ .infra.image }}"
+          entrypoint: ["node", "/seed/seed.js"]
+          environment:
+            FLOWISE_URL: "http://127.0.0.1:3000"
+            OWNER_EMAIL: "{{ .infra.owner_email }}"
+            OWNER_PASSWORD: "{{ if $passwordKey }}{{ index .context.inject.env $passwordKey }}{{ else }}{{ .context.inject.env.OWNER_PASSWORD }}{{ end }}"
+            CHATFLOW_ID: "{{ .values.chatflow_id }}"
+            CHATFLOW_NAME: {{ optional .values "display_name" "" | default .values.chatflow_id | replace "$" "$$" | toJson }}
+          configs:
+            - source: {{ .context.instance_id }}-flow
+              target: /seed/flow.json
+            - source: {{ .context.instance_id }}-flow-seed
+              target: /seed/seed.js
+          network_mode: "service:{{ .context.instance_id }}"
+          depends_on:
+            {{ .context.instance_id }}:
+              condition: service_healthy
+          restart: "no"
+      configs:
+        {{ .context.instance_id }}-flow:
+          content: |
+      {{ .values.flow_definition | replace "$" "$$" | indent 6 }}
+        {{ .context.instance_id }}-flow-seed:
+          content: |
+            const fs = require("fs");
+
+            const API = process.env.FLOWISE_URL + "/api/v1";
+            const EMAIL = process.env.OWNER_EMAIL;
+            const PASSWORD = process.env.OWNER_PASSWORD;
+            const ID = process.env.CHATFLOW_ID;
+            const NAME = process.env.CHATFLOW_NAME;
+
+            function fail(message) {
+              console.error(message);
+              process.exit(1);
+            }
+
+            async function call(method, path, body, headers) {
+              const init = {
+                method: method,
+                headers: Object.assign({ "Content-Type": "application/json" }, headers || {}),
+                signal: AbortSignal.timeout(60000)
+              };
+              if (body !== undefined) init.body = JSON.stringify(body);
+              const response = await fetch(API + path, init);
+              const text = await response.text();
+              let json = {};
+              try {
+                json = JSON.parse(text);
+              } catch (error) {
+                json = {};
+              }
+              return { status: response.status, json: json || {}, cookies: response.headers.getSetCookie() };
+            }
+
+            function cause(result) {
+              const message = result.json && result.json.message;
+              return "HTTP " + result.status + (message ? ": " + message : "");
+            }
+
+            async function waitForPlatform() {
+              const deadline = Date.now() + 600000;
+              while (Date.now() < deadline) {
+                try {
+                  const response = await fetch(API + "/ping", { signal: AbortSignal.timeout(10000) });
+                  if (response.ok) return;
+                } catch (error) {
+                  // not answering yet
+                }
+                await new Promise((resolve) => setTimeout(resolve, 5000));
+              }
+              fail("Flowise did not answer " + API + "/ping within ten minutes");
+            }
+
+            async function main() {
+              const definition = fs.readFileSync("/seed/flow.json", "utf8");
+              try {
+                JSON.parse(definition);
+              } catch (error) {
+                fail("the chatflow definition is not JSON: " + error.message);
+              }
+              await waitForPlatform();
+              const setup = await call("POST", "/auth/resolve");
+              if (setup.status !== 200) fail("asking Flowise whether it has an owner was refused with " + cause(setup));
+              if (setup.json.redirectUrl === "/organization-setup") {
+                const owner = { user: { name: EMAIL.split("@")[0].slice(0, 100), email: EMAIL, credential: PASSWORD } };
+                const registered = await call("POST", "/account/register", owner);
+                if (registered.status !== 201) fail("registering the owner account " + EMAIL + " was refused with " + cause(registered));
+                console.log("registered the owner account " + EMAIL);
+              }
+              const login = await call("POST", "/auth/login", { email: EMAIL, password: PASSWORD });
+              if (login.status !== 200) fail("signing in to Flowise as " + EMAIL + " was refused with " + cause(login));
+              const session = {
+                "x-request-from": "internal",
+                Cookie: login.cookies.map((cookie) => cookie.split(";")[0]).join("; ")
+              };
+              const current = await call("GET", "/chatflows/" + ID, undefined, session);
+              if (current.status === 200) {
+                const updated = await call("PUT", "/chatflows/" + ID, { flowData: definition }, session);
+                if (updated.status !== 200) fail("updating chatflow " + ID + " was refused with " + cause(updated));
+                console.log("updated chatflow " + ID + " from the definition");
+                return;
+              }
+              if (current.status !== 404) fail("reading chatflow " + ID + " was refused with " + cause(current));
+              const payload = { ChatFlow: [{ id: ID, name: NAME, flowData: definition, type: "CHATFLOW" }] };
+              const imported = await call("POST", "/export-import/import", payload, session);
+              if (imported.status !== 200) fail("importing chatflow " + ID + " was refused with " + cause(imported));
+              console.log("imported chatflow " + ID + " as " + JSON.stringify(NAME));
+            }
+
+            main().catch((error) => fail("seeding chatflow " + ID + " failed: " + error.message));
+      {{- end }}
   # Synthesized-mode Workload: image, environment, the data volume, and the
   # exposed port are translated from the Workload kind by the compose provider.
   # Two pieces of durable state land on the named volume and survive a restart:

@@ -9,19 +9,15 @@ metadata:
   description: >
     The Flowise visual agent-builder on Kubernetes, rendered offline as plain
     manifests by the helm provider's Workload synthesis: a Deployment serving
-    the Flowise editor on a ClusterIP Service, backed by a persistent volume.
-    The chatflow database and the encryption key protecting the credentials
-    created in the editor both live on that volume and survive a restart; state
-    written anywhere else in the container does not.
+    the editor on a ClusterIP Service, backed by a persistent volume holding
+    the chatflow database and the key encrypting the editor's credentials, so
+    both survive a restart; nothing else in the container does.
 
     The model endpoint wired into the `model` socket is injected as
-    OPENAI_BASE_URL and a model API key attached on that connection as
-    OPENAI_API_KEY. A chatflow's OpenAI node reads them only while its Connect
-    Credential and
-    Base Path fields are left empty, through the client library's environment
-    fallback rather than a documented Flowise feature; a credential selected
-    on the node takes precedence, and the model is chosen in the node, not in
-    the environment.
+    OPENAI_BASE_URL and a key attached on that connection as OPENAI_API_KEY,
+    which a chatflow's OpenAI node reads only while its Connect Credential and
+    Base Path fields are empty, through the client library's environment
+    fallback rather than a Flowise feature; a credential on the node wins.
 
     Each tool and store wired into the `tools` and `vector_store` sockets
     reaches the platform under variables named for the connection's alias:
@@ -34,15 +30,221 @@ metadata:
     AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL. A chatflow reads each through a
     Runtime variable of the same name created on Flowise's Variables page.
 
-    Chatflows are authored or imported through the editor or its REST API:
-    Flowise has no startup flow-load path, so this Recipe seeds none. The
-    environment-variable contract is authored against Flowise 3.1.3.
+    A flow_definition, when set, is carried in a ConfigMap and seeded by a
+    one-shot Job in the platform's image: it registers infra.owner_email as
+    the owner on a fresh instance, the owner_password credential read by
+    secretKeyRef, signs in, and updates the chatflow at chatflow_id or imports
+    it there. With none, neither is rendered. The contract is authored against
+    Flowise 3.1.3.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
 spec:
   capability: helm
   implements: core/ai-agent/flowise:1.0.0
+  # When values.flow_definition is set, a ConfigMap carries the definition
+  # verbatim beside the script that seeds it, and a one-shot Job runs that
+  # script once the platform answers. With no definition both render empty and
+  # neither is emitted, so the output is what it is without the value. The
+  # Component's assertions have already halted a definition with no
+  # infra.owner_email, no owner_password credential or a chatflow_id that is
+  # not a UUID.
+  #
+  # The step, in order: it checks the definition parses as JSON; it waits for
+  # GET /api/v1/ping to answer; it asks POST /api/v1/auth/resolve whether the
+  # instance has an owner, and while it has none, registers infra.owner_email
+  # with the owner password at POST /api/v1/account/register, which makes the
+  # first account the owner; it signs in at POST /api/v1/auth/login; then, with
+  # the session the sign-in set — the token cookie and the session cookie, sent
+  # back explicitly with x-request-from: internal — it reads
+  # GET /api/v1/chatflows/<chatflow_id> and, where the chatflow exists,
+  # replaces its nodes and edges with PUT, keeping its id, name and settings, or,
+  # where it does not, imports the definition at that id through
+  # POST /api/v1/export-import/import, named after values.display_name or the
+  # id. Creating a chatflow through POST /api/v1/chatflows is not used, because
+  # it discards a supplied id, so running it twice would add a second chatflow;
+  # the import keeps the id. Signing in, registering, reading, updating and
+  # importing each halt the step with the platform's own status and message
+  # when refused, and nothing the step prints repeats the password. Running it
+  # again updates the same chatflow, so a retried or repeated run converges.
+  #
+  # The script is the same text as the one compose/flowise carries in its
+  # compose config: the two Recipes are separate files with no shared template
+  # either could import, so the two copies are edited together. It holds no $
+  # and no doubled braces, so it reaches the container as written on both
+  # targets.
+  #
+  # The Job runs the platform's own image, whose Node.js runtime carries the
+  # HTTP client the script uses, so the step adds no image; the command
+  # replaces the image's own entrypoint, which would start a second platform.
+  # It has the form the provider gives a run-to-completion workload —
+  # restartPolicy Never, and no deadline or retry count, so the cluster's
+  # defaults apply — and each attempt stops waiting for the platform after
+  # about ten minutes. The address is the Service the Workload below is
+  # served on, <rendered_name>-default, on the port it serves, 3000. That bare
+  # name resolves only inside the Service's own namespace, and the Secret the
+  # password is read from must sit beside the Job too, so the ConfigMap and the
+  # Job carry the namespace the Release declares for the component through the
+  # aggrega.ai/namespace annotation, as the Workload's own resources do, and
+  # none where it declares none, where the applying tool places all three. The
+  # definition sits in the ConfigMap rather than in the Job, so editing it
+  # leaves the Job's pod template unchanged; a Job runs when it is created,
+  # so seeding an edited definition into a running platform means deleting the
+  # completed Job and applying again. A Job's pod template cannot be changed
+  # once created, so a Release changing anything else the Job's pod carries —
+  # the owner's email, the image, the chatflow's id or name — deletes the
+  # completed Job before applying.
+  #
+  # The owner password reaches the step by reference: OWNER_PASSWORD is a
+  # secretKeyRef to the Secret name and data key the owner_password credential
+  # publishes, so no file this Recipe renders carries the password, and a
+  # credential publishing neither halts the build.
+  artifacts:
+    flowise-flow.configmap.yaml: |
+      {{- if .values.flow_definition -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-flow
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+        namespace: "{{ . }}"
+        {{- end }}
+      data:
+        flow.json: |
+      {{ .values.flow_definition | indent 4 }}
+        seed.js: |
+          const fs = require("fs");
+
+          const API = process.env.FLOWISE_URL + "/api/v1";
+          const EMAIL = process.env.OWNER_EMAIL;
+          const PASSWORD = process.env.OWNER_PASSWORD;
+          const ID = process.env.CHATFLOW_ID;
+          const NAME = process.env.CHATFLOW_NAME;
+
+          function fail(message) {
+            console.error(message);
+            process.exit(1);
+          }
+
+          async function call(method, path, body, headers) {
+            const init = {
+              method: method,
+              headers: Object.assign({ "Content-Type": "application/json" }, headers || {}),
+              signal: AbortSignal.timeout(60000)
+            };
+            if (body !== undefined) init.body = JSON.stringify(body);
+            const response = await fetch(API + path, init);
+            const text = await response.text();
+            let json = {};
+            try {
+              json = JSON.parse(text);
+            } catch (error) {
+              json = {};
+            }
+            return { status: response.status, json: json || {}, cookies: response.headers.getSetCookie() };
+          }
+
+          function cause(result) {
+            const message = result.json && result.json.message;
+            return "HTTP " + result.status + (message ? ": " + message : "");
+          }
+
+          async function waitForPlatform() {
+            const deadline = Date.now() + 600000;
+            while (Date.now() < deadline) {
+              try {
+                const response = await fetch(API + "/ping", { signal: AbortSignal.timeout(10000) });
+                if (response.ok) return;
+              } catch (error) {
+                // not answering yet
+              }
+              await new Promise((resolve) => setTimeout(resolve, 5000));
+            }
+            fail("Flowise did not answer " + API + "/ping within ten minutes");
+          }
+
+          async function main() {
+            const definition = fs.readFileSync("/seed/flow.json", "utf8");
+            try {
+              JSON.parse(definition);
+            } catch (error) {
+              fail("the chatflow definition is not JSON: " + error.message);
+            }
+            await waitForPlatform();
+            const setup = await call("POST", "/auth/resolve");
+            if (setup.status !== 200) fail("asking Flowise whether it has an owner was refused with " + cause(setup));
+            if (setup.json.redirectUrl === "/organization-setup") {
+              const owner = { user: { name: EMAIL.split("@")[0].slice(0, 100), email: EMAIL, credential: PASSWORD } };
+              const registered = await call("POST", "/account/register", owner);
+              if (registered.status !== 201) fail("registering the owner account " + EMAIL + " was refused with " + cause(registered));
+              console.log("registered the owner account " + EMAIL);
+            }
+            const login = await call("POST", "/auth/login", { email: EMAIL, password: PASSWORD });
+            if (login.status !== 200) fail("signing in to Flowise as " + EMAIL + " was refused with " + cause(login));
+            const session = {
+              "x-request-from": "internal",
+              Cookie: login.cookies.map((cookie) => cookie.split(";")[0]).join("; ")
+            };
+            const current = await call("GET", "/chatflows/" + ID, undefined, session);
+            if (current.status === 200) {
+              const updated = await call("PUT", "/chatflows/" + ID, { flowData: definition }, session);
+              if (updated.status !== 200) fail("updating chatflow " + ID + " was refused with " + cause(updated));
+              console.log("updated chatflow " + ID + " from the definition");
+              return;
+            }
+            if (current.status !== 404) fail("reading chatflow " + ID + " was refused with " + cause(current));
+            const payload = { ChatFlow: [{ id: ID, name: NAME, flowData: definition, type: "CHATFLOW" }] };
+            const imported = await call("POST", "/export-import/import", payload, session);
+            if (imported.status !== 200) fail("importing chatflow " + ID + " was refused with " + cause(imported));
+            console.log("imported chatflow " + ID + " as " + JSON.stringify(NAME));
+          }
+
+          main().catch((error) => fail("seeding chatflow " + ID + " failed: " + error.message));
+      {{- end }}
+    flowise-flow-seed.job.yaml: |
+      {{- if .values.flow_definition }}
+      {{- $locator := optional (optional (default dict .features) "owner_password" dict) "provides" dict }}
+      {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) }}
+      {{- fail (printf "the owner_password credential of the Flowise platform %q publishes no Secret name and data key, so the step seeding values.flow_definition could not be given a reference to read it from: attach an owner_password credential publishing both, such as core/referenced-secret" .context.instance_id) }}
+      {{- end -}}
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ .context.rendered_name }}-flow-seed
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+        namespace: "{{ . }}"
+        {{- end }}
+      spec:
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: seed
+                image: "{{ .infra.image }}"
+                command: ["node", "/seed/seed.js"]
+                env:
+                  - name: FLOWISE_URL
+                    value: "http://{{ .context.rendered_name }}-default:3000"
+                  - name: OWNER_EMAIL
+                    value: "{{ .infra.owner_email }}"
+                  - name: OWNER_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: "{{ .features.owner_password.provides.name }}"
+                        key: "{{ .features.owner_password.provides.key }}"
+                  - name: CHATFLOW_ID
+                    value: "{{ .values.chatflow_id }}"
+                  - name: CHATFLOW_NAME
+                    value: {{ optional .values "display_name" "" | default .values.chatflow_id | toJson }}
+                volumeMounts:
+                  - name: seed
+                    mountPath: /seed
+                    readOnly: true
+            volumes:
+              - name: seed
+                configMap:
+                  name: {{ .context.rendered_name }}-flow
+      {{- end }}
   # The Workload becomes a Deployment serving the Flowise editor on a ClusterIP
   # Service, backed by a persistent volume. Two pieces of durable state land on
   # that volume and survive a restart: the chatflow database, and the
@@ -67,9 +269,10 @@ spec:
   # inside the chatflow's own OpenAI node, whose model-name field carries the
   # platform's default; the environment carries no model name.
   #
-  # Chatflows are authored or imported through the Flowise editor or its REST
-  # API; Flowise has no startup flow-load path, so seeding is not declarative on
-  # this platform.
+  # Chatflows are authored in the Flowise editor, or seeded from
+  # values.flow_definition by the one-shot Job the artifacts above describe:
+  # Flowise loads no chatflow from a file or a variable at start-up, so the
+  # Workload itself carries nothing for it.
   #
   # Each `tools` and `vector_store` connection's variables are named for its
   # alias, upper-cased, with every character other than a letter or a digit an
