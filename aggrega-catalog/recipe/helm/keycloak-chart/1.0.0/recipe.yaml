@@ -33,6 +33,10 @@ metadata:
     port its console Service carries, whatever `values.metrics_enabled` says;
     that port checks no caller. True publishes the address as
     provides.metrics_endpoint; false leaves that key empty.
+
+    That Service, and the management port with it, stays inside the cluster
+    whatever `infra.overrides.service_type` says; LoadBalancer or NodePort
+    publishes the console alone on `<rendered_name>-external`.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -72,6 +76,10 @@ spec:
   # consumer in another namespace qualifies the host with the target namespace
   # on its own side (caller-side routing).
   #
+  # It names that in-cluster Service whatever infra.overrides.service_type
+  # says. The "<rendered_name>-external" Service this Recipe emits for an
+  # exposed console is for clients outside the cluster, and is not published.
+  #
   # metrics_endpoint is where the chart serves the server's own metrics, while
   # values.metrics_enabled is true: /metrics under the path the chart serves the
   # server at, /auth, which this Recipe leaves at the chart's default, on the
@@ -91,12 +99,22 @@ spec:
   # file is named "<realm>-realm.json", so an entry named any other way would be
   # mounted and never imported. Halt on it here, where the fix is renaming one
   # key in the Aggregate.
+  #
+  # infra.overrides.service_type says how the console is exposed, and this
+  # Recipe acts on three values only: ClusterIP, LoadBalancer and NodePort.
+  # Any other would otherwise be dropped without a word, so it halts here,
+  # where the fix is one value in the Release.
   assertions:
     realm_import_file_names: >-
       {{- range $name, $_ := optional .values "realm_imports" dict -}}
       {{- if not (hasSuffix "-realm.json" $name) -}}
       {{- fail (printf "values.realm_imports entry %q is not named <realm>-realm.json, so the server would never import it; name each entry after the realm it defines, for example demo-realm.json for the realm demo" $name) -}}
       {{- end -}}
+      {{- end -}}
+    service_type_accepted: >-
+      {{- $type := optional (optional .infra "overrides" dict | default dict) "service_type" "" | default "" | toString -}}
+      {{- if and $type (not (has $type (list "ClusterIP" "LoadBalancer" "NodePort"))) -}}
+      {{- fail (printf "infra.overrides.service_type is %q, but this realization exposes the console as ClusterIP, LoadBalancer or NodePort only; set one of those, or leave it unset for ClusterIP" $type) -}}
       {{- end -}}
 
   # The realms the server imports on startup, one file per values.realm_imports
@@ -106,6 +124,22 @@ spec:
   # value: unset, the entry renders empty and no ConfigMap is emitted. It is
   # named from the same rendered name as the chart's own objects, and the value
   # mapping below mounts it by that name.
+  #
+  # The console, exposed outside the cluster without the management port. The
+  # chart's console Service always carries that port, which checks no caller,
+  # and no chart value takes it off, so that Service stays ClusterIP; with
+  # infra.overrides.service_type LoadBalancer or NodePort this Recipe emits a
+  # second Service of that type carrying the console's http port alone — the
+  # port and target the chart's console Service gives it — and nothing else.
+  # It selects the server's pods by the chart's own selector labels: the
+  # chart's name, keycloakx, since this Recipe sets no nameOverride, and the
+  # release name, which is the rendered name. Both were read from a render of
+  # the chart, not assumed. It is named from the rendered name as the chart's
+  # objects are, and placed in the namespace the chart is rendered against:
+  # the one the Release declares through the aggrega.ai/namespace annotation,
+  # or `default` where it declares none. The helm provider places no artifact
+  # in a namespace itself, so the Service writes its own. With ClusterIP, or
+  # no override, nothing is emitted.
   artifacts:
     realm-import-configmap.yaml: |
       {{- if .values.realm_imports -}}
@@ -119,10 +153,33 @@ spec:
       {{ $content | trimSuffix "\n" | indent 4 }}
       {{- end }}
       {{- end }}
+    console-external-service.yaml: |
+      {{- $type := optional (optional .infra "overrides" dict | default dict) "service_type" "" | default "" | toString -}}
+      {{- if has $type (list "LoadBalancer" "NodePort") -}}
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: {{ .context.rendered_name }}-external
+        namespace: "{{ optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default" }}"
+      spec:
+        type: {{ $type }}
+        ports:
+          - name: http
+            port: {{ .infra.http_port }}
+            targetPort: http
+            protocol: TCP
+        selector:
+          app.kubernetes.io/name: keycloakx
+          app.kubernetes.io/instance: {{ .context.rendered_name }}
+      {{- end }}
 
   # This Recipe reads from infra.overrides:
   #   image        - map[string]string (image.* fields; overrides the tag pin)
-  #   service_type - string (service.type; how the console is exposed, default ClusterIP)
+  #   service_type - string (ClusterIP, LoadBalancer or NodePort, default
+  #                  ClusterIP; how the console is exposed. The chart's console
+  #                  Service stays ClusterIP whatever it says; LoadBalancer or
+  #                  NodePort adds <rendered_name>-external, of that type,
+  #                  carrying the console port alone. Any other value halts)
   #   requests     - { cpu: string, memory: string } (server resource requests)
   #   nodeSelector - map[string]string (pod scheduling)
   #   tolerations  - []object (pod scheduling)
@@ -239,12 +296,13 @@ spec:
     ## is merged over the chart's defaults, which leaves the chart's own 8443
     ## standing. A zero passes the schema and reads as absent to the chart's own
     ## test on the key. Established by rendering all three.
+    ##
+    ## The Service is always ClusterIP, whatever infra.overrides.service_type
+    ## says: the chart writes the management port into it as well, so a type
+    ## exposing it would expose that port too. An exposed console is the
+    ## "<rendered_name>-external" Service this Recipe emits beside the chart.
     service:
-      {{- if and .infra.overrides .infra.overrides.service_type }}
-      type: "{{ .infra.overrides.service_type }}"
-      {{- else }}
       type: ClusterIP
-      {{- end }}
       httpPort: {{ .infra.http_port }}
       httpsPort: 0
     {{- if .values.metrics_enabled }}
