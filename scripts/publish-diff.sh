@@ -128,10 +128,8 @@ load_publishable_kinds "$PUBLISHABLE_EXCLUDE" || exit 1
 # --- Destructive-op confirm (full reconcile) ---------------------------------
 # A real --full reconcile re-pushes every catalog entity. Guard it: --yes
 # bypasses (CI), an interactive terminal prompts [y/N], and a non-interactive
-# stdin without --yes refuses rather than hanging. This mirrors the shared
-# confirm contract used by the sibling full-repush scripts; it is inlined here
-# because this script also runs from a standalone hub checkout that has no
-# access to the umbrella script tree.
+# stdin without --yes refuses rather than hanging. The confirm is inlined so the
+# script runs from a checkout of this repository alone.
 confirm_destructive() {
   local summary="$1"
   if [ -n "$YES" ]; then
