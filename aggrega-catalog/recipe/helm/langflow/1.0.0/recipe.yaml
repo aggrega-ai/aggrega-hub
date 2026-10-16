@@ -7,38 +7,37 @@ metadata:
   name: langflow
   version: 1.0.0
   description: >
-    The Langflow visual flow-builder on Kubernetes, rendered offline as plain
-    manifests by the helm provider's Workload synthesis: a Deployment serving
-    the editor on a ClusterIP Service, with a persistent volume at Langflow's
-    config directory. The flow database is directed there, so the flows
-    survive a restart with the encryption key the platform generates beside
-    them; state written anywhere else in the container does not. A supplied
-    flow definition is carried in a ConfigMap Langflow loads at each start,
-    even with signing in required, which an image at Langflow 1.5.1 or older
-    does not do.
+    The Langflow visual flow-builder on Kubernetes, rendered by the helm
+    provider's Workload synthesis: a Deployment serving the editor on a
+    ClusterIP Service, with a persistent volume at Langflow's config
+    directory holding the flow database and its encryption key; nothing else
+    in the container survives a restart. A supplied flow definition is
+    carried in a ConfigMap Langflow loads at each start, even with signing in
+    required, which an image at Langflow 1.5.1 or older does not do.
 
-    Signing in is required: the sign-in bypass is off and an administrator is
-    seeded from values.admin_user and the password attached to
-    admin_password. Setting values.require_authentication to false leaves
-    the editor open to anyone reaching it, with no credential; doing neither
+    Signing in is required, as an administrator seeded from values.admin_user
+    and the password attached to admin_password; values.require_authentication
+    false leaves the editor open to anyone reaching it, and doing neither
     halts the build.
 
     The `model` socket's endpoint arrives as OPENAI_BASE_URL and a key
-    attached on that connection as OPENAI_API_KEY, an env secret. The
-    environment-variable contract is authored against langflow-base 0.11.0.
+    attached on that connection as OPENAI_API_KEY. The environment-variable
+    contract is authored against langflow-base 0.11.0.
 
     Each `vector_store` connection arrives under variables named for its
-    alias in capitals: its address as AGGREGA_VECTOR_STORE_<ALIAS>_URL and a
-    credential the connection carries as
-    AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL, by a secretKeyRef. A store
-    publishing a database and a user also arrives as
-    AGGREGA_VECTOR_STORE_<ALIAS>_CONNECTION_STRING, its password expanded
-    from that Secret at startup.
+    alias in capitals: its address as AGGREGA_VECTOR_STORE_<ALIAS>_URL, a
+    credential by a secretKeyRef as AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL,
+    and, for a store publishing a database and a user,
+    AGGREGA_VECTOR_STORE_<ALIAS>_CONNECTION_STRING. Each `tools` connection's
+    address is written into the flow's MCP Tools node named for its alias,
+    and its credential arrives by a secretKeyRef as
+    AGGREGA_TOOL_<ALIAS>_CREDENTIAL, the name that node's header carries.
+    LANGFLOW_SSRF_ALLOWED_HOSTS admits the hosts of both.
 
     With `values.metrics_enabled` true, LANGFLOW_PROMETHEUS_PORT turns on
     Langflow's metrics at port 9090, which checks no caller and joins the
-    Service, and provides.metrics_endpoint publishes the address; false, that
-    key is empty.
+    Service, and provides.metrics_endpoint publishes their address; false, it
+    is empty.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -84,16 +83,97 @@ spec:
   # it in the editor is replaced at the next start. An image at Langflow 1.5.1
   # or older loads the directory only while the sign-in bypass is on, which
   # values.require_authentication false turns on.
+  #
+  # The pod mounts the ConfigMap by name, which resolves only in the pod's own
+  # namespace, so the ConfigMap carries the namespace the Release declares for
+  # the component through the aggrega.ai/namespace annotation, as the
+  # Workload's own resources do, and none where it declares none.
+  #
+  # Each `tools` connection is written into the flow, because Langflow's MCP
+  # Tools component reads a server's address from the flow and from no
+  # variable. The component's assertion has already held the flow and the
+  # connections to each other — every connection named by a node, every node
+  # naming a connection — so here every MCP Tools node whose server is named
+  # for a connection's alias has the server configuration in its mcp_server
+  # value given the address the tool publishes as its url. A node naming the
+  # server alone gets a configuration holding the name and the address. A
+  # connection carrying a credential also writes, under the header the tool
+  # publishes, the name of the variable the credential is delivered as,
+  # replacing a header of that name in any letter case: Langflow presents a
+  # header's value from the stored global variable whose name is that whole
+  # value, so the credential itself is written into no file. Every other key
+  # the definition carries is kept, and the definition is written back as
+  # JSON with its keys sorted, which is deterministic but not the authored
+  # text byte for byte: numbers are read as double-precision values, and <,
+  # > and & are written as \u escapes, all of which Langflow reads as the same
+  # JSON. With no tools connection the definition is written as authored.
+  # Three things outside the flow can still change what a node reaches: a
+  # server of the same name stored in Langflow's settings takes precedence
+  # over this configuration, a header of the same name written in the node's
+  # own Headers field takes precedence over the one written here, and a run
+  # whose request supplies global variables of its own resolves the header
+  # against those instead.
   artifacts:
     langflow-flow.configmap.yaml: |
       {{- if .values.flow_definition }}
+      {{- $definition := .values.flow_definition }}
+      {{- $tools := dict }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "tools" }}
+      {{- $_ := set $tools $alias $edge }}
+      {{- end }}
+      {{- end }}
+      {{- if $tools }}
+      {{- $flow := fromJson $definition }}
+      {{- range $node := optional (optional $flow "data" dict) "nodes" list }}
+      {{- $field := $node }}
+      {{- range $key := list "data" "node" "template" "mcp_server" }}
+      {{- if kindIs "map" $field }}{{ $field = optional $field $key dict }}{{ else }}{{ $field = dict }}{{ end }}
+      {{- end }}
+      {{- if kindIs "map" $field }}
+      {{- $value := optional $field "value" "" }}
+      {{- $server := "" }}
+      {{- if kindIs "string" $value }}{{ $server = $value }}{{ else if kindIs "map" $value }}{{ $name := optional $value "name" "" }}{{ if kindIs "string" $name }}{{ $server = $name }}{{ end }}{{ end }}
+      {{- if and $server (hasKey $tools $server) }}
+      {{- $edge := index $tools $server }}
+      {{- if not (kindIs "map" $value) }}
+      {{- $value = dict "name" $server }}
+      {{- $_ := set $field "value" $value }}
+      {{- end }}
+      {{- $config := optional $value "config" dict }}
+      {{- if not (kindIs "map" $config) }}{{ $config = dict }}{{ end }}
+      {{- $_ := set $value "config" $config }}
+      {{- $_ := set $config "url" $edge.provides.endpoint }}
+      {{- if hasKey (default dict $edge.features) "credential" }}
+      {{- $header := optional $edge.provides "credential_header" "" }}
+      {{- $variable := printf "AGGREGA_TOOL_%s_CREDENTIAL" (regexReplaceAll "[^A-Z0-9]" (upper $server) "_") }}
+      {{- $headers := optional $config "headers" dict }}
+      {{- if kindIs "slice" $headers }}
+      {{- $kept := list }}
+      {{- range $item := $headers }}{{ if not (and (kindIs "map" $item) (eq (lower (toString (optional $item "key" ""))) (lower $header))) }}{{ $kept = append $kept $item }}{{ end }}{{ end }}
+      {{- $headers = append $kept (dict "key" $header "value" $variable) }}
+      {{- else }}
+      {{- if not (kindIs "map" $headers) }}{{ $headers = dict }}{{ end }}
+      {{- range $name := keys $headers | sortAlpha }}{{ if eq (lower $name) (lower $header) }}{{ $_ := unset $headers $name }}{{ end }}{{ end }}
+      {{- $_ := set $headers $header $variable }}
+      {{- end }}
+      {{- $_ := set $config "headers" $headers }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- $definition = toJson $flow }}
+      {{- end }}
       apiVersion: v1
       kind: ConfigMap
       metadata:
         name: {{ .context.rendered_name }}-flow
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+        namespace: "{{ . }}"
+        {{- end }}
       data:
         flow.json: |
-      {{ .values.flow_definition | indent 6 }}
+      {{ $definition | indent 6 }}
       {{- end }}
   # The Workload becomes a Deployment serving the Langflow editor on a ClusterIP
   # Service, backed by a persistent volume mounted at the platform's config
@@ -138,6 +218,34 @@ spec:
   # before it connects, so a password encoded beforehand would be encoded
   # twice. A store publishing no database or no user gets no string.
   #
+  # A `tools` connection's address reaches the platform in the flow the
+  # artifact above writes, never as a variable. Its credential, where the
+  # connection carries one, is delivered as AGGREGA_TOOL_<ALIAS>_CREDENTIAL,
+  # named as the vector stores' variables are, through a secretKeyRef naming
+  # the connection, and every such name is listed, comma-separated, in
+  # LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT. Langflow adds that list to the
+  # names it already reads, and stores each listed variable the environment
+  # holds as a global variable of the administrator's: at each sign-in, or,
+  # with the sign-in bypass on, once when it creates the administrator. The
+  # node's header names that variable, so until the variable is stored the
+  # header carries its name rather than the credential. Langflow substitutes
+  # a header's value only when the whole value names a stored variable, so
+  # under the Authorization header, whose value is Bearer and the credential
+  # together, no variable delivered here holds what the header needs, and the
+  # build halts naming the connection; it halts as well on a credential for a
+  # tool publishing no credential_header, such as one behind a bridge, which
+  # checks no caller's credential. An attachment on the connection's endpoint
+  # slot, a whole address carrying its key, halts the build too: the address
+  # could reach Langflow only written into the flow file, its key with it.
+  #
+  # Langflow refuses an MCP server or a vector store whose host resolves to a
+  # private network address, which an in-cluster Service name normally does,
+  # unless LANGFLOW_SSRF_ALLOWED_HOSTS lists the host. So the variable lists,
+  # comma-separated, the host of every `tools` and `vector_store` connection's
+  # address, once each, lower-cased as Langflow compares it; with neither
+  # socket wired it is not rendered, and Langflow's guard stays as shipped.
+  # Set here, it replaces a list given through Langflow's own settings.
+  #
   # With values.metrics_enabled true, LANGFLOW_PROMETHEUS_PORT switches on the
   # platform's own metrics and names their port, 9090, where Langflow starts a
   # listener of its own on every interface, apart from the editor's port, that
@@ -156,12 +264,48 @@ spec:
     {{- $modelCredential := "" -}}
     {{- /* Whether a `vector_store` connection carries a credential. */ -}}
     {{- $storeCredential := false -}}
+    {{- /* The aliases of the `tools` connections carrying a credential. */ -}}
+    {{- $toolCredentials := list -}}
+    {{- /* The address each `tools` and `vector_store` connection is delivered at, by alias. */ -}}
+    {{- $addresses := dict -}}
     {{- range $alias, $edge := .context.uses -}}
-    {{- if and (eq $edge.socket "model") (hasKey (default dict $edge.features) "credential") -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if and (eq $edge.socket "model") (hasKey $features "credential") -}}
     {{- $modelCredential = $alias -}}
     {{- end -}}
-    {{- if and (eq $edge.socket "vector_store") (hasKey (default dict $edge.features) "credential") -}}
+    {{- if and (eq $edge.socket "vector_store") (hasKey $features "credential") -}}
     {{- $storeCredential = true -}}
+    {{- end -}}
+    {{- if eq $edge.socket "vector_store" -}}
+    {{- $url := optional $edge.provides "endpoint" "" -}}
+    {{- if not $url -}}
+    {{- $url = printf "%v://%v:%v" $edge.provides.protocol $edge.provides.host $edge.provides.port -}}
+    {{- end -}}
+    {{- $_ := set $addresses $alias $url -}}
+    {{- end -}}
+    {{- if eq $edge.socket "tools" -}}
+    {{- if hasKey $features "endpoint" -}}
+    {{- fail (printf "the tools connection %s of the Langflow platform %q carries an endpoint attachment, a whole address carrying its key: Langflow reads an MCP server's address only from the flow file it loads, so the address and its key would be written into that file as a literal; remove the attachment and reach the tool at the address it publishes, with its key on the connection's credential slot" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- $_ := set $addresses $alias $edge.provides.endpoint -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $header := optional $edge.provides "credential_header" "" -}}
+    {{- if not $header -}}
+    {{- fail (printf "the tools connection %s of the Langflow platform %q carries a credential, but the tool it reaches publishes no credential_header to present it under, as a tool behind a bridge, which checks no caller's credential, does not: remove the credential from the connection" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if eq (lower $header) "authorization" -}}
+    {{- fail (printf "the tools connection %s of the Langflow platform %q carries a credential the tool it reaches reads from the Authorization header, as Bearer and the credential: Langflow fills a header from a stored global variable only when the header's whole value is the variable's name, and no variable this Recipe delivers holds Bearer and the credential together, so the credential cannot reach that header by reference; remove the credential, or reach a server that reads it from another header, named in the tool's infra.credential_header" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- $toolCredentials = append $toolCredentials $alias -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /* The host of every delivered address, once each, as Langflow's private-address guard compares it. */ -}}
+    {{- $allowedHosts := list -}}
+    {{- range $alias, $url := $addresses -}}
+    {{- $host := lower (urlParse $url).hostname -}}
+    {{- if and $host (not (has $host $allowedHosts)) -}}
+    {{- $allowedHosts = append $allowedHosts $host -}}
     {{- end -}}
     {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
@@ -225,11 +369,7 @@ spec:
     {{- range $alias, $edge := .context.uses }}
     {{- if eq $edge.socket "vector_store" }}
     {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
-    {{- $url := optional $edge.provides "endpoint" "" }}
-    {{- if not $url }}
-    {{- $url = printf "%v://%v:%v" $edge.provides.protocol $edge.provides.host $edge.provides.port }}
-    {{- end }}
-          AGGREGA_VECTOR_STORE_{{ $name }}_URL: "{{ $url }}"
+          AGGREGA_VECTOR_STORE_{{ $name }}_URL: "{{ index $addresses $alias }}"
     {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") }}
     {{- /* The password is the credential entry the attachments block below
            writes for this connection, referenced as $(NAME): the provider
@@ -245,7 +385,13 @@ spec:
     {{- end }}
     {{- end }}
     {{- end }}
-    {{- if or $modelCredential $adminCredential $storeCredential }}
+    {{- with $toolCredentials }}
+          LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT: "{{ range $i, $alias := . }}{{ if $i }},{{ end }}AGGREGA_TOOL_{{ regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}_CREDENTIAL{{ end }}"
+    {{- end }}
+    {{- with $allowedHosts }}
+          LANGFLOW_SSRF_ALLOWED_HOSTS: "{{ join "," . }}"
+    {{- end }}
+    {{- if or $modelCredential $adminCredential $storeCredential $toolCredentials }}
         attachments:
     {{- with $modelCredential }}
           OPENAI_API_KEY:
@@ -265,6 +411,12 @@ spec:
             from: credential
             as: env
     {{- end }}
+    {{- end }}
+    {{- range $alias := $toolCredentials }}
+          AGGREGA_TOOL_{{ regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}_CREDENTIAL:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
     {{- end }}
     {{- end }}
         ports:

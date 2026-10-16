@@ -2824,7 +2824,10 @@ strings, and checks none of what follows.
   `core/ai-agent/agent-framework`, `core/ai-agent/google-adk` and
   `core/ai-agent/mastra`, and the platforms
   `core/ai-agent/flowise` and `core/ai-agent/n8n`, declare the slot on their
-  `tools` socket and read it on both targets;
+  `tools` socket and read it on both targets; `core/ai-agent/langflow`
+  declares it and its Recipes halt the build on an attachment there, because
+  Langflow reads a server's address only from the flow file it loads, where
+  the key would be written as a literal;
   [`language-reference/examples/mcp-address-from-secret/`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/examples/mcp-address-from-secret/)
   declares one on a consumer of its own and renders both targets too.
 - **A bridged server checks no caller's credential.** The bridge reads no
@@ -2893,9 +2896,30 @@ strings, and checks none of what follows.
   no stored variable carries that name; on `flowise` through a Runtime
   variable of the same name created on Flowise's Variables page; on `n8n`
   through `$env`, which its Recipes leave blocked unless the Aggregate sets
-  `allow_env_access_in_nodes`. `langflow` declares no `tools` socket, because
-  its MCP Tools component takes a server's address only from Langflow's own
-  settings or the flow.
+  `allow_env_access_in_nodes`.
+- **`core/ai-agent/langflow` takes its `tools` connections through the flow
+  it runs**, because its MCP Tools component reads a server's address from
+  the server configuration written into the flow, or from a server of that
+  name stored in Langflow's settings, which takes precedence, and never from
+  a variable. A flow names a wired connection by Langflow's own server name:
+  an MCP Tools node whose `mcp_server` value names the connection's alias. The
+  Recipes write the address the tool publishes into that node's server
+  configuration as its `url`, keep every other part of the definition, and
+  write it back as JSON with its keys sorted; with no `tools` connection the
+  definition is carried as authored. The Component's assertion halts the
+  build on a connection with no flow or one no node names, and on a node
+  naming a server no connection answers. A `credential` is delivered as
+  `AGGREGA_TOOL_<ALIAS>_CREDENTIAL`, by reference as on every socket, listed in
+  `LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT`, and the node's header under the
+  tool's `credential_header` carries that variable's name, which Langflow
+  replaces with the stored variable's value — only when the whole header value
+  is the name, and only once the variable is stored, at the administrator's
+  sign-in. So a credential under `Authorization`, whose value is `Bearer
+  <credential>`, halts the build, as does one for a tool publishing no
+  header. Langflow also refuses an MCP server or a vector store whose host
+  resolves to a private address, so its Recipes set
+  `LANGFLOW_SSRF_ALLOWED_HOSTS` to the hosts of the wired `tools` and
+  `vector_store` connections, and leave it unset where neither is wired.
 
 ### Gateway / operator-driven (custom-resource-emitting) Recipes
 
