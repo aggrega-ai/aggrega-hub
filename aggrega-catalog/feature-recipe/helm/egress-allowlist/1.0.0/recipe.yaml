@@ -1,0 +1,343 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: egress-allowlist
+  version: 1.0.0
+  description: >
+    Component-scope FeatureRecipe for core/egress-allowlist on Kubernetes:
+    writes one NetworkPolicy for each workload the attached component renders,
+    in the namespace that workload is emitted into, admitting egress to four
+    kinds of destination only — the attached component's own pods, the pods of
+    every component its uses edges point at, the cluster's DNS pods on port 53,
+    and the address ranges the attachment lists. Each component's pods are
+    matched by their labels and by the namespace they are emitted into
+    together, on the ports their own containers declare. Ingress is left
+    untouched.
+
+    A workload's pods are selected by its controller's own selector or, where
+    it writes none, by the identity labels the build stamps on its pods, never
+    by a label carrying a version. Selectors, namespaces and ports are read
+    from what the renders emitted, never restated by hand; the attachment
+    renders after every component has rendered, for that reason. The build
+    halts unless the Operator affirms the cluster's network plugin enforces
+    network policy, and wherever a policy could not admit exactly what the
+    Aggregate and the attachment declare: naming every connection whose target
+    renders no pods and has no address range listed; a target declaring no
+    port; a workload emitted into no namespace, or selected neither by its
+    controller nor by the build's identity labels; a component rendering no
+    pods; an address-range entry naming no connection, or no range; and DNS
+    pods named by nothing.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/egress-allowlist:1.0.0
+  # executionScope omitted -> component: renders once per attached component.
+
+  # The targets' renders are read below, so the attachment renders once every
+  # component in the build has rendered rather than right after its own host.
+  readsTargetRenderFacts: true
+
+  # A network policy restricts nothing unless the cluster's network plugin
+  # implements network policy; written into a cluster whose plugin does not, it
+  # is accepted and enforces nothing. The compiler is ahead-of-time and cannot
+  # inspect the cluster, so the prerequisite is declared instead: the Operator
+  # affirms it on this attachment in the Release, and an unaffirmed build halts
+  # here rather than shipping a policy that may restrict nothing.
+  assertions:
+    network_policy_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail (printf "core/egress-allowlist attachment %q on %q writes a network policy, which restricts connections only where the cluster's network plugin enforces network policy; once the target cluster's plugin does, affirm it by setting infra.control_plane_present to true on this attachment in the Release" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+
+  # One NetworkPolicy per pod template the attached component's render emitted,
+  # in one file.
+  #
+  # Names and namespace exactly as core/caller-allowlist's realization places
+  # its own: each policy is named from the workload it selects — its name and
+  # kind, both taken from the attached component's render — and the attachment
+  # name, folded to hyphens; and it is placed in the namespace the workload's own
+  # document writes, because a network policy selects pods in its own namespace
+  # only. A workload whose document writes no namespace halts rather than guess
+  # one. The attachment name keeps this policy apart from a caller allowlist's
+  # on the same workload.
+  #
+  # Selection, for the attached component and for every target alike: the
+  # selector a workload's controller writes — a Deployment's, a StatefulSet's,
+  # a DaemonSet's, a ReplicaSet's, a Job's or a CronJob's matchLabels — or,
+  # where it writes none, the identity labels the build stamps on every
+  # workload it synthesizes and on every bare Pod, taken only from a template
+  # carrying the component's identity label, the one stamp no chart writes. A
+  # pod template a chart or an artifact writes inside a controller keeps its
+  # author's labels and carries none of them, so a chart-rendered target is
+  # selected by its controller's selector. A workload carrying neither halts:
+  # selecting it by every label its template carries would include labels that
+  # change with a version, and every rollout changing one would leave the old
+  # pods unmatched until they were replaced. Where two controllers of one
+  # render share a workload's kind, name and namespace, which selector owns its
+  # pods cannot be told, and the build halts rather than pick one. A selector's
+  # matchExpressions are not reported to a FeatureRecipe, so a controller
+  # selecting by expressions as well is matched by its matchLabels alone.
+  #
+  # Ports. Each workload's pods are admitted on the ports its own containers
+  # declare, read from the same render, with the protocol it wrote and TCP
+  # where it wrote none; a workload declaring none adds no rule. A connection
+  # is made to a pod's own port — a Service maps its port onto it — so the
+  # port a target provides to its callers is never read here. A target none of
+  # whose workloads declares a port could not be reached on any, and halts,
+  # naming the connection; the attached component itself may declare none, as
+  # a client that listens nowhere does.
+  #
+  # Destinations, in this order and each written once: the attached
+  # component's own pods; each target's pods, in alias order; the DNS pods, on
+  # UDP and TCP port 53; and each listed address range, on any port. A target
+  # connected twice adds its pods once. A connection whose target emitted no
+  # pod template — a hosted API, a component another provider renders, pods a
+  # controller creates at runtime — is admitted only through an
+  # admitted_destinations entry naming its target; every such connection with
+  # none is named in one halt.
+  #
+  # DNS. Where the attachment leaves infra.dns_pods unset, the policy admits
+  # the kube-dns pods: namespace kube-system, pod label k8s-app: kube-dns. That
+  # default is applied here, and a value the attachment writes replaces it
+  # whole.
+  #
+  # Every label key and value is written through toJson, so a value that reads
+  # as a number or a boolean stays a string, and every map is written in key
+  # order, so identical input renders identical bytes.
+  artifacts:
+    networkpolicy.yaml: |
+      {{- $att := .attachment_name | replace "_" "-" }}
+      {{- $host := .context.instance_id }}
+      {{- $name := .attachment_name }}
+      {{- /* The identity labels the build stamps on the pods of a workload it synthesizes and on a bare Pod, less the two carrying a version. */}}
+      {{- $identity := list "aggrega.ai/component-id" "aggrega.ai/aggregate-name" "aggrega.ai/environment" "aggrega.ai/provider" "app.kubernetes.io/name" }}
+
+      {{- /* The connections, by target, and the address ranges listed for them; a malformed entry halts naming it. */}}
+      {{- $wired := dict }}
+      {{- $wiredNames := list }}
+      {{- range $alias, $edge := .context.uses }}
+        {{- if not (hasKey $wired $edge.target) }}
+          {{- $wiredNames = append $wiredNames (printf "%q" $edge.target) }}
+        {{- end }}
+        {{- $_ := set $wired $edge.target $alias }}
+      {{- end }}
+      {{- $ranged := dict }}
+      {{- $ranges := list }}
+      {{- $seenRanges := dict }}
+      {{- range $i, $dst := .infra.admitted_destinations }}
+        {{- $t := get $dst "target" }}
+        {{- $cidr := get $dst "cidr" }}
+        {{- if not $t }}
+          {{- fail (printf "core/egress-allowlist attachment %q on %q: entry %d of infra.admitted_destinations names no target; give it the target of the connection its range is for, or remove it" $name $host (add1 $i)) }}
+        {{- end }}
+        {{- if not (hasKey $wired $t) }}
+          {{- fail (printf "core/egress-allowlist attachment %q on %q: entry %d of infra.admitted_destinations names the target %q, but %q has no connection to it; name the target of one of its uses edges (%s), or remove the entry" $name $host (add1 $i) $t $host (default "none" (join ", " $wiredNames))) }}
+        {{- end }}
+        {{- if not $cidr }}
+          {{- fail (printf "core/egress-allowlist attachment %q on %q: entry %d of infra.admitted_destinations, for the target %q, names no address range; give it a cidr, or remove it" $name $host (add1 $i) $t) }}
+        {{- end }}
+        {{- $_ := set $ranged $t true }}
+        {{- if not (hasKey $seenRanges $cidr) }}
+          {{- $_ := set $seenRanges $cidr true }}
+          {{- $ranges = append $ranges $cidr }}
+        {{- end }}
+      {{- end }}
+
+      {{- /* Whose workloads are selected: the attached component's, then each target's, in alias order. */}}
+      {{- $owners := list (dict "role" "host" "id" $host "alias" "" "facts" (default (dict) .context.render_facts)) }}
+      {{- range $alias, $edge := .context.uses }}
+        {{- $owners = append $owners (dict "role" "target" "id" $edge.target "alias" $alias "facts" (default (dict) $edge.render_facts)) }}
+      {{- end }}
+
+      {{- $hostWorkloads := list }}
+      {{- $rules := list }}
+      {{- $seenRules := dict }}
+      {{- $unreached := list }}
+      {{- range $owners }}
+        {{- $o := . }}
+        {{- $templates := default (list) $o.facts.pod_template_labels }}
+        {{- if not $templates }}
+          {{- if eq $o.role "host" }}
+            {{- fail (printf "core/egress-allowlist attachment %q on %q: %q renders no workload whose pods a policy can select, so nothing it runs could be restricted; this Feature needs a component whose own render emits its pods, not one whose pods a controller creates later or one reached outside the cluster" $name $host $host) }}
+          {{- else if not (hasKey $ranged $o.id) }}
+            {{- $unreached = append $unreached (printf "%q through its connection %q" $o.id $o.alias) }}
+          {{- end }}
+        {{- end }}
+        {{- $ownerRules := 0 }}
+        {{- range $templates }}
+          {{- $tpl := . }}
+          {{- $kind := get $tpl "kind" }}
+          {{- $wname := get $tpl "name" }}
+          {{- $wns := get $tpl "namespace" }}
+          {{- if not $wns }}
+            {{- if eq $o.role "host" }}
+              {{- fail (printf "core/egress-allowlist attachment %q on %q: the %s %q that %q renders is emitted into no namespace, and a network policy selects pods in its own namespace only, so it cannot be placed beside them; set aggrega.ai/namespace on the boundary holding %q, or on its own entry, in the Release, or have the manifest that carries it write one" $name $host $kind $wname $host $host) }}
+            {{- else }}
+              {{- fail (printf "core/egress-allowlist attachment %q on %q: %q connects to %q through its connection %q, but the %s %q that %q renders is emitted into no namespace, so the policy cannot name where its pods run; set aggrega.ai/namespace on the boundary holding %q, or on its own entry, in the Release, or have the manifest that carries it write one" $name $host $host $o.id $o.alias $kind $wname $o.id $o.id) }}
+            {{- end }}
+          {{- end }}
+
+          {{- /* The selector its controller writes, where the render reports exactly one controller for it. */}}
+          {{- $found := list }}
+          {{- range (default (list) $o.facts.controller_selectors) }}
+            {{- if and (eq (get . "kind") $kind) (eq (get . "name") $wname) (eq (get . "namespace") $wns) }}
+              {{- $found = append $found (get . "match_labels") }}
+            {{- end }}
+          {{- end }}
+          {{- if gt (len $found) 1 }}
+            {{- fail (printf "core/egress-allowlist attachment %q on %q: the %s %q that %q renders matches %d controllers of that kind, name and namespace, so which selector owns its pods cannot be told; give each workload %q renders a name of its own, or leave this Feature off %q" $name $host $kind $wname $o.id (len $found) $o.id $host) }}
+          {{- end }}
+          {{- $sel := dict }}
+          {{- if $found }}
+            {{- with index $found 0 }}
+              {{- range $k, $v := . }}
+                {{- $_ := set $sel $k $v }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
+
+          {{- /* Otherwise the build's identity labels, from a template the build stamped. */}}
+          {{- if not $sel }}
+            {{- $labels := default (dict) (get $tpl "labels") }}
+            {{- if hasKey $labels "aggrega.ai/component-id" }}
+              {{- range $identity }}
+                {{- if hasKey $labels . }}
+                  {{- $_ := set $sel . (get $labels .) }}
+                {{- end }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
+          {{- if not $sel }}
+            {{- if eq $o.role "host" }}
+              {{- fail (printf "core/egress-allowlist attachment %q on %q: the %s %q that %q renders writes no controller selector and carries none of the identity labels the build stamps on its pods, and selecting it by every label its template carries would stop matching its pods whenever a label carrying a version changes; leave this Feature off %q, or realize it with a Recipe whose workloads write a controller selector" $name $host $kind $wname $host $host) }}
+            {{- else }}
+              {{- fail (printf "core/egress-allowlist attachment %q on %q: %q connects to %q through its connection %q, but the %s %q that %q renders writes no controller selector and carries none of the identity labels the build stamps on its pods, and admitting it by every label its template carries would stop admitting its pods whenever a label carrying a version changes; realize %q with a Recipe whose workloads write a controller selector, or leave this Feature off %q" $name $host $host $o.id $o.alias $kind $wname $o.id $o.id $host) }}
+            {{- end }}
+          {{- end }}
+
+          {{- /* The ports this workload's own containers declare, once each. */}}
+          {{- $ports := list }}
+          {{- $seenPorts := dict }}
+          {{- range (default (list) $o.facts.container_ports) }}
+            {{- if and (eq (get . "kind") $kind) (eq (get . "name") $wname) (eq (get . "namespace") $wns) }}
+              {{- range (default (list) .ports) }}
+                {{- if hasKey . "container_port" }}
+                  {{- $proto := default "TCP" (get . "protocol") }}
+                  {{- $key := printf "%d/%s" (int .container_port) $proto }}
+                  {{- if not (hasKey $seenPorts $key) }}
+                    {{- $_ := set $seenPorts $key true }}
+                    {{- $ports = append $ports (dict "port" (int .container_port) "protocol" $proto) }}
+                  {{- end }}
+                {{- end }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
+
+          {{- if eq $o.role "host" }}
+            {{- $hostWorkloads = append $hostWorkloads (dict "kind" $kind "name" $wname "namespace" $wns "selector" $sel) }}
+          {{- end }}
+          {{- if $ports }}
+            {{- $peer := dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" $wns)) "podSelector" (dict "matchLabels" $sel) }}
+            {{- $rule := dict "to" (list $peer) "ports" $ports }}
+            {{- $key := toJson $rule }}
+            {{- if not (hasKey $seenRules $key) }}
+              {{- $_ := set $seenRules $key true }}
+              {{- $rules = append $rules $rule }}
+            {{- end }}
+            {{- $ownerRules = add1 $ownerRules }}
+          {{- end }}
+        {{- end }}
+        {{- if and (eq $o.role "target") $templates (not $ownerRules) }}
+          {{- fail (printf "core/egress-allowlist attachment %q on %q: %q connects to %q through its connection %q, but none of the containers %q renders declares a port, so there is no port the connection could be admitted on; declare the ports its containers listen on, or leave this Feature off %q" $name $host $host $o.id $o.alias $o.id $host) }}
+        {{- end }}
+      {{- end }}
+
+      {{- /* Every connection whose target the policy cannot select, with no address range listed, in one halt. */}}
+      {{- if $unreached }}
+        {{- fail (printf "core/egress-allowlist attachment %q on %q: %q connects to %s, whose render emitted no pods a network policy can select, such as a target the cluster does not run, so the connection could only be admitted by address; list the address ranges each such target is reached at under infra.admitted_destinations on this attachment in the Release, one entry per range, or leave this Feature off %q" $name $host $host (join ", " $unreached) $host) }}
+      {{- end }}
+
+      {{- /* The cluster's DNS pods, on UDP and TCP port 53: the kube-dns pods unless the attachment names others. */}}
+      {{- $dns := dict "namespace" "kube-system" "pod_labels" (dict "k8s-app" "kube-dns") }}
+      {{- if kindIs "map" .infra.dns_pods }}
+        {{- $dns = .infra.dns_pods }}
+      {{- end }}
+      {{- $dnsNs := get $dns "namespace" }}
+      {{- $dnsLabels := get $dns "pod_labels" }}
+      {{- if not (or $dnsNs $dnsLabels) }}
+        {{- fail (printf "core/egress-allowlist attachment %q on %q: infra.dns_pods names no pods, so the component could resolve no name; give it the namespace, the pod_labels, or both, of the pods serving the cluster's DNS, or leave it unset for the kube-dns pods in kube-system" $name $host) }}
+      {{- end }}
+      {{- $dnsPeer := dict }}
+      {{- if $dnsNs }}
+        {{- $_ := set $dnsPeer "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" $dnsNs)) }}
+      {{- end }}
+      {{- if $dnsLabels }}
+        {{- $_ := set $dnsPeer "podSelector" (dict "matchLabels" $dnsLabels) }}
+      {{- end }}
+      {{- $rules = append $rules (dict "to" (list $dnsPeer) "ports" (list (dict "port" 53 "protocol" "UDP") (dict "port" 53 "protocol" "TCP"))) }}
+
+      {{- /* The listed address ranges, on any port. */}}
+      {{- if $ranges }}
+        {{- $blocks := list }}
+        {{- range $ranges }}
+          {{- $blocks = append $blocks (dict "ipBlock" (dict "cidr" .)) }}
+        {{- end }}
+        {{- $rules = append $rules (dict "to" $blocks) }}
+      {{- end }}
+
+      {{- /* One policy per workload the attached component renders, in that workload's namespace. */}}
+      {{- range $i, $w := $hostWorkloads }}
+      {{- if $i }}
+      ---
+      {{- end }}
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: {{ toJson (printf "%s-%s-%s" (default (printf "%d" $i) $w.name) (lower $w.kind) $att) }}
+        namespace: {{ toJson $w.namespace }}
+      spec:
+        podSelector:
+          matchLabels:
+            {{- range $k, $v := $w.selector }}
+            {{ toJson $k }}: {{ toJson $v }}
+            {{- end }}
+        policyTypes:
+          - Egress
+        egress:
+          {{- range $rules }}
+          - to:
+              {{- range .to }}
+              -
+                {{- with get . "ipBlock" }}
+                ipBlock:
+                  cidr: {{ toJson .cidr }}
+                {{- end }}
+                {{- with get . "namespaceSelector" }}
+                namespaceSelector:
+                  matchLabels:
+                    {{- range $k, $v := .matchLabels }}
+                    {{ toJson $k }}: {{ toJson $v }}
+                    {{- end }}
+                {{- end }}
+                {{- with get . "podSelector" }}
+                podSelector:
+                  matchLabels:
+                    {{- range $k, $v := .matchLabels }}
+                    {{ toJson $k }}: {{ toJson $v }}
+                    {{- end }}
+                {{- end }}
+              {{- end }}
+            {{- with get . "ports" }}
+            ports:
+              {{- range . }}
+              - port: {{ .port }}
+                protocol: {{ toJson .protocol }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
+      {{- end }}
