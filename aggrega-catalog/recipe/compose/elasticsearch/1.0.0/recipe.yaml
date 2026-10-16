@@ -1,0 +1,146 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: elasticsearch
+  version: 1.0.0
+  # Elastic publishes the image this Recipe runs under the Elastic License 2.0.
+  license: Elastic-2.0
+  description: >
+    Elasticsearch for local development via Docker Compose. Synthesized-mode
+    Workload: one service running Elastic's own image as one node, with its
+    indexes on a named volume. provides.host is the bare service name, resolved
+    on the compose network; the port is published on no host interface, so only
+    the stack's own services reach the server.
+
+    Authentication stays on with the built-in superuser, elastic, whose password
+    is the value the attached credential delivers, written into the compose file
+    as delivered — a Compose variable reference such as ${ELASTIC_PASSWORD}
+    keeps the material out of the file; with none attached it is a development
+    default. The image's first-start setup, which generates certificates and
+    prints a password, is switched off. The REST API is served over plain HTTP,
+    not encrypted, and is reachable only inside the Release; the transport layer
+    listens inside the container only.
+
+    Reach for this realization for local development; on Kubernetes the
+    component is realized by the Helm Recipe elasticsearch.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/datastore/elasticsearch:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # protocol is "http", the scheme the REST API is served over, and endpoint
+  # joins the parts into that address, carrying no credential. user is
+  # `elastic`, the built-in superuser, the account the password slot's
+  # credential belongs to.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    user: "elastic"
+    protocol: "http"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}"
+  workload: |
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $bound := hasKey (default dict .features) "password" -}}
+    {{- if and $bound (not (hasKey $env "ELASTIC_PASSWORD")) -}}
+    {{- fail (printf "the password credential of the Elasticsearch server %q delivers no ELASTIC_PASSWORD variable, the name this Recipe reads the superuser's password under: deliver it under that name, for example by setting values.key: ELASTIC_PASSWORD on a core/secret-value attachment" .context.instance_id) -}}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    containers:
+      main:
+        image: "docker.elastic.co/elasticsearch/elasticsearch:{{ .infra.engine_version }}"
+        # The image reads each variable named like a setting — dotted and in
+        # lower case — as that setting of the server, which is how the product
+        # documents configuring it in a container.
+        #
+        # One node: single-node discovery, so the server elects itself and joins
+        # no other. Its transport layer, which a node of several would use to
+        # reach its peers, is bound to the container's loopback interface, so it
+        # is reachable from nowhere else; the REST API keeps the image's own
+        # all-interfaces address. A single node needs no certificate on its
+        # transport layer: the server reports the missing one as a warning at
+        # each start, as it does in this mode. readiness.port is the port the
+        # server opens once it is ready to serve, which the health check below
+        # probes.
+        #
+        # 🔴 AUTHENTICATION STAYS ON, AND THE IMAGE'S FIRST-START SETUP IS
+        # SWITCHED OFF. xpack.security.enabled is set explicitly and the image's
+        # security auto-configuration is turned off, so the server generates no
+        # certificate and prints neither a password nor an enrollment token. The
+        # REST API is served over HTTP: a certificate generated inside the
+        # container gives a client nothing to verify it against.
+        #
+        # 🔴 THE PASSWORD FOLLOWS THE PASSWORD SLOT. ELASTIC_PASSWORD is the
+        # variable the product documents for the superuser's password, which the
+        # image's start-up script stores as the server's bootstrap password when
+        # the container is first started. Attached, it is the value the
+        # credential delivered on the inject pipe, read from it as a map so a
+        # credential delivering another name halts above rather than rendering an
+        # empty password. Unattached, it is the development default `apppass`,
+        # the same for every reader of the catalog, which attaching a credential
+        # replaces.
+        variables:
+          discovery.type: single-node
+          transport.host: 127.0.0.1
+          http.port: "{{ .infra.port }}"
+          readiness.port: "8080"
+          xpack.security.enabled: "true"
+          xpack.security.autoconfiguration.enabled: "false"
+          xpack.security.http.ssl.enabled: "false"
+    {{- if $bound }}
+          ELASTIC_PASSWORD: "{{ get $env "ELASTIC_PASSWORD" }}"
+    {{- else }}
+          ELASTIC_PASSWORD: apppass
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The product's own Kubernetes distribution checks readiness by opening a
+        # connection to the readiness port, which the server opens only once it
+        # has elected itself and is ready to serve; this check runs the same
+        # command, with the nc the image carries against the IPv4 loopback
+        # address, and its timing. A service keeps one healthcheck, so one probe
+        # is declared.
+        health:
+          ready:
+            exec: ["nc", "-z", "-w5", "127.0.0.1", "8080"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        # The indexes live on one volume. A named volume starts out with the
+        # ownership of the image's own copy of that directory, the unprivileged
+        # user the server runs as. The server keeps the product's own
+        # memory-mapped index store, which asks the host for a high
+        # vm.max_map_count; this Recipe changes no kernel setting, and in
+        # single-node mode a lower value is reported as a warning at start.
+        volumeMounts:
+          - name: data
+            path: /usr/share/elasticsearch/data
+    # The server owns a durable volume on this target too. A datastore whose data
+    # vanished with its container would be a different thing from the one the
+    # Kubernetes target deploys. The declared size is read from the operator's
+    # own sizing knob so one Release configures either target.
+    volumes:
+      data:
+        persistent:
+          size: "{{ .infra.storage.size }}"
+    # ClusterIP publishes the port on no host interface: the stack's own services
+    # reach the server, and nothing outside it does.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

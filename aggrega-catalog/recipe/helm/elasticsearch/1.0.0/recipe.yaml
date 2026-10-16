@@ -1,0 +1,210 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: elasticsearch
+  version: 1.0.0
+  # Elastic publishes the image this Recipe runs under the Elastic License 2.0.
+  license: Elastic-2.0
+  description: >
+    Elasticsearch on Kubernetes via the helm provider's Workload synthesis: a
+    StatefulSet running Elastic's own image as one node, with its indexes on a
+    persistent volume, a ClusterIP Service publishing the REST API, and the
+    headless Service the stateful form requires. Elastic's own Helm chart for
+    Elasticsearch has had no release since version 8.5.1 and its repository is
+    archived, so the server is synthesized rather than sourced.
+
+    Authentication stays on with the built-in superuser, elastic, whose password
+    is read from the attached credential's Secret by name, so it never appears
+    in the rendered files; with none attached it is a development default. A
+    credential that names no Secret halts the build. The image's first-start
+    setup, which generates certificates and prints a password, is switched off.
+    The REST API is served over plain HTTP, not encrypted, and is reachable only
+    inside the Release; the transport layer listens inside the pod only.
+
+    Reach for this realization on Kubernetes: it needs no control plane and no
+    chart repository, and it builds with nothing fetched. The Compose Recipe of
+    the same name is the local-development realization.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/datastore/elasticsearch:1.0.0
+  # This Recipe reads from infra.overrides:
+  #   image          - { repository: string, tag: string } (the server's image;
+  #                    overrides the version pin, for a registry that mirrors it)
+  #   nodeSelector   - map[string]string (pod scheduling)
+  #   tolerations    - []object (pod scheduling)
+  #
+  # provides.host is the bare Service name "<rendered_name>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<rendered_name>-<service-key>"
+  # (here "<rendered_name>-default"), with no namespace segment. A same-namespace
+  # consumer reaches it under this name directly; a cross-namespace consumer
+  # qualifies it with the target namespace caller-side. port follows the port
+  # the operator set. protocol is "http", the scheme the REST API is served
+  # over, and endpoint joins the parts into that address, carrying no
+  # credential. user is `elastic`, the built-in superuser, the account the
+  # password slot's credential belongs to.
+  provides:
+    host: "{{ .context.rendered_name }}-default"
+    port: "{{ .infra.port }}"
+    user: "elastic"
+    protocol: "http"
+    endpoint: "http://{{ .context.rendered_name }}-default:{{ .infra.port }}"
+  # A Release may write a key of an infra group as an empty string —
+  # `compute.cpu: ""`, or `storage.size: ""` — and a key written that way
+  # replaces the Component's default rather than falling back to it. Rendered,
+  # that would emit a workload with no CPU or memory limit, or a volume that
+  # requests no size: a Release materially different from the one the
+  # Component's declared defaults describe, with nothing in the output saying so.
+  # The build halts here instead, naming the key and the group it belongs to, so
+  # the fix is one line in the Release. A key the Release leaves out takes the
+  # Component's default. The storage class is not checked: left unset, the
+  # volume is provisioned from the cluster's default storage class.
+  assertions:
+    compute_group_complete: >-
+      {{- if not (optional (default dict .infra.compute) "cpu" "") -}}
+      {{- fail "this Release sets part of infra.compute on the Elasticsearch server but leaves compute.cpu empty, so the rendered workload would carry no CPU request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+      {{- if not (optional (default dict .infra.compute) "memory" "") -}}
+      {{- fail "this Release sets part of infra.compute on the Elasticsearch server but leaves compute.memory empty, so the rendered workload would carry no memory request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+    storage_group_complete: >-
+      {{- if not (optional (default dict .infra.storage) "size" "") -}}
+      {{- fail "this Release leaves storage.size empty on the Elasticsearch server, so the rendered volume would request no size: set storage.size to the size the volume needs, or leave it out of the Release to take the component's default" -}}
+      {{- end -}}
+  workload: |
+    {{- $repo := "docker.elastic.co/elasticsearch/elasticsearch" -}}
+    {{- $tag := .infra.engine_version -}}
+    {{- $overrides := default dict .infra.overrides -}}
+    {{- with optional $overrides "image" dict -}}
+    {{- $repo = optional . "repository" $repo -}}
+    {{- $tag = optional . "tag" $tag -}}
+    {{- end -}}
+    {{- $nodeSelector := optional $overrides "nodeSelector" dict -}}
+    {{- $tolerations := optional $overrides "tolerations" list -}}
+    {{- $bound := hasKey (default dict .features) "password" -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # form: stateful selects a StatefulSet on the helm provider; the
+    # persistentTemplate volume and the headless Service below are companions of
+    # this form.
+    form: stateful
+    replicas: 1
+    # The server runs as the unprivileged user 1000, as the image declares, and
+    # the volume is given to group 1000 so that user can write to it — the same
+    # pod setting the product's own Kubernetes distribution applies.
+    podSecurityContext:
+      fsGroup: 1000
+    {{- if or $nodeSelector $tolerations }}
+    scheduling:
+    {{- with $nodeSelector }}
+      nodeSelector: {{ toJson . }}
+    {{- end }}
+    {{- with $tolerations }}
+      tolerations: {{ toJson . }}
+    {{- end }}
+    {{- end }}
+    containers:
+      main:
+        image: "{{ $repo }}:{{ $tag }}"
+        # The image reads each variable named like a setting — dotted and in
+        # lower case — as that setting of the server, which is how the product
+        # documents configuring it in a container.
+        #
+        # One node: single-node discovery, so the server elects itself and joins
+        # no other. Its transport layer, which a node of several would use to
+        # reach its peers, is bound to the pod's loopback interface, so it is
+        # reachable from nowhere else; the REST API keeps the image's own
+        # all-interfaces address. A single node needs no certificate on its
+        # transport layer: the server reports the missing one as a warning at
+        # each start, as it does in this mode. readiness.port is the port the
+        # server opens once it is ready to serve, which the readiness check
+        # below probes.
+        #
+        # 🔴 AUTHENTICATION STAYS ON, AND THE IMAGE'S FIRST-START SETUP IS
+        # SWITCHED OFF. xpack.security.enabled is set explicitly and the image's
+        # security auto-configuration is turned off, so the server generates no
+        # certificate and prints neither a password nor an enrollment token. The
+        # REST API is served over HTTP: a certificate generated inside the pod
+        # gives a client nothing to verify it against.
+        #
+        # 🔴 THE PASSWORD FOLLOWS THE PASSWORD SLOT. ELASTIC_PASSWORD is the
+        # variable the product documents for the superuser's password, which the
+        # image's start-up script stores as the server's bootstrap password.
+        # Attached, it is read from the attached credential's Secret BY NAME, so
+        # the material never appears in the rendered artifact; a credential that
+        # publishes no Secret name and data key halts the build, which refuses a
+        # reference with nothing to read. Unattached, it is the development
+        # default `apppass`, the same for every reader of the catalog, which
+        # attaching a credential replaces. The file form the image also reads,
+        # ELASTIC_PASSWORD_FILE, is not used: the image refuses a password file
+        # that its group or other users may read, which a mounted Secret is by
+        # default.
+        variables:
+          discovery.type: single-node
+          transport.host: 127.0.0.1
+          http.port: "{{ .infra.port }}"
+          readiness.port: "8080"
+          xpack.security.enabled: "true"
+          xpack.security.autoconfiguration.enabled: "false"
+          xpack.security.http.ssl.enabled: "false"
+    {{- if not $bound }}
+          ELASTIC_PASSWORD: apppass
+    {{- end }}
+    {{- if $bound }}
+        attachments:
+          ELASTIC_PASSWORD:
+            from: password
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The product's own Kubernetes distribution checks readiness by opening a
+        # connection to the readiness port, which the server opens only once it
+        # has elected itself and is ready to serve, and declares no liveness or
+        # startup probe; this check does the same, with its timing. The port
+        # accepts a connection and sends nothing.
+        health:
+          ready:
+            tcp: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+        # The resource quantities are quoted so the rendered value stays a string
+        # whatever the Release supplies. The server sizes its heap from the memory
+        # limit, half of it.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        # The indexes live on one volume. The server keeps the product's own
+        # memory-mapped index store, which asks the host for a high
+        # vm.max_map_count; this Recipe changes no kernel setting, and in
+        # single-node mode a lower value is reported as a warning at start.
+        volumeMounts:
+          - name: data
+            path: /usr/share/elasticsearch/data
+    volumes:
+      data:
+        persistentTemplate:
+          size: "{{ .infra.storage.size }}"
+          class: "{{ .infra.storage.type }}"
+    # ClusterIP publishes the REST port inside the cluster and nowhere else; the
+    # transport layer is published on no Service.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
+      headless:
+        type: Headless
+        ports:
+          http: {{ .infra.port }}
