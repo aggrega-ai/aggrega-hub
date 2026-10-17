@@ -585,6 +585,54 @@ selected component publishes and checks nothing about what answers there. As
 with every family on this page, a value is added in the same act as the first
 component to carry it.
 
+### The `observability.aggrega.ai/metrics-credential` annotation
+
+`observability.aggrega.ai/metrics-credential`, under a Component's
+`metadata.annotations`, states how the product's Prometheus metrics
+authenticate: whether a scraper presents a credential, and which one. It is an
+annotation rather than a label because nothing selects on it; `aggrega lint`
+reads it, in the two rules below. A metrics scraper reaches the components it
+scrapes through a socket named `scrape_target`, as
+`core/observability/prometheus` does.
+
+| Value | What the value asserts |
+| --- | --- |
+| `none` | The product serves its metrics with no credential, even while the Component's `api_key` slot is filled, so a scrape presents none. |
+| `target-key` | The metrics take the key the Component requires of every caller, the one its `api_key` slot holds, so a scrape presents that key as any caller does. |
+| `separate-token` | The metrics take a token of their own rather than the key the Component requires of its callers — one the running product issues, or one created or set for the metrics alone — so a scrape presents that token and never the `api_key`. |
+
+Three rules bind it:
+
+- **`target-key` and `separate-token` go with the provides key
+  `metrics_credential_required`.** A Component annotated either way declares
+  it, as a `boolean` in its `provides` pillar beside `metrics_endpoint`, and
+  every Recipe publishes it: true exactly while a scrape of the
+  `metrics_endpoint` that instance publishes must present a credential. A
+  Recipe whose metrics are off publishes it false beside an empty
+  `metrics_endpoint`. The annotation states the product's behaviour; the key
+  states what one configured instance asks of a scraper, so neither stands in
+  for the other. A Component annotated `none` declares no such key. The rule
+  `metrics-credential-annotation-matches-provides`, which `aggrega lint` runs
+  over each Component it checks, advises where a Component's annotation and its
+  declaration disagree.
+- **The annotation decides how a scrape connection is compared with the
+  target's `api_key`.** The rule `connection-credential-matches-target-key`,
+  described under "A key both ends of a connection hold" below, passes over a
+  `scrape_target` connection whose target is annotated `none`, does not compare
+  the connection's `credential` with the target's `api_key` where it is
+  annotated `separate-token`, and judges it like any other connection where it
+  is annotated `target-key` or not annotated at all.
+- **A value states the product's behaviour at the version the catalog runs**,
+  read from the product's source or documentation at that version, and is
+  written only once it has been. A product that serves no Prometheus metrics
+  carries no annotation.
+
+For example, `core/ai-model/vllm` carries `none`, since vLLM serves its
+metrics outside the routes its `api_key` guards, and `core/storage/minio`
+carries `separate-token`, since MinIO answers its metrics only to a token
+`mc admin prometheus generate` mints. The compiler attaches no meaning to the
+annotation, and the build checks neither rule.
+
 ### The `component.aggrega.ai/upstream-licensing` label
 
 `component.aggrega.ai/upstream-licensing` records the licensing class of the
@@ -2242,9 +2290,11 @@ the connection with the target's
 and two ends whose `origin` is written differently, and it never quotes
 either. It reads `api_key` and `credential` and no other slot, so a target's
 other secrets — `core/ai-model/vllm`'s `model_pull_token` — are never
-compared, and a key slot named any other way draws no advice. The finding is
-advisory, and a workspace whose two ends deliberately differ opts out with
-`allow_connection_credential_mismatches`.
+compared, and a key slot named any other way draws no advice. A connection on a
+`scrape_target` socket is compared as its target's
+`observability.aggrega.ai/metrics-credential` annotation says, described with
+that annotation above. The finding is advisory, and a workspace whose two ends
+deliberately differ opts out with `allow_connection_credential_mismatches`.
 
 **A managed target's `api_key` is the vendor's key, and the rule does not
 judge it.** A Component labelled `component.aggrega.ai/hosting: managed`
