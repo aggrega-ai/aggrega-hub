@@ -63,6 +63,11 @@
 #                 redacted); no network, no OIDC, no marker advance.
 #
 # Env: AGGREGA_BIN overrides the `aggrega` binary (e.g. a freshly-built one).
+#      AGGREGA_WORKSPACE_ROOT names the Aggrega workspace every aggrega call uses,
+#      the one a Recipe's remote source is fetched into. Unset, a run started
+#      outside any workspace on a checkout outside any workspace names a scratch
+#      one in its temporary directory, removed at exit
+#      (scripts/lib/scratch-workspace.sh).
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -104,6 +109,21 @@ while [ $# -gt 0 ]; do
 done
 
 [ -d "$CATALOG" ] || { echo "publish-diff: catalog dir not found: $CATALOG" >&2; exit 1; }
+
+# --- The workspace every aggrega call below uses ------------------------------
+# Named once here, before the first call, through the helper both publish scripts
+# share (scripts/lib/scratch-workspace.sh, which carries when a scratch workspace is
+# named and why). `aggrega push` finds its workspace from the folder it runs in
+# before the entity's own, so both this run's working directory and the checkout
+# are asked. A scratch workspace lives in this run's temporary directory and goes
+# with it, and the guard below inherits it rather than naming one of its own.
+# shellcheck source=lib/scratch-workspace.sh
+. "$DIR/lib/scratch-workspace.sh" || exit 1
+RUN_TMP="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/publish-diff.XXXXXX")" ||
+  { echo "publish-diff: cannot make a temporary directory" >&2; exit 1; }
+trap 'rm -rf "$RUN_TMP"' EXIT
+scratch_workspace_root "$RUN_TMP" "$PWD" "$HUB_ROOT" ||
+  { echo "publish-diff: cannot make a scratch workspace in $RUN_TMP" >&2; exit 1; }
 
 # --- The entity kinds this publisher pushes -----------------------------------
 # Read from the binary that does the pushing, through the one reader every script

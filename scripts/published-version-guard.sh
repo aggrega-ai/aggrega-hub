@@ -53,7 +53,11 @@ THE RECORD
   and contacts no git remote, and the dry run it runs contacts no registry. The
   one fetch a run can make is the dry run's own: for a Recipe or FeatureRecipe
   whose remote source is written out in full, aggrega push --dry-run fetches that
-  source to compare its pin. With no published branch fetched, nothing is
+  source to compare its pin, into the cache of the Aggrega workspace the dry run
+  uses: the one AGGREGA_WORKSPACE_ROOT names, else the one aggrega finds. With
+  that variable unset, a repository that is in no workspace — a checkout on its
+  own — gets a scratch workspace in the run's temporary directory, removed when
+  the run exits. With no published branch fetched, nothing is
   recorded and nothing is judged. A record fetched before a publish
   misses only the versions published since, which aggrega push still refuses to
   overwrite when they are published again.
@@ -122,6 +126,8 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 2
 . "$HERE/lib/published-branch.sh" || exit 2
 # shellcheck source=lib/catalog-entities.sh
 . "$HERE/lib/catalog-entities.sh" || exit 2
+# shellcheck source=lib/scratch-workspace.sh
+. "$HERE/lib/scratch-workspace.sh" || exit 2
 
 # Paths given relative to where the guard was started — the binary and the entity
 # files — are made absolute before it moves, so they name the same files from the
@@ -231,6 +237,10 @@ if [ -n "$ROWS" ]; then
   DOCS=()
   if [ "$MODE" = files ]; then
     if [ "${#ARGS[@]}" -gt 0 ]; then
+      # The workspace the dry runs use (scripts/lib/scratch-workspace.sh), settled
+      # here rather than at the top, so a run with nothing to judge never calls the
+      # binary.
+      scratch_workspace_root "$TMP" "$TOP" || broken "cannot make a scratch workspace in $TMP"
       if load_publishable_kinds Plugin; then
         for f in "${ARGS[@]}"; do
           [ -f "$f" ] || { finding "$f: not judged — no such file"; continue; }
@@ -245,6 +255,7 @@ if [ -n "$ROWS" ]; then
   else
     mapfile -d '' -t CHANGED < <(git diff --cached --name-only -z --no-renames "$BASE" -- "$CATALOG_ROOT/")
     if [ "${#CHANGED[@]}" -gt 0 ]; then
+      scratch_workspace_root "$TMP" "$TOP" || broken "cannot make a scratch workspace in $TMP"
       if load_publishable_kinds Plugin; then
         declare -A SEEN=()
         for f in "${CHANGED[@]}"; do
