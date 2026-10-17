@@ -256,7 +256,7 @@ The dimensions and their value sets:
 | `period-budget` | `cost`, `tokens` | The component can refuse model requests once what it has counted over a period exceeds a limit set in its configuration, and the value names what it counts. `cost`: what the traffic cost, priced from a table the component keeps per model. `tokens`: the tokens each model's reply reports reading, writing or both, which the component counts and prices nothing. |
 | `concurrency-cap` | `total`, `per-target` | The component can hold or refuse a request that would take the requests it is carrying at once past a cap set in its configuration, and the value names what one cap counts. `total`: every request the component forwards, whatever it forwards it to, against one cap. `per-target`: one cap for each upstream target the component sends to, each counting the requests in flight to that target, and none on their total. |
 
-Three rules bind the family, and each has already been got wrong once:
+Three rules bind the family:
 
 - **The fidelity rides in the value, not in a second key.** Two components that
   both mirror requests can still differ in the way a Feature cares about, so a
@@ -1611,7 +1611,7 @@ spec:
 
 Two `infra` fields carry version selection, and they are distinct. Both are provider-neutral conventions — the compiler reads neither; each Recipe decides which it honors and how.
 
-- **`engine_version`** — the running server or binary version. Every component carries it. On synthesized and Compose targets it selects the container image tag; on managed-service targets (Terraform, CloudFormation) it selects the provider's engine version — an RDS `engine_version`, for example. It is the live version knob for the software the component runs.
+- **`engine_version`** — the running server or binary version. On synthesized and Compose targets it selects the container image tag; on managed-service targets (Terraform, CloudFormation) it selects the provider's engine version — an RDS `engine_version`, for example. It is the live version knob for the software the component runs.
 - **`source_version`** — the version of the *source artifact* a Recipe pulls: a Helm chart version, a Terraform module version. Only artifact-backed Recipes (a sourced Recipe, over a chart or over a module) pull such an artifact, so `source_version` belongs only on components whose Recipes are artifact-backed. A pure-synth Recipe assembles its workload directly and pulls no chart or module, so it has no source artifact to version — it exposes `engine_version` alone.
 
 Declare `source_version` only where an artifact-backed Recipe reads it:
