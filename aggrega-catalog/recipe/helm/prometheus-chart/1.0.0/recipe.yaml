@@ -9,22 +9,25 @@ metadata:
   license: Apache-2.0
   description: >
     Prometheus metrics server on Kubernetes via the prometheus-community Helm
-    chart, served from that project's HTTPS chart repository, configured as one
-    server: the chart's alerting, exporter and push-gateway subcharts are
-    switched off. It renders a Deployment, a ConfigMap carrying the scrape
-    configuration, a PersistentVolumeClaim for the time-series database, a
-    ClusterIP Service, and the ServiceAccount, ClusterRole and ClusterRoleBinding
-    the server reads the cluster's own endpoints under. The server image and the
-    chart version are pinned.
+    chart, configured as one server: the chart's alerting, exporter and
+    push-gateway subcharts are switched off. It renders a Deployment, a
+    ConfigMap carrying the scrape configuration, a PersistentVolumeClaim for the
+    time-series database, a ClusterIP Service, and the ServiceAccount,
+    ClusterRole and ClusterRoleBinding the server reads the cluster's own
+    endpoints under. The server image and the chart version are pinned.
 
-    That cluster-scoped read grant is what this realization carries: a server
-    assembled as a plain workload cannot discover targets from the cluster at
-    all. Each connection on the `scrape_target` uses-socket still becomes one
-    scrape job, as on the workload-synthesis realization. Reach for this
-    realization where a chart repository is reachable at build time and the
-    server is expected to discover targets from the cluster; reach for
-    `prometheus`, the workload-synthesis realization, where the build must
-    complete with nothing fetched.
+    That cluster-scoped read grant also serves the chart's own jobs, which
+    scrape whatever the cluster advertises through scrape annotations. Each
+    connection on the `scrape_target` uses-socket becomes one scrape job, as on
+    the workload-synthesis realization: a target publishing
+    `metrics_service` or `metrics_pod_selector` is discovered in the namespace
+    its connection's `aggrega.ai/namespace` annotation names, in every
+    namespace for KEDA and Knative Serving, or in the server's own where
+    neither declares one; Prometheus declaring a namespace while such a target
+    declares none halts the build. Reach for this realization where a chart
+    repository is reachable and the server is expected to discover targets
+    beyond those wired; reach for `prometheus`, the workload-synthesis
+    realization, where the build must complete with nothing fetched.
 
     With `infra.external_base_url` set, the server takes it as its external URL
     through the chart's `server.baseURL` and is kept serving at its root through
@@ -48,9 +51,11 @@ spec:
   # to read the cluster's own endpoints.
   #
   # That cluster-scoped read grant is the reason to reach for this
-  # realization: a server assembled as a plain workload carries no such grant
-  # and cannot discover targets from the cluster at all. Each connection on the
-  # `scrape_target` uses-socket becomes one job in the scrape configuration the
+  # realization: it lets the chart's own jobs scrape whatever the cluster
+  # advertises, beyond the targets the topology wires, where the
+  # workload-synthesis realization grants itself read access only where the
+  # wired targets it discovers run. Each connection on the `scrape_target`
+  # uses-socket becomes one job in the scrape configuration the
   # chart writes, exactly as the workload-synthesis realization does, so the
   # developer-facing contract is unchanged between the two.
   #
@@ -239,12 +244,35 @@ spec:
     ## realization performs, so a developer who wired the topology once gets the
     ## same jobs from either realization.
     ##
+    ## A target publishing metrics_service or metrics_pod_selector is discovered
+    ## from the cluster instead, by the same rule as on the workload-synthesis
+    ## realization: an endpointslice job keeping the endpoints of the Services
+    ## named (a comma-separated list, written as an alternation) on the Service
+    ## port named, or a pod job passing the selector to the cluster as written
+    ## and keeping the container port named on running pods; the path is the one
+    ## the target publishes, and every series is labelled with its namespace and
+    ## pod. A target publishing both kinds, or a discovery fact without its port
+    ## name or path, halts the build, naming it. The job discovers in the
+    ## namespace the connection's aggrega.ai/namespace annotation names; in
+    ## every namespace for KEDA and Knative Serving, which run once per cluster
+    ## in a namespace of their own and are recognised by the Component the target
+    ## is; and in the server's own namespace where neither Prometheus nor the
+    ## target declares one, both then placed alike. Prometheus declaring a
+    ## namespace while the target declares none leaves the job nowhere to look,
+    ## and the build halts, naming both. The chart's own ClusterRole already
+    ## grants the server read access to pods, services, endpoints and
+    ## endpointslices in every namespace, so no grant is added here.
+    ##
     ## The jobs below are ADDED to the chart's own cluster-discovery jobs rather
     ## than replacing them, so this realization scrapes both the targets the
     ## topology wires and whatever the cluster advertises through the annotations
     ## the chart's jobs match on. That is a deliberate difference from the
-    ## workload-synthesis realization, which carries only the wired targets
-    ## because it has no grant to discover anything else.
+    ## workload-synthesis realization, which scrapes only the wired targets and
+    ## grants itself read access only where one of them is discovered. The
+    ## chart's pod and endpoint jobs keep anything annotated
+    ## prometheus.io/scrape, so a wired target whose pods or Service carry that
+    ## annotation — cert-manager's and Temporal's pods do — is scraped twice:
+    ## once under the chart's job and once under its connection's.
     ##
     ## job_name keeps a template fallback because its default is the edge alias —
     ## per-edge context, which no static value in the socket's valueSchema can
@@ -259,14 +287,77 @@ spec:
     serverFiles:
       prometheus.yml:
         scrape_configs:
+        {{- $promNs := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
         {{- range $alias, $edge := .context.uses }}
         {{- if eq $edge.socket "scrape_target" }}
         {{- $v := default (dict) $edge.values }}
+        {{- $p := default (dict) $edge.provides }}
+        {{- $svc := optional $p "metrics_service" "" }}
+        {{- $sel := optional $p "metrics_pod_selector" "" }}
+        {{- if and $svc $sel }}
+        {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes both metrics_service (%q) and metrics_pod_selector (%q); Prometheus discovers a target either through its Service or through its pods, so the target's Recipe publishes one of the two and leaves the other empty" $edge.target $.context.instance_id $svc $sel) }}
+        {{- end }}
+        {{- if or $svc $sel }}
+        {{- $fact := "metrics_pod_selector" }}{{ $portFact := "metrics_pod_port" }}{{ $found := $sel }}
+        {{- if $svc }}{{ $fact = "metrics_service" }}{{ $portFact = "metrics_service_port" }}{{ $found = $svc }}{{ end }}
+        {{- $port := optional $p $portFact "" }}
+        {{- $path := optional $p "metrics_path" "" }}
+        {{- if not (and $port $path) }}
+        {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes %s %q, but its %s is %q and its metrics_path %q; Prometheus keeps what it discovers on that port name and requests that path, so the target's Recipe publishes all three" $edge.target $.context.instance_id $fact $found $portFact $port $path) }}
+        {{- end }}
+        {{- $everywhere := has $edge.component (list "core/compute/keda" "core/compute/knative-serving") }}
+        {{- $ns := optional (optional (default dict $edge.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+        {{- if and (not $everywhere) (not $ns) $promNs }}
+        {{- fail (printf "%q is placed in namespace %q and discovers the metrics of %q from the cluster, but %q declares no namespace, so there is no namespace to discover it in; declare the annotation aggrega.ai/namespace on %q in the Release" $.context.instance_id $promNs $edge.target $edge.target $edge.target) }}
+        {{- end }}
+          - job_name: {{ default $alias (get $v "job_name") }}
+            scrape_interval: {{ get $v "scrape_interval" }}
+            metrics_path: {{ $path | toJson }}
+            kubernetes_sd_configs:
+              - role: {{ if $svc }}endpointslice{{ else }}pod{{ end }}
+        {{- if not $everywhere }}
+                namespaces:
+        {{- if $ns }}
+                  names:
+                    - {{ $ns | toJson }}
+        {{- else }}
+                  own_namespace: true
+        {{- end }}
+        {{- end }}
+        {{- if $sel }}
+                selectors:
+                  - role: pod
+                    label: {{ $sel | toJson }}
+        {{- end }}
+            relabel_configs:
+        {{- if $svc }}
+        {{- $names := list }}
+        {{- range splitList "," $svc }}{{ $names = append $names (trim .) }}{{ end }}
+              - source_labels: [__meta_kubernetes_service_name]
+                regex: {{ join "|" $names | toJson }}
+                action: keep
+              - source_labels: [__meta_kubernetes_endpointslice_port_name]
+                regex: {{ $port | toJson }}
+                action: keep
+        {{- else }}
+              - source_labels: [__meta_kubernetes_pod_container_port_name]
+                regex: {{ $port | toJson }}
+                action: keep
+              - source_labels: [__meta_kubernetes_pod_phase]
+                regex: Running
+                action: keep
+        {{- end }}
+              - source_labels: [__meta_kubernetes_namespace]
+                target_label: namespace
+              - source_labels: [__meta_kubernetes_pod_name]
+                target_label: pod
+        {{- else }}
           - job_name: {{ default $alias (get $v "job_name") }}
             scrape_interval: {{ get $v "scrape_interval" }}
             metrics_path: {{ get $v "metrics_path" }}
             static_configs:
               - targets:
                   - {{ $edge.provides.host }}:{{ $edge.provides.port }}
+        {{- end }}
         {{- end }}
         {{- end }}
