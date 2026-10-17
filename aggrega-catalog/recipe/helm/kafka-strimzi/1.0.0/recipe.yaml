@@ -22,6 +22,13 @@ metadata:
     realization where the control plane is already in place and the cluster should
     own broker upgrades, rolling restarts and partition rebalancing; reach for the
     synthesis recipe where it is not.
+
+    Both resources are written into the namespace the Release names through the
+    aggrega.ai/namespace annotation, where one is set. With values.metrics_enabled
+    true the Kafka resource turns on the Strimzi metrics reporter on every node,
+    which serves /metrics on port tcp-prometheus and checks no caller, and
+    provides publishes the pod label, port name and path a scraper discovers the
+    nodes by; false, those keys are empty and nothing else changes.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -32,10 +39,24 @@ spec:
   # "{cluster}-kafka-bootstrap" for the Kafka custom resource; provides.host is
   # that bare in-cluster name, matching the synthesis realization's contract so
   # consumers are realization-agnostic.
+  #
+  # The metrics keys say where a scraper finds the brokers' metrics while
+  # values.metrics_enabled is true: every node the operator runs for this Kafka
+  # resource is labelled strimzi.io/cluster with the resource's name and
+  # strimzi.io/name with that name followed by -kafka, a label no other pod of the
+  # cluster carries — the entity operator, the Kafka Exporter and Cruise Control
+  # each have their own — and with metrics configured each node's container
+  # declares the port tcp-prometheus, 9404, which no Service carries. The labels
+  # and the port name are the operator's, read from its 0.51.0 and 1.3.0
+  # releases, and evolve with it like every other detail here. While the value is
+  # false the operator declares no metrics port and the keys are empty.
   provides:
     host: "{{ .context.instance_id }}-kafka-bootstrap"
     port: "{{ .infra.broker_port }}"
     protocol: "kafka"
+    metrics_pod_selector: "{{ if .values.metrics_enabled }}strimzi.io/cluster={{ .context.instance_id }},strimzi.io/name={{ .context.instance_id }}-kafka{{ end }}"
+    metrics_pod_port: "{{ if .values.metrics_enabled }}tcp-prometheus{{ end }}"
+    metrics_path: "{{ if .values.metrics_enabled }}/metrics{{ end }}"
   # The Strimzi Cluster Operator must exist in the target cluster before a Kafka
   # custom resource can reconcile. The compiler cannot inspect cluster state, so
   # the prerequisite is declared: an operator affirms it in the Release, and an
@@ -59,12 +80,42 @@ spec:
   # to satisfy. A multi-node cluster needs different factors, so the whole
   # block is replaced rather than merged key by key; supply the complete config
   # map when overriding it.
+  #
+  # The Kafka resource and its node pool are written into the namespace the
+  # Release names for this component through the aggrega.ai/namespace
+  # annotation, on its boundary or its own entry — the pool must sit beside the
+  # resource it names — and the operator creates the nodes and the bootstrap
+  # Service there, so they land where a consumer reads that the cluster runs:
+  # the namespace it qualifies host with, and the one a scraper discovers the
+  # nodes in. The provider does not place an artifact on its own. Where no
+  # namespace is named the field is omitted, and both land wherever the applying
+  # tool puts them.
+  #
+  # With values.metrics_enabled true the Kafka resource's metrics configuration
+  # names the Strimzi metrics reporter and nothing more: the operator then
+  # configures it on every node with its own default selection of metrics and
+  # declares the tcp-prometheus port. That is the smallest configuration the
+  # operator documents — its own example for the reporter sets the type alone —
+  # and it needs no ConfigMap of exporter rules, which the older JMX exporter
+  # type does. The reporter type is taken by the operator from its 0.47.0
+  # release on, under this API version and under the newer one. With the value
+  # false nothing of it is rendered.
   artifacts:
     kafkanodepool.yaml: |
       apiVersion: kafka.strimzi.io/v1beta2
       kind: KafkaNodePool
       metadata:
         name: {{ .context.instance_id }}-pool
+        {{- $ns := "" }}
+        {{- if .context.annotations }}
+          {{- if .context.annotations.release }}
+            {{- $raw := optional .context.annotations.release "aggrega.ai/namespace" "" }}
+            {{- if $raw }}{{- $ns = $raw }}{{- end }}
+          {{- end }}
+        {{- end }}
+        {{- with $ns }}
+        namespace: "{{ . }}"
+        {{- end }}
         labels:
           strimzi.io/cluster: {{ .context.instance_id }}
       spec:
@@ -85,6 +136,16 @@ spec:
       kind: Kafka
       metadata:
         name: {{ .context.instance_id }}
+        {{- $ns := "" }}
+        {{- if .context.annotations }}
+          {{- if .context.annotations.release }}
+            {{- $raw := optional .context.annotations.release "aggrega.ai/namespace" "" }}
+            {{- if $raw }}{{- $ns = $raw }}{{- end }}
+          {{- end }}
+        {{- end }}
+        {{- with $ns }}
+        namespace: "{{ . }}"
+        {{- end }}
         annotations:
           strimzi.io/node-pools: enabled
           strimzi.io/kraft: enabled
@@ -108,6 +169,10 @@ spec:
             default.replication.factor: 1
             min.insync.replicas: 1
             {{- end }}
+          {{- if .values.metrics_enabled }}
+          metricsConfig:
+            type: strimziMetricsReporter
+          {{- end }}
         entityOperator:
           topicOperator: {}
           userOperator: {}
