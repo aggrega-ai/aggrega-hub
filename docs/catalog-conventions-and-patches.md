@@ -2906,20 +2906,29 @@ strings, and checks none of what follows.
   Recipes write the address the tool publishes into that node's server
   configuration as its `url`, keep every other part of the definition, and
   write it back as JSON with its keys sorted; with no `tools` connection the
-  definition is carried as authored. The Component's assertion halts the
-  build on a connection with no flow or one no node names, and on a node
-  naming a server no connection answers. A `credential` is delivered as
-  `AGGREGA_TOOL_<ALIAS>_CREDENTIAL`, by reference as on every socket, listed in
-  `LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT`, and the node's header under the
-  tool's `credential_header` carries that variable's name, which Langflow
-  replaces with the stored variable's value — only when the whole header value
-  is the name, and only once the variable is stored, at the administrator's
-  sign-in. So a credential under `Authorization`, whose value is `Bearer
-  <credential>`, halts the build, as does one for a tool publishing no
-  header. Langflow also refuses an MCP server or a vector store whose host
-  resolves to a private address, so its Recipes set
-  `LANGFLOW_SSRF_ALLOWED_HOSTS` to the hosts of the wired `tools` and
-  `vector_store` connections, and leave it unset where neither is wired.
+  definition is carried as authored. Both Recipes import that rewrite from
+  one ArtifactLibrary, `LangflowFlow`, whose bundle `FlowFile` emits the flow
+  as the helm ConfigMap or the compose config. The Component's assertion
+  halts the build on a connection with no flow or one no node names, and on
+  a node naming a server no connection answers. A `credential` is delivered
+  as `AGGREGA_TOOL_<ALIAS>_CREDENTIAL`, by reference as on every socket, and
+  the node's header under the tool's `credential_header` carries the name of
+  a variable holding that header's whole value, listed in
+  `LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT`, which Langflow replaces with
+  the stored variable's value — only when the whole header value is the name,
+  and only once the variable is stored, at the administrator's sign-in. Under
+  any header but `Authorization` that variable is
+  `AGGREGA_TOOL_<ALIAS>_CREDENTIAL` itself. Under `Authorization`, whose value
+  is `Bearer <credential>`, it is `AGGREGA_TOOL_<ALIAS>_AUTHORIZATION`,
+  holding `Bearer` and the credential by reference: on Kubernetes `Bearer
+  $(AGGREGA_TOOL_<ALIAS>_CREDENTIAL)`, which expands from the Secret-read
+  entry the helm provider lists ahead of the plain variables, and on compose
+  the credential as delivered, a Compose variable reference staying one. A
+  credential for a tool publishing no header halts the build. Langflow also
+  refuses an MCP server or a vector store whose host resolves to a private
+  address, so its Recipes set `LANGFLOW_SSRF_ALLOWED_HOSTS` to the hosts of
+  the wired `tools` and `vector_store` connections, and leave it unset where
+  neither is wired.
 
 ### Gateway / operator-driven (custom-resource-emitting) Recipes
 
