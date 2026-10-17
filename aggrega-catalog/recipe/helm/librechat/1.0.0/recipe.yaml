@@ -23,13 +23,19 @@ metadata:
     environment. infra.external_base_url, when set, reaches the platform as
     DOMAIN_CLIENT and DOMAIN_SERVER; unset, both carry its in-cluster address.
 
-    Five credential slots are wired: the model API key on the `model`
-    connection, and four on the component. The two token secrets and the
+    Six credential slots are wired: the model API key on the `model`
+    connection, and five on the component. The two token secrets and the
     credential-encryption key have no default: the Component requires their
     slots. With no model API key attached, each person enters their own key in
     the interface. Unattached, the initialization vector renders a pinned
     development literal published in this catalog, which suits evaluation and
     local development.
+
+    With values.metrics_enabled true, the secret attached to metrics_secret
+    reaches the platform as METRICS_SECRET, turning on its Prometheus metrics
+    at /metrics on the listen port, and provides.metrics_endpoint publishes the
+    address with metrics_credential_required true; the build halts when that
+    slot is unfilled. False delivers nothing.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -43,10 +49,31 @@ spec:
   # with no namespace segment, so the Recipe is independent of where it is
   # deployed. A same-namespace consumer reaches it under this name directly; a
   # cross-namespace consumer qualifies it caller-side.
+  #
+  # metrics_endpoint is where the platform serves its Prometheus metrics while
+  # values.metrics_enabled is true, when the Workload below delivers
+  # METRICS_SECRET: /metrics on the listen port of the same Service, spelling
+  # the Service name out again because a provides entry cannot read another
+  # provides entry. Empty while the value is false. metrics_credential_required
+  # follows it, true exactly while there is an address to scrape, since the
+  # platform answers its metrics only to a bearer token equal to that secret.
   provides:
     host: "{{ .context.rendered_name }}-default"
     port: "{{ .infra.port }}"
     protocol: "http"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-default:{{ .infra.port }}/metrics{{ end }}"
+    metrics_credential_required: "{{ if .values.metrics_enabled }}true{{ else }}false{{ end }}"
+  # The platform answers /metrics only to a bearer token equal to
+  # METRICS_SECRET, and to every request with 401 while that variable is unset,
+  # so turning its metrics on without a secret would publish an address no
+  # scrape could read. The build halts here instead, naming the slot and the
+  # value, so the fix is one line of authored YAML. With the value false
+  # nothing is read and nothing halts.
+  assertions:
+    metrics_need_a_secret: >-
+      {{- if and (optional .values "metrics_enabled" false) (not (hasKey (default dict .features) "metrics_secret")) -}}
+      {{- fail (printf "the LibreChat platform %q has values.metrics_enabled true but nothing fills its metrics_secret slot, and the platform answers its metrics only to a bearer token equal to that secret: attach a secret credential to metrics_secret, the token a scrape presents on its connection's credential slot, or set metrics_enabled to false" .metadata.instance_id) -}}
+      {{- end -}}
   # The accounts, conversations, agents and stored per-user credentials live in
   # the document store wired on the `backend` edge rather than on the uploads
   # volume.
@@ -69,7 +96,7 @@ spec:
   # same reason as the Service and container port read it: the process reads
   # its port from the environment.
   #
-  # Five credential slots are wired, and every credential value the rendered
+  # Six credential slots are wired, and every credential value the rendered
   # Deployment carries has one, so attaching a slot leaves no partner of it
   # behind on a published literal. A model API key attached on the `model`
   # connection is delivered as the platform's provider key, through a
@@ -85,7 +112,11 @@ spec:
   # the initialization vector is unattached the Recipe emits a pinned
   # development literal in its place, sized as the platform requires. That
   # literal is published in this catalog and suits evaluation and local
-  # development.
+  # development. The metrics secret attached to metrics_secret is delivered as
+  # METRICS_SECRET, through a secretKeyRef like the others, only while
+  # values.metrics_enabled is true: setting that variable is what turns the
+  # platform's metrics on, so with the value false nothing is delivered and
+  # the metrics route stays closed.
   workload: |
     {{- $uploadsPath := "/app/uploads" -}}
     {{- $selfUrl := printf "http://%s-default:%v" .context.rendered_name .infra.port -}}
@@ -164,7 +195,8 @@ spec:
           # credential_encryption_iv slot for one of the Release's own.
           CREDS_IV: 8881b05adef1cab28b10901e03dff8ba
     {{- end }}
-    {{- if or $modelCredential (hasKey (default dict .features) "session_secret") (hasKey (default dict .features) "session_refresh_secret") (hasKey (default dict .features) "credential_encryption_key") (hasKey (default dict .features) "credential_encryption_iv") }}
+    {{- $metricsSecret := and .values.metrics_enabled (hasKey (default dict .features) "metrics_secret") }}
+    {{- if or $modelCredential (hasKey (default dict .features) "session_secret") (hasKey (default dict .features) "session_refresh_secret") (hasKey (default dict .features) "credential_encryption_key") (hasKey (default dict .features) "credential_encryption_iv") $metricsSecret }}
         attachments:
     {{- with $modelCredential }}
           OPENAI_API_KEY:
@@ -193,6 +225,13 @@ spec:
     {{- if hasKey (default dict .features) "credential_encryption_iv" }}
           CREDS_IV:
             from: credential_encryption_iv
+            as: env
+    {{- end }}
+    {{- if $metricsSecret }}
+          # METRICS_SECRET is the token the platform answers its /metrics route
+          # to; setting it turns the metrics on.
+          METRICS_SECRET:
+            from: metrics_secret
             as: env
     {{- end }}
     {{- end }}
