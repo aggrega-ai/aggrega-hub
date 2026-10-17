@@ -19,25 +19,24 @@ metadata:
     release: a bootstrap, an up-migration before an upgrade and a finishing
     migration after one.
 
-    A workload assembled by hand can run the bootstrap and nothing more, so it
-    cannot express what must happen on either side of a version change. Reach
-    for this realization where a chart repository is reachable at build time
-    and the gateway will be upgraded in place; reach for `kong`, the
+    Reach for this realization where a chart repository is reachable at build
+    time and the gateway will be upgraded in place; reach for `kong`, the
     workload-synthesis realization, where the build must complete with nothing
     fetched.
-
-    The gateway image and the chart version (source.version, overridden via
-    infra.source_version) are pinned. provides.host is the proxy data-plane
-    Service name, with no namespace; a consumer in another namespace qualifies
-    it on its own side.
 
     Each model wired to the models socket gets a chat and a completion route
     through Kong's AI proxy, in a ConfigMap beside the chart that an init
     container imports into the database, retried on a first install until the
-    bootstrap Job provisions the schema. A changed route set rolls the gateway.
-    A connection's credential arrives as an env secretKeyRef the routes name
-    through Kong's environment vault, so no credential value is in the
-    rendered output.
+    bootstrap Job provisions the schema. A connection's credential arrives as
+    an env secretKeyRef the routes name through Kong's environment vault, so
+    no credential value is in the rendered output.
+
+    With `values.metrics_enabled` true a ClusterIP Service,
+    `<rendered_name>-status`, carries the chart's status port, 8100, and
+    provides.metrics_endpoint publishes /metrics on it; false, neither. The
+    port checks no caller and also answers POST /status/ready, whose
+    status=draining takes the gateway out of readiness until it restarts, GET
+    /status/dns and GET /status, as the pod already does.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -76,12 +75,21 @@ spec:
   # the entries are edited together. With nothing wired to the models socket
   # values.model is omitted — the component's assertion halts on any other
   # combination — and both are empty.
+  #
+  # metrics_endpoint is the address Kong serves its own metrics at while
+  # values.metrics_enabled is true: /metrics on the status port of the
+  # ClusterIP Service "<rendered_name>-status" this Recipe emits beside the
+  # chart then (below). The Prometheus plugin bundled with Kong answers it
+  # there with no plugin instance configured. It carries no namespace, as
+  # host does. It is empty while the value is false, when the chart's status
+  # listener still answers on the pod and no Service carries it.
   provides:
     host: "{{ .context.rendered_name }}-proxy"
     port: "{{ .infra.proxy_port }}"
     protocol: "http"
     endpoint: '{{ with optional .values "model" "" }}http://{{ $.context.rendered_name }}-proxy:{{ $.infra.proxy_port }}/{{ . }}/v1{{ end }}'
     model: '{{ optional .values "model" "" }}'
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-status:{{ .locals.status_port }}/metrics{{ end }}"
 
   # The entries below are the values the value mapping shares with the
   # KongModelRoutes bundle imported for the gateway's model routes. Each has
@@ -101,6 +109,13 @@ spec:
   # connection's routes name through Kong's environment vault. A locals entry
   # cannot read a connection, so the value mapping applies the alias rule
   # itself, once.
+  #
+  # status_port is this Recipe's own rather than the bundle's: the port the
+  # Service this Recipe emits for Kong's Status API listens on, the chart's
+  # own default for that listener, and the single authored home for that
+  # Service and provides.metrics_endpoint. The Service forwards to the
+  # container port by the name the chart gives it, status, so a chart that
+  # moves the listener's number keeps the address working.
   locals:
     model_routes_delivery: config_map
     model_routes_file: model-routes.yaml
@@ -108,6 +123,7 @@ spec:
     connection_variable_prefix: AI_PROXY_
     credential_variable_suffix: _API_KEY
     header_variable_suffix: _AUTHORIZATION
+    status_port: "8100"
 
   # The models the gateway serves, as Kong's own declarative configuration,
   # from the KongModelRoutes bundle every Recipe running this gateway imports,
@@ -124,9 +140,49 @@ spec:
   # "<rendered_name>-model-routes", carrying the routes as model_routes_file;
   # with nothing wired to the models socket it emits nothing. The bundle stops
   # the build when a local above differs from its own side.
+  #
+  # Kong's Status API, put on a Service while values.metrics_enabled is true.
+  # The chart binds the status listener on every interface of the gateway's
+  # pod, where its probes reach it, and its templates offer no Service for it,
+  # so this Recipe emits one beside the chart: a ClusterIP Service,
+  # "<rendered_name>-status", whose port status_port forwards to the
+  # container port the chart names status. It names that listener for a
+  # scraper and adds no caller that could not reach the pod already, and
+  # infra.overrides.service_type, which sets the proxy's Service, never
+  # reaches it. The listener checks no caller: beside /metrics it answers GET
+  # /status, GET /status/ready and GET /status/dns, and POST /status/ready,
+  # which with status=draining marks the node draining so its readiness probe
+  # fails and the pod leaves its Services until it restarts. It selects the
+  # gateway's pods by the chart's own selector labels — the chart's name,
+  # kong, since this Recipe sets no nameOverride, the component app, which
+  # the chart gives the gateway's pods and not the migration Jobs', and the
+  # release name, which is the rendered name. It is placed in the namespace
+  # the chart is rendered against: the one the Release declares through the
+  # aggrega.ai/namespace annotation, or `default` where it declares none; the
+  # helm provider places no artifact in a namespace itself, so the Service
+  # writes its own. With the value false, nothing is emitted.
   artifacts:
     model-routes:
       $import: KongModelRoutes#/artifacts/ModelRoutes
+    status-service.yaml: |
+      {{- if .values.metrics_enabled -}}
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: {{ .context.rendered_name }}-status
+        namespace: "{{ optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default" }}"
+      spec:
+        type: ClusterIP
+        ports:
+          - name: status
+            port: {{ .locals.status_port }}
+            targetPort: status
+            protocol: TCP
+        selector:
+          app.kubernetes.io/name: kong
+          app.kubernetes.io/component: app
+          app.kubernetes.io/instance: {{ .context.rendered_name }}
+      {{- end }}
 
   # This Recipe reads from infra.overrides:
   #   image        - map[string]string (image.* fields; overrides the tag pin)

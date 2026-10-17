@@ -15,25 +15,28 @@ metadata:
     database arrive on the inject pipe under the four KONG_PG_* variables the
     edge's inject block names; an edge leaving any missing halts the build
     naming the edge and the variables. A schema-provisioning step runs the same
-    image and connection before the gateway starts. On a cold host it may run
-    before the backend accepts connections: no service is ordered after the
-    backend, and no readiness wait is hidden in a command line.
+    image and connection before the gateway starts.
 
     With no credential on the backend connection, the steps and the gateway
     share the inline development default the PostgreSQL Recipe for this target
     also falls back to; an attached one is rendered as KONG_PG_PASSWORD, the key
-    it must publish under. Nothing is published to the host; the replica count
-    is reported as an unsupported-field warning. provides.host is the compose
-    service name.
+    it must publish under.
 
     Each model wired to the models socket gets a chat and a completion route
     through Kong's AI proxy, in Kong's declarative configuration that a second
-    step imports into the database before the gateway starts. A changed route
-    set rolls the gateway: the next docker compose up re-creates that step,
-    then the gateway. A connection's credential is the value it publishes as
-    AI_PROXY_<ALIAS>_API_KEY, written into the bearer token the routes name
-    through Kong's environment vault: a Compose variable reference such as
-    ${OPENAI_API_KEY} lands as that reference, a literal as itself.
+    step imports into the database before the gateway starts. A connection's
+    credential is the value it publishes as AI_PROXY_<ALIAS>_API_KEY, written
+    into the bearer token the routes name through Kong's environment vault: a
+    Compose variable reference such as ${OPENAI_API_KEY} lands as that
+    reference, a literal as itself.
+
+    With `values.metrics_enabled` true the Status API moves off loopback to
+    port 8007 of every interface and provides.metrics_endpoint publishes
+    /metrics on it; false, that key is empty. While it is on, every peer on
+    the Compose network reaches that port with no caller check: POST
+    /status/ready, whose status=draining takes the gateway out of readiness
+    until it restarts, GET /status/dns and GET /status answer beside the
+    metrics.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -60,12 +63,21 @@ spec:
   # that alias. With nothing wired to the models socket values.model is
   # omitted — the component's assertion halts on any other combination — and
   # both are empty.
+  #
+  # metrics_endpoint is the address Kong serves its own metrics at while
+  # values.metrics_enabled is true: /metrics on the Status API port of the
+  # service name, which any peer on the compose network reaches once the
+  # workload below binds that listener on every interface. The Prometheus
+  # plugin bundled with Kong answers it there with no plugin instance
+  # configured. It is empty while the value is false, when the listener stays
+  # on the container's loopback address.
   provides:
     host: "{{ .context.instance_id }}"
     port: "{{ .infra.proxy_port }}"
     protocol: "http"
     endpoint: '{{ with optional .values "model" "" }}http://{{ $.context.instance_id }}:{{ $.infra.proxy_port }}/{{ . }}/v1{{ end }}'
     model: '{{ optional .values "model" "" }}'
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.instance_id }}:{{ .locals.status_port }}/metrics{{ end }}"
   # The entries below are the values the workload shares with the
   # KongModelRoutes bundle imported for the gateway's model routes. Each that
   # the bundle reads has its home in the bundle, which stops the build naming
@@ -81,6 +93,11 @@ spec:
   # with every character other than a letter or a digit as an underscore,
   # between the fixed parts here. A locals entry cannot read a connection, so
   # the workload applies the alias rule itself, once.
+  #
+  # status_port is this Recipe's own rather than the bundle's: Kong's Status
+  # API port, the product's own default, and the single authored home for the
+  # listen address the workload sets while values.metrics_enabled is true and
+  # for provides.metrics_endpoint, which cannot read the workload.
   locals:
     model_routes_delivery: compose_configs
     model_routes_config_name: "{{ .context.instance_id }}-model-routes"
@@ -88,6 +105,7 @@ spec:
     connection_variable_prefix: AI_PROXY_
     credential_variable_suffix: _API_KEY
     header_variable_suffix: _AUTHORIZATION
+    status_port: "8007"
   # The models the gateway serves, as Kong's own declarative configuration,
   # from the KongModelRoutes bundle every Recipe running this gateway imports,
   # so the routes and the rules they are written by have one text wherever the
@@ -306,6 +324,17 @@ spec:
         # two listen addresses carry the operator's own port knobs; the admin
         # API is reachable on the compose network only, because the service
         # entry below publishes nothing to the host.
+        #
+        # Kong's Status API stays on the container's loopback address, the
+        # product's own default, unless values.metrics_enabled is true. Then
+        # KONG_STATUS_LISTEN binds it on every interface, so the published
+        # metrics address reaches it, and every peer on the compose network
+        # reaches it too: it checks no caller, and beside /metrics it answers
+        # GET /status, GET /status/ready and GET /status/dns, and POST
+        # /status/ready, which with status=draining marks the node draining
+        # so it reports itself not ready until it restarts. No port is
+        # declared for it: a compose service entry publishes nothing to the
+        # host, so the listen address is what opens it to the network.
         variables:
           KONG_DATABASE: postgres
           KONG_PG_HOST: "{{ $env.KONG_PG_HOST }}"
@@ -314,6 +343,9 @@ spec:
           KONG_PG_DATABASE: "{{ $env.KONG_PG_DATABASE }}"
           KONG_PROXY_LISTEN: "0.0.0.0:{{ .infra.proxy_port }}, 0.0.0.0:8443 ssl"
           KONG_ADMIN_LISTEN: "0.0.0.0:{{ .infra.admin_port }}"
+    {{- if .values.metrics_enabled }}
+          KONG_STATUS_LISTEN: "0.0.0.0:{{ .locals.status_port }}"
+    {{- end }}
     {{- if $backendCredential }}
           KONG_PG_PASSWORD: "{{ .context.inject.env.KONG_PG_PASSWORD }}"
     {{- else }}
