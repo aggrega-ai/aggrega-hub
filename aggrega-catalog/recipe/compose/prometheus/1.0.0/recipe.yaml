@@ -11,12 +11,15 @@ metadata:
     Synthesized-mode Workload — the compose provider translates the Workload
     into a service entry. Each connection on the `scrape_target` uses-socket
     becomes one job in a minimal prometheus.yml the container writes at
-    start-up: the host and port that connection's target publishes are the job's
-    address, and the connection's own `values` set that job's label, cadence and
-    metrics path. A target publishing `metrics_service` or
-    `metrics_pod_selector` halts the build, naming it: its metrics are found by
-    discovering it in a Kubernetes cluster, which Docker Compose does not have.
-    The time-series database is persisted to a named volume. With
+    start-up: the `metrics_endpoint` that connection's target publishes is the
+    job's address, and the connection's own `values` set that job's label and
+    cadence. A target publishing none halts the build, naming it, and so does
+    one publishing `metrics_service` or `metrics_pod_selector`: its metrics
+    are found by discovering it in a Kubernetes cluster, which Docker Compose
+    does not have. A connection's `credential` arrives as a container
+    variable, which the start-up command writes to the file the job presents
+    as a bearer token. The time-series database is persisted to a named
+    volume. With
     `infra.external_base_url` set, the server takes it as its external URL and
     is kept serving at its root; unset, neither flag is emitted.
     provides.host is the bare service name, resolved on the compose network.
@@ -42,28 +45,67 @@ spec:
   # /v1/metrics to this base itself — and empty while it is false, when the
   # server serves no receiver. The address is spelled out in full on purpose: a
   # provides entry cannot read another.
+  #
+  # metrics_endpoint is where the server serves its own metrics: /metrics on
+  # the service name and port, always on, asking no credential.
   provides:
     host: "{{ .context.instance_id }}"
     port: "{{ .infra.port }}"
     protocol: "http"
     otlp_http_endpoint: "{{ if .values.otlp_receiver }}http://{{ .context.instance_id }}:{{ .infra.port }}/api/v1/otlp{{ end }}"
+    metrics_endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}/metrics"
 
+  # A connection carrying a credential is scraped with it. Docker Compose has
+  # no secret reference a container can mount, so the value the credential
+  # writes on the inject pipe — a ${VAR} reference Docker Compose substitutes
+  # when the stack starts, under core/secret-value bound to dotenv-secret —
+  # reaches the container as PROMETHEUS_SCRAPE_<n>_CREDENTIAL, <n> counting
+  # the connections carrying one from 0 in the alphabetical order of their
+  # aliases. The start-up command writes each to /tmp/scrape-credentials/<n>
+  # before Prometheus starts, and that connection's job reads the file through
+  # authorization's credentials_file, as a Bearer credential; the scrape
+  # configuration names only the file. $$ is how a compose file writes a
+  # literal $, so the shell, not Docker Compose, expands the variable. A
+  # credential writing no value on the inject pipe halts the build, naming the
+  # connection, and so does a connection carrying none to a target publishing
+  # metrics_credential_required true. The inject pipe holds one value per data
+  # key, and the build refuses a key two attachments write, so each
+  # connection's credential names a data key of its own.
   workload: |
+    {{- $env := optional (default dict .context.inject) "env" dict }}
+    {{- $credentials := list }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if and (eq $edge.socket "scrape_target") (hasKey (default dict $edge.features) "credential") }}
+    {{- $key := optional (optional (default dict $edge.features.credential) "values" dict) "key" "" }}
+    {{- if not (and $key (hasKey $env $key)) }}
+    {{- fail (printf "the credential on the scrape_target connection %s of %q writes no value on the inject pipe, so there is nothing to hand the server as the file the scrape job reads; on Docker Compose attach core/secret-value, bound to dotenv-secret, whose origin is the credential or a ${VAR} reference to it" $alias $.context.instance_id) }}
+    {{- end }}
+    {{- $credentials = append $credentials $alias }}
+    {{- end }}
+    {{- end }}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     containers:
       main:
         image: "prom/prometheus:{{ .infra.engine_version }}"
         # Every component wired on the `scrape_target` socket becomes one scrape
-        # job: its resolved host and port from the enriched topology pipe are the
-        # job's target, and the edge's per-connection values tune the job's
-        # label, cadence, and metrics path. The rendered prometheus.yml is
-        # written at start-up, then Prometheus is exec'd against it with the
-        # time-series database on the data volume.
+        # job on the metrics_endpoint its target publishes: the address's
+        # scheme, its path, and its host and port, used as published, as the
+        # job's target, on the label and cadence the edge's per-connection
+        # values set. The rendered prometheus.yml is written at start-up, then
+        # Prometheus is exec'd against it with the time-series database on the
+        # data volume.
         # A target publishing metrics_service or metrics_pod_selector serves its
         # metrics on Kubernetes endpoints or pods a scraper discovers from the
         # cluster's API; Docker Compose has no such API, so a connection to one
-        # halts the build, naming the target and the fact it publishes.
+        # halts the build, naming the target and the fact it publishes. So
+        # does a target publishing none of the three, one publishing an
+        # address beside a discovery fact, and an address that is not an http
+        # or https URL naming a host, or that carries a query string, a
+        # fragment or a user name. A connection to OpenBao
+        # (core/security/openbao) also sends the request parameter
+        # format=prometheus, which OpenBao reads to answer in the Prometheus
+        # format.
         # With infra.external_base_url set, --web.external-url carries it, the
         # base of every link the server writes back to itself. The server would
         # otherwise also move every endpoint under that address's path, so
@@ -81,6 +123,12 @@ spec:
           - /bin/sh
           - -c
           - |-
+            {{- if $credentials }}
+            mkdir -p /tmp/scrape-credentials
+            {{- range $n, $alias := $credentials }}
+            printf '%s' "$$PROMETHEUS_SCRAPE_{{ $n }}_CREDENTIAL" > /tmp/scrape-credentials/{{ $n }}
+            {{- end }}
+            {{- end }}
             cat > /tmp/prometheus.yml <<'EOF'
             global: {}
             scrape_configs:
@@ -89,28 +137,68 @@ spec:
             {{- $v := default (dict) $edge.values }}
             {{- /* job_name keeps a template fallback because its default is the
                    edge alias — per-edge context, which no static value in the
-                   socket's valueSchema can express. Leave it here. The two keys
-                   below take their defaults from that valueSchema, so they read
-                   the edge value directly and this template holds no second
-                   copy of them. */}}
+                   socket's valueSchema can express. Leave it here.
+                   scrape_interval takes its default from that valueSchema, so
+                   it reads the edge value directly and this template holds no
+                   second copy of it. */}}
             {{- $p := default (dict) $edge.provides }}
+            {{- $endpoint := toString (optional $p "metrics_endpoint" "") }}
+            {{- $discovery := default (optional $p "metrics_pod_selector" "") (optional $p "metrics_service" "") }}
+            {{- if and $discovery $endpoint }}
+            {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes both metrics_endpoint (%q) and a fact Prometheus discovers it by (%q); a target says where it serves metrics in one of the two ways, so the target's Recipe publishes one and leaves the other empty" $edge.target $.context.instance_id $endpoint $discovery) }}
+            {{- end }}
             {{- range $fact := list "metrics_service" "metrics_pod_selector" }}
             {{- with optional $p $fact "" }}
             {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes %s %q, so its metrics are found by discovering it in a Kubernetes cluster, and Docker Compose has no cluster to discover it in; wire it through a Kubernetes realization of Prometheus, or a realization of %q that publishes metrics_endpoint" $edge.target $.context.instance_id $fact . $edge.target) }}
             {{- end }}
             {{- end }}
+            {{- if not $endpoint }}
+            {{- fail (printf "%q is wired to %q on its scrape_target socket but publishes none of metrics_endpoint, metrics_service and metrics_pod_selector, so there is nowhere to scrape it: a target publishes where it serves metrics only while it serves them, some only while a value such as metrics_enabled turns them on; turn its metrics on, or remove the connection" $edge.target $.context.instance_id) }}
+            {{- end }}
+            {{- $features := default dict $edge.features }}
+            {{- if and (eq (toString (optional $p "metrics_credential_required" false)) "true") (not (hasKey $features "credential")) }}
+            {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes metrics_credential_required true, so it answers its metrics only to a scrape presenting a credential, but the connection carries none; attach one under credential on that connection" $edge.target $.context.instance_id) }}
+            {{- end }}
+            {{- $u := urlParse $endpoint }}
+            {{- if or $u.query $u.fragment $u.userinfo }}
+            {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes a metrics_endpoint carrying a query string, a fragment or a user name, which a scrape job takes from no address: Prometheus requests a path and sends its parameters apart from it, and a credential reaches it on the connection's credential slot; the target's Recipe publishes the scheme, host, port and path alone" $edge.target $.context.instance_id) }}
+            {{- end }}
+            {{- if not (and (has $u.scheme (list "http" "https")) $u.host) }}
+            {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes metrics_endpoint %q, which is not an http or https URL naming a host, so Prometheus has no address to scrape; the target's Recipe publishes the full address, such as http://<host>:<port>/metrics" $edge.target $.context.instance_id $endpoint) }}
+            {{- end }}
               - job_name: {{ default $alias (get $v "job_name") }}
                 scrape_interval: {{ get $v "scrape_interval" }}
-                metrics_path: {{ get $v "metrics_path" }}
+                scheme: {{ $u.scheme }}
+                metrics_path: {{ default "/" $u.path | toJson }}
+            {{- if hasKey $features "credential" }}
+            {{- $n := 0 }}
+            {{- range $i, $a := $credentials }}{{ if eq $a $alias }}{{ $n = $i }}{{ end }}{{ end }}
+                authorization:
+                  type: Bearer
+                  credentials_file: "/tmp/scrape-credentials/{{ $n }}"
+            {{- end }}
+            {{- if eq $edge.component "core/security/openbao" }}
+                params:
+                  format: [prometheus]
+            {{- end }}
                 static_configs:
                   - targets:
-                      - {{ $edge.provides.host }}:{{ $edge.provides.port }}
+                      - {{ $u.host | toJson }}
             {{- end }}
             {{- end }}
             EOF
             exec /bin/prometheus --config.file=/tmp/prometheus.yml --storage.tsdb.path=/prometheus --web.listen-address=0.0.0.0:{{ .infra.port }}{{ if .values.otlp_receiver }} --web.enable-otlp-receiver{{ end }}{{ with .infra.external_base_url }} '--web.external-url={{ . }}' --web.route-prefix=/{{ end }}
         ports:
           http: {{ .infra.port }}
+        {{- /* The value each connection's credential writes on the inject pipe,
+               which the start-up command above writes to that connection's
+               file; rendered only while a connection carries a credential. */}}
+        {{- if $credentials }}
+        variables:
+        {{- range $n, $alias := $credentials }}
+          PROMETHEUS_SCRAPE_{{ $n }}_CREDENTIAL: {{ index $env (index $.context.uses $alias).features.credential.values.key | toJson }}
+        {{- end }}
+        {{- end }}
         # Prometheus reports readiness at /-/ready. The image carries no curl,
         # so the healthcheck asks it with the wget of the image's busybox,
         # which fails on an error answer and when nothing answers. The timing is

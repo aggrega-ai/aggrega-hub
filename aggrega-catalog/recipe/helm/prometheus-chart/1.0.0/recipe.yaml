@@ -19,21 +19,21 @@ metadata:
     That cluster-scoped read grant also serves the chart's own jobs, which
     scrape whatever the cluster advertises through scrape annotations. Each
     connection on the `scrape_target` uses-socket becomes one scrape job, as on
-    the workload-synthesis realization: a target publishing
-    `metrics_service` or `metrics_pod_selector` is discovered in the namespace
-    its connection's `aggrega.ai/namespace` annotation names, in every
-    namespace for KEDA and Knative Serving, or in the server's own where
-    neither declares one; Prometheus declaring a namespace while such a target
-    declares none halts the build. Reach for this realization where a chart
-    repository is reachable and the server is expected to discover targets
-    beyond those wired; reach for `prometheus`, the workload-synthesis
-    realization, where the build must complete with nothing fetched.
+    the workload-synthesis realization: a target publishing `metrics_endpoint`
+    is scraped at that address; one publishing `metrics_service` or
+    `metrics_pod_selector` is discovered in the namespace its connection's
+    `aggrega.ai/namespace` annotation names, in every namespace for KEDA and
+    Knative Serving, or in the server's own where neither declares one; a
+    target publishing none halts the build. A connection's `credential` is
+    mounted as a file through `server.extraSecretMounts`, and its job presents
+    it as a bearer token. Reach for it where a chart repository is reachable
+    and the server should discover targets beyond those wired, and for
+    `prometheus` where the build must fetch nothing.
 
     With `infra.external_base_url` set, the server takes it as its external URL
-    through the chart's `server.baseURL` and is kept serving at its root through
-    `server.extraArgs`; unset, neither value is set. With `values.otlp_receiver`
-    true, `server.extraArgs` also turns on the OTLP receiver, whose address it
-    publishes as provides.otlp_http_endpoint; false, that key is empty.
+    through the chart's `server.baseURL` and is kept serving at its root. With
+    `values.otlp_receiver` true, `server.extraArgs` also turns on the OTLP
+    receiver, whose address it publishes as provides.otlp_http_endpoint.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -95,11 +95,15 @@ spec:
   # this base itself — and empty while it is false, when the server serves no
   # receiver. The address is spelled out in full on purpose: a provides entry
   # cannot read another.
+  #
+  # metrics_endpoint is where the server serves its own metrics: /metrics on
+  # that Service and port, always on, asking no credential.
   provides:
     host: "{{ .context.rendered_name }}"
     port: "{{ .infra.port }}"
     protocol: "http"
     otlp_http_endpoint: "{{ if .values.otlp_receiver }}http://{{ .context.rendered_name }}:{{ .infra.port }}/api/v1/otlp{{ end }}"
+    metrics_endpoint: "http://{{ .context.rendered_name }}:{{ .infra.port }}/metrics"
 
   # This Recipe reads from infra.overrides:
   #   image               - map[string]string (server.image.* fields; overrides the tag pin)
@@ -108,7 +112,25 @@ spec:
   #   storage_class       - string (server.persistentVolume.storageClass for the data PVC)
   #   nodeSelector        - map[string]string (server pod scheduling)
   #   tolerations         - []object (server pod scheduling)
+  #
+  # The connections carrying a credential are read once, at the top of the
+  # mapping, in the alphabetical order of their aliases: each is numbered from
+  # 0, the chart mounts the Secret it publishes under
+  # /etc/prometheus/scrape-credentials/<n>/ through server.extraSecretMounts,
+  # and that connection's scrape job below reads the file named by the data
+  # key it publishes. A credential publishing no Secret name and data key
+  # halts the build, naming the connection, since nothing could be mounted.
   valuesMapping: |
+    {{- $credentials := list }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if and (eq $edge.socket "scrape_target") (hasKey (default dict $edge.features) "credential") }}
+    {{- $locator := optional (default dict $edge.features.credential) "provides" dict }}
+    {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) }}
+    {{- fail (printf "the credential on the scrape_target connection %s of %q publishes no Secret name and data key, so there is no Secret to mount as the file the scrape job reads; attach a credential publishing both, such as core/referenced-secret" $alias $.context.instance_id) }}
+    {{- end }}
+    {{- $credentials = append $credentials $alias }}
+    {{- end }}
+    {{- end }}
     ## ── Subcharts this Component does not describe ─────────────
     ## The chart can also deploy an alert manager, a node exporter, a
     ## kube-state-metrics instance and a push gateway. The Component publishes a
@@ -236,13 +258,50 @@ spec:
       {{- end }}
       {{- end }}
 
+      ## ── Scrape credentials ───────────────────────────────────
+      ## One read-only mount per connection carrying a credential: the whole
+      ## Secret it publishes, so each data key is a file and the cluster keeps
+      ## it current, at the path that connection's scrape job reads. Rendered
+      ## only while a connection carries one.
+      {{- if $credentials }}
+      extraSecretMounts:
+      {{- range $n, $alias := $credentials }}
+        - name: scrape-credential-{{ $n }}
+          mountPath: /etc/prometheus/scrape-credentials/{{ $n }}
+          subPath: ""
+          secretName: {{ (index $.context.uses $alias).features.credential.provides.name | toJson }}
+          readOnly: true
+      {{- end }}
+      {{- end }}
+
     ## ── Scrape configuration ───────────────────────────────────
     ## Every component wired on the `scrape_target` socket becomes one scrape
-    ## job: its resolved host and port from the enriched topology pipe are the
-    ## job's target, and the edge's per-connection values tune the job's label,
-    ## cadence and metrics path. This is the same mapping the workload-synthesis
-    ## realization performs, so a developer who wired the topology once gets the
-    ## same jobs from either realization.
+    ## job, its label and cadence tuned by the edge's per-connection values.
+    ## This is the same mapping the workload-synthesis realization performs, so
+    ## a developer who wired the topology once gets the same jobs from either
+    ## realization.
+    ##
+    ## A target publishing metrics_endpoint is scraped by a static job built
+    ## from it: its scheme, its path, and its host and port as the target. A
+    ## host carrying no dot is a Service in the target's own namespace, so where
+    ## the connection's aggrega.ai/namespace annotation names one other than
+    ## Prometheus's the host is qualified with it, caller-side, as
+    ## <host>.<namespace>.svc.cluster.local; a host already carrying its
+    ## namespace, and one whose target declares none, is used as published. An
+    ## address that is not an http or https URL naming a host, or that carries
+    ## a query string, a fragment or a user name, halts the build, naming the
+    ## target, and so does a target publishing none of metrics_endpoint,
+    ## metrics_service and metrics_pod_selector, or an address beside a
+    ## discovery fact.
+    ##
+    ## A connection carrying a credential is scraped with it, static and
+    ## discovered jobs alike: the job reads the file mounted above through
+    ## authorization's credentials_file, as a Bearer credential, and the
+    ## configuration names only the file. A connection carrying none to a
+    ## target publishing metrics_credential_required true halts the build,
+    ## naming the target. A connection to OpenBao (core/security/openbao) also
+    ## sends the request parameter format=prometheus, which OpenBao reads to
+    ## answer in the Prometheus format.
     ##
     ## A target publishing metrics_service or metrics_pod_selector is discovered
     ## from the cluster instead, by the same rule as on the workload-synthesis
@@ -276,8 +335,8 @@ spec:
     ##
     ## job_name keeps a template fallback because its default is the edge alias —
     ## per-edge context, which no static value in the socket's valueSchema can
-    ## express. The two keys below take their defaults from that valueSchema, so
-    ## they read the edge value directly and this template holds no second copy.
+    ## express. scrape_interval takes its default from that valueSchema, so it
+    ## reads the edge value directly and this template holds no second copy.
     ## 🔴 Only `scrape_configs` is authored here. The chart's own
     ## `prometheus.yml` already carries `global` and `rule_files`, and setting
     ## either again from this overlay emits the key TWICE in the rendered
@@ -294,8 +353,25 @@ spec:
         {{- $p := default (dict) $edge.provides }}
         {{- $svc := optional $p "metrics_service" "" }}
         {{- $sel := optional $p "metrics_pod_selector" "" }}
+        {{- $endpoint := toString (optional $p "metrics_endpoint" "") }}
         {{- if and $svc $sel }}
         {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes both metrics_service (%q) and metrics_pod_selector (%q); Prometheus discovers a target either through its Service or through its pods, so the target's Recipe publishes one of the two and leaves the other empty" $edge.target $.context.instance_id $svc $sel) }}
+        {{- end }}
+        {{- if and (or $svc $sel) $endpoint }}
+        {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes both metrics_endpoint (%q) and a fact Prometheus discovers it by (%q); a target says where it serves metrics in one of the two ways, so the target's Recipe publishes one and leaves the other empty" $edge.target $.context.instance_id $endpoint (default $sel $svc)) }}
+        {{- end }}
+        {{- if not (or $svc $sel $endpoint) }}
+        {{- fail (printf "%q is wired to %q on its scrape_target socket but publishes none of metrics_endpoint, metrics_service and metrics_pod_selector, so there is nowhere to scrape it: a target publishes where it serves metrics only while it serves them, some only while a value such as metrics_enabled turns them on; turn its metrics on, or remove the connection" $edge.target $.context.instance_id) }}
+        {{- end }}
+        {{- $features := default dict $edge.features }}
+        {{- if and (eq (toString (optional $p "metrics_credential_required" false)) "true") (not (hasKey $features "credential")) }}
+        {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes metrics_credential_required true, so it answers its metrics only to a scrape presenting a credential, but the connection carries none; attach one under credential on that connection" $edge.target $.context.instance_id) }}
+        {{- end }}
+        {{- $credentialFile := "" }}
+        {{- if hasKey $features "credential" }}
+        {{- $n := 0 }}
+        {{- range $i, $a := $credentials }}{{ if eq $a $alias }}{{ $n = $i }}{{ end }}{{ end }}
+        {{- $credentialFile = printf "/etc/prometheus/scrape-credentials/%d/%s" $n $features.credential.provides.key }}
         {{- end }}
         {{- if or $svc $sel }}
         {{- $fact := "metrics_pod_selector" }}{{ $portFact := "metrics_pod_port" }}{{ $found := $sel }}
@@ -313,6 +389,15 @@ spec:
           - job_name: {{ default $alias (get $v "job_name") }}
             scrape_interval: {{ get $v "scrape_interval" }}
             metrics_path: {{ $path | toJson }}
+        {{- with $credentialFile }}
+            authorization:
+              type: Bearer
+              credentials_file: {{ . | toJson }}
+        {{- end }}
+        {{- if eq $edge.component "core/security/openbao" }}
+            params:
+              format: [prometheus]
+        {{- end }}
             kubernetes_sd_configs:
               - role: {{ if $svc }}endpointslice{{ else }}pod{{ end }}
         {{- if not $everywhere }}
@@ -352,12 +437,36 @@ spec:
               - source_labels: [__meta_kubernetes_pod_name]
                 target_label: pod
         {{- else }}
+        {{- $u := urlParse $endpoint }}
+        {{- if or $u.query $u.fragment $u.userinfo }}
+        {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes a metrics_endpoint carrying a query string, a fragment or a user name, which a scrape job takes from no address: Prometheus requests a path and sends its parameters apart from it, and a credential reaches it on the connection's credential slot; the target's Recipe publishes the scheme, host, port and path alone" $edge.target $.context.instance_id) }}
+        {{- end }}
+        {{- if not (and (has $u.scheme (list "http" "https")) $u.host) }}
+        {{- fail (printf "%q is wired to %q on its scrape_target socket and publishes metrics_endpoint %q, which is not an http or https URL naming a host, so Prometheus has no address to scrape; the target's Recipe publishes the full address, such as http://<host>:<port>/metrics" $edge.target $.context.instance_id $endpoint) }}
+        {{- end }}
+        {{- $host := $u.host }}
+        {{- $portSuffix := "" }}
+        {{- with regexFind ":[0-9]+$" $host }}{{ $portSuffix = . }}{{ $host = trimSuffix . $host }}{{ end }}
+        {{- $ns := optional (optional (default dict $edge.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+        {{- if and $ns (ne $ns $promNs) (not (contains "." $host)) (not (contains ":" $host)) }}
+        {{- $host = printf "%s.%s.svc.cluster.local" $host $ns }}
+        {{- end }}
           - job_name: {{ default $alias (get $v "job_name") }}
             scrape_interval: {{ get $v "scrape_interval" }}
-            metrics_path: {{ get $v "metrics_path" }}
+            scheme: {{ $u.scheme }}
+            metrics_path: {{ default "/" $u.path | toJson }}
+        {{- with $credentialFile }}
+            authorization:
+              type: Bearer
+              credentials_file: {{ . | toJson }}
+        {{- end }}
+        {{- if eq $edge.component "core/security/openbao" }}
+            params:
+              format: [prometheus]
+        {{- end }}
             static_configs:
               - targets:
-                  - {{ $edge.provides.host }}:{{ $edge.provides.port }}
+                  - {{ printf "%s%s" $host $portSuffix | toJson }}
         {{- end }}
         {{- end }}
         {{- end }}

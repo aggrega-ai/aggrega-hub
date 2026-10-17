@@ -585,6 +585,68 @@ selected component publishes and checks nothing about what answers there. As
 with every family on this page, a value is added in the same act as the first
 component to carry it.
 
+### Where a component serves its Prometheus metrics
+
+A component whose product serves metrics in the Prometheus format publishes
+where, so a scraper reads that fact rather than guessing a port and a path.
+`core/observability/prometheus` reads it off each connection of its
+`scrape_target` socket, which admits any `server` or `stateful-server`. The
+keys are declared in the Component's `provides` pillar, and every Recipe of it
+publishes them — empty where that realization offers no such address. They
+come in three shapes:
+
+| Keys | What they hold |
+| --- | --- |
+| `metrics_endpoint` | The full address — scheme, host, port and path, an `http` or `https` URL with no query string — where one address reaches all of the product's metrics. |
+| `metrics_service`, `metrics_service_port`, `metrics_path` | A Service the product already has, or a comma-separated list of them, the name of the Service port carrying the metrics, and the path — where every pod behind the Service serves them, as a server running more than one replica does. |
+| `metrics_pod_selector`, `metrics_pod_port`, `metrics_path` | A label selector over the pods serving them, the name of their container port, and the path — where no Service carries them. |
+
+Six rules bind them:
+
+- **One shape per instance.** A Recipe publishes one shape and leaves the other
+  keys empty. A model server publishes the Service facts only while its
+  `replicas` is above one, and `metrics_endpoint` otherwise. Prometheus halts
+  the build, naming the target, on a target publishing none of the three, an
+  address beside a discovery fact, or both discovery kinds.
+- **The host is published as the realization names it.** A Recipe publishes the
+  bare name its realization gives the Service, and a consumer in another
+  namespace qualifies it caller-side; a Recipe placing its objects in a
+  namespace of its own, as the operators' raw manifests do, publishes the host
+  already qualified, `<name>.<namespace>`. On Kubernetes Prometheus qualifies a
+  host carrying no dot with the namespace its connection's
+  `aggrega.ai/namespace` annotation names, where that differs from its own, and
+  leaves every other host as published.
+- **Metrics a product serves only on request take `metrics_enabled`.** One
+  boolean in the Component's `values`, false by default, under the same name on
+  every Component offering it: true turns the product's metrics on and, where
+  needed, puts their port on a Service, and the Recipe publishes the address;
+  false publishes the keys empty, even where the product keeps its metrics on
+  internally. A realization that cannot honour true refuses it by name. The
+  value's description states what else the metrics port serves with no caller
+  check.
+- **Discovery is Kubernetes'.** Prometheus's Kubernetes Recipes render a job
+  that discovers the Service's endpoints or the selected pods, in the namespace
+  the connection's annotation names. A Compose Recipe publishes
+  `metrics_endpoint` or nothing, and Prometheus's Compose Recipe halts on a
+  discovery fact, naming the target.
+- **A credential is the connection's.** A target whose metrics answer only a
+  scrape presenting a credential publishes `metrics_credential_required` true,
+  as the annotation below describes; the connection carries the credential in
+  its `credential` slot, which Prometheus presents as `Authorization: Bearer`,
+  read from a file each of its Recipes delivers by reference, and a connection
+  carrying none halts the build. That halt sits in Prometheus's Recipes rather
+  than in a Component assertion, because an assertion sees a connection's
+  attachments but nothing its target published, so `aggrega build` reaches it
+  and `aggrega validate --release` does not.
+- **A request parameter is the scraper's.** The address carries no query
+  string. Where a product needs one, Prometheus sends it as a scrape parameter
+  of its own: `format=prometheus` to `core/security/openbao`, whose connection
+  it recognises by the target's Component.
+
+The compiler routes these strings and checks none of the rules; they are this
+catalog's, and Prometheus's Recipes are where a target breaking them halts the
+build.
+
 ### The `observability.aggrega.ai/metrics-credential` annotation
 
 `observability.aggrega.ai/metrics-credential`, under a Component's
@@ -2343,7 +2405,11 @@ credential publishes and Envoy AI Gateway's controller reads the key from it
 under the data key `apiKey`; and on `cache`, where it is the password Envoy
 Gateway's rate-limit service presents to the store keeping a period budget's
 count, handed to that service as `REDIS_AUTH` from the Secret the credential
-publishes. The name holds one
+publishes. `core/observability/prometheus` declares it on its `scrape_target`
+socket, for the token it presents to each target it scrapes as
+`Authorization: Bearer`, which its Recipes deliver as a file the scrape job
+reads: a Secret mounted by reference on Kubernetes, and on Docker Compose a
+variable the start-up command writes to the file. The name holds one
 credential; it is a key a developer writes on the connection
 (`uses.<socket>.<alias>.features.credential`) and an operator writes on a
 connection the Release wires, so it is the same word on every socket.
@@ -2407,6 +2473,11 @@ connection the Release wires, so it is the same word on every socket.
   counts a `client_secret` or a `client_certificate` on the connection as its
   credential (below), since the token obtained with the one, and the
   certificate the other holds, are what the target is presented.
+  `core/observability/prometheus`'s `scrape_target` socket declares no
+  `unauthenticated` and no such assertion names it, because the socket selects
+  only `server` and `stateful-server` components and every Component this
+  catalog labels `managed` is a `resource`, so no managed target can be wired
+  there.
 - **Several consumers share one credential by authoring.** Nothing cascades into
   a connection, so a shared key is one parameter every connection's credential
   reads — under `k8s-existing-secret`, the name of one Secret each connection

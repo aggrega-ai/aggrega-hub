@@ -7,18 +7,20 @@ metadata:
   name: core/observability/prometheus
   version: 1.0.0
   description: >
-    A Prometheus metrics server. Prometheus scrapes metrics from its targets and
-    stores them in a local time-series database. The targets it scrapes are
-    wired through its `scrape_target` uses-socket, as many connections as the
-    topology binds, and each connection becomes one scrape job, its label and
-    cadence set on that connection. A target publishing one address is scraped
-    at its host and port, on the connection's metrics path. On Kubernetes, a
-    target publishing `metrics_service` or `metrics_pod_selector` is
-    discovered from the cluster instead, on the port and path it publishes, in
-    the namespace its connection's `aggrega.ai/namespace` annotation names; on
-    Docker Compose it halts the build. Prometheus renders as a stateful server,
-    its database on a data volume, and exports its query endpoint host and port
-    to consumers.
+    A Prometheus metrics server, storing what it scrapes in a local time-series
+    database. Its targets are wired through its `scrape_target` uses-socket,
+    which admits servers and stateful servers, and each connection becomes one
+    scrape job, its label and cadence set on that connection. The target says
+    where it serves metrics: it publishes `metrics_endpoint`, the address
+    Prometheus scrapes, or, on Kubernetes, `metrics_service` or
+    `metrics_pod_selector`, which Prometheus discovers from the cluster. A
+    target publishing none of them halts the build, naming it.
+
+    A connection's optional `credential` is presented to its target as a
+    bearer token, read from a file the Recipe delivers by reference; a target
+    publishing `metrics_credential_required` true halts the build while its
+    connection carries none. Prometheus publishes its own metrics address as
+    `metrics_endpoint` too.
 
     With `values.otlp_receiver` true it also receives metrics pushed over OTLP
     HTTP, at the address it then publishes as `otlp_http_endpoint`, and that
@@ -27,13 +29,11 @@ metadata:
     Collector's `metrics` socket selects.
 
     On Kubernetes the Manifest chooses between two realizations. `prometheus`
-    synthesizes the server as a workload and fetches nothing,
-    so it is the one to reach for where the build must complete with no chart
-    repository reachable. `prometheus-chart` renders the prometheus-community
-    Helm chart, whose cluster-wide read grant also lets the server scrape
-    whatever the cluster advertises through scrape annotations — reach for it
-    where a chart repository is reachable at build time and the server is
-    expected to find its own targets beyond the ones the topology wires.
+    synthesizes the server as a workload and fetches nothing, for a build that
+    must complete with no chart repository reachable. `prometheus-chart`
+    renders the prometheus-community Helm chart, whose cluster-wide read grant
+    also lets the server scrape whatever the cluster advertises through scrape
+    annotations.
   labels:
     component.aggrega.ai/type: stateful-server
     component.aggrega.ai/category: observability
@@ -56,29 +56,62 @@ spec:
 
   usesSchema:
     # The targets Prometheus scrapes. Each component wired here becomes one
-    # scrape job: its provides host and port are the job's target, and the
-    # per-edge values below tune how that one target is scraped. One Prometheus
-    # scrapes many targets, so scrape settings are per-connection rather than
-    # component-wide.
+    # scrape job, and the per-edge values below set that job's label and
+    # cadence. One Prometheus scrapes many targets, so scrape settings are
+    # per-connection rather than component-wide. The selector admits servers
+    # and stateful servers alike, and among them what decides whether a target
+    # can be scraped is what it publishes.
     #
-    # A target whose metrics no one address reaches publishes, instead, where a
-    # scraper discovers them in the cluster: metrics_service (the Service, or a
-    # comma-separated list of Services, every endpoint of which serves them)
-    # with metrics_service_port, or metrics_pod_selector (a label selector over
-    # the pods that serve them, no Service carrying them) with
-    # metrics_pod_port, and metrics_path beside either. The Kubernetes Recipes
-    # then render a discovery job on that port and path, keeping job_name and
-    # scrape_interval from the connection, in the namespace the connection's
-    # aggrega.ai/namespace annotation names — in every namespace for KEDA and
-    # Knative Serving, which run once per cluster in a namespace of their own —
-    # and halt, naming the target, where it publishes both kinds or a fact
-    # without its port name or path, or where Prometheus declares a namespace
-    # and the target none. The workload-synthesis Recipe, which grants itself
-    # the read access discovery needs, also halts where Prometheus declares no
-    # namespace. The Compose Recipe has no cluster to discover from and halts on
-    # either fact, naming the target.
+    # Where it serves metrics is the target's own fact, and it publishes ONE of
+    # three shapes:
+    #   - metrics_endpoint, the full address — scheme, host, port and path, as
+    #     an http or https URL with no query string. Every Recipe builds a
+    #     static job from it: the scheme, the path, and the host and port as
+    #     the target. On Kubernetes a host carrying no dot is qualified with the
+    #     namespace the connection's aggrega.ai/namespace annotation names,
+    #     read caller-side, where that differs from Prometheus's own — a host
+    #     already carrying its namespace, as an operator's often does, is left
+    #     as published; on Docker Compose the host is used as published.
+    #   - metrics_service (the Service, or a comma-separated list of Services,
+    #     every endpoint of which serves them) with metrics_service_port and
+    #     metrics_path; or
+    #   - metrics_pod_selector (a label selector over the pods that serve them,
+    #     no Service carrying them) with metrics_pod_port and metrics_path.
+    #     The Kubernetes Recipes render a discovery job on that port and path,
+    #     in the namespace the connection's aggrega.ai/namespace annotation
+    #     names — in every namespace for KEDA and Knative Serving, which run
+    #     once per cluster in a namespace of their own.
+    # Every Recipe halts the build, naming the target, where it publishes none
+    # of the three; an address beside a discovery fact, or both discovery
+    # kinds; a discovery fact without its port name or path; or an address
+    # that is not an http or https URL naming a host, or that carries a query
+    # string, a fragment or a user name. The Kubernetes Recipes also halt where
+    # Prometheus declares a namespace and a discovered target none, and the
+    # workload-synthesis Recipe, which grants itself the read access discovery
+    # needs, where Prometheus declares no namespace while it discovers. The
+    # Compose Recipe has no cluster to discover from and halts on either
+    # discovery fact, naming the target.
+    #
+    # A target publishing metrics_credential_required true answers its metrics
+    # only to a scrape presenting a credential, so a connection to it carrying
+    # no credential halts the build, naming the target. The halt lives in each
+    # Recipe's render rather than in an assertion here, because an assertion
+    # sees the connection's attachments but nothing its target published.
+    #
+    # Prometheus's connection to OpenBao (core/security/openbao), recognised by
+    # the Component the target is, also sends the request parameter
+    # format=prometheus, which OpenBao reads to answer its metrics in the
+    # Prometheus format; Prometheus sends a request parameter as params, never
+    # inside the path.
+    #
+    # This socket declares no unauthenticated value, and the Component carries
+    # no assertion refusing a managed target reached with neither a credential
+    # nor that value, which every other socket declaring credential pairs with
+    # it: the socket selects servers and stateful servers alone, and a
+    # Component labelled component.aggrega.ai/hosting: managed is a resource,
+    # so no managed target can be wired here.
     scrape_target:
-      selector: "component.aggrega.ai/type=server"
+      selector: "component.aggrega.ai/type in (server, stateful-server)"
       inject: [env]
       valueSchema:
         # Job label for this scrape target. Appears as the `job` label on every
@@ -94,14 +127,38 @@ spec:
           type: string
           default: "15s"
           description: How often Prometheus scrapes this target (a Prometheus duration such as `15s` or `1m`). Defaults to 15s.
-        # HTTP path Prometheus requests when scraping this target. When omitted,
-        # the default below is filled into the edge. A target Prometheus
-        # discovers from the cluster publishes its own metrics_path, which the
-        # discovery job requests instead.
-        metrics_path:
-          type: string
-          default: "/metrics"
-          description: HTTP path Prometheus requests when scraping this target at the address it publishes. Defaults to the conventional `/metrics` endpoint. A target Prometheus discovers from the cluster publishes its own path, which is requested instead.
+      # The credential Prometheus presents to this connection's target, under
+      # the catalog's one name for a caller's key on a socket. Prometheus sends
+      # it as Authorization: Bearer <credential>, adding the scheme itself, so
+      # the attachment holds the bare token. It reaches the server by
+      # reference, as a file the scrape job names in authorization's
+      # credentials_file and Prometheus reads again on every scrape — so on
+      # Kubernetes, where the whole Secret is mounted and kept current, a
+      # rotated Secret is picked up with no restart:
+      #   - helm/prometheus mounts the Secret the credential publishes through
+      #     an attachment naming this connection, delivered as: file at
+      #     /etc/prometheus/scrape-credentials/<n>, the file named by the data
+      #     key it publishes;
+      #   - helm/prometheus-chart mounts the same Secret at the same path
+      #     through the chart's server.extraSecretMounts;
+      #   - compose/prometheus delivers the value the credential writes on the
+      #     inject pipe as the container variable
+      #     PROMETHEUS_SCRAPE_<n>_CREDENTIAL, which the start-up command writes
+      #     to /tmp/scrape-credentials/<n> before Prometheus starts; there each
+      #     connection's credential names a data key of its own, since the
+      #     inject pipe holds one value per key.
+      # <n> counts the connections carrying a credential, in the alphabetical
+      # order of their aliases, from 0. The scrape configuration names only the
+      # file. A credential publishing no Secret name and data key halts the
+      # build on Kubernetes, and one writing no value on the inject pipe halts
+      # it on Docker Compose, each naming the connection. Unattached, the
+      # scrape presents no credential.
+      featuresSchema:
+        credential:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [env, file]
+          description: "Optional credential Prometheus presents when it scrapes the target of this connection, as Authorization: Bearer followed by the attachment's value, so the attachment holds the bare token. It reaches the server by reference, as a file the scrape job reads on every scrape: on Kubernetes the Secret the credential publishes is mounted as a file, and a credential publishing no Secret name and data key halts the build; on Docker Compose the value arrives as the container variable PROMETHEUS_SCRAPE_<n>_CREDENTIAL, which the start-up command writes to the file. The scrape configuration names only the file. Prometheus scrapes the address the target publishes, which inside a Release is usually http, so the credential crosses the network unencrypted there. Unattached, the scrape presents none, and a target publishing metrics_credential_required true halts the build."
 
   schema:
     # The developer tunes each scrape target through the `scrape_target`
@@ -223,3 +280,14 @@ spec:
           The OTLP HTTP base address metrics are received at —
           `http://<host>:<port>/api/v1/otlp` — while `values.otlp_receiver` is
           true; empty while it is false.
+      # The address Prometheus serves its own metrics at, in the Prometheus
+      # format: /metrics on the query endpoint's address, always on and asking
+      # no credential, since the Recipes render no web configuration for the
+      # server. Every Recipe publishes it, so one Prometheus can be wired to
+      # another's scrape_target socket.
+      metrics_endpoint:
+        type: string
+        description: >
+          The address Prometheus serves its own metrics at —
+          `http://<host>:<port>/metrics`, on the query endpoint — for another
+          scraper to scrape.
