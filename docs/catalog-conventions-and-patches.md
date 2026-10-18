@@ -160,7 +160,7 @@ There is no stored "is-AI" boolean — tooling derives AI-relevance from any
 The category-vs-directory mirror is checked by the publishing linter's
 `category-matches-directory` rule (warning at `aggrega lint`, error at
 pre-publish, per-workspace opt-out for enterprise layouts). The compiler
-itself is blind to all label vocabulary; the closed set is a standard-library
+itself is agnostic to all label vocabulary; the closed set is a standard-library
 convention enterprises may extend or replace in their own catalogs.
 
 ### The `component.aggrega.ai/hosting` label
@@ -171,7 +171,7 @@ exfiltration and ownership. It is a **cross-cutter**: the same three values
 describe a managed database, a managed LLM API, and a self-run inference server
 alike, so the label lives under the shared `component.aggrega.ai/` namespace
 rather than any one category's `<role>.aggrega.ai/` capability namespace. The
-value set is a standard-library convention (the compiler is blind to it):
+value set is a standard-library convention (the compiler is agnostic to it):
 
 - **`self-hosted`** — the Release runs the compute itself, as containers in
   its own cluster. The operator owns the process lifecycle.
@@ -734,7 +734,7 @@ the file, `metadata.license: AGPL-3.0` over the datastore the file describes, an
 `upstream-licensing: osi-approved` over the class that licence falls into.
 
 The value set is a closed, single-valued standard-library convention (the
-compiler is blind to it, as it is to every label):
+compiler is agnostic to it, as it is to every label):
 
 - **`osi-approved`** — the wrapped product is published under an OSI-approved
   licence, and that licence covers the artifact a Release runs.
@@ -3538,7 +3538,7 @@ The distinction to hold, because it decides which kind you are authoring:
   this workload, an `ExternalSecret` for this workload — is a **Feature**.
 
 A runtime guardrail or gateway binding to a node is a Feature (or its annotation
-shortcut), **not** a `uses` edge. A `uses` edge is dumb string-routing between
+shortcut), **not** a `uses` edge. A `uses` edge is content-neutral string-routing between
 components that already exist; a guardrail is new runtime configuration to attach,
 which is exactly what a Feature is for. Whether a given guardrail earns a Feature
 of its own is the test below: one that only a single product in the field has is
@@ -3800,7 +3800,7 @@ from one question: which of the two decides it.
 
 **This is a convention of this catalog, not something the compiler enforces.**
 The compiler validates each pillar against the Feature's schema and pipes the
-strings through. It is blind to which author decided an input, and it accepts a
+strings through. It is agnostic to which author decided an input, and it accepts a
 Feature attached in either document, so an enterprise catalog is free to draw
 the line elsewhere. One line under the convention is the schema's rather than
 the catalog's: the Release schema admits no `values`, so a Feature whose
