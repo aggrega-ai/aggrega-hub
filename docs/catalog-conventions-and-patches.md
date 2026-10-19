@@ -2602,8 +2602,11 @@ an authority's certificate is not itself secret.
   those keys, or holds a certificate the target accepts.
 - **The Recipe refuses, naming the connection**, either slot whose attachment
   publishes no Secret name, since nothing could be mounted, and either slot on
-  a connection whose target publishes `protocol` `http`, since no TLS handshake
-  takes place there.
+  a connection whose target would be reached without TLS, since no TLS
+  handshake takes place there: a target publishing `protocol` `http`, and a
+  target publishing no `protocol` whose published `endpoint` is not an `https`
+  URL. A target publishing neither is reached by its host alone and is not
+  judged.
 - **The slots compose.** A card requiring mutual TLS together with a key or a
   token is reached with `client_certificate` beside `credential` or
   `client_secret`, each delivered under its own variables. Between them the
@@ -2833,7 +2836,11 @@ another party runs over the A2A protocol, `core/ai-agent/a2a-remote`, whose
 and which also publishes where that card is read, `agent_card_url`, and, for a
 card requiring OAuth 2.0 client credentials or OpenID Connect, where a caller
 obtains a token: `token_url`, `oidc_discovery_url` and `scopes`, from infra keys
-of the same names, each optional and published empty while unset.
+of the same names, each optional and published empty while unset. A
+`token_url` or `oidc_discovery_url` that is set is refused by both realizations
+unless it is an `https` URL naming a host with no user name or password, since
+OAuth 2.0 sends a client secret only over TLS, so the rule holds whichever
+consumer reads the address.
 `core/ai-tool/agent-invocation` holds the credential for such an agent on its
 `target_agent` connection, the client secret it obtains a token with, and the
 client certificate it presents for a card requiring mutual TLS, which names no
