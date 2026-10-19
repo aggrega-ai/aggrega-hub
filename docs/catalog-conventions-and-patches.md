@@ -454,7 +454,10 @@ Three rules bind it:
   each SDK speaking that API alone; `core/ai-agent/mastra`'s and
   `core/ai-agent/agent-framework`'s select `model.aggrega.ai/api=openai`, the API
   whose variables their Recipes deliver; and `core/ai-agent/google-adk`'s selects
-  `model.aggrega.ai/api=gemini`, the API whose key its Recipes deliver) — or,
+  `model.aggrega.ai/api=gemini`, the API whose key its Recipes deliver, with its
+  category narrowed to `component.aggrega.ai/category=ai-model`, because ADK's
+  client reads no address and would send a gateway's credential to Google's
+  own address) — or,
   where a model it cannot
   use has somewhere else to go, admits the whole category and refuses the value
   in an assertion that says where. `core/gateway/litellm`'s `models` socket
