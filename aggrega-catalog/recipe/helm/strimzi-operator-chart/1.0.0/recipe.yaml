@@ -1,0 +1,183 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: strimzi-operator-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Installs the Strimzi Cluster Operator through the project's own Helm chart,
+    at the chart release whose application version is the operator image's.
+    The chart is official, published by the Strimzi maintainers; complete,
+    carrying the operator, its definitions and every role it binds; and
+    maintained, released with every operator release.
+
+    Beside what the minimal bootstrap installs — the operator Deployment, its
+    service account and a narrow cluster role — the chart renders the ten
+    Strimzi custom-resource definitions, all served at the `v1` API, the
+    operator's full namespaced, cluster-wide, watched-namespace and
+    leader-election roles, the roles it binds the Kafka brokers, the entity
+    operator and clients to, and the operator's logging configuration. The
+    operator image is infra.image, and every image the operator starts Kafka
+    and its companions on is pinned to the one that release names; nothing is generated
+    when the build runs.
+
+    Reach for this realization; its chart repository must be reachable from
+    the build. The alternative, `strimzi-operator`, installs no definitions and
+    at the image the Component pins grants less than the operator needs to run
+    a Kafka cluster. The chart places every namespaced object in the
+    namespace the Release declares for the component, so the build halts unless
+    that namespace is infra.namespace; the operator watches that namespace.
+    With `values.metrics_enabled` true a ClusterIP Service, `<name>-metrics` in
+    infra.namespace, carries the operator's metrics port and
+    provides.metrics_endpoint publishes its address; false, that key is empty.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/messaging/strimzi-operator:1.0.0
+
+  # The project's own chart, from its own chart repository. Its default
+  # version, 1.3.0, is the release whose application version is the tag of the
+  # image the Component pins, so the chart's templates, its definitions and the
+  # operator move together; infra.source_version picks another chart release,
+  # and the image follows it only where the Release sets infra.image too.
+  source:
+    kind: helm-https-chart
+    url: https://strimzi.io/charts
+    chart: strimzi-kafka-operator
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"1.3.0\" }}"
+
+  # metrics_endpoint is the address the operator serves its own metrics at
+  # while values.metrics_enabled is true: /metrics on port 8080 of the
+  # ClusterIP Service this Recipe renders beside the chart, which carries no
+  # Service of its own. It lives in infra.namespace, so the host carries that
+  # namespace and resolves from a Prometheus server in any other. It is
+  # spelled out in full on purpose: a provides entry cannot read another.
+  provides:
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-metrics.{{ .infra.namespace }}:8080/metrics{{ end }}"
+
+  # This Recipe reads from infra.overrides:
+  #   operand_image - map[string]string (registry, repository, tag: the
+  #                    chart's defaultImageRegistry, defaultImageRepository and
+  #                    defaultImageTag, from which every image the operator
+  #                    starts Kafka, its exporter, Cruise Control, the entity
+  #                    operator and the build tooling on is composed; each key
+  #                    given replaces that part of the pin below)
+  #
+  # The chart is read for the values below; everything else stays the chart's
+  # own default at its release.
+  #
+  # Names. The chart names its objects strimzi-cluster-operator and the like,
+  # and offers no setting renaming them. They are the operator's own wiring:
+  # the operator binds the Kafka brokers, the entity operator and clients to
+  # the cluster roles strimzi-kafka-broker, strimzi-entity-operator and
+  # strimzi-kafka-client by those names, and holds the leader-election lease
+  # named strimzi-cluster-operator. So they stand as the chart publishes them,
+  # and one installation runs per namespace. The metrics Service below is this
+  # Recipe's own object and carries the rendered name.
+  #
+  # Images. The chart composes the operator image from image.registry,
+  # image.repository and image.name, each falling back to the chart's defaults
+  # when empty, and its tag from image.tag or defaultImageTag. So the
+  # Component's infra.image is cut at the last colon after its last slash into
+  # a reference and a tag, and the reference into its first segment (the
+  # registry), its last (the name) and what lies between (the repository); a
+  # reference with fewer than three segments has no repository to give the
+  # chart and halts the build, naming infra.image. The parts join back into
+  # exactly the reference the Release names, a digest reference included. The
+  # images the operator starts its operands on are composed by the chart from
+  # defaultImageRegistry, defaultImageRepository and defaultImageTag — Kafka at
+  # each version this release supports, its exporter and Cruise Control, the
+  # entity operator, the init container and the build tooling — and they are
+  # pinned here to the release, quay.io/strimzi at 1.3.0, as is the HTTP
+  # bridge's own tag; infra.overrides.operand_image replaces that pin.
+  #
+  # Custom-resource definitions. The chart carries them in its crds directory,
+  # which the helm provider renders with the chart, so they are installed
+  # beside the operator at the chart's release. They serve the `v1` API alone.
+  # The chart has no admission webhook.
+  #
+  # Extras outside the control plane stay off, as the chart ships them, and are
+  # written out so the render does not depend on the defaults: the Grafana
+  # dashboards ConfigMap, the operator's own network policy, its
+  # PodDisruptionBudget and the cluster roles aggregating to the cluster's
+  # default roles.
+  #
+  # Namespace. The chart writes the release namespace on every namespaced
+  # object it renders, which is the namespace the Release declares for the
+  # component through the aggrega.ai/namespace annotation, and it offers no
+  # value placing them anywhere else; the operator watches the release
+  # namespace, so a Kafka it reconciles is written there too. So
+  # infra.namespace is honoured by requiring the two to agree: a build
+  # declaring no namespace, or one other than infra.namespace, halts at the top
+  # of the mapping, naming both.
+  valuesMapping: |
+    {{- $declared := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+    {{- if not $declared }}
+    {{- fail (printf "%q is installed through the Strimzi project's chart, which places the operator in the namespace the Release declares for the component, and the Release declares none; declare the annotation aggrega.ai/namespace: %q on %q or on its boundary in the Release, the namespace infra.namespace names" .context.instance_id .infra.namespace .context.instance_id) }}
+    {{- else if ne $declared .infra.namespace }}
+    {{- fail (printf "%q is installed through the Strimzi project's chart, which places the operator in the namespace the Release declares for the component, %q, but infra.namespace names %q; set the two to the same namespace in the Release" .context.instance_id $declared .infra.namespace) }}
+    {{- end }}
+    {{- $reference := .infra.image }}
+    {{- $tag := "" }}
+    {{- if contains ":" (last (splitList "/" .infra.image)) }}
+      {{- $tag = last (splitList ":" (last (splitList "/" .infra.image))) }}
+      {{- $reference = trimSuffix (printf ":%s" $tag) .infra.image }}
+    {{- end }}
+    {{- $segments := splitList "/" $reference }}
+    {{- if lt (len $segments) 3 }}
+    {{- fail (printf "infra.image of %q is %q, which names no repository between its registry and its image name; the Strimzi chart composes the operator image from a registry, a repository and a name, so set infra.image to a reference of the form <registry>/<repository>/<name>:<tag>" .context.instance_id .infra.image) }}
+    {{- end }}
+    {{- $operands := optional (default dict .infra.overrides) "operand_image" dict }}
+    defaultImageRegistry: "{{ optional $operands "registry" "quay.io" }}"
+    defaultImageRepository: "{{ optional $operands "repository" "strimzi" }}"
+    defaultImageTag: "{{ optional $operands "tag" "1.3.0" }}"
+    image:
+      registry: "{{ first $segments }}"
+      repository: "{{ join "/" (initial (rest $segments)) }}"
+      name: "{{ last $segments }}"
+      tag: "{{ $tag }}"
+    kafkaBridge:
+      image:
+        name: kafka-bridge
+        tag: "1.2.0"
+    createGlobalResources: true
+    createAggregateRoles: false
+    dashboards:
+      enabled: false
+    operatorNetworkPolicy:
+      enabled: false
+    podDisruptionBudget:
+      enabled: false
+
+  # The chart renders no Service for the operator, whose health and metrics
+  # server listens on port 8080 of its pod — /healthy, /ready and /metrics,
+  # plain HTTP on every address of the pod, the container port the chart names
+  # http. While values.metrics_enabled is true this Service carries that port,
+  # selecting the operator's pod by the two labels the chart gives it, and it
+  # is written into infra.namespace, beside the operator, because the provider
+  # places no artifact on its own. While the value is false the body renders
+  # empty and no file is emitted.
+  artifacts:
+    strimzi-operator-metrics-service.yaml: |
+      {{- if .values.metrics_enabled }}
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: {{ .context.rendered_name }}-metrics
+        namespace: {{ .infra.namespace }}
+      spec:
+        type: ClusterIP
+        selector:
+          name: strimzi-cluster-operator
+          strimzi.io/kind: cluster-operator
+        ports:
+          - name: metrics
+            port: 8080
+            targetPort: http
+      {{- end }}

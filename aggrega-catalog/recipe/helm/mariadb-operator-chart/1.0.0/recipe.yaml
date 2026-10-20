@@ -1,0 +1,215 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: mariadb-operator-chart
+  version: 1.0.0
+  license: MIT
+  description: >
+    Installs the mariadb-operator control plane through the project's own Helm
+    chart, at the chart release whose application version is the controller
+    image's. The chart is official, published by the mariadb-operator
+    maintainers from the project's repository; complete, carrying the
+    controller, its definitions and its admission webhook; and maintained,
+    released with every controller release.
+
+    Beside what the minimal bootstrap installs — the controller, its
+    configuration and its permissions — the chart renders the twelve
+    custom-resource definitions, the certificate controller that issues and
+    rotates the webhook's serving certificate in the cluster, and the
+    validating admission webhook with its Deployment and Service. Every image
+    is pinned, the controller's three from infra.image, and nothing is
+    generated when the build runs.
+
+    Reach for this realization for a full install, where the chart repository
+    is reachable from the build; reach for `mariadb-operator` where the
+    custom-resource definitions are already installed in the cluster and the
+    build must fetch nothing. The chart places every namespaced object in the
+    namespace the Release declares for the component, so the build halts unless
+    that namespace is infra.namespace. With `values.metrics_enabled` true the
+    chart's `<name>-metrics` Service carries the controller's metrics port and
+    provides.metrics_endpoint publishes its address; false, that key is empty.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/datastore/mariadb-operator:1.0.0
+
+  # The project's own chart, from its own chart repository. Its default
+  # version, 26.10.0, is the release whose application version is the tag of
+  # the image the Component pins, so the chart's templates and the controller
+  # move together; infra.source_version picks another chart release, and the
+  # image follows it only where the Release sets infra.image too. The project
+  # also publishes its definitions as a chart of their own; this chart carries
+  # that same chart as a dependency, so they are rendered from here (see
+  # crds.enabled below).
+  source:
+    kind: helm-https-chart
+    url: https://helm.mariadb.com/mariadb-operator
+    chart: mariadb-operator
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"26.10.0\" }}"
+
+  # metrics_endpoint is the address the controller serves its own metrics at
+  # while values.metrics_enabled is true: /metrics on port 8080 of the Service
+  # the chart names after the rendered name with -metrics appended, which it
+  # renders only while its metrics are switched on. Every namespaced object
+  # lands in infra.namespace (see the namespace note below), so the host
+  # carries that namespace and resolves from a Prometheus server in any other.
+  # It is spelled out in full on purpose: a provides entry cannot read another.
+  provides:
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-metrics.{{ .infra.namespace }}:8080/metrics{{ end }}"
+
+  # This Recipe reads from infra.overrides:
+  #   mariadb_image          - map[string]string (config.mariadbImage.* fields:
+  #                            repository, tag or digest; the default database
+  #                            image the controller runs a MariaDB custom
+  #                            resource naming none on)
+  #   maxscale_image         - map[string]string (config.maxscaleImage.*)
+  #   exporter_image         - map[string]string (config.exporterImage.*)
+  #   exporter_maxscale_image - map[string]string (config.exporterMaxscaleImage.*)
+  # Each replaces the matching pin below.
+  #
+  # The chart is read for the values below; everything else stays the chart's
+  # own default at its release.
+  #
+  # Names. The chart derives every name it renders from its fullnameOverride —
+  # the controller's Deployment and service account carry it, and the
+  # webhook's and the certificate controller's carry it with -webhook and
+  # -cert-controller appended — and the mapping binds it to the rendered name,
+  # the release name the helm provider gives the chart. Established by
+  # rendering the chart with and without it. The configuration the controller
+  # reads its related images from is the exception: the chart names it
+  # mariadb-operator-env whatever it is given.
+  #
+  # Images. The controller, the webhook and the certificate controller are one
+  # binary, so all three run the Component's infra.image. The chart writes each
+  # as "<repository>:<tag>", so the reference is cut at the last colon after its
+  # last slash and the two halves join back into exactly the reference the
+  # Release names, a digest reference included; a reference with no tag leaves
+  # the chart's own tag, its application version, in place. The controller
+  # also launches the database, MaxScale and exporter images a MariaDB or
+  # MaxScale custom resource naming none of its own runs on; the chart names
+  # them in the controller's configuration, and they are pinned here to the
+  # tags the chart's release names, so they do not move with a chart upgrade.
+  #
+  # Custom-resource definitions. The chart renders them from its bundled
+  # definitions chart while crds.enabled is on, which the mapping turns on, so
+  # they are rendered from the same chart release as the controller and follow
+  # infra.source_version with it. They are the definitions the project's own
+  # definitions chart publishes at the same release, byte for byte. The chart
+  # warns that removing a release that carries the definitions removes every
+  # MariaDB the controller runs, because removing a definition removes its
+  # resources; that holds for whatever tool applies this output.
+  #
+  # Webhook certificate. The certificate controller generates the webhook's
+  # serving certificate and its CA when it starts, stores them in Secrets in
+  # its own namespace and writes the CA into the webhook configuration, so the
+  # chart renders no certificate and no Secret and two renders are
+  # byte-identical; cert-manager mode stays off, so cert-manager is not
+  # needed.
+  #
+  # Metrics. The chart renders the controller's metrics Service only together
+  # with a Prometheus-operator ServiceMonitor, which needs that operator's
+  # definitions in the cluster. So with values.metrics_enabled true both are
+  # rendered and the omits entry below leaves the ServiceMonitor out; the
+  # webhook's and the certificate controller's monitors stay off.
+  #
+  # Namespace. The chart writes no namespace on most of what it renders, and
+  # the release namespace where it writes one, so every namespaced object lands
+  # in the namespace the Release declares for the component through the
+  # aggrega.ai/namespace annotation; the chart offers no value placing them
+  # anywhere else. So infra.namespace is honoured by requiring the two to
+  # agree: a build declaring no namespace, or one other than infra.namespace,
+  # halts at the top of the mapping, naming both.
+  valuesMapping: |
+    {{- $declared := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+    {{- if not $declared }}
+    {{- fail (printf "%q is installed through the mariadb-operator project's chart, which places the control plane in the namespace the Release declares for the component, and the Release declares none; declare the annotation aggrega.ai/namespace: %q on %q or on its boundary in the Release, the namespace infra.namespace names" .context.instance_id .infra.namespace .context.instance_id) }}
+    {{- else if ne $declared .infra.namespace }}
+    {{- fail (printf "%q is installed through the mariadb-operator project's chart, which places the control plane in the namespace the Release declares for the component, %q, but infra.namespace names %q; set the two to the same namespace in the Release" .context.instance_id $declared .infra.namespace) }}
+    {{- end }}
+    {{- $repository := .infra.image }}
+    {{- $tag := "" }}
+    {{- if contains ":" (last (splitList "/" .infra.image)) }}
+      {{- $tag = last (splitList ":" (last (splitList "/" .infra.image))) }}
+      {{- $repository = trimSuffix (printf ":%s" $tag) .infra.image }}
+    {{- end }}
+    {{- $overrides := default dict .infra.overrides }}
+    fullnameOverride: "{{ .context.rendered_name }}"
+    crds:
+      enabled: true
+    image:
+      repository: "{{ $repository }}"
+      tag: "{{ $tag }}"
+    webhook:
+      enabled: true
+      image:
+        repository: "{{ $repository }}"
+        tag: "{{ $tag }}"
+      cert:
+        certManager:
+          enabled: false
+      serviceMonitor:
+        enabled: false
+    certController:
+      enabled: true
+      image:
+        repository: "{{ $repository }}"
+        tag: "{{ $tag }}"
+      serviceMonitor:
+        enabled: false
+    metrics:
+      enabled: {{ .values.metrics_enabled }}
+      serviceMonitor:
+        enabled: {{ .values.metrics_enabled }}
+    config:
+      mariadbImage:
+        {{- with optional $overrides "mariadb_image" dict }}
+        {{- range $k, $v := . }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+        {{- else }}
+        repository: mariadb
+        tag: "12.3.3"
+        {{- end }}
+      maxscaleImage:
+        {{- with optional $overrides "maxscale_image" dict }}
+        {{- range $k, $v := . }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+        {{- else }}
+        repository: mariadb/maxscale
+        tag: "23.08.13-2"
+        {{- end }}
+      exporterImage:
+        {{- with optional $overrides "exporter_image" dict }}
+        {{- range $k, $v := . }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+        {{- else }}
+        repository: prom/mysqld-exporter
+        tag: "v0.15.1"
+        {{- end }}
+      exporterMaxscaleImage:
+        {{- with optional $overrides "exporter_maxscale_image" dict }}
+        {{- range $k, $v := . }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+        {{- else }}
+        repository: mariadb/maxscale-prometheus-exporter-ubi
+        tag: "v0.0.1"
+        {{- end }}
+
+  # The chart renders the controller's metrics Service only beside a
+  # ServiceMonitor, a Prometheus-operator resource a cluster without that
+  # operator cannot accept, so with values.metrics_enabled true the
+  # ServiceMonitor is left out and the Service is kept. False, the chart renders
+  # neither and the entry does not apply.
+  omits:
+    - kind: ServiceMonitor
+      name: "{{ .context.rendered_name }}"
+      when: "{{ .values.metrics_enabled }}"

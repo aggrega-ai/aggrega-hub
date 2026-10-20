@@ -3145,14 +3145,20 @@ never a silent emit. Two shapes, both explicit:
   unaffirmed. The operator sets the flag in the Release once the control plane is
   in place, consciously acknowledging the requirement.
 - **Bundled-deploy** — the Release ships the control plane too. The operator
-  install is a first-class **companion component** (a `server` component whose
-  Recipe emits the ServiceAccount, cluster RBAC, and controller Deployment, or
-  sources the project's upstream install chart — and, where the project ships
-  its custom-resource definitions as a chart of their own, carries those
-  definitions beside the Recipe as published and emits them beside the chart's
-  render), declared in the same Aggregate alongside the custom-resource-emitting
+  install is a first-class **companion component** (a `server` component),
+  declared in the same Aggregate alongside the custom-resource-emitting
   component, so the custom resource and the controller that reconciles it are
-  deployed together. Where the emitting component reaches the controller through
+  deployed together. A companion is realized by a Recipe that sources the
+  project's own install chart, rendering the custom-resource definitions,
+  webhooks and roles the project ships with the controller — and, where the
+  project ships its definitions only as a chart of their own, carrying those
+  definitions beside the Recipe as published and emitting them beside the
+  chart's render — or by a bootstrap Recipe that emits the ServiceAccount,
+  cluster RBAC and controller Deployment and no definitions, the realization
+  for a cluster whose definitions are already installed and a build that must
+  fetch nothing. Where a companion carries both, as the KEDA, mariadb-operator,
+  MySQL Operator and Strimzi companions do, the chart realization is named
+  `-chart`. Where the emitting component reaches the controller through
   a socket, that connection is the declared prerequisite: Envoy Gateway's models
   need the AI gateway controller wired to its `extension` socket, and the build
   halts while it is not.
@@ -3174,9 +3180,10 @@ the security policy without exposing the value.
 
 **The exemplar.** Strimzi Kafka is the template for this pattern: `core/messaging/kafka`
 offers an operator-driven realization emitting a `Kafka` and `KafkaNodePool`
-custom resource alongside its synthesized StatefulSet realization, and ships both
-prerequisite modes (the Strimzi Cluster Operator as an ambient assumption or as a
-bundled companion component). The same shape carries to further operators —
+custom resource at the Strimzi `v1` API alongside its synthesized StatefulSet
+realization, and ships both prerequisite modes (the Strimzi Cluster Operator as
+an ambient assumption or as a bundled companion component, realized by the
+project's own chart or by a bootstrap). The same shape carries to further operators —
 Elasticsearch, HA Postgres, additional AI gateways. The Envoy AI Gateway path is
 the AI-gateway instance of the pattern, in its bundled shape.
 `core/gateway/envoy-ai-gateway-operator` is the companion: its Recipe sources the

@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: keda-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Installs the KEDA control plane through the project's own Helm chart, at
+    the chart release whose application version is the one the operator and
+    metrics-adapter images come from. The chart is official, published by the
+    KEDA maintainers; complete, carrying everything the project's install
+    needs; and maintained, released with every KEDA release.
+
+    Beside what the minimal bootstrap installs — the operator, the metrics
+    adapter, their Services, their permissions and the external-metrics API
+    registration — the chart renders the six KEDA custom-resource definitions,
+    the admission-webhook Deployment, its Service and the validating webhook
+    configuration that checks scaling resources as they are written. The
+    operator issues the certificates the adapter and the webhooks serve on when
+    it starts, so nothing is generated when the build runs.
+
+    Reach for this realization; its chart repository must be reachable from
+    the build. The alternative, `keda`, installs no definitions and at the
+    images the Component pins does not start. The chart places every namespaced object in the namespace the
+    Release declares for the component, so the build halts unless that
+    namespace is infra.namespace. provides publishes the names of the operator's
+    and the adapter's Services, their metrics port name and the path a scraper
+    discovers their metrics by.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/compute/keda:1.0.0
+
+  # The project's own chart, from its own chart repository. Its default
+  # version is the release whose application version, 2.20.2, is the tag of
+  # the two images the Component pins, so the chart's templates and the images
+  # it runs move together; infra.source_version picks another chart release,
+  # and the image keys then follow it only where the Release sets them too.
+  source:
+    kind: helm-https-chart
+    url: https://kedacore.github.io/charts
+    chart: keda
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"2.20.2\" }}"
+
+  # The metrics keys say where a scraper finds the operator's and the metrics
+  # adapter's own metrics: /metrics on port 8080 of each, behind the Services
+  # the chart names keda-operator and keda-operator-metrics-apiserver, on the
+  # port each names metrics. The adapter always serves them and its Service
+  # always carries the port. The operator serves them, and its Service carries
+  # the port, only while the chart's prometheus.operator.enabled is on, which
+  # the mapping below turns on; the chart then also annotates the operator's
+  # Service for annotation-driven scraping. The names carry no namespace: the
+  # control plane runs once per cluster, in the namespace infra.namespace
+  # names, so a scraper looks the two Services up by name across the cluster.
+  # The names, the port and the path are the chart's, read from its 2.20.2
+  # templates, and move with the chart like every other detail here.
+  provides:
+    metrics_service: "keda-operator,keda-operator-metrics-apiserver"
+    metrics_service_port: "metrics"
+    metrics_path: "/metrics"
+
+  # This Recipe reads from infra.overrides:
+  #   webhooks_image - map[string]string (image.webhooks.* fields: registry,
+  #                    repository, tag; replaces the admission-webhooks image pin)
+  #
+  # The chart is read for the values below; everything else stays the chart's
+  # own default at its release.
+  #
+  # Names. The chart names its objects after operator.name and webhooks.name,
+  # keda-operator and keda-admission-webhooks by default, and hands those names
+  # to the operator as its wiring: the operator is told the Service names of
+  # itself, of the metrics adapter and of the webhooks, and the adapter reaches
+  # the operator by its Service name. This Recipe leaves them as the chart
+  # publishes them rather than binding them to the rendered name: KEDA runs
+  # once per cluster, because the external-metrics API it registers admits one
+  # provider, so there is no second installation for a per-component name to
+  # tell apart, and these are the names the project documents its control
+  # plane by.
+  #
+  # Images. The operator and the metrics adapter run the Component's
+  # infra.operator_image and infra.metrics_adapter_image. The chart writes each
+  # as "<registry>/<repository>:<tag>", leaving out the registry where it is
+  # empty, so the registry is set empty and each reference is cut at the last
+  # colon after its last slash: the two halves join back into exactly the
+  # reference the Release names, a digest reference included, and a reference
+  # with no tag leaves the chart's own tag, its application version, in place.
+  # The admission webhooks are a third image the Component has no key for; it
+  # is pinned here to the same release tag as the Component's two images.
+  #
+  # Custom-resource definitions and webhooks. Both are the chart's defaults and
+  # are written out so the render does not depend on them: crds.install renders
+  # the six definitions as templates, so they are installed and upgraded with
+  # the release, and webhooks.enabled renders the admission webhooks and lets
+  # the operator write the webhook configuration's CA bundle.
+  #
+  # Certificates. The operator generates the certificate the adapter and the
+  # webhooks serve on, and its CA, when it starts, storing them in the Secret
+  # kedaorg-certs in its own namespace; the chart renders no certificate and
+  # no Secret, so two renders are byte-identical. cert-manager mode stays off,
+  # so cert-manager is not needed.
+  #
+  # Extras outside the control plane — the Prometheus-operator monitor and rule
+  # objects and the network policies — stay off, as the chart ships them, and
+  # are written out for the same reason as above.
+  #
+  # Namespace. The chart writes the namespace of every namespaced object it
+  # renders as the release namespace, which is the namespace the Release
+  # declares for the component through the aggrega.ai/namespace annotation, and
+  # it offers no value placing them anywhere else. So infra.namespace is
+  # honoured by requiring the two to agree: a build declaring no namespace, or
+  # one other than infra.namespace, halts at the top of the mapping, naming
+  # both, rather than placing the control plane somewhere infra.namespace does
+  # not say. The one object outside it is the chart's own choice: the
+  # RoleBinding granting the read on the aggregated-API configuration lands in
+  # kube-system, where that configuration lives.
+  valuesMapping: |
+    {{- $declared := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+    {{- if not $declared }}
+    {{- fail (printf "%q is installed through the KEDA project's chart, which places the control plane in the namespace the Release declares for the component, and the Release declares none; declare the annotation aggrega.ai/namespace: %q on %q or on its boundary in the Release, the namespace infra.namespace names" .context.instance_id .infra.namespace .context.instance_id) }}
+    {{- else if ne $declared .infra.namespace }}
+    {{- fail (printf "%q is installed through the KEDA project's chart, which places the control plane in the namespace the Release declares for the component, %q, but infra.namespace names %q; set the two to the same namespace in the Release" .context.instance_id $declared .infra.namespace) }}
+    {{- end }}
+    {{- $operatorRepo := .infra.operator_image }}
+    {{- $operatorTag := "" }}
+    {{- if contains ":" (last (splitList "/" .infra.operator_image)) }}
+      {{- $operatorTag = last (splitList ":" (last (splitList "/" .infra.operator_image))) }}
+      {{- $operatorRepo = trimSuffix (printf ":%s" $operatorTag) .infra.operator_image }}
+    {{- end }}
+    {{- $adapterRepo := .infra.metrics_adapter_image }}
+    {{- $adapterTag := "" }}
+    {{- if contains ":" (last (splitList "/" .infra.metrics_adapter_image)) }}
+      {{- $adapterTag = last (splitList ":" (last (splitList "/" .infra.metrics_adapter_image))) }}
+      {{- $adapterRepo = trimSuffix (printf ":%s" $adapterTag) .infra.metrics_adapter_image }}
+    {{- end }}
+    crds:
+      install: true
+    webhooks:
+      enabled: true
+    metricsServer:
+      enabled: true
+    certificates:
+      autoGenerated: true
+      certManager:
+        enabled: false
+    networkPolicy:
+      enabled: false
+    image:
+      keda:
+        registry: ""
+        repository: "{{ $operatorRepo }}"
+        tag: "{{ $operatorTag }}"
+      metricsApiServer:
+        registry: ""
+        repository: "{{ $adapterRepo }}"
+        tag: "{{ $adapterTag }}"
+      webhooks:
+        {{- if and .infra.overrides .infra.overrides.webhooks_image }}
+        {{- range $k, $v := .infra.overrides.webhooks_image }}
+        {{ $k }}: "{{ $v }}"
+        {{- end }}
+        {{- else }}
+        registry: ghcr.io
+        repository: kedacore/keda-admission-webhooks
+        tag: "2.20.2"
+        {{- end }}
+    prometheus:
+      operator:
+        enabled: true
+        serviceMonitor:
+          enabled: false
+        podMonitor:
+          enabled: false
+        prometheusRules:
+          enabled: false
+      metricServer:
+        serviceMonitor:
+          enabled: false
+        podMonitor:
+          enabled: false
+      webhooks:
+        serviceMonitor:
+          enabled: false
+        prometheusRules:
+          enabled: false
