@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: docker-model-runner
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    A model served by the host's own Docker Model Runner, for local
+    development via Docker Compose. The Recipe writes the model into the compose
+    file's top-level `models` element under the component's own name, with its
+    context size and runtime flags, and Compose pulls and configures it there
+    when the stack starts.
+
+    Beside it the Recipe adds one service under the same name, granted the
+    model. Compose leaves out a model no service is granted, so without it a
+    plain `docker compose up` would pull nothing. The service runs a minimal
+    image that exits at once; Compose has already pulled and configured the
+    model before it starts any container.
+
+    provides.endpoint is the address containers reach the host's runner at,
+    infra.endpoint, which defaults to Docker Desktop's
+    http://model-runner.docker.internal/engines/v1; on Docker Engine a Release
+    sets it to the address the host's runner answers containers at. Host, port
+    and protocol are read from it. The settings that size or place an
+    in-cluster server — port, engine_version, replicas, compute, gpu and
+    model_cache — are refused here by name.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/ai-model/docker-model-runner:1.0.0
+  # This Recipe reads no infra.overrides keys, and the component declares no
+  # such block.
+  #
+  # infra.endpoint is read once here, and provides read the parts below from
+  # it. It is read with optional, which keeps this Recipe's default where a
+  # Release sets none; the address is a deterministic pointer the build pipes
+  # through and never resolves.
+  #
+  # port is the one the address names, or its scheme's default port where it
+  # names none: 80 for http, 443 for https. Matching the host's trailing
+  # digits rather than splitting on the colon keeps an IPv6 literal whole.
+  # DELIBERATE NEAR-DUPLICATE of the same three locals in compose/mcp-remote and
+  # compose/a2a-remote: a local sits inside the Recipe that renders it and no
+  # catalog kind holds one for several Recipes to share, so a change to how an
+  # address is split is made in each of them together.
+  locals:
+    endpoint: '{{ optional .infra "endpoint" "http://model-runner.docker.internal/engines/v1" }}'
+    scheme: '{{ (urlParse .locals.endpoint).scheme }}'
+    hostname: '{{ (urlParse .locals.endpoint).hostname }}'
+    port: '{{ $u := urlParse .locals.endpoint }}{{ $p := regexFind ":[0-9]+$" $u.host | trimPrefix ":" }}{{ if $p }}{{ $p }}{{ else if eq $u.scheme "http" }}80{{ else }}443{{ end }}'
+  # The contract is key-for-key the one the Kubernetes realization publishes,
+  # so a consumer reads the same keys on either target. model is the reference
+  # as the Aggregate wrote it, which is the name the runner serves it under.
+  provides:
+    host: "{{ .locals.hostname }}"
+    port: "{{ .locals.port }}"
+    endpoint: "{{ .locals.endpoint }}"
+    model: "{{ .values.model }}"
+    protocol: "{{ .locals.scheme }}"
+  assertions:
+    # The settings that size or place an in-cluster server have no meaning for
+    # the host's own runner, which is sized, versioned and given its GPU by the
+    # host. Each one a Release sets halts the build naming it, rather than
+    # being accepted and ignored. Each reads the key's presence only, so a
+    # Release that sets none of them renders exactly as it would without them.
+    in_cluster_settings_refused: >-
+      {{- range $key := list "port" "engine_version" "replicas" "compute" "gpu" "model_cache" -}}
+      {{- if hasKey $.infra $key -}}
+      {{- fail (printf "infra.%s is set, but on Docker Compose the model is served by the host's own Docker Model Runner, which this compose file neither runs nor sizes; remove infra.%s, or map the component to the Kubernetes realization, helm/docker-model-runner, which runs the server in-cluster and reads it. The address of the host's runner is infra.endpoint" $key $key) -}}
+      {{- end -}}
+      {{- end -}}
+    # An address that is not an http or https URL naming a host would reach
+    # every consumer as a base URL no client can use.
+    endpoint_is_an_address: >-
+      {{- $u := urlParse .locals.endpoint -}}
+      {{- if not (and (has $u.scheme (list "http" "https")) $u.hostname) -}}
+      {{- fail "infra.endpoint is not an http or https URL naming a host: set it to the base URL of the OpenAI-compatible API of the host's Docker Model Runner as containers reach it, for example http://172.17.0.1:12434/engines/v1 on Docker Engine, or leave it out for Docker Desktop's http://model-runner.docker.internal/engines/v1" -}}
+      {{- end -}}
+  # The fragment writes two things under the component's own name, and the
+  # compose provider carries both into the assembled file.
+  #
+  # The top-level models entry is what Compose pulls and configures through the
+  # host's model runner: model is the reference, context_size the
+  # Aggregate's context_window (Compose's own spelling for it), runtime_flags the
+  # flags as the Aggregate listed them. A member the Aggregate leaves out is
+  # written nowhere, and a context_window of 0 is treated as unset, as Compose
+  # itself passes no context size for 0.
+  #
+  # The service is there because Compose leaves out every model no service is
+  # granted before it pulls anything, unless it is started with
+  # --all-resources. It is granted the model through the short-form models
+  # reference, runs `true` on busybox (the release the catalog already pins)
+  # and exits, and restart: "no" keeps it from being started again. Compose
+  # pulls and configures the models before it creates any container, so the
+  # model is ready before this service, or anything waiting on it, starts.
+  #
+  # Every string is written as a JSON string, so a quote, a colon or a leading
+  # character YAML treats specially cannot change what the line means, with
+  # U+0085 written as an escape: JSON leaves that character as it is, and YAML
+  # would read it as a line break and fold it into a space. Each $ is doubled
+  # first, because Compose substitutes $NAME and ${NAME} in every value of the
+  # file, the models element included, and reads $$ as one literal $.
+  artifacts:
+    docker-model-runner.compose-fragment.yaml: |
+      {{- $name := .context.instance_id -}}
+      models:
+        {{ $name | toJson }}:
+          model: {{ .values.model | replace "$" "$$" | toJson | replace "\u0085" "\\u0085" }}
+      {{- with .values.context_window }}
+          context_size: {{ . }}
+      {{- end }}
+      {{- with .values.runtime_flags }}
+          runtime_flags:
+      {{- range . }}
+            - {{ . | replace "$" "$$" | toJson | replace "\u0085" "\\u0085" }}
+      {{- end }}
+      {{- end }}
+      services:
+        {{ $name | toJson }}:
+          image: "busybox:1.38.0"
+          command: ["true"]
+          restart: "no"
+          models:
+            - {{ $name | toJson }}

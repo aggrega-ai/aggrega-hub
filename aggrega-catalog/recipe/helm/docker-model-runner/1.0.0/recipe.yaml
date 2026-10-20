@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: docker-model-runner
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Docker Model Runner as a self-hosted inference server on Kubernetes,
+    synthesized as a StatefulSet running the runner's own image. It serves the
+    OCI model reference the Aggregate names, the same reference the Docker
+    Compose realization hands the host's runner, so one Aggregate asks both
+    targets for the same model. A pull step running the same image puts the
+    model into a per-replica model cache before the server starts. The server
+    applies the context size and runtime flags each time it starts, and serves
+    the OpenAI-compatible API under /engines/v1 behind a ClusterIP Service. The
+    compiler never fetches the model.
+
+    This realization is synthesized because the project's own Helm chart fails
+    the maintained and complete tests: it lags the runner's releases, and it
+    exposes no setting for the context size, runtime flags, compute resources
+    or listen port. It is also published to no chart repository.
+
+    provides.host is the bare in-cluster name of the Service, with no
+    namespace, so a consumer in another namespace qualifies it itself.
+    infra.endpoint, the host runner's address on Docker Compose, is refused
+    here.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-model/docker-model-runner:1.0.0
+  # This Recipe reads no infra.overrides keys, and the component declares no
+  # such block.
+  #
+  # The Component holds no infra default, because each setting means something
+  # on this target only and the Docker Compose realization refuses it when it is
+  # set. So the defaults live here, once each, read with optional so a Release
+  # that sets a key gets exactly what it wrote, and every reader below
+  # dereferences the local rather than repeating a literal.
+  #
+  # engine_version selects the image tag, never latest; with a GPU count set
+  # the runner's CUDA build of the same release is run, which is the image
+  # variant the project publishes for NVIDIA GPUs (<tag>-cuda).
+  locals:
+    port: '{{ optional .infra "port" 12434 }}'
+    gpu_count: '{{ optional (optional .infra "gpu" dict) "count" 0 }}'
+    runtime_class: '{{ optional (optional .infra "gpu" dict) "runtime_class" "" }}'
+    image: 'docker/model-runner:{{ optional .infra "engine_version" "v1.2.8" }}{{ if ne .locals.gpu_count "0" }}-cuda{{ end }}'
+    replicas: '{{ optional .infra "replicas" 1 }}'
+    cpu: '{{ optional (optional .infra "compute" dict) "cpu" "1" }}'
+    memory: '{{ optional (optional .infra "compute" dict) "memory" "4Gi" }}'
+    cache_size: '{{ optional (optional .infra "model_cache" dict) "size" "20Gi" }}'
+    cache_class: '{{ optional (optional .infra "model_cache" dict) "class" "" }}'
+  # provides.host is the bare Service name "<rendered_name>-default"; endpoint is
+  # the OpenAI-compatible base URL an ai-agent consumer reads, under the
+  # /engines/v1 path Docker documents for OpenAI clients, single-sourced from
+  # the same host and port. model is the reference as the Aggregate wrote it,
+  # which is the name the runner serves it under.
+  provides:
+    host: "{{ .context.rendered_name }}-default"
+    port: "{{ .locals.port }}"
+    endpoint: "http://{{ .context.rendered_name }}-default:{{ .locals.port }}/engines/v1"
+    model: "{{ .values.model }}"
+    protocol: "http"
+  assertions:
+    # infra.endpoint is the address of the host's own runner, which only the
+    # Docker Compose realization reaches. Here the runner is the one this Recipe
+    # runs, and its address is the Service it publishes, so a Release setting
+    # the key halts the build naming it rather than having it ignored.
+    endpoint_refused: >-
+      {{- if hasKey .infra "endpoint" -}}
+      {{- fail "infra.endpoint is set, but on Kubernetes the model is served by the runner this realization runs in-cluster, whose address is the Service it publishes; remove infra.endpoint, which only the Docker Compose realization, compose/docker-model-runner, reads as the address of the host's own Docker Model Runner" -}}
+      {{- end -}}
+  # The runner reads three things from this Recipe, and each reaches it as data.
+  #
+  # The pull request is the JSON body {"from": <model>} the runner's
+  # /models/create takes, and the configure request the body its
+  # /engines/_configure takes — the model, its context size and its runtime
+  # flags, the request the model CLI's configure command sends, which is what
+  # Docker Compose sends for a compose file's models element. Both bodies are
+  # built as maps and written with toJson, so the model reference and every
+  # flag are JSON strings whatever they contain. The model reference also
+  # reaches the pull step on its own, to confirm the model is in the store.
+  #
+  # Each reaches its container as an environment variable, and the shell lines
+  # below name the variable inside double quotes, so the shell passes the value
+  # to curl as one argument and expands or runs nothing in it. Each $ in a value
+  # is doubled, because Kubernetes expands $(NAME) in a container's environment
+  # values and reads $$ as one $. Each value is written as a JSON string, so a
+  # quote or a backslash cannot end it early, with U+0085 written as an escape:
+  # JSON leaves that character as it is, and YAML would read it as a line break
+  # and fold it into a space.
+  #
+  # A context_window of 0 is written nowhere, as on Docker Compose, which passes
+  # no context size for 0; the runner then keeps the model's own default.
+  workload: |
+    {{- $modelsPath := "/models" -}}
+    {{- $pull := dict "from" .values.model | toJson -}}
+    {{- $configure := dict "model" .values.model -}}
+    {{- with .values.context_window }}{{ $_ := set $configure "context-size" . }}{{ end -}}
+    {{- with .values.runtime_flags }}{{ $_ := set $configure "runtime-flags" . }}{{ end -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # form: stateful gives each replica its own model-cache claim
+    # (persistentTemplate below); the pull step fills it before the server
+    # starts.
+    form: stateful
+    replicas: {{ .locals.replicas }}
+    {{- with .locals.runtime_class }}
+    runtimeClassName: "{{ . }}"
+    {{- end }}
+    initContainers:
+      # The runner's image runs as its own non-root user, and a fresh claim is
+      # not writable by it, so the first step opens the store directory to it.
+      # It is the step the project's own chart runs for the same volume, on the
+      # busybox release the catalog already pins.
+      - name: volume-permissions
+        image: "busybox:1.38.0"
+        command: ["chmod", "a+rwx", "{{ $modelsPath }}"]
+        volumeMounts:
+          - name: model-cache
+            path: "{{ $modelsPath }}"
+      # The pull runs the runner itself, the same image at the same tag as the
+      # server: the runner pulls a model only through its own API, so this step
+      # starts one in the background against the shared store, waits until it
+      # answers, asks it to pull, and stops it. A failed pull can still answer
+      # 200 once its progress stream has begun, so the step also asks the
+      # runner for the model it just pulled, which answers only when the model
+      # is in the store. That answer becomes the step's exit status, so a
+      # missing model keeps the server from starting against an empty cache.
+      # The model value is the deterministic pointer the runner resolves here;
+      # the compiler pipes the string through unresolved.
+      - name: model-pull
+        image: "{{ .locals.image }}"
+        command: ["/bin/sh"]
+        args:
+          - "-c"
+          - '/app/model-runner & serve_pid=$!; until curl -fsS -o /dev/null "http://127.0.0.1:$MODEL_RUNNER_PORT/engines/status"; do kill -0 "$serve_pid" || exit 1; sleep 1; done; curl -fsS -X POST -H "Content-Type: application/json" --data "$MODEL_PULL_REQUEST" "http://127.0.0.1:$MODEL_RUNNER_PORT/models/create" && curl -fsS -o /dev/null "http://127.0.0.1:$MODEL_RUNNER_PORT/models/$MODEL_REFERENCE"; pull_status=$?; kill "$serve_pid"; wait "$serve_pid"; exit $pull_status'
+        variables:
+          MODEL_RUNNER_PORT: "{{ .locals.port }}"
+          MODELS_PATH: "{{ $modelsPath }}"
+          MODEL_PULL_REQUEST: {{ $pull | replace "$" "$$" | toJson | replace "\u0085" "\\u0085" }}
+          MODEL_REFERENCE: {{ .values.model | replace "$" "$$" | toJson | replace "\u0085" "\\u0085" }}
+        volumeMounts:
+          - name: model-cache
+            path: "{{ $modelsPath }}"
+    containers:
+      main:
+        image: "{{ .locals.image }}"
+        # The image starts the runner on its own; it listens on TCP at the port
+        # MODEL_RUNNER_PORT names and keeps its models where MODELS_PATH points,
+        # which is the store the pull step filled.
+        variables:
+          MODEL_RUNNER_PORT: "{{ .locals.port }}"
+          MODELS_PATH: "{{ $modelsPath }}"
+          MODEL_CONFIGURE_REQUEST: {{ $configure | toJson | replace "$" "$$" | toJson | replace "\u0085" "\\u0085" }}
+        ports:
+          http: {{ .locals.port }}
+        # The runner holds a model's configuration in the serving process, so it
+        # is applied to the server after it starts, and again each time the
+        # container starts. A postStart hook runs on every start; Kubernetes
+        # reports the container started, and runs its probes, only once the
+        # hook returns; and a failing hook stops the container, which then
+        # restarts and applies it again. The hook waits, for two minutes at
+        # most, until the server answers, then sends the configure request,
+        # which also has the runner load the model ahead of the first request.
+        lifecycle:
+          postStart:
+            exec:
+              - "/bin/sh"
+              - "-c"
+              - 'i=0; until curl -fsS -o /dev/null "http://127.0.0.1:$MODEL_RUNNER_PORT/engines/status"; do i=$((i+1)); [ "$i" -lt 120 ] || exit 1; sleep 1; done; curl -fsS -o /dev/null -X POST -H "Content-Type: application/json" --data "$MODEL_CONFIGURE_REQUEST" "http://127.0.0.1:$MODEL_RUNNER_PORT/engines/_configure"'
+        # /engines/status is the path the image's own healthcheck asks, and the
+        # timings are the ones the project's own chart gives its probes.
+        health:
+          ready:
+            http: /engines/status
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          live:
+            http: /engines/status
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .locals.cpu }}"
+            memory: "{{ .locals.memory }}"
+          limits:
+            cpu: "{{ .locals.cpu }}"
+            memory: "{{ .locals.memory }}"
+    {{- if ne .locals.gpu_count "0" }}
+            "nvidia.com/gpu": "{{ .locals.gpu_count }}"
+    {{- end }}
+        volumeMounts:
+          - name: model-cache
+            path: "{{ $modelsPath }}"
+    volumes:
+      model-cache:
+        persistentTemplate:
+          size: "{{ .locals.cache_size }}"
+    {{- with .locals.cache_class }}
+          class: "{{ . }}"
+    {{- end }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .locals.port }}
+      headless:
+        type: Headless
+        ports:
+          http: {{ .locals.port }}

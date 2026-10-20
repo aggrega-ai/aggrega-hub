@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/ai-model/docker-model-runner
+  version: 1.0.0
+  description: >
+    A model served by Docker Model Runner, named by its OCI model reference
+    (`ai/smollm2`, say), behind an OpenAI-compatible API. The same reference is
+    served on both targets, so one Aggregate builds for Docker Compose and for
+    Kubernetes and asks both for the same model. The reference is a
+    deterministic pointer the runner resolves when it pulls the model; the
+    compiler never fetches it.
+
+    On Docker Compose the host's own Docker Model Runner serves it: the compose
+    file declares the model in its top-level `models` element, and Compose pulls
+    and configures it when the stack starts. That needs what no build can
+    check: Docker Compose 2.38 or later, Docker Model Runner enabled on the
+    host, and a model CLI of at least 1.0.6 for `runtime_flags` to reach the
+    engine. On Kubernetes the Docker Model Runner server runs in-cluster, pulls
+    the same reference into a per-replica model cache, and serves it behind a
+    ClusterIP Service.
+
+    Consumers read the endpoint, model, host, port and protocol over a `uses`
+    edge. Each operator setting works on the target where it means something
+    and is refused by name on the other.
+  labels:
+    component.aggrega.ai/type: server
+    component.aggrega.ai/category: ai-model
+    model.aggrega.ai/capability: generative
+    # Model API: Docker Model Runner's OpenAI-compatible API answers at the
+    # endpoint published here, under the /engines/v1 path it carries — the path
+    # Docker documents as the base URL for OpenAI clients. The runner answers
+    # the same routes under /v1 too, and serves its own model-management routes
+    # outside both.
+    model.aggrega.ai/api: openai
+    component.aggrega.ai/hosting: self-hosted
+    component.aggrega.ai/upstream-licensing: osi-approved
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  # Self-inject allowlist: the component may inject its own provides keys into
+  # the env delivery mechanism.
+  inject: [env]
+  schema:
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate. `model` is
+      # the OCI model reference exactly as a compose file's `models` element
+      # writes it (ai/smollm2, or a reference on another OCI registry); the
+      # runner pulls it, and the compiler pipes the string unresolved.
+      # `context_window` is the model's context length in tokens: the compose
+      # Recipe writes it as Compose's `context_size`, the Kubernetes Recipe sends
+      # it to the runner as its context size, and 0 or an absent value leaves
+      # the runner's own default on both.
+      $ref: "BaseComponents#/schemas/BaseModelParameter"
+      properties:
+        runtime_flags:
+          type: array
+          items: { type: string }
+          description: Raw command-line flags passed to the inference engine when the model is started, in Compose's own `runtime_flags` sense. Each flag reaches the runner as one list item and is never read by a shell. On Docker Compose they reach the engine only where the host's model CLI is at least 1.0.6; an older one drops them without saying so.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this. No key carries a default here: each one means
+      # something on one target only, so the Recipe that honours it holds its
+      # default and the other Recipe refuses it by name when a Release sets it.
+      # No Recipe of this component reads an overrides key, so it declares no
+      # overrides block.
+      endpoint:
+        type: string
+        description: Base URL of the OpenAI-compatible API of the host's Docker Model Runner, as a container on the compose network reaches it. Read by the Docker Compose realization only, which defaults it to Docker Desktop's container-facing address, http://model-runner.docker.internal/engines/v1; on Docker Engine set it to the address the host's runner answers containers at, such as http://172.17.0.1:12434/engines/v1. The build pipes the address and never resolves it. The Kubernetes realization publishes its own Service address and refuses this key.
+      port:
+        type: integer
+        min: 1024
+        max: 65535
+        description: Port the in-cluster runner listens on and its Service accepts requests on. Read by the Kubernetes realization, which defaults it to 12434; on Docker Compose the port is the host runner's own and part of infra.endpoint, so the key is refused there.
+      engine_version:
+        type: string
+        description: Docker Model Runner image tag the Kubernetes realization runs (default v1.2.8), on the server and on its model-pull step; with a GPU requested the CUDA variant of that tag is run. On Docker Compose the runner is the host's own installation, so the key is refused there.
+      replicas:
+        type: integer
+        min: 1
+        description: Number of serving replicas on Kubernetes (default 1), each with its own model cache and its own pull. On Docker Compose one host runner serves the model, so the key is refused there.
+      compute:
+        type: object
+        description: CPU and memory for the serving container on Kubernetes (defaults 1 and 4Gi), as requests and limits. On Docker Compose the host runner is sized by the host, so the key is refused there.
+        properties:
+          cpu: { type: string }
+          memory: { type: string }
+      gpu:
+        type: object
+        description: Optional GPU scheduling for the serving container on Kubernetes. When count is set, the Recipe requests GPUs as the extended resource nvidia.com/gpu and runs the runner's CUDA image; a named runtime class schedules the pod under it. Omit the whole object to serve on CPU. On Docker Compose the host runner decides its own GPU use, so the key is refused there.
+        properties:
+          count:
+            type: integer
+            min: 1
+            description: Number of GPUs requested for the serving container, delivered as the extended resource nvidia.com/gpu.
+          runtime_class:
+            type: string
+            description: Name of the RuntimeClass selecting the GPU-enabled container runtime (for example nvidia). Omit to use the cluster default runtime.
+      model_cache:
+        type: object
+        description: Per-replica model store on Kubernetes (default size 20Gi), sized for the pulled model; each serving replica gets its own claim. On Docker Compose the host runner keeps its own store, so the key is refused there.
+        properties:
+          size: { type: string }
+          class: { type: string }
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      # endpoint and model are the family contract an ai-agent consumer reads;
+      # host, port and protocol expose the serving location for a consumer
+      # composing its own address.
+      host:
+        type: string
+        required: true
+        description: >
+          Host name the runner's API is reached at: the in-cluster Service name
+          on Kubernetes, and the host part of the endpoint on Docker Compose.
+          A consumer that composes its own address dials this name; one that
+          does not reads `endpoint` instead.
+      port:
+        type: integer
+        required: true
+        description: >
+          TCP port the runner's API accepts requests on: the Service port on
+          Kubernetes, and the port of the endpoint on Docker Compose (its
+          scheme's default where the endpoint names none).
+      endpoint:
+        type: string
+        required: true
+        description: >
+          Full base URL of the OpenAI-compatible API the runner serves, with
+          the host, the port and the API path already composed. A consumer
+          hands it to a client library as its base URL.
+      model:
+        type: string
+        required: true
+        description: Name a request must ask the runner for, which is the OCI model reference as the Aggregate wrote it, on both targets.
+      protocol:
+        type: string
+        description: URL scheme to reach `host` and `port` over, for a consumer composing its own address rather than reading `endpoint`.

@@ -504,7 +504,7 @@ Three rules bind it:
 Components today: `core/gateway/litellm`, `core/gateway/kong`,
 `core/gateway/kong-enterprise`, `core/gateway/apisix`, `core/gateway/envoy-gateway`,
 `core/gateway/traefik-hub`, `core/gateway/agentgateway` and
-`core/gateway/higress` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
+`core/gateway/higress` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `docker-model-runner`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
 `openai-embedding`, `nvidia-api` and `openai-compatible` — the broker, whose
 whole contract is to be pointed at a service speaking that API, and which stays
 the handle for an endpoint the catalog does not model.
@@ -3197,9 +3197,9 @@ custom-resource schemas evolve independently of the catalog.
 
 A self-hosted inference runtime — a model server run on the cluster's own
 compute, marked `component.aggrega.ai/hosting: self-hosted` in the `ai-model`
-category (`ollama`, `vllm`, `tgi`, `tei`, `nvidia-nim`) — is deployed two
-genuinely different ways in the field, and each is a Recipe realizing the same
-component, selected per Release through the Manifest:
+category (`ollama`, `docker-model-runner`, `vllm`, `tgi`, `tei`, `nvidia-nim`) —
+is deployed two genuinely different ways in the field, and each is a Recipe
+realizing the same component, selected per Release through the Manifest:
 
 - **Direct synthesis.** The Recipe synthesizes the server itself as a `Workload`:
   a weights-pull initContainer resolves the model pointer into a per-replica
@@ -3228,7 +3228,10 @@ runtime requires. A synthesized server publishes its own ClusterIP Service and t
 weights id as the model name; a KServe realization publishes the predictor Service
 the controller creates; a KubeAI realization publishes the operator's shared proxy
 and the resource name the operator routes on. The contract is one of keys, not
-values: the consumer's wiring is unchanged across all of them.
+values: the consumer's wiring is unchanged across all of them. On Docker Compose,
+`docker-model-runner` runs no server of its own: the host's Docker Model Runner
+serves the model the compose file declares, and the same keys name that runner's
+address, which the Release can point elsewhere.
 
 Which realization to choose follows the cluster: with no serving control plane,
 synthesize directly; with KServe or KubeAI installed, emit its custom resource and
@@ -3299,6 +3302,7 @@ account reads exactly as authoritative as a right one.
 | `replicas` | **Dropped, with a warning** naming it. |
 | An attached credential | Arrives on the inject pipe and is delivered as a **literal environment value** in the emitted file, written as the credential delivered it — so the material sits in the artifact, unless the delivered value is itself a Compose variable reference such as `${DB_PASSWORD}`, which Docker Compose substitutes from the shell environment or a `.env` file when the stack starts. The target has no secret-reference primitive for a `secretKeyRef`-style pointer to resolve, so neither credential Feature that publishes only a locator — `core/referenced-secret`, `core/referenced-secret-set` — has a `compose` realization, and attaching one the Manifest leaves unmapped halts the build. |
 | `containers.<n>.lifecycle`, `containers.<n>.envFrom` | **The build halts.** The target has neither primitive, and dropping either silently would change what the Release means. |
+| A top-level `models` entry — not a Workload construct; an `artifacts:` fragment or a sourced compose file writes it, with a service's `models:` reference | **Carried as written**, in Compose's own spelling. Docker Compose 2.38 or later, with Docker Model Runner on the host, pulls and configures each model before it starts any container, and the build checks neither. **A model no service is granted is left out**: `docker compose up` drops it unless run with `--all-resources`. So a Recipe that writes a model also writes a service granted it, as `compose/docker-model-runner` does. |
 
 Two consequences for a Recipe author:
 
