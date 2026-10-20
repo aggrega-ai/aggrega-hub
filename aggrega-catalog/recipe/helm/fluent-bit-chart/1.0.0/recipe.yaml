@@ -14,23 +14,22 @@ metadata:
     container log files that node writes, a filter that enriches every record
     with the pod, namespace and label metadata it reads back from the cluster,
     and the ServiceAccount, ClusterRole and ClusterRoleBinding that filter needs
-    to do so. That cluster-scoped read grant is the reason to reach for this
-    realization — a forwarder assembled as a plain workload carries no such
-    grant, so it can neither read the node's log files nor enrich a record with
-    the workload it came from. The sink wired on the `forward_target` uses-socket
-    becomes the `forward` output, exactly as in the workload-synthesis
-    realization, so the developer-facing contract is unchanged between the two.
+    to do so — a grant a forwarder assembled as a plain workload lacks, so it can
+    neither read the node's log files nor enrich a record with the workload it
+    came from. The sink wired on the `forward_target` uses-socket becomes the
+    `forward` output, exactly as in the workload-synthesis realization.
     Reach for this realization where a chart repository is reachable at build
     time and log records are to be collected from the cluster itself; reach for
     `fluent-bit`, the workload-synthesis realization, where the build must
     complete with nothing fetched, or where a single forwarding pod with its own
     inputs is what is wanted rather than a per-node collector. The forwarder image
-    is pinned to a resolvable release tag for reproducible renders. Default chart
-    version in source.version; override via infra.source_version. provides.host is
-    the bare in-cluster Service name, carrying no namespace.
-    provides.metrics_service names that Service, for a scraper to discover every
-    node's collector behind it; metrics_endpoint stays empty, as one address
-    reaches one node per scrape. The Fluent Bit server is Apache-2.0.
+    tag is pinned. Default chart version in source.version; override via
+    infra.source_version. provides.host and provides.metrics_service name the
+    in-cluster Service, with no namespace, for a scraper to discover every node's
+    collector behind it; metrics_endpoint stays empty, as one address reaches one
+    node per scrape. That Service carries the monitoring port alone, which checks
+    no caller, so it stays inside the cluster: an `infra.overrides.service_type`
+    other than ClusterIP halts the build. The Fluent Bit server is Apache-2.0.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -93,9 +92,23 @@ spec:
     target-protocol:
       $import: TargetProtocol#/artifacts/Check
 
+  # The chart's Service carries the monitoring port alone (its extra ports are
+  # left empty here), and that port answers metrics, health, uptime and build
+  # and plugin listings to any caller, so the Service stays ClusterIP and there
+  # is nothing else to publish outside the cluster. infra.overrides.service_type
+  # set to anything but ClusterIP would otherwise be dropped without a word, so
+  # it halts here, where the fix is one value in the Release.
+  assertions:
+    service_type_accepted: >-
+      {{- $type := optional (optional .infra "overrides" dict | default dict) "service_type" "" | default "" | toString -}}
+      {{- if and $type (ne $type "ClusterIP") -}}
+      {{- fail (printf "infra.overrides.service_type is %q, but this realization's Service carries Fluent Bit's monitoring port alone, which answers metrics, health, uptime and build and plugin listings to any caller, so it stays inside the cluster as ClusterIP; leave service_type unset, or set it to ClusterIP" $type) -}}
+      {{- end -}}
+
   # This Recipe reads from infra.overrides:
   #   image        - map[string]string (image.* fields; overrides the tag pin)
-  #   service_type - string (service.type; default ClusterIP)
+  #   service_type - string (ClusterIP only; any other value halts the build,
+  #                  see the assertion above — service.type is always ClusterIP)
   #   requests     - { cpu: string, memory: string } (container resource requests)
   #   nodeSelector - map[string]string (pod scheduling)
   #   tolerations  - []object (pod scheduling)
@@ -169,14 +182,13 @@ spec:
     ## ── Monitoring endpoint ────────────────────────────────────
     ## infra.port sets both the port the HTTP monitoring server binds and the
     ## port its Service carries, so the published address and the listener move
-    ## together.
+    ## together. The Service is always ClusterIP, whatever
+    ## infra.overrides.service_type says: the monitoring port is all it carries,
+    ## and that port checks no caller, so a type exposing it would expose the
+    ## endpoint outside the cluster. The assertion above halts on any other value.
     metricsPort: {{ .infra.port }}
     service:
-      {{- if and .infra.overrides .infra.overrides.service_type }}
-      type: "{{ .infra.overrides.service_type }}"
-      {{- else }}
       type: ClusterIP
-      {{- end }}
       port: {{ .infra.port }}
 
     ## ── Resources ──────────────────────────────────────────────
