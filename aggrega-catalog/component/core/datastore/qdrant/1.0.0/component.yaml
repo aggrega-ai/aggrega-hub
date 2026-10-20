@@ -10,34 +10,47 @@ metadata:
   # different field from the licence of this catalog file itself (the SPDX header
   # above) and from the upstream-licensing class label below.
   license: Apache-2.0
+  # The realizations, in more detail than the description gives them. On
+  # Kubernetes, `qdrant` is Workload synthesis to native resources, running
+  # the official upstream image with no external chart; `qdrant-chart`
+  # renders the product's own chart, whose start-up script joins each pod to
+  # the peer group, whose ownership step takes over a pre-existing data volume
+  # before the unprivileged server starts, and whose pre-stop pause lets
+  # in-flight requests finish. On Docker Compose a Compose Recipe serves local
+  # development.
+  #
+  # The lint advisory the description names is the rule comparing a
+  # connection's credential with its target's api_key. It reads api_key and no
+  # other slot, so a scrape presenting the read-only key is reported as naming
+  # a different secret, though the server holds that key too.
   description: >
     A Qdrant vector database. Stores embedding vectors alongside their payloads
     and answers nearest-neighbour queries over them, so an application that
     retrieves reference material by similarity is wired to this component rather
     than to a general-purpose store. Collections are created through Qdrant's own
-    API at runtime; the component declares the server, not its contents.
-    Provider-agnostic: the same component is implemented by a Helm Recipe
-    (Workload synthesis to native Kubernetes resources, running the official
-    upstream image with no external chart) and a Compose Recipe (local
-    development). Exports its host, its HTTP port and its gRPC port to consumers
-    via the uses topology.
+    API at runtime; the component declares the server, not its contents. It is
+    realized on Kubernetes and, for local development, on Docker Compose, and
+    exports its host, its HTTP port and its gRPC port to consumers via the uses
+    topology.
 
     On Kubernetes there are two realizations and the Manifest chooses between
     them. `qdrant` synthesizes the server as a workload and fetches nothing, so
     it is the one to reach for where the build must complete with no chart
     repository reachable. `qdrant-chart` renders the product's own Helm chart,
-    which additionally carries the start-up script that joins each pod to the
-    peer group, a step that takes ownership of a pre-existing data volume before
-    the unprivileged server starts, and a pre-stop pause that lets in-flight
-    requests finish, so reach for it where a chart repository is reachable at
-    build time. That chart also renders an interaction check — a Pod annotated
-    as a test hook, whose script deletes and recreates a collection named
-    `test_collection` on the running server — which the chart offers no setting
-    to decline; the chart realization's own description states what it does and
-    when it runs.
+    which additionally carries its maintainers' start-up script, data-volume
+    ownership step and pre-stop pause, so reach for it where a chart repository
+    is reachable at build time. That chart also renders an interaction check —
+    a Pod annotated as a test hook, whose script deletes and recreates a
+    collection named `test_collection` on the running server — which the chart
+    offers no setting to decline; the chart realization's own description
+    states what it does and when it runs.
 
-    While the api_key slot is filled, a scrape of `metrics_endpoint` presents
-    that key on its connection's `credential` slot.
+    While api_key is filled, a scrape of `metrics_endpoint` presents on its
+    connection's `credential` the key attached to read_only_api_key, or the
+    api_key where that slot is empty. The read-only key still reads every
+    collection: it makes a scraper read-only, not metrics-only. `aggrega lint
+    --release` reports such a credential as differing from api_key, as
+    expected.
   labels:
     component.aggrega.ai/type: stateful-server
     component.aggrega.ai/category: datastore
@@ -64,8 +77,9 @@ spec:
   featuresSchema:
     # Optional API-key credential slot. Qdrant serves without authentication by
     # default; when a credential is attached here, the Recipe supplies
-    # it as the service API key and every request must present it. `required`
-    # omitted → optional, so a bare `vectors: {}` still loads, and
+    # it as the service API key and every request must present it, or for a
+    # read the read-only key below. `required` omitted → optional, so a bare
+    # `vectors: {}` still loads, and
     # with nothing attached the render is byte-identical to a Recipe carrying no
     # slot at all. Transparent (inject: [env]) so the injected value reaches the
     # Recipe on the env pipe; the selector is secret-kind-pinned but
@@ -75,7 +89,23 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [env]
-      description: "Optional service API-key credential. When attached, every request to the server must present this key; unattached, the server accepts unauthenticated requests."
+      description: "Optional service API-key credential. When attached, every request to the server must present this key, or for a read the key attached to read_only_api_key; unattached, the server accepts unauthenticated requests."
+    # Optional read-only key, Qdrant's own read_only_api_key setting, delivered
+    # to the server beside api_key. The server answers a request presenting it
+    # with read access to everything it holds — every collection, its metrics
+    # included — and refuses every write made with it, so it is the key a
+    # scrape of metrics_endpoint presents. It narrows a scraper from read-write
+    # to read-only, never to the metrics alone. Filled without api_key it would
+    # be the server's only key, and no request could then write — not even the
+    # one creating a collection — so the build halts on that combination (see
+    # assertions below). Same shape as api_key: secret-kind selector, sensitive,
+    # transparent on the env pipe, and with nothing attached every render is
+    # byte-identical to a Recipe carrying no such slot.
+    read_only_api_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Optional read-only API key, filled beside api_key. When attached, the server also accepts this key and answers it with read access to every collection and to its metrics, refusing any write made with it; a scrape of metrics_endpoint presents it in place of api_key, and `aggrega lint --release` then reports that scrape's credential as differing from api_key, which is expected, since the server holds both keys. Filled without api_key, the build halts."
   schema:
     values:
       # Developer Intent — filled by the Developer in the Aggregate. Every knob
@@ -170,15 +200,30 @@ spec:
       # The address a Prometheus server scrapes the store's own metrics at:
       # /metrics on the REST port, where Qdrant serves them on every Recipe.
       # The key attached to the api_key slot guards that route as it guards the
-      # rest of the REST API, and the server takes it as a bearer token as well
-      # as in its own api-key header, so while the slot is filled a scrape
-      # presents the key on its connection's credential slot; unattached, a
-      # scrape presents nothing. Every Recipe publishes it spelled out in full.
+      # rest of the REST API, and the server takes a key as a bearer token as
+      # well as in its own api-key header. The route asks only for read access,
+      # so the key attached to read_only_api_key opens it too. While api_key is
+      # filled a scrape therefore presents a key on its connection's credential
+      # slot: the read-only key where read_only_api_key is filled, which reads
+      # every collection but writes none, and the api_key otherwise; unattached,
+      # a scrape presents nothing. Every Recipe publishes it spelled out in full.
       metrics_endpoint:
         type: string
         description: >
           The full address Prometheus scrapes this component's metrics at —
           scheme, host, port and path, `http://<host>:<port>/metrics`, on the
           REST port. While the api_key slot is filled the server answers it
-          only to that key, so a scrape presents the key on its connection's
-          `credential` slot.
+          only to a key it holds, so a scrape presents one on its connection's
+          `credential` slot: the read-only key where read_only_api_key is
+          filled, and the api_key otherwise.
+  # Qdrant turns authentication on as soon as any key is set, and takes a
+  # read-only key set alone as its only key. Every write must then present a key
+  # that can write, and none exists, so not even the request creating a
+  # collection succeeds, and this store's collections are created through that
+  # API. The build halts on that combination whichever Recipe binds, naming both
+  # slots, where the fix is one attachment.
+  assertions:
+    read_only_api_key_needs_api_key: >-
+      {{- if and (hasKey (default dict .features) "read_only_api_key") (not (hasKey (default dict .features) "api_key")) -}}
+      {{- fail (printf "the Qdrant vector store %q has its read_only_api_key slot filled and its api_key slot empty: the server would take the read-only key as its only key and refuse every write, the one creating a collection included; attach the read-write key to api_key as well, or detach read_only_api_key" .metadata.instance_id) -}}
+      {{- end -}}
