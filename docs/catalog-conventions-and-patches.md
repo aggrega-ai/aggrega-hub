@@ -3056,7 +3056,7 @@ strings, and checks none of what follows.
   `postgresql://<user>:<password>@<host>:<port>/<database>`, the connection's
   `credential` its password: on Kubernetes the reference
   `$(AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL)`, which expands from the
-  Secret-read entry the helm provider lists ahead of the plain variables, and
+  Secret-read entry written ahead of the plain variables, and
   on compose the credential as delivered, a Compose variable reference staying
   one. The password is written unencoded, because Langflow percent-encodes it
   itself, and a connection with no `credential` gets the string without one. A
@@ -3083,7 +3083,7 @@ strings, and checks none of what follows.
   Recipes write the address the tool publishes into that node's server
   configuration as its `url`, keep every other part of the definition, and
   write it back as JSON with its keys sorted; with no `tools` connection the
-  definition is carried as authored. Both Recipes import that rewrite from
+  definition is carried as authored. Every Recipe imports that rewrite from
   one ArtifactLibrary, `LangflowFlow`, whose bundle `FlowFile` emits the flow
   as the helm ConfigMap or the compose config. The Component's assertion
   halts the build on a connection with no flow or one no node names, and on
@@ -3099,7 +3099,7 @@ strings, and checks none of what follows.
   is `Bearer <credential>`, it is `AGGREGA_TOOL_<ALIAS>_AUTHORIZATION`,
   holding `Bearer` and the credential by reference: on Kubernetes `Bearer
   $(AGGREGA_TOOL_<ALIAS>_CREDENTIAL)`, which expands from the Secret-read
-  entry the helm provider lists ahead of the plain variables, and on compose
+  entry written ahead of the plain variables, and on compose
   the credential as delivered, a Compose variable reference staying one. A
   credential for a tool publishing no header halts the build. Langflow also
   refuses an MCP server or a vector store whose host resolves to a private

@@ -1,0 +1,399 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: langflow-chart
+  version: 1.0.0
+  description: >
+    The Langflow visual flow-builder on Kubernetes via the project's own
+    langflow-ide Helm chart, served from its HTTPS chart repository: one
+    StatefulSet pod serving the editor and the flows' endpoint, with a
+    persistent volume holding the flow database and its encryption key. The
+    chart was checked for being official, complete and maintained against the
+    chart itself; its separate front-end pod and its bundled PostgreSQL stay
+    off, and the image is the one the Release names in `infra.image`, never
+    the chart's floating default, so the build halts until it is set.
+
+    A supplied flow definition is mounted as the directory Langflow loads at
+    each start. Signing in is required, as an administrator seeded from
+    values.admin_user and the password attached to admin_password;
+    values.require_authentication false leaves the editor open, and doing
+    neither halts the build.
+
+    The `model`, `tools` and `vector_store` connections arrive as the
+    workload-synthesis realization delivers them, every credential through a
+    secretKeyRef, and LANGFLOW_SSRF_ALLOWED_HOSTS admits the wired hosts. The
+    chart's Service carries no port for Langflow's own metrics, so
+    values.metrics_enabled true halts the build on this Recipe.
+
+    Reach for this realization where a chart repository is reachable at build
+    time; reach for `langflow`, the workload-synthesis realization, where the
+    build must complete with nothing fetched or the metrics are wanted.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/langflow:1.0.0
+
+  # The chart is published by Langflow's maintainers (contact@langflow.org) in
+  # the chart repository Langflow's own guide to running it on Kubernetes
+  # names, under the MIT licence, and the version pinned below is the latest
+  # it has published. Of the repository's two charts, langflow-ide serves the
+  # editor and the flows' endpoint, which is this Component's shape, and
+  # langflow-runtime serves flows with no editor. It carries what this
+  # Component exposes — the image, a list of environment entries that takes
+  # references to Secrets, the volumes and mounts of the platform's pod, and a
+  # persistent volume for its database — save a Service port for Langflow's
+  # own metrics, which the halt below refuses by name. Those were the three
+  # checks a chart is held to — official, complete, maintained — before a
+  # Recipe points at it. Every chart version the repository publishes declares
+  # the Langflow version it packages as `latest`, a floating tag, which is why
+  # the image is never left to it.
+  source:
+    kind: helm-https-chart
+    url: https://langflow-ai.github.io/langflow-helm-charts
+    chart: langflow-ide
+    # Default chart version. Override via infra.source_version; a version
+    # other than this one may need a different value mapping.
+    version: "{{ optional .infra `source_version` \"0.1.2\" }}"
+
+  # The values the flow's ConfigMap shares with the LangflowFlow bundle
+  # imported below, each with its home in the bundle, which stops the build
+  # naming the local when one is missing or differs from its own; the value
+  # mapping reads them here, because it cannot read the bundle.
+  locals:
+    flow_file_delivery: config_map
+    flow_file_config_map_suffix: "-flow"
+
+  # The Component publishes the metrics address alone, and this realization
+  # publishes it empty: the halt below refuses the value that would turn the
+  # metrics on.
+  provides:
+    metrics_endpoint: ""
+
+  # Four halts, each naming what to change in the document a reader wrote.
+  #
+  # The image. The catalog names no Langflow image, and this chart's own
+  # default is a floating tag, so a Release that names none would run
+  # whatever that tag points at on the day the pod starts. The chart composes
+  # the image from a repository and a tag, so the image the Release names
+  # carries a tag or a digest, which the chart writes back exactly as named.
+  #
+  # The editor's sign-in, exactly as the workload-synthesis realization holds
+  # it: with the sign-in bypass off the seeded administrator account is the
+  # only way in and its password comes from the attached credential, so
+  # require_authentication at its default with nothing attached is refused.
+  #
+  # The metrics. Langflow serves its own metrics on a listener of its own,
+  # port 9090, and this chart's Service carries the editor's port alone, with
+  # no setting that adds another, so an address published for them would
+  # reach nothing.
+  assertions:
+    image_is_named: >-
+      {{- $image := optional .infra "image" "" -}}
+      {{- if not $image -}}
+      {{- fail (printf "the Langflow platform %q names no container image: the catalog pins none, so set infra.image in the Release to the Langflow image to run, with its tag or digest" .metadata.instance_id) -}}
+      {{- else if not (contains ":" (last (splitList "/" $image))) -}}
+      {{- fail (printf "the Langflow platform %q names the image %q with no tag or digest, and the chart this Recipe renders would run it at its own floating default tag: write the tag or the digest into infra.image" .metadata.instance_id $image) -}}
+      {{- end -}}
+    admin_credential_prerequisite: >-
+      {{- if and .values.require_authentication (not (hasKey (default dict .features) "admin_password")) -}}
+      {{- fail "the Langflow editor needs an administrator password to sign in with and none is attached: attach a secret credential to the admin_password slot to set that password, or set values.require_authentication to false to run the editor with no sign-in required at all" -}}
+      {{- end -}}
+    metrics_need_a_service_port: >-
+      {{- if optional .values "metrics_enabled" false -}}
+      {{- fail (printf "the Langflow platform %q has values.metrics_enabled true, but the chart this Recipe renders gives its Service no port for Langflow's own metrics listener, so the published address would reach nothing: set metrics_enabled to false, or bind the workload-synthesis Recipe langflow, which serves them on port 9090" .metadata.instance_id) -}}
+      {{- end -}}
+
+  # The chart always renders a Service under the rendered name for its
+  # separate front-end pod, which this realization switches off below, so that
+  # Service would select no pod; it is left out. The platform is served by the
+  # chart's other Service, "<rendered_name>-backend".
+  omits:
+    - kind: Service
+      name: "{{ .context.rendered_name }}"
+
+  # When a flow definition is supplied, the LangflowFlow bundle emits a
+  # ConfigMap carrying it, which the value mapping below mounts as the
+  # directory the platform loads at each start; with no definition no
+  # ConfigMap is rendered. The bundle is the one the other Langflow Recipes
+  # import, so every target writes the flow with one text: each `tools`
+  # connection's address is written into the MCP Tools node named for its
+  # alias, with, for a connection carrying a credential, the name of the
+  # variable the value mapping delivers for it under the header the tool
+  # publishes. The component's assertion has already held the flow and the
+  # connections to each other.
+  artifacts:
+    langflow-flow:
+      $import: LangflowFlow#/artifacts/FlowFile
+
+  # This Recipe reads no infra.overrides keys; the Component declares none.
+  #
+  # Under this configuration the chart renders a StatefulSet running the
+  # platform, with a claim template for its database volume; a ClusterIP
+  # Service, "<rendered_name>-backend", on the editor's port 7860; and the
+  # ServiceAccount the pod runs under. Its front-end pod is off, because the
+  # Langflow image serves the editor itself once the chart's backend-only
+  # switch is off, which is the one-process shape this Component describes;
+  # its Ingress, its bundled PostgreSQL and its secret-store mount are left
+  # off, because the Component describes none of them. Its StatefulSet names
+  # a governing Service the chart does not render, which a pod running as one
+  # replica does not need. The chart sets no namespace on anything it
+  # renders, and the helm provider places each object in the namespace the
+  # Release declares.
+  #
+  # The chart's pod runs with a read-only root filesystem, so the chart's own
+  # writable volumes are kept as it ships them: scratch directories at /tmp and
+  # /app/db, its flows directory, and a volume at /app/data that shares its
+  # name with the database claim. It keeps its database at /data, on the
+  # claim, as sqlite:////data/langflow.db. The value mapping
+  # points the platform's config directory at /data too, so the encryption
+  # key the platform generates on its first start is kept on the claim beside
+  # the flows authored in the editor; the workload-synthesis realization keeps
+  # both on its volume at /app/langflow-data. The chart's own variables for
+  # the alembic log on the scratch database directory, the port and not
+  # re-seeding the starter projects at each start are kept.
+  #
+  # The editor's sign-in. The chart writes the administrator's password, and
+  # a secret key it generates on every render, as literal values whenever its
+  # own sign-in setting is used, so that setting is left unset and the
+  # platform's variables are written into the chart's list of environment
+  # entries instead: the bypass off, the account name and, by a secretKeyRef
+  # to the Secret the admin_password slot names, its password; or the bypass
+  # on and neither.
+  #
+  # The model, tool and store connections are delivered under the names, and
+  # in the forms, the workload-synthesis realization delivers them, and its
+  # comments say what each one does: OPENAI_BASE_URL and OPENAI_API_KEY;
+  # AGGREGA_VECTOR_STORE_<ALIAS>_URL, _CREDENTIAL and, for a store publishing
+  # a database and a user, _CONNECTION_STRING; AGGREGA_TOOL_<ALIAS>_CREDENTIAL
+  # and, under an Authorization header, AGGREGA_TOOL_<ALIAS>_AUTHORIZATION,
+  # each named in LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT; and
+  # LANGFLOW_SSRF_ALLOWED_HOSTS. Every credential is a secretKeyRef to the
+  # Secret its slot's realization names, with that realization's key, and
+  # each is written ahead of the plain variables, because a variable reading
+  # another as $(NAME) is expanded only from one written before it. An
+  # endpoint attachment on a tools connection, and a credential for a tool
+  # publishing no header, halt the build as they do there.
+  #
+  # The probes are the chart's: readiness and liveness both on /health, with
+  # the timing the workload-synthesis realization also takes from it; that
+  # realization asks /health_check for readiness instead, which waits for the
+  # database. The resource requests are the chart's own, half a core and 1Gi.
+  #
+  # DELIBERATE NEAR-DUPLICATE: the variables and their names repeat the
+  # workload-synthesis realization's, because that realization writes them as a
+  # synthesized workload's variables and attachments and this one as a chart's
+  # values, and no catalog kind lets one template feed both. A variable added to
+  # one is added to the other.
+  valuesMapping: |
+    {{- $flowsPath := "/app/flows" }}
+    {{- $dataPath := "/data" }}
+    {{- $features := default dict .features }}
+    {{- $image := optional .infra "image" "" }}
+    {{- $tag := last (splitList ":" (last (splitList "/" $image))) }}
+    {{- $repository := trimSuffix (printf ":%s" $tag) $image }}
+    {{- $requireAuth := .values.require_authentication }}
+    {{- $adminCredential := and $requireAuth (hasKey $features "admin_password") }}
+    {{- /* The credentials, as name, Secret and key, in the order they are written. */}}
+    {{- $secretRefs := list }}
+    {{- /* The aliases of the `tools` connections whose credential is presented under Authorization. */}}
+    {{- $toolAuthorizations := list }}
+    {{- /* The name of the variable the flow's header carries for each tool credential, in alias order. */}}
+    {{- $toolVariables := list }}
+    {{- /* The address each `tools` and `vector_store` connection is delivered at, by alias. */}}
+    {{- $addresses := dict }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- $edgeFeatures := default dict $edge.features }}
+    {{- if and (eq $edge.socket "model") (hasKey $edgeFeatures "credential") }}
+    {{- $secretRefs = append $secretRefs (list "OPENAI_API_KEY" $edgeFeatures.credential.provides.name $edgeFeatures.credential.provides.key) }}
+    {{- end }}
+    {{- end }}
+    {{- if $adminCredential }}
+    {{- $secretRefs = append $secretRefs (list "LANGFLOW_SUPERUSER_PASSWORD" .features.admin_password.provides.name .features.admin_password.provides.key) }}
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- $edgeFeatures := default dict $edge.features }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- if eq $edge.socket "vector_store" }}
+    {{- $url := optional $edge.provides "endpoint" "" }}
+    {{- if not $url }}
+    {{- $url = printf "%v://%v:%v" $edge.provides.protocol $edge.provides.host $edge.provides.port }}
+    {{- end }}
+    {{- $_ := set $addresses $alias $url }}
+    {{- if hasKey $edgeFeatures "credential" }}
+    {{- $secretRefs = append $secretRefs (list (printf "AGGREGA_VECTOR_STORE_%s_CREDENTIAL" $name) $edgeFeatures.credential.provides.name $edgeFeatures.credential.provides.key) }}
+    {{- end }}
+    {{- end }}
+    {{- if eq $edge.socket "tools" }}
+    {{- if hasKey $edgeFeatures "endpoint" }}
+    {{- fail (printf "the tools connection %s of the Langflow platform %q carries an endpoint attachment, a whole address carrying its key: Langflow reads an MCP server's address only from the flow file it loads, so the address and its key would be written into that file as a literal; remove the attachment and reach the tool at the address it publishes, with its key on the connection's credential slot" $alias $.context.instance_id) }}
+    {{- end }}
+    {{- $_ := set $addresses $alias $edge.provides.endpoint }}
+    {{- if hasKey $edgeFeatures "credential" }}
+    {{- $header := optional $edge.provides "credential_header" "" }}
+    {{- if not $header }}
+    {{- fail (printf "the tools connection %s of the Langflow platform %q carries a credential, but the tool it reaches publishes no credential_header to present it under, as a tool behind a bridge, which checks no caller's credential, does not: remove the credential from the connection" $alias $.context.instance_id) }}
+    {{- end }}
+    {{- if eq (lower $header) "authorization" }}
+    {{- $toolAuthorizations = append $toolAuthorizations $alias }}
+    {{- $toolVariables = append $toolVariables (printf "AGGREGA_TOOL_%s_AUTHORIZATION" $name) }}
+    {{- else }}
+    {{- $toolVariables = append $toolVariables (printf "AGGREGA_TOOL_%s_CREDENTIAL" $name) }}
+    {{- end }}
+    {{- $secretRefs = append $secretRefs (list (printf "AGGREGA_TOOL_%s_CREDENTIAL" $name) $edgeFeatures.credential.provides.name $edgeFeatures.credential.provides.key) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- /* The host of every delivered address, once each, as Langflow's private-address guard compares it. */}}
+    {{- $allowedHosts := list }}
+    {{- range $alias, $url := $addresses }}
+    {{- $host := lower (urlParse $url).hostname }}
+    {{- if and $host (not (has $host $allowedHosts)) }}
+    {{- $allowedHosts = append $allowedHosts $host }}
+    {{- end }}
+    {{- end }}
+
+    ## ── Pin the chart's resource names to the rendered name ────
+    ## The chart names its StatefulSet and ServiceAccount by this key and its
+    ## two Services by it, the platform's with a "-backend" suffix.
+    fullnameOverride: "{{ .context.rendered_name }}"
+
+    langflow:
+      ## The separate front-end pod is off: with the backend-only switch off
+      ## below, the platform's own image serves the editor itself.
+      frontend:
+        enabled: false
+      backend:
+        replicaCount: 1
+        backendOnly: false
+        numWorkers: 1
+        ## ── The image the Release names ────────────────────────
+        ## Split into the repository and the tag the chart composes, the tag
+        ## being what follows the last colon of the last path segment, so a
+        ## digest is written back exactly as named.
+        image:
+          repository: "{{ $repository }}"
+          tag: "{{ $tag }}"
+          imagePullPolicy: IfNotPresent
+        service:
+          type: ClusterIP
+          port: 7860
+        ## ── The database volume ────────────────────────────────
+        ## The chart's claim template, sized from infra.storage.size; the
+        ## storage-class setting is the chart's own spelling of "the cluster's
+        ## default class", so no StorageClass is rendered.
+        sqlite:
+          enabled: true
+          volume:
+            size: "{{ .infra.storage.size }}"
+            existingStorageClassName: "default"
+        externalDatabase:
+          enabled: false
+        ## ── The platform's variables ───────────────────────────
+        env:
+        {{- range $ref := $secretRefs }}
+          - name: {{ index $ref 0 }}
+            valueFrom:
+              secretKeyRef:
+                name: "{{ index $ref 1 }}"
+                key: "{{ index $ref 2 }}"
+        {{- end }}
+          - name: LANGFLOW_PORT
+            value: "7860"
+          - name: LANGFLOW_ALEMBIC_LOG_FILE
+            value: "/app/db/alembic.log"
+          - name: LANGFLOW_UPDATE_STARTER_PROJECTS
+            value: "false"
+          - name: LANGFLOW_CONFIG_DIR
+            value: "{{ $dataPath }}"
+        {{- if $requireAuth }}
+          - name: LANGFLOW_AUTO_LOGIN
+            value: "false"
+          ## Quoted because a login name is free text.
+          - name: LANGFLOW_SUPERUSER
+            value: "{{ .values.admin_user }}"
+        {{- else }}
+          - name: LANGFLOW_AUTO_LOGIN
+            value: "true"
+        {{- end }}
+        {{- range $alias, $edge := .context.uses }}
+        {{- if eq $edge.socket "model" }}
+          - name: OPENAI_BASE_URL
+            value: "{{ $edge.provides.endpoint }}"
+        {{- end }}
+        {{- end }}
+        {{- if .values.flow_definition }}
+          - name: LANGFLOW_LOAD_FLOWS_PATH
+            value: "{{ $flowsPath }}"
+        {{- end }}
+        {{- range $alias, $edge := .context.uses }}
+        {{- if eq $edge.socket "vector_store" }}
+        {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+          - name: AGGREGA_VECTOR_STORE_{{ $name }}_URL
+            value: "{{ index $addresses $alias }}"
+        {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") }}
+        {{- $password := "" }}
+        {{- if hasKey (default dict $edge.features) "credential" }}
+        {{- $password = printf ":$(AGGREGA_VECTOR_STORE_%s_CREDENTIAL)" $name }}
+        {{- end }}
+          - name: AGGREGA_VECTOR_STORE_{{ $name }}_CONNECTION_STRING
+            value: "postgresql://{{ $edge.provides.user }}{{ $password }}@{{ $edge.provides.host }}:{{ $edge.provides.port }}/{{ $edge.provides.database }}"
+        {{- end }}
+        {{- end }}
+        {{- end }}
+        {{- range $alias := $toolAuthorizations }}
+        {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+          - name: AGGREGA_TOOL_{{ $name }}_AUTHORIZATION
+            value: "Bearer $(AGGREGA_TOOL_{{ $name }}_CREDENTIAL)"
+        {{- end }}
+        {{- with $toolVariables }}
+          - name: LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT
+            value: "{{ join "," . }}"
+        {{- end }}
+        {{- with $allowedHosts }}
+          - name: LANGFLOW_SSRF_ALLOWED_HOSTS
+            value: "{{ join "," . }}"
+        {{- end }}
+        ## ── The pod's volumes ──────────────────────────────────
+        ## The chart's own volumes, which the read-only root filesystem needs,
+        ## with the flows directory carrying the supplied flow where one is
+        ## supplied and left as the chart's empty directory otherwise.
+        volumes:
+        {{- if .values.flow_definition }}
+          - name: flows
+            configMap:
+              name: "{{ .context.rendered_name }}{{ .locals.flow_file_config_map_suffix }}"
+        {{- else }}
+          - name: flows
+            emptyDir: {}
+        {{- end }}
+          - name: tmp
+            emptyDir: {}
+          - name: data
+            emptyDir: {}
+          - name: db
+            emptyDir: {}
+        volumeMounts:
+          - name: flows
+            mountPath: "{{ $flowsPath }}"
+            readOnly: {{ if .values.flow_definition }}true{{ else }}false{{ end }}
+          - name: tmp
+            mountPath: /tmp
+            readOnly: false
+          - name: data
+            mountPath: /app/data
+            readOnly: false
+          - name: db
+            mountPath: /app/db
+            readOnly: false
+
+    postgresql:
+      enabled: false
+    ingress:
+      enabled: false
+    secretProvider:
+      enabled: false
