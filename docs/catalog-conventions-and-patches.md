@@ -3228,7 +3228,11 @@ runtime requires. A synthesized server publishes its own ClusterIP Service and t
 weights id as the model name; a KServe realization publishes the predictor Service
 the controller creates; a KubeAI realization publishes the operator's shared proxy
 and the resource name the operator routes on. The contract is one of keys, not
-values: the consumer's wiring is unchanged across all of them. On Docker Compose,
+values: the consumer's wiring is unchanged across all of them. Every runtime
+listed above also has a Docker Compose Recipe publishing the same keys. `ollama`,
+`vllm`, `tgi`, `tei` and `nvidia-nim` synthesize their server on the compose
+network, and a GPU count the Release sets is reserved there as that many NVIDIA
+GPUs on the serving service — which `nvidia-nim` always reserves, at least one.
 `docker-model-runner` runs no server of its own: the host's Docker Model Runner
 serves the model the compose file declares, and the same keys name that runner's
 address, which the Release can point elsewhere.
@@ -3295,7 +3299,7 @@ account reads exactly as authoritative as a right one.
 | `volumes.<n>.configmap`, mounted by a `volumeMounts` entry | **Realized.** The source becomes a compose `config` carrying the content, delivered as **one file at the mount path**. The mount path is emitted verbatim, so it names a *file*. The content is **interpolated**: Docker Compose substitutes a variable reference, `$NAME` or `${NAME}`, inside it as in every other value of the file, an unset one by an empty string, and reads `$$` as one literal `$`. The content an `artifacts:` fragment declares is written as the Recipe rendered it, with nothing escaped, so a Recipe carrying content that must reach the container as authored — a definition an Aggregate supplies verbatim, say — doubles every `$` in it with `replace "$" "$$"`, and leaves single only a reference it means Compose to substitute. |
 | Several named files mounted as a **directory** | **Not expressible.** One config is one file, and the target performs no key expansion: pointing the mount at a directory path writes a single file at that path. A value shaped as a map of filename to content — bootstrap scripts, a drop-in directory — has no `compose` realization. |
 | `volumes.<n>.persistent` | The volume is **created and named**; the declared `size` reaches no emitted byte, and nothing reports it. The target has no volume-size concept. |
-| `containers.<n>.resources` | **Realized** as `deploy.resources` — `cpu` as fractional cores, `memory` as an exact byte count. An operator's sizing is honored here, not dropped. |
+| `containers.<n>.resources` | **Realized** as `deploy.resources` — `cpu` as fractional cores, `memory` as an exact byte count, and an `nvidia.com/gpu` count as a reservation of that many NVIDIA GPUs, which the Docker host must be able to hand to containers. An operator's sizing is honored here, not dropped. Every other extended resource key is dropped, with a warning naming it. |
 | `containers.<n>.health` | **One healthcheck per service.** Of the probes a container declares, `live` is translated, else `ready`, else `startup`, and a warning names the ones dropped. The check runs **inside the image**: an `http` probe becomes `curl -f` against the port whose name sorts first and a `tcp` probe becomes `nc -z`, both through the image's shell, while an `exec` probe runs its command directly. A `depends_on` entry derived from a `uses` edge has `service_started` semantics, so it orders start-up and does not wait for the target to report healthy. |
 | `initContainers` | **Realized** as a companion service the main service waits on, through `depends_on` with `service_completed_successfully`. |
 | `services.<n>` | A `NodePort` or `LoadBalancer` entry publishes its ports on every host interface, and a `Loopback` entry on the host's loopback address, 127.0.0.1, only. A `ClusterIP` or `Headless` entry publishes nothing, so a port an operator sets reaches no emitted byte. |

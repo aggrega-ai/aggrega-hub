@@ -1,0 +1,185 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: nvidia-nim
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    NVIDIA Inference Microservice as a self-hosted, GPU-native inference server
+    on a single Docker host via Docker Compose, synthesized from the Workload
+    kind. The NIM container resolves the model profile into a named model-cache
+    volume at start and serves the OpenAI-compatible API on the compose network;
+    the compiler never fetches the profile.
+
+    The image is infra.image, which the Release supplies: the catalog names no
+    NIM image, since NIM images are distributed under NVIDIA's own terms. Docker
+    pulls it with the host's own registry login, so where the image needs
+    credentials, log the host in to nvcr.io first; infra.image_pull_secret names
+    a Kubernetes Secret, and a Release setting it here halts the build.
+
+    An attached ngc_api_key arrives on the inject pipe and is rendered as the
+    NGC_API_KEY variable, written into the file as delivered: attach a Compose
+    variable reference such as ${NGC_API_KEY} to keep the key out of it.
+    Unattached, no such variable is emitted.
+
+    The service always reserves infra.gpu.count NVIDIA GPUs, at least one,
+    which the host must hand to containers through the NVIDIA Container Toolkit.
+    The replica count and the GPU runtime class are reported as unsupported-field
+    warnings, and the service declares no healthcheck, because NVIDIA does not
+    document a health client inside the image. provides.host is the compose service
+    name; provides.metrics_endpoint is always set, since compose runs one
+    instance.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/ai-model/nvidia-nim:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # No healthcheck is declared. A compose service carries one healthcheck, and
+  # it runs inside the image; NVIDIA documents the health endpoints,
+  # /v1/health/ready and /v1/health/live, as checked from outside the container,
+  # and documents no HTTP client, socket tool or health command the image
+  # carries. A check whose tool is missing would report the server unhealthy
+  # for ever while every build stayed green, so none is authored.
+  #
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences —
+  # provides.port, provides.endpoint and provides.metrics_endpoint here, and
+  # below the server's own listen port, the container port and the service
+  # entry; the literal is never repeated. The contract is key-for-key the one the
+  # Kubernetes realization publishes, so a consumer reads the same keys on
+  # either target.
+  #
+  # host is the name the compose provider gives the synthesized service, which is
+  # the component instance's own name, so a consumer on the same compose network
+  # resolves it directly. host, endpoint and metrics_endpoint spell it out three
+  # times on purpose: a provides entry cannot read another provides entry, so
+  # there is no home any of them could dereference instead — the repetition is
+  # forced, not a choice, and the three must be edited together.
+  #
+  # metrics_endpoint is where the server serves its Prometheus metrics:
+  # /v1/metrics on the serving port, as NVIDIA documents for its LLM images.
+  # Compose runs one instance whatever the replica count says, so the one
+  # address reaches all of it, and the discovery keys — the service, its port
+  # name and the path — are published empty: there is nothing on this target to
+  # discover.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}/v1"
+    model: "{{ .values.model }}"
+    protocol: "http"
+    metrics_endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}/v1/metrics"
+    metrics_service: ""
+    metrics_service_port: ""
+    metrics_path: ""
+  assertions:
+    # The image-pull Secret is a Kubernetes object the pod names; a compose
+    # host pulls with its own registry login, which no field of the compose
+    # file carries. The key's presence alone halts, so a Release that does not
+    # set it renders exactly as it would without this check.
+    image_pull_secret_refused: >-
+      {{- if hasKey .infra "image_pull_secret" -}}
+      {{- fail "infra.image_pull_secret is set, but it names a Kubernetes image-pull Secret, and on Docker Compose the host pulls the NIM image with its own registry login rather than with a Secret: remove infra.image_pull_secret and log the Docker host in to the registry instead (for nvcr.io, docker login nvcr.io), or map the component to the Kubernetes realization, helm/nvidia-nim, which reads it" -}}
+      {{- end -}}
+  # Synthesized-mode Workload: the image, the environment, the model-cache
+  # volume, the GPU reservation and the service entry are translated from the
+  # Workload kind by the compose provider. NIM resolves its model profile
+  # itself at start, so there is no separate weights-pull step.
+  #
+  # When the optional ngc_api_key credential slot is attached its value arrives
+  # on the inject pipe, under the key the attachment publishes — the attachment's
+  # own values.key, which is "value" for an attachment the Release alone makes —
+  # and is rendered as NGC_API_KEY, the variable NIM reads its key from.
+  # Unattached, no such variable is emitted, and the container starts without
+  # it; a profile that needs the key then fails when the container starts.
+  #
+  # The GPU count is honoured here as on Kubernetes: the compose provider writes
+  # it as a reservation of that many NVIDIA GPUs on the serving service. Compose
+  # is single-host, so two operator settings the Kubernetes realization honours
+  # cannot be honoured here: the replica count and the GPU runtime class. Each
+  # is authored all the same, so the build reports it as an unsupported-field
+  # warning naming the setting rather than dropping it in silence.
+  workload: |
+    {{- $cachePath := "/opt/nim/.cache" -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    # The replica count is authored even though compose serves one instance: the
+    # setting is a real operator knob, and authoring it is what turns a value this
+    # target cannot honour into a named warning instead of a silent loss.
+    replicas: {{ .infra.replicas }}
+    # The runtime class here and the GPU count further down are authored exactly
+    # as the Kubernetes realization authors them. The compose target reserves the
+    # GPU count as that many NVIDIA GPUs; the runtime class has no single-host
+    # compose analog, and the target reports it as an unsupported-field warning
+    # naming the setting.
+    {{- with (default dict .infra.gpu).runtime_class }}
+    runtimeClassName: "{{ . }}"
+    {{- end }}
+    containers:
+      main:
+        # The serving image is operator-supplied and must be the NIM image for
+        # the model named in .values.model, which the container resolves at
+        # start. The compiler pipes both strings unresolved (AOT).
+        image: "{{ .infra.image }}"
+        # $cachePath is the single authored home for the model cache: NIM reads
+        # NIM_CACHE_PATH, and the volume mount below puts the named volume
+        # there. NIM_SERVER_PORT is the port the API server listens on, which is
+        # 8000 unless the image is told otherwise; it carries the port every
+        # other reader of .infra.port already agrees on, because a consumer on
+        # the compose network dials the container port directly. NIM serves its
+        # health endpoints on the same port unless told otherwise, and this
+        # Recipe tells it nothing.
+        variables:
+          NIM_CACHE_PATH: "{{ $cachePath }}"
+          NIM_SERVER_PORT: "{{ .infra.port }}"
+    {{- if hasKey (default dict .features) "ngc_api_key" }}
+          NGC_API_KEY: "{{ index .context.inject.env .features.ngc_api_key.values.key }}"
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # Each quantity is quoted because it is a string: a value with no unit
+        # suffix — a whole-core cpu count, say — would otherwise be read as a
+        # number and rejected before the target ever sees it. The GPU count is
+        # always written, defaulting to one: NIM always needs a GPU, and a
+        # service reserving none would build and then fail when it starts.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+            "nvidia.com/gpu": "{{ (default dict .infra.gpu).count | default 1 }}"
+        volumeMounts:
+          - name: model-cache
+            path: "{{ $cachePath }}"
+    volumes:
+      model-cache:
+        # One named volume, which is what a single-host target has: compose runs
+        # one instance of a service, so there is no per-replica claim to
+        # template. The Kubernetes realization gives each replica its own claim.
+        # The size and class are read from the operator's own sizing knob so one
+        # Release configures either target; this target has no volume-size or
+        # storage-class concept, and the volume is created at the Docker host's
+        # default.
+        persistent:
+          size: "{{ .infra.model_cache.size }}"
+    {{- with .infra.model_cache.class }}
+          class: "{{ . }}"
+    {{- end }}
+    # A ClusterIP service entry keeps the server internal to the compose network,
+    # which is where its consumers sit: the agent wired to it resolves the service
+    # name and the port straight from the edge. Nothing is published to the host,
+    # so the API is not reachable from outside the network on this target.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
