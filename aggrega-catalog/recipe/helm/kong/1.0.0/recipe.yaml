@@ -32,10 +32,9 @@ metadata:
 
     With `values.metrics_enabled` true the Service also carries the Status API
     port, 8007, and provides.metrics_endpoint publishes /metrics on it; false,
-    that key is empty. The port checks no caller and also answers POST
-    /status/ready, whose status=draining takes the gateway out of readiness
-    until it restarts, GET /status/dns and GET /status, as the pod already
-    does.
+    that key is empty. That port, open on the pod for the probes, answers only
+    a GET of /status, /status/ready or /metrics from another address: the
+    KongStatusGuard bundle refuses the rest, POST /status/ready among them.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -68,6 +67,17 @@ spec:
   # listen address, the container port and the probes in the workload, for
   # the Service port while values.metrics_enabled is true, and for
   # provides.metrics_endpoint, which cannot read the workload.
+  #
+  # The last three entries are the names the workload shares with the
+  # KongStatusGuard bundle imported for the Status API's allowlist, each with
+  # its home in that bundle, which stops the build naming the local when one
+  # is missing or differs from its own. status_guard_delivery has the bundle
+  # emit one ConfigMap. status_guard_file is the file that ConfigMap carries
+  # the allowlist as and the file the gateway includes. The ConfigMap is named
+  # after the rendered name followed by status_guard_config_map_suffix, which
+  # the volume composes, as it does for the model routes. No default namespace
+  # is declared: the synthesized workload names one only where the Release
+  # does, and the bundle places the ConfigMap the same way.
   locals:
     model_routes_delivery: config_map
     model_routes_file: model-routes.yaml
@@ -76,6 +86,9 @@ spec:
     credential_variable_suffix: _API_KEY
     header_variable_suffix: _AUTHORIZATION
     status_port: "8007"
+    status_guard_delivery: config_map
+    status_guard_file: status-guard.conf
+    status_guard_config_map_suffix: "-status-guard"
   # provides.host is the bare Service name "<rendered_name>-default" — the helm
   # provider names the synthesized ClusterIP Service "<rendered_name>-<service-key>"
   # (here "<rendered_name>-default"), with no namespace segment. A same-namespace
@@ -94,8 +107,9 @@ spec:
   # values.metrics_enabled is true: /metrics on the Status API port, of the
   # same ClusterIP Service, which carries that port only then. The Prometheus
   # plugin bundled with Kong answers it there with no plugin instance
-  # configured. It is empty while the value is false, when the Status API still
-  # answers on the pod and no Service carries it.
+  # configured, and the Status API's allowlist lets a GET of it through. It is
+  # empty while the value is false, when the Status API still answers on the
+  # pod and no Service carries it.
   provides:
     host: "{{ .context.rendered_name }}-default"
     port: "{{ .infra.proxy_port }}"
@@ -117,9 +131,23 @@ spec:
   # "<rendered_name>-model-routes", carrying the routes as model_routes_file;
   # with nothing wired to the models socket it emits nothing. The bundle stops
   # the build when a local above differs from its own side.
+  #
+  # The Status API's allowlist, from the KongStatusGuard bundle every Recipe
+  # running this gateway imports, so the line between what the probes and a
+  # scraper may ask and what nobody else may has one text wherever the gateway
+  # runs. With status_guard_delivery set to config_map the bundle emits one
+  # ConfigMap, "<rendered_name>-status-guard", carrying a fragment of nginx
+  # configuration as status_guard_file, on every Release; the workload below
+  # mounts it and has Kong include it in the Status API's own server block.
+  # From any address but the pod's loopback one the fragment lets through a
+  # GET of /status, /status/ready or /metrics, and answers every other request
+  # 403 before Kong handles it. The bundle stops the build when a local above
+  # differs from its own side.
   artifacts:
     model-routes:
       $import: KongModelRoutes#/artifacts/ModelRoutes
+    status-guard:
+      $import: KongStatusGuard#/artifacts/StatusGuard
   workload: |
     {{- /* Kong's Status API port, from the local that is its single authored
            home: the listen address below, the container port and the probes
@@ -175,6 +203,9 @@ spec:
     {{- range $attachment := (default dict .features) }}{{ if eq (first (splitList ":" (toString $attachment.type))) "core/prompt-deny-patterns" }}{{ $values := default dict $attachment.values }}{{ $routeSet = append $routeSet (list "core/prompt-deny-patterns" (optional $values "deny_patterns" list) (optional $values "allow_patterns" list)) }}{{ end }}{{ end -}}
     {{- $routesDigest := sha256sum (toJson $routeSet) -}}
     {{- $routesDir := "/etc/kong/model-routes" -}}
+    {{- /* The directory the Status API's allowlist is mounted at, the single
+           authored home for the mount and the file the gateway includes. */ -}}
+    {{- $guardDir := "/etc/kong/status-guard" -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # Kong holds no durable state — the PostgreSQL backend is the system of
@@ -265,10 +296,14 @@ spec:
         # ClusterIP. The Status API listens on loopback by default; it is
         # bound on every address so the kubelet can reach it, and the Service
         # carries it only while values.metrics_enabled is true. It checks no
-        # caller: beside /metrics it answers GET /status, GET /status/ready
-        # and GET /status/dns, and POST /status/ready, which with
+        # caller itself: beside /metrics it answers GET /status, GET
+        # /status/ready and GET /status/dns, and POST /status/ready, which with
         # status=draining marks the node draining so its readiness probe fails
-        # and the pod leaves the Service until it restarts.
+        # and the pod leaves the Service until it restarts. So
+        # KONG_NGINX_STATUS_INCLUDE has Kong include the allowlist mounted
+        # below in the Status API's own server block: from any address but the
+        # pod's loopback one only a GET of /status, /status/ready or /metrics
+        # reaches the Status API, and every other request is answered 403.
         #
         # Each models connection carrying a credential delivers it below as
         # AI_PROXY_<ALIAS>_API_KEY, an env secretKeyRef, and its routes read
@@ -296,6 +331,7 @@ spec:
           KONG_PROXY_LISTEN: "0.0.0.0:{{ .infra.proxy_port }}, 0.0.0.0:8443 ssl"
           KONG_ADMIN_LISTEN: "0.0.0.0:{{ .infra.admin_port }}"
           KONG_STATUS_LISTEN: "0.0.0.0:{{ $statusPort }}"
+          KONG_NGINX_STATUS_INCLUDE: "{{ $guardDir }}/{{ .locals.status_guard_file }}"
     {{- if not $backendCredential }}
           KONG_PG_PASSWORD: apppass
     {{- end }}
@@ -323,6 +359,7 @@ spec:
         # Kong reports readiness at /status/ready, which answers once the
         # database connects and the router is built, and liveness at /status.
         # The timings are the ones the product's own chart gives these probes.
+        # Both are GETs the Status API's allowlist lets through.
         health:
           ready:
             http: /status/ready
@@ -343,16 +380,24 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
-    {{- if $wired }}
+        # The Status API's allowlist, the file KONG_NGINX_STATUS_INCLUDE names.
+        volumeMounts:
+          - name: status-guard
+            path: "{{ $guardDir }}"
+            readonly: true
     volumes:
+      status-guard:
+        configmap:
+          source: "{{ .context.rendered_name }}{{ .locals.status_guard_config_map_suffix }}"
+    {{- if $wired }}
       model-routes:
         configmap:
           source: "{{ .context.rendered_name }}{{ .locals.model_routes_config_map_suffix }}"
     {{- end }}
     # The Service carries the proxy port, and the Status API port while
     # values.metrics_enabled is true, so the published metrics address reaches
-    # it; the pod already answers on that port, so it adds no caller that
-    # could not reach it before.
+    # it; the pod already answers on that port, behind the same allowlist, so
+    # it adds no caller that could not reach it before.
     services:
       default:
         type: ClusterIP

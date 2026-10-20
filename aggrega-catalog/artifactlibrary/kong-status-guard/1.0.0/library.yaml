@@ -1,0 +1,198 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: ArtifactLibrary
+metadata:
+  name: KongStatusGuard
+  version: 1.0.0
+  description: >
+    The request allowlist a Kong gateway's Status API answers behind, as one
+    bundle every Recipe running that gateway imports, so the line between what
+    the probes and a scraper may ask and what nobody else may lives here once.
+
+    StatusGuard writes a fragment of nginx configuration that Kong includes in
+    its Status API's own server block. A request from the gateway's loopback
+    address passes as it is. From any other address only a GET of /status,
+    /status/ready or /metrics passes; every other request, POST /status/ready
+    among them, is answered 403 and Kong never sees it.
+
+    The importing Recipe picks the delivery with the local
+    status_guard_delivery — config_map, one ConfigMap for a Kubernetes target,
+    or compose_configs, one compose config, written only while the importing
+    Component's values.metrics_enabled is true — and declares as locals the
+    names it shares with the bundle, which stops the build when one is missing
+    or differs. The bundle is authored against Kong 3.9.3.
+spec:
+  artifacts:
+    # The request allowlist of a Kong gateway's Status API, as one bundle every
+    # Recipe running that gateway imports. The Status API checks no caller, and
+    # beside the reads the probes and a scraper make it answers POST
+    # /status/ready, which with status=draining marks the node draining: its
+    # readiness then fails until it restarts. The line between the two is the
+    # same whichever target the gateway runs on, so it lives here once rather
+    # than as a copy in each Recipe that a later edit could leave behind.
+    #
+    # StatusGuard writes a fragment of nginx configuration. Kong takes every
+    # configuration property named nginx_status_<directive>, given in its
+    # environment as KONG_NGINX_STATUS_<DIRECTIVE>, and writes it as that
+    # directive inside its Status API's own server block, so the importing
+    # Recipe sets KONG_NGINX_STATUS_INCLUDE to the file this bundle delivers and
+    # Kong's own nginx reads the fragment there, before any of the block's
+    # locations. The fragment's directives run before Kong's Status API handler
+    # does: a request they refuse is answered 403 with a short JSON message, and
+    # Kong never sees it.
+    #
+    # What passes. A request from the loopback address, 127.0.0.1 or ::1, passes
+    # as it is: inside the gateway's own container on Compose and its own pod on
+    # Kubernetes, which is where Kong's own kong drain command, an operator's
+    # shutdown hook among its callers, sends its POST. From any other address a
+    # request passes only when its method is GET and its path, matched exactly
+    # as the caller sent it, is /status, /status/ready or /metrics, with or
+    # without a query: the liveness and readiness the probes read, and the
+    # metrics a scraper reads. So no encoded character, dot segment, doubled
+    # slash or change of letter case makes a refused path look like an allowed
+    # one, and POST /status/ready, GET /status/dns and every route a plugin or
+    # an edition adds to the Status API are refused. /metrics passes whatever
+    # values.metrics_enabled says: Kong reads the fragment when it starts, and a
+    # fragment that changed with the value would leave a running gateway on the
+    # old text once the value flipped.
+    #
+    # How the fragment reaches the workload. The importing Recipe chooses
+    # through the local status_guard_delivery. With config_map the bundle emits
+    # one ConfigMap carrying the fragment as a file, for a Kubernetes target,
+    # where the Status API listens on the pod's address whatever
+    # values.metrics_enabled says, so the probes reach it. The gateway's pod
+    # mounts it from its own namespace, so the ConfigMap is placed in the
+    # namespace the Release names through the aggrega.ai/namespace annotation;
+    # where the Release names none, in the one the importing Recipe declares as
+    # the local status_guard_default_namespace, the namespace its workload is
+    # rendered against then, and in none where the Recipe declares none, as a
+    # synthesized workload names none. With compose_configs
+    # it emits one compose config, for the compose target, which delivers a
+    # config as one file at the path it is mounted at; there the Status API
+    # stays on the container's loopback address unless values.metrics_enabled
+    # is true, so the config is written only while it is, and with the value
+    # false nothing is emitted. Compose reads a $ in a config's content as the
+    # start of a variable of its own, so there each $ of the fragment is written
+    # as $$, the compose file's spelling of a literal $. Either way the workload
+    # receives the same fragment. Any other value, or none, stops the build.
+    #
+    # What the importing Recipe declares. The importing Recipe mounts the
+    # fragment into the gateway's container and points KONG_NGINX_STATUS_INCLUDE
+    # at it. That is its own workload, which a bundle cannot write, so it
+    # declares as locals the names it shares with this bundle, and the bundle
+    # stops the build, naming the local, when one is missing or differs from its
+    # own. With config_map it declares status_guard_file (status-guard.conf),
+    # the file the ConfigMap carries the fragment as, and
+    # status_guard_config_map_suffix (-status-guard): the ConfigMap is named
+    # after the name the Recipe's provider gives the component, followed by that
+    # suffix, and since a local cannot read that name, the Recipe's workload
+    # composes the two where it mounts the ConfigMap. A Recipe whose workload
+    # names a namespace even where the Release names none, as a chart does,
+    # also declares status_guard_default_namespace, that namespace; it is the
+    # one local the bundle does not check, since its absence is meaningful.
+    # With compose_configs it declares status_guard_config_name instead, the
+    # config's name (the instance name followed by -status-guard); the file it
+    # is mounted as is the Recipe's own.
+    #
+    # The template reads the importing Recipe's context: .values.metrics_enabled
+    # with compose_configs, .context.instance_id, .context.rendered_name and
+    # .context.annotations with config_map, and the locals listed above. It checks every local before it
+    # writes anything, because a local the importing Recipe does not declare
+    # reads as empty here rather than stopping the build, and a name that
+    # differs on the two sides would leave a gateway pointed at a file that is
+    # not there, which stops it from starting.
+    StatusGuard:
+      status-guard.yaml: |
+        {{- /* The values this bundle shares with the Recipe importing it. Each has its home here, and the importing
+          Recipe restates it as a local because its own workload, which this bundle cannot write, reads it too. A local
+          the Recipe does not declare reads as empty here, so each is checked before anything is written: absent, or
+          not the value below, and the build stops naming it. */}}
+        {{- $bundle := "KongStatusGuard#/artifacts/StatusGuard" }}
+        {{- $file := "status-guard.conf" }}
+        {{- $nameSuffix := "-status-guard" }}
+        {{- $configName := printf "%s%s" .context.instance_id $nameSuffix }}
+        {{- $have := "" }}
+        {{- /* How the fragment reaches the importing Recipe's workload, which that Recipe chooses because its workload
+          mounts it: "config_map", one ConfigMap carrying it as a file, for a Kubernetes target; or "compose_configs",
+          one compose config, for the compose target, which delivers a config as one file at the path it is mounted
+          at. Any other value stops the build. */}}
+        {{- $have = optional .locals "status_guard_delivery" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local status_guard_delivery, which takes \"config_map\" or \"compose_configs\": whether this bundle delivers the gateway's Status API allowlist as a ConfigMap, for a Kubernetes target, or as a compose config, for the compose target; declare it as one of the two" $bundle) }}
+        {{- else if not (has $have (list "config_map" "compose_configs")) }}
+        {{- fail (printf "the Recipe importing %s declares the local status_guard_delivery as %q, but it takes \"config_map\" or \"compose_configs\": whether this bundle delivers the gateway's Status API allowlist as a ConfigMap, for a Kubernetes target, or as a compose config, for the compose target; declare it as one of the two" $bundle $have) }}
+        {{- end }}
+        {{- $compose := eq $have "compose_configs" }}
+        {{- /* The names the importing Recipe's workload mounts what this bundle emits by: the compose config's, or the
+          ConfigMap's and the file it carries. The ConfigMap is named after the name the Recipe's provider gives the
+          component, which a local cannot read, so the Recipe declares the part after it and composes the two where it
+          mounts the ConfigMap. */}}
+        {{- if $compose }}
+        {{- $have = optional .locals "status_guard_config_name" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local status_guard_config_name, which is the name of the compose config its workload mounts the gateway's Status API allowlist from, which this bundle emits; declare it as %q" $bundle $configName) }}
+        {{- else if ne $have $configName }}
+        {{- fail (printf "the Recipe importing %s declares the local status_guard_config_name as %q, but that local is the name of the compose config its workload mounts the gateway's Status API allowlist from, which this bundle emits, and this bundle's side of it is %q; declare it as %q" $bundle $have $configName $configName) }}
+        {{- end }}
+        {{- else }}
+        {{- $have = optional .locals "status_guard_file" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local status_guard_file, which is the file its gateway includes the Status API allowlist from and this bundle's ConfigMap carries it as; declare it as %q" $bundle $file) }}
+        {{- else if ne $have $file }}
+        {{- fail (printf "the Recipe importing %s declares the local status_guard_file as %q, but that local is the file its gateway includes the Status API allowlist from and this bundle's ConfigMap carries it as, and this bundle's side of it is %q; declare it as %q" $bundle $have $file $file) }}
+        {{- end }}
+        {{- $have = optional .locals "status_guard_config_map_suffix" "" }}
+        {{- if not $have }}
+        {{- fail (printf "the Recipe importing %s does not declare the local status_guard_config_map_suffix, which follows the component's rendered name in the name of the ConfigMap its workload mounts, which this bundle emits; declare it as %q" $bundle $nameSuffix) }}
+        {{- else if ne $have $nameSuffix }}
+        {{- fail (printf "the Recipe importing %s declares the local status_guard_config_map_suffix as %q, but that local follows the component's rendered name in the name of the ConfigMap its workload mounts, which this bundle emits, and this bundle's side of it is %q; declare it as %q" $bundle $have $nameSuffix $nameSuffix) }}
+        {{- end }}
+        {{- if not .context.rendered_name }}
+        {{- fail (printf "the Recipe importing %s declares the local status_guard_delivery as \"config_map\", but its provider reports no rendered name for %q, and the ConfigMap is named after it; declare \"compose_configs\" on the compose target, or import this bundle from a Recipe whose provider names the component" $bundle .context.instance_id) }}
+        {{- end }}
+        {{- end }}
+        {{- /* How a literal dollar sign is written in the fragment. Compose reads a $ anywhere in the file it is given,
+          a config's content included, as the start of a variable of its own, and a compose file spells a literal $ as
+          $$, while a ConfigMap carries its data as written. So each $ of the fragment is written through $dollar,
+          which is $ in a ConfigMap and $$ in a compose config, and the gateway reads the same fragment on either
+          delivery. */}}
+        {{- $dollar := "$" }}
+        {{- if $compose }}{{ $dollar = "$$" }}{{ end }}
+        {{- /* On the compose target the Status API leaves the container's loopback address only while the importing
+          Component's values.metrics_enabled is true, so the fragment is written only then; with the value false the
+          template writes nothing and no file is emitted. */}}
+        {{- if or (not $compose) (optional .values "metrics_enabled" false) }}
+        {{- /* The envelope. The fragment below is written once and wrapped by the envelope the importing Recipe chose:
+          a compose config's content or a ConfigMap key. Both are block scalars holding it at one indentation, so in
+          the compose fragment the config's content key sits one column deeper than its name, the shallowest place a
+          block scalar of that indentation can hang from; the compose target reads the fragment's configs and writes
+          them into the compose file, so that column reaches no emitted byte. */}}
+        {{- if $compose -}}
+        configs:
+          {{ $configName }}:
+           content: |
+        {{- else -}}
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: {{ .context.rendered_name }}{{ $nameSuffix }}
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" | default (optional .locals "status_guard_default_namespace" "") }}
+          namespace: {{ . | quote }}
+        {{- end }}
+        data:
+          {{ $file }}: |
+        {{- end }}
+            # The request allowlist of Kong's Status API, included in that API's
+            # own server block. A request from the loopback address passes as it
+            # is. From any other address a request passes only when it is a GET
+            # of /status, /status/ready or /metrics, matched exactly as the
+            # caller sent it, with or without a query; every other request is
+            # answered 403 and Kong's Status API never sees it.
+            default_type application/json;
+            set {{ $dollar }}status_api_request "{{ $dollar }}remote_addr {{ $dollar }}request_method {{ $dollar }}request_uri";
+            if ({{ $dollar }}status_api_request !~ "^(127\.0\.0\.1|::1) |^[^ ]+ GET /(status|status/ready|metrics)(\?|{{ $dollar }})") {
+                return 403 '{"message": "This Status API answers a GET of /status, /status/ready or /metrics from another address, and refuses every other request without handling it."}';
+            }
+        {{- end }}

@@ -33,10 +33,10 @@ metadata:
 
     With `values.metrics_enabled` true a ClusterIP Service,
     `<rendered_name>-status`, carries the chart's status port, 8100, and
-    provides.metrics_endpoint publishes /metrics on it; false, neither. The
-    port checks no caller and also answers POST /status/ready, whose
-    status=draining takes the gateway out of readiness until it restarts, GET
-    /status/dns and GET /status, as the pod already does.
+    provides.metrics_endpoint publishes /metrics on it; false, neither. That
+    port, open on the pod for the probes, answers only a GET of /status,
+    /status/ready or /metrics from another address: the KongStatusGuard
+    bundle refuses the rest, POST /status/ready among them.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -80,9 +80,10 @@ spec:
   # values.metrics_enabled is true: /metrics on the status port of the
   # ClusterIP Service "<rendered_name>-status" this Recipe emits beside the
   # chart then (below). The Prometheus plugin bundled with Kong answers it
-  # there with no plugin instance configured. It carries no namespace, as
-  # host does. It is empty while the value is false, when the chart's status
-  # listener still answers on the pod and no Service carries it.
+  # there with no plugin instance configured, and the Status API's allowlist
+  # lets a GET of it through. It carries no namespace, as host does. It is
+  # empty while the value is false, when the chart's status listener still
+  # answers on the pod and no Service carries it.
   provides:
     host: "{{ .context.rendered_name }}-proxy"
     port: "{{ .infra.proxy_port }}"
@@ -116,6 +117,20 @@ spec:
   # Service and provides.metrics_endpoint. The Service forwards to the
   # container port by the name the chart gives it, status, so a chart that
   # moves the listener's number keeps the address working.
+  #
+  # The last four entries are what the value mapping shares with the
+  # KongStatusGuard bundle imported for the Status API's allowlist. The first
+  # three have their home in that bundle, which stops the build naming the
+  # local when one is missing or differs from its own: status_guard_delivery
+  # has the bundle emit one ConfigMap; status_guard_file is the file that
+  # ConfigMap carries the allowlist as and the file the gateway includes; the
+  # ConfigMap is named after the rendered name followed by
+  # status_guard_config_map_suffix, which the volume composes, as it does for
+  # the model routes. status_guard_default_namespace is this Recipe's own: the
+  # namespace the chart is rendered against where the Release names none
+  # through the aggrega.ai/namespace annotation, as the status Service below
+  # writes it, so the bundle places the ConfigMap where the gateway's pods and
+  # Jobs mount it from either way.
   locals:
     model_routes_delivery: config_map
     model_routes_file: model-routes.yaml
@@ -124,6 +139,10 @@ spec:
     credential_variable_suffix: _API_KEY
     header_variable_suffix: _AUTHORIZATION
     status_port: "8100"
+    status_guard_delivery: config_map
+    status_guard_file: status-guard.conf
+    status_guard_config_map_suffix: "-status-guard"
+    status_guard_default_namespace: default
 
   # The models the gateway serves, as Kong's own declarative configuration,
   # from the KongModelRoutes bundle every Recipe running this gateway imports,
@@ -149,10 +168,11 @@ spec:
   # container port the chart names status. It names that listener for a
   # scraper and adds no caller that could not reach the pod already, and
   # infra.overrides.service_type, which sets the proxy's Service, never
-  # reaches it. The listener checks no caller: beside /metrics it answers GET
-  # /status, GET /status/ready and GET /status/dns, and POST /status/ready,
-  # which with status=draining marks the node draining so its readiness probe
-  # fails and the pod leaves its Services until it restarts. It selects the
+  # reaches it. The listener checks no caller itself: beside /metrics it
+  # answers GET /status, GET /status/ready and GET /status/dns, and POST
+  # /status/ready, which with status=draining marks the node draining so its
+  # readiness probe fails and the pod leaves its Services until it restarts;
+  # the allowlist below stands in front of all of it. It selects the
   # gateway's pods by the chart's own selector labels — the chart's name,
   # kong, since this Recipe sets no nameOverride, the component app, which
   # the chart gives the gateway's pods and not the migration Jobs', and the
@@ -161,9 +181,24 @@ spec:
   # aggrega.ai/namespace annotation, or `default` where it declares none; the
   # helm provider places no artifact in a namespace itself, so the Service
   # writes its own. With the value false, nothing is emitted.
+  #
+  # The Status API's allowlist, from the KongStatusGuard bundle every Recipe
+  # running this gateway imports, so the line between what the probes and a
+  # scraper may ask and what nobody else may has one text wherever the gateway
+  # runs. With status_guard_delivery set to config_map the bundle emits one
+  # ConfigMap, "<rendered_name>-status-guard", carrying a fragment of nginx
+  # configuration as status_guard_file, on every Release; the value mapping
+  # below mounts it and has Kong include it in the Status API's own server
+  # block. From any address but the pod's loopback one the fragment lets
+  # through a GET of /status, /status/ready or /metrics — the chart's
+  # readiness and liveness probes and a scrape — and answers every other
+  # request 403 before Kong handles it. It is emitted beside the chart's
+  # resources, in the namespace they are rendered against.
   artifacts:
     model-routes:
       $import: KongModelRoutes#/artifacts/ModelRoutes
+    status-guard:
+      $import: KongStatusGuard#/artifacts/StatusGuard
     status-service.yaml: |
       {{- if .values.metrics_enabled -}}
       apiVersion: v1
@@ -227,6 +262,9 @@ spec:
            routes' prompt guard carries; their digest is what rolls the
            gateway's pod when the route set changes, below. */}}
     {{- $routesDir := "/etc/kong/model-routes" }}
+    {{- /* The directory the Status API's allowlist is mounted at, the single
+           authored home for the mount and the file the gateway includes. */}}
+    {{- $guardDir := "/etc/kong/status-guard" }}
     {{- $wired := list }}
     {{- $credentialed := list }}
     {{- $routeSet := list }}
@@ -301,6 +339,16 @@ spec:
     ## artifact; with none, the Component declares the slot optional, so an
     ## inline development default keeps the render working exactly as the
     ## workload-synthesis realization does.
+    ##
+    ## nginx_status_include has Kong include the Status API's allowlist, which
+    ## the KongStatusGuard bundle emits and the volume below mounts, in the
+    ## Status API's own server block: from any address but the pod's loopback
+    ## one only a GET of /status, /status/ready or /metrics reaches the chart's
+    ## status listener, so its probes and a scrape keep answering and every
+    ## other request, POST /status/ready among them, is answered 403. The chart
+    ## writes it as KONG_NGINX_STATUS_INCLUDE into every container it runs Kong
+    ## in, its migration Jobs' included; only the gateway's own container starts
+    ## a listener that reads it.
     env:
       database: postgres
       pg_host: "{{ $backend.provides.host }}"
@@ -316,6 +364,7 @@ spec:
       {{- else }}
       pg_password: "{{ $devPassword }}"
       {{- end }}
+      nginx_status_include: "{{ $guardDir }}/{{ .locals.status_guard_file }}"
 
     ## ── The models the gateway serves ──────────────────────────
     ## While the models socket holds a connection, an init container of the
@@ -348,10 +397,17 @@ spec:
     ## prompt guard a core/prompt-deny-patterns attachment wrote once the
     ## attachment is removed. The step reads no model credential: the routes
     ## hold a reference to one, which only the gateway resolves.
+    ##
+    ## The Status API's allowlist is mounted on every Release, beside the
+    ## routes' ConfigMap while a model is wired; the chart mounts a user volume
+    ## in the gateway's container, its own wait for the database and its
+    ## migration Jobs alike.
     {{- if $wired }}
     podAnnotations:
       checksum/model-routes: "{{ $routesDigest }}"
+    {{- end }}
     deployment:
+      {{- if $wired }}
       initContainers:
         - name: model-routes
           image: "{{ $image }}"
@@ -387,11 +443,20 @@ spec:
             - name: model-routes
               mountPath: "{{ $routesDir }}"
               readOnly: true
+      {{- end }}
       userDefinedVolumes:
+        - name: status-guard
+          configMap:
+            name: "{{ .context.rendered_name }}{{ .locals.status_guard_config_map_suffix }}"
+      {{- if $wired }}
         - name: model-routes
           configMap:
             name: "{{ .context.rendered_name }}{{ .locals.model_routes_config_map_suffix }}"
-    {{- end }}
+      {{- end }}
+      userDefinedVolumeMounts:
+        - name: status-guard
+          mountPath: "{{ $guardDir }}"
+          readOnly: true
 
     ## Each models connection carrying a credential delivers it as
     ## AI_PROXY_<ALIAS>_API_KEY, bound by NAME to the secret its attachment

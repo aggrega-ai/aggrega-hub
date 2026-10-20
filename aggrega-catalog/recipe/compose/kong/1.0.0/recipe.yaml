@@ -33,10 +33,9 @@ metadata:
     With `values.metrics_enabled` true the Status API moves off loopback to
     port 8007 of every interface and provides.metrics_endpoint publishes
     /metrics on it; false, that key is empty. While it is on, every peer on
-    the Compose network reaches that port with no caller check: POST
-    /status/ready, whose status=draining takes the gateway out of readiness
-    until it restarts, GET /status/dns and GET /status answer beside the
-    metrics.
+    the Compose network reaches that port, but only a GET of /status,
+    /status/ready or /metrics: the KongStatusGuard bundle refuses the rest,
+    POST /status/ready among them.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -69,8 +68,9 @@ spec:
   # service name, which any peer on the compose network reaches once the
   # workload below binds that listener on every interface. The Prometheus
   # plugin bundled with Kong answers it there with no plugin instance
-  # configured. It is empty while the value is false, when the listener stays
-  # on the container's loopback address.
+  # configured, and the Status API's allowlist lets a GET of it through. It is
+  # empty while the value is false, when the listener stays on the
+  # container's loopback address.
   provides:
     host: "{{ .context.instance_id }}"
     port: "{{ .infra.proxy_port }}"
@@ -98,6 +98,13 @@ spec:
   # API port, the product's own default, and the single authored home for the
   # listen address the workload sets while values.metrics_enabled is true and
   # for provides.metrics_endpoint, which cannot read the workload.
+  #
+  # The last three entries are shared with the KongStatusGuard bundle imported
+  # for the Status API's allowlist. status_guard_delivery has the bundle
+  # declare one compose config, named status_guard_config_name, which the
+  # volume sources and the bundle checks against its own side;
+  # status_guard_path, the file it is mounted as and the gateway includes, is
+  # this Recipe's own, since a compose config carries no file name.
   locals:
     model_routes_delivery: compose_configs
     model_routes_config_name: "{{ .context.instance_id }}-model-routes"
@@ -106,6 +113,9 @@ spec:
     credential_variable_suffix: _API_KEY
     header_variable_suffix: _AUTHORIZATION
     status_port: "8007"
+    status_guard_delivery: compose_configs
+    status_guard_config_name: "{{ .context.instance_id }}-status-guard"
+    status_guard_path: /etc/kong/status-guard.conf
   # The models the gateway serves, as Kong's own declarative configuration,
   # from the KongModelRoutes bundle every Recipe running this gateway imports,
   # so the routes and the rules they are written by have one text wherever the
@@ -121,9 +131,25 @@ spec:
   # an expression the guard carries as $$, the compose file's spelling of a
   # literal $; with nothing wired to the models socket it declares nothing. The
   # bundle stops the build when a local above differs from its own side.
+  #
+  # The Status API's allowlist, from the KongStatusGuard bundle every Recipe
+  # running this gateway imports, so the line between what a scraper may ask
+  # and what nobody else may has one text wherever the gateway runs. With
+  # status_guard_delivery set to compose_configs the bundle declares one
+  # compose config, named status_guard_config_name, carrying a fragment of
+  # nginx configuration, and only while values.metrics_enabled is true — the
+  # only time the workload below binds the Status API off the container's
+  # loopback address; with the value false it declares nothing. The workload
+  # mounts it and has Kong include it in the Status API's own server block.
+  # From any address but the container's loopback one the fragment lets
+  # through a GET of /status, /status/ready or /metrics, and answers every
+  # other request 403 before Kong handles it. Each $ of the fragment is
+  # written as $$ there, as the model routes' are.
   artifacts:
     model-routes:
       $import: KongModelRoutes#/artifacts/ModelRoutes
+    status-guard:
+      $import: KongStatusGuard#/artifacts/StatusGuard
   # Synthesized-mode Workload: the image, the environment, the exposed port and
   # the schema-provisioning step are translated from the Workload kind by the
   # compose provider.
@@ -328,12 +354,17 @@ spec:
         # product's own default, unless values.metrics_enabled is true. Then
         # KONG_STATUS_LISTEN binds it on every interface, so the published
         # metrics address reaches it, and every peer on the compose network
-        # reaches it too: it checks no caller, and beside /metrics it answers
-        # GET /status, GET /status/ready and GET /status/dns, and POST
+        # reaches it too. It checks no caller itself: beside /metrics it
+        # answers GET /status, GET /status/ready and GET /status/dns, and POST
         # /status/ready, which with status=draining marks the node draining
-        # so it reports itself not ready until it restarts. No port is
-        # declared for it: a compose service entry publishes nothing to the
-        # host, so the listen address is what opens it to the network.
+        # so it reports itself not ready until it restarts. So, under the same
+        # condition, KONG_NGINX_STATUS_INCLUDE has Kong include the allowlist
+        # mounted below in the Status API's own server block: from any address
+        # but the container's loopback one only a GET of /status,
+        # /status/ready or /metrics reaches the Status API, and every other
+        # request is answered 403. No port is declared for it: a compose
+        # service entry publishes nothing to the host, so the listen address
+        # is what opens it to the network.
         variables:
           KONG_DATABASE: postgres
           KONG_PG_HOST: "{{ $env.KONG_PG_HOST }}"
@@ -344,6 +375,7 @@ spec:
           KONG_ADMIN_LISTEN: "0.0.0.0:{{ .infra.admin_port }}"
     {{- if .values.metrics_enabled }}
           KONG_STATUS_LISTEN: "0.0.0.0:{{ .locals.status_port }}"
+          KONG_NGINX_STATUS_INCLUDE: "{{ .locals.status_guard_path }}"
     {{- end }}
     {{- if $backendCredential }}
           KONG_PG_PASSWORD: "{{ .context.inject.env.KONG_PG_PASSWORD }}"
@@ -385,16 +417,30 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+    {{- /* The Status API's allowlist, the file KONG_NGINX_STATUS_INCLUDE
+           names, while values.metrics_enabled is true. */ -}}
+    {{- if .values.metrics_enabled }}
+        volumeMounts:
+          - name: status-guard
+            path: "{{ .locals.status_guard_path }}"
+    {{- end }}
     # A ClusterIP service entry keeps the gateway on the compose network, which
     # is where its consumers sit: a consumer wired to it resolves the service
     # name and the port straight from the edge. Nothing is published to the
     # host, so neither the proxy port nor the admin API is reachable from
     # outside the network on this target.
-    {{- if $wired }}
+    {{- if or $wired .values.metrics_enabled }}
     volumes:
+    {{- end }}
+    {{- if $wired }}
       model-routes:
         configmap:
           source: "{{ .locals.model_routes_config_name }}"
+    {{- end }}
+    {{- if .values.metrics_enabled }}
+      status-guard:
+        configmap:
+          source: "{{ .locals.status_guard_config_name }}"
     {{- end }}
     services:
       default:
