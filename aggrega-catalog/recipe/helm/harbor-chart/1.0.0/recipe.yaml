@@ -12,9 +12,14 @@ metadata:
     A Harbor container registry on Kubernetes via the product's own Helm chart,
     served from its project's HTTPS chart repository. The chart deploys the
     whole registry as one unit, in the order its services need, with the wiring
-    the product's own maintainers keep in step with it. Its Ingress, transport
-    security and metrics are left switched off, and the reverse proxy is
+    the product's own maintainers keep in step with it. Its Ingress and
+    transport security are left switched off, and the reverse proxy is
     published as one cluster-internal Service.
+
+    `values.metrics_enabled` turns the chart's metrics on and publishes the
+    four Services serving them. The same chart setting opens the blob store's
+    debug listener — profiling, execution traces and runtime variables, with no
+    caller check — to every in-cluster caller.
 
     Every image the chart runs is pinned to a resolvable release tag — one tag,
     which infra.engine_version selects for all of them — and the chart version
@@ -85,10 +90,23 @@ spec:
   # moving infra.port moves the published address and not the listener — which is
   # why infra.port admits the privileged ports a registry is conventionally
   # reached on.
+  #
+  # The metrics keys are published while values.metrics_enabled is true, and
+  # empty otherwise. The chart serves the metrics of four services, each on
+  # port 8001 at /metrics, and names that port http-metrics on each one's
+  # Service: the control plane's "<rendered_name>-core", the blob store's
+  # "<rendered_name>-registry", the worker tier's "<rendered_name>-jobservice"
+  # and the exporter's "<rendered_name>-exporter", the names the valuesMapping
+  # below derives from the rendered name. The port is http-metrics because
+  # this Recipe leaves the chart's internal transport security off; under it
+  # the chart would name the port https-metrics.
   provides:
     host: "{{ .context.rendered_name }}"
     port: "{{ .infra.port }}"
     protocol: "http"
+    metrics_service: "{{ if .values.metrics_enabled }}{{ .context.rendered_name }}-core,{{ .context.rendered_name }}-registry,{{ .context.rendered_name }}-jobservice,{{ .context.rendered_name }}-exporter{{ end }}"
+    metrics_service_port: "{{ if .values.metrics_enabled }}http-metrics{{ end }}"
+    metrics_path: "{{ if .values.metrics_enabled }}/metrics{{ end }}"
 
   assertions:
     # The blob store checks a presented account against a bcrypt line of the form
@@ -169,9 +187,23 @@ spec:
   # configuration maps and secrets each service reads; and eight Services. The
   # chart's Ingress is left switched off and the reverse proxy exposed as a
   # cluster-internal Service instead, because the Component publishes an
-  # in-cluster address rather than an external hostname. Transport security, the
-  # metrics exporter and the Prometheus-operator monitor are left switched off
-  # too, because the Component describes none of them.
+  # in-cluster address rather than an external hostname. Transport security and
+  # the Prometheus-operator monitor are left switched off too, because the
+  # Component describes neither.
+  #
+  # With values.metrics_enabled true the chart's metrics are on: the control
+  # plane, the worker tier and the blob store serve theirs, and the chart adds
+  # the metrics exporter — a Deployment, its configuration map and secret, and a
+  # ninth Service — and puts the metrics port on the Services of all four.
+  # 🔴 That one chart setting also moves the blob store's debug listener from
+  # the pod's loopback address onto every interface, on the metrics port its
+  # Service now names. The listener checks no caller and serves, beside the
+  # metrics, the profiling routes — CPU profiles and execution traces on
+  # request, heap and goroutine dumps, the command line — and the runtime
+  # variables, so turning the metrics on opens those to every in-cluster caller
+  # that reaches the pod. It has no route that changes the registry. The chart
+  # moves the listener and the metrics together, so this Recipe cannot turn one
+  # on without the other.
   #
   # What it carries that a hand-assembled workload does not is the wiring the
   # product's own maintainers keep in step with it: the reverse-proxy
@@ -256,6 +288,18 @@ spec:
     logLevel: "{{ . }}"
     {{- end }}
 
+    ## ── Metrics ────────────────────────────────────────────────
+    ## Emitted only while values.metrics_enabled is true, so a bare declaration
+    ## renders exactly what the chart's own default does. The chart's one switch
+    ## turns on the metrics of the control plane, the worker tier, the blob store
+    ## and the exporter, and also moves the blob store's debug listener onto
+    ## every interface of its pod, as the comment above this mapping describes.
+    ## The ports and paths stay the chart's own, which provides publishes.
+    {{- if .values.metrics_enabled }}
+    metrics:
+      enabled: true
+    {{- end }}
+
     ## ── Every image the registry runs ──────────────────────────
     ## The chart's own tags track the version of the software it packages, so
     ## leaving them unset makes the render move whenever the chart moves. Each is
@@ -264,9 +308,8 @@ spec:
     ## repositories are the chart's own, so the images this realization runs are
     ## the ones its chart is tested against.
     ##
-    ## The metrics exporter is pinned with the rest although this configuration
-    ## does not emit it and no value or override turns the chart's metrics on;
-    ## the pin keeps the image fixed all the same.
+    ## The metrics exporter is pinned with the rest; the chart runs it only
+    ## while values.metrics_enabled is true.
     ##
     ## 🔴 AN OVERRIDE NAMES ONE SERVICE. The registry runs ten images, so a
     ## single replacement map would point all ten at whichever one it named —
