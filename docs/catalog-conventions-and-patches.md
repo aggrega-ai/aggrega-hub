@@ -1976,14 +1976,26 @@ synthesized Recipe needs no such check, because the provider refuses a workload
 reference to a fill that publishes none. An entity that follows this shape
 applies it to every key the product signs or encrypts with and every secret its
 own services authenticate to each other with, while a password stays an
-optional slot with a development default. The shipped slots are
+optional slot with a development default — save a root password that opens what
+the product trusts, as `core/storage/minio`'s `root_password` opens the whole
+server, the metrics token `mc admin prometheus generate` mints included. The
+shipped slots are
 `core/devtool/harbor`'s `token_key`, `core_secret`, `csrf_key`, `secret_key`,
 `jobservice_secret` and `registry_http_secret`,
-`core/observability/langfuse`'s `encryption_key` and `session_secret`, and
+`core/observability/langfuse`'s `encryption_key` and `session_secret`,
 `core/ai-agent/librechat`'s `credential_encryption_key`, `session_secret` and
-`session_refresh_secret`. A module filling such a slot from a parameter declares
-the parameter required with no default, as `core/harbor` does for `csrf_key`,
-`jobservice_secret` and `registry_http_secret`.
+`session_refresh_secret`, and `core/storage/minio`'s `root_password`. The
+Recipes presenting that password to the store as an S3 secret key —
+`helm/agenta-api`, `helm/agenta-services` and `helm/thanos-store` — carry no
+default for it either: a store connection with nothing in its `credential` halts
+the build, naming the connection, unless its values set `unauthenticated: true`,
+and then no secret key is presented. A module filling such a slot from a
+parameter declares the parameter required with no default, as `core/harbor` does for `csrf_key`,
+`jobservice_secret` and `registry_http_secret`. `core/agenta` and `core/thanos`
+are the exception: each fills `root_password`, and the store connection that
+presents the same secret, from one parameter — `store_secret_key` and
+`s3_secret_key` — carrying a pinned development default its description says is
+for evaluation only.
 
 `token_key` holds the registry's token-signing key and its certificate in one
 Secret, under `tls.key` and `tls.crt`, which the chart reads by name. No catalog
@@ -2455,8 +2467,10 @@ connection the Release wires, so it is the same word on every socket.
 - **The socket says when none is intended.** Each such socket also declares
   `unauthenticated` (`type: boolean`, `default: false`) in its `valueSchema`: the
   connection's own statement that its target takes no credential. It changes
-  nothing a Component renders. A socket whose `credential` is `required` declares
-  no `unauthenticated`, because a connection carrying no credential there halts
+  nothing a Component renders. Where the Recipe carries no default for the
+  credential, it is also what lets a connection carrying none build, as on the
+  object-store connections named under "A key with no development default". A
+  socket whose `credential` is `required` declares no `unauthenticated`, because a connection carrying no credential there halts
   whatever the connection says.
 - **A managed target reached with neither is refused.** Every Component
   declaring such a socket carries the assertion
