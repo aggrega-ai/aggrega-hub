@@ -802,6 +802,30 @@ software it packages, and where the two differ the packaged software governs.
   and run the pinned artifact for themselves — a right terms can grant while
   still attaching conditions to redistribution, to hosting, or to offering the
   software as a service.
+
+  **The NVIDIA NIM entities are carried without that test being applied to
+  them**, so that a reader who holds an NVIDIA account can deploy NIM from the
+  catalog. Two of their Recipes pin artifacts NVIDIA publishes under its own
+  licence: `helm/nvidia-nim-chart` pins NVIDIA's `nim-llm` chart, whose licence
+  file names `LicenseRef-NvidiaProprietary`, and `helm/nvidia-nim-operator`
+  pins the NIM Operator's chart and image, which NVIDIA's NIM Operator
+  documentation lists under the "NVIDIA AI Enterprise Software License
+  Agreement". Using them needs that account and an NGC API key, under NVIDIA's
+  licence terms. NVIDIA's own pages say so in their words. The chart's licence
+  file: "Any use, reproduction, disclosure or distribution of this material and
+  related documentation without an express license agreement from NVIDIA
+  CORPORATION or its affiliates is strictly prohibited." The chart's NGC page:
+  "The NVIDIA NIM Helm Chart is governed by the NVIDIA Software License
+  Agreement and the Product-Specific Terms for NVIDIA AI Products." The
+  operator's NGC page: "By pulling and using the containers from NGC, you
+  accept the terms and conditions of this license." The operator's install
+  page names its prerequisite as "An active subscription to an NVIDIA AI
+  Enterprise product or be an NVIDIA Developer Program member." and says
+  "Access to the containers and models for NVIDIA NIM microservices is
+  restricted." The catalog distributes none of NVIDIA's artifacts: each build
+  fetches the chart it names from NVIDIA's chart repository, a publication of
+  either Recipe carries the Recipe and no chart, and every NIM image is the one
+  the Release names.
 - **A service a Release merely calls is not a pinned artifact.** Where the
   entity pins nothing and its Recipes only wire a Release to a service the
   reader contracts for directly — the reference realization of a hosted API — the
@@ -3184,7 +3208,10 @@ never a silent emit. Two shapes, both explicit:
   for a cluster whose definitions are already installed and a build that must
   fetch nothing. Where a companion carries both, as the KEDA, mariadb-operator,
   MySQL Operator and Strimzi companions do, the chart realization is named
-  `-chart`. Where the emitting component reaches the controller through
+  `-chart`; a companion realized by the project's chart alone gives that Recipe
+  the bare name, as the NIM Operator companion,
+  `core/ai-model/nvidia-nim-operator`, does with `helm/nvidia-nim-operator`.
+  Where the emitting component reaches the controller through
   a socket, that connection is the declared prerequisite: Envoy Gateway's models
   need the AI gateway controller wired to its `extension` socket, and the build
   halts while it is not.
@@ -3210,7 +3237,12 @@ custom resource at the Strimzi `v1` API alongside its synthesized StatefulSet
 realization, and ships both prerequisite modes (the Strimzi Cluster Operator as
 an ambient assumption or as a bundled companion component, realized by the
 project's own chart or by a bootstrap). The same shape carries to further operators —
-Elasticsearch, HA Postgres, additional AI gateways. The Envoy AI Gateway path is
+Elasticsearch, HA Postgres, additional AI gateways. NVIDIA's NIM Operator is one:
+`core/ai-model/nvidia-nim` offers a realization emitting a `NIMService`, guarded by
+the same `control_plane_present` affirmation, and the operator itself is the
+companion `core/ai-model/nvidia-nim-operator`, realized from NVIDIA's own chart. The
+cluster must already run NVIDIA's GPU Operator, which NVIDIA names as the NIM
+Operator's prerequisite and the catalog does not install. The Envoy AI Gateway path is
 the AI-gateway instance of the pattern, in its bundled shape.
 `core/gateway/envoy-ai-gateway-operator` is the companion: its Recipe sources the
 project's controller chart and emits the project's six custom-resource
@@ -3244,8 +3276,9 @@ realizing the same component, selected per Release through the Manifest:
   expressible: GPU requests the extended resource `nvidia.com/gpu` on the serving
   container and, when a runtime class is named, schedules the pod under it.
 - **Controller-driven.** The Recipe emits a model-serving controller's custom
-  resource — a KServe `InferenceService` or a KubeAI `Model` — in `artifacts:`,
-  and the controller owns the serving workload. GPU carries through the custom
+  resource — a KServe `InferenceService`, a KubeAI `Model` or a `NIMService` of
+  NVIDIA's NIM Operator — in `artifacts:`, and the controller owns the serving
+  workload. GPU carries through the custom
   resource directly. This realization suits a cluster that already runs a serving
   control plane, and carries the **runtime-prerequisite discipline** described
   under "Gateway / operator-driven (custom-resource-emitting) Recipes" above —
@@ -3260,7 +3293,8 @@ same keys regardless of realization; only the values differ, each supplied as it
 runtime requires. A synthesized server publishes its own ClusterIP Service and the
 weights id as the model name; a KServe realization publishes the predictor Service
 the controller creates; a KubeAI realization publishes the operator's shared proxy
-and the resource name the operator routes on. The contract is one of keys, not
+and the resource name the operator routes on; a NIM Operator realization publishes
+the Service the operator names after the `NIMService`. The contract is one of keys, not
 values: the consumer's wiring is unchanged across all of them. Every runtime
 listed above also has a Docker Compose Recipe publishing the same keys. `ollama`,
 `vllm`, `tgi`, `tei` and `nvidia-nim` synthesize their server on the compose
@@ -3271,8 +3305,10 @@ serves the model the compose file declares, and the same keys name that runner's
 address, which the Release can point elsewhere.
 
 Which realization to choose follows the cluster: with no serving control plane,
-synthesize directly; with KServe or KubeAI installed, emit its custom resource and
-let the controller serve. Custom-resource field names and service-naming
+synthesize directly; with KServe, KubeAI or NVIDIA's NIM Operator installed, emit
+its custom resource and let the controller serve. The NIM Operator is also a
+companion component of the catalog's own, `core/ai-model/nvidia-nim-operator`, so
+a Release can ship it beside the model. Custom-resource field names and service-naming
 conventions here (for example a predictor Service name, or an operator's resource
 profile names) follow each project's current API and installation, which evolve
 independently of the catalog — verify them against the target cluster, per the

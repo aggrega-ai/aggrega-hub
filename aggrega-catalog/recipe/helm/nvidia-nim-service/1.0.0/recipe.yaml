@@ -1,0 +1,205 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: nvidia-nim-service
+  version: 1.0.0
+  # No licence identifier is stated: the NIM image this Recipe's custom
+  # resource runs is the one the Release names, under NVIDIA's terms.
+  description: >
+    NVIDIA Inference Microservice realized as a `NIMService` custom resource
+    that NVIDIA's NIM Operator reconciles, rather than a directly synthesized
+    StatefulSet, selectable in the Manifest beside the synthesis and chart
+    realizations. Using it needs an NVIDIA account and an NGC API key, under
+    NVIDIA's licence terms: the operator runs the NIM image infra.image names,
+    which the reader must be entitled to pull, and reads the key from the
+    Secret the ngc_api_key slot names, so the build halts while that slot is
+    unattached. The catalog names no image.
+
+    The resource is authored against the operator's 3.1.2 release at the
+    `apps.nvidia.com/v1alpha1` API, and written into the namespace the Release
+    names through the aggrega.ai/namespace annotation. The operator runs one
+    serving replica on one model-cache claim it creates, requests the GPU on
+    the container, and creates the Service provides names.
+
+    The NIM Operator is a runtime prerequisite: the build halts unless the
+    operator affirms it with infra.control_plane_present. Reach for this
+    realization where the operator runs, or is declared beside the model as
+    `core/ai-model/nvidia-nim-operator`; reach for `nvidia-nim`, the synthesis,
+    where it is not, or where more than one replica is wanted.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-model/nvidia-nim:1.0.0
+
+  # provides is the Service the NIM Operator creates for the NIMService: a
+  # ClusterIP Service named after the NIMService itself, whose port, named api,
+  # is the one spec.expose.service.port sets, infra.port here. The server is
+  # told to listen on the same port, and serves the OpenAI-compatible API under
+  # /v1. This matches the synthesis realization's contract key for key. The
+  # host carries no namespace, so a consumer in another namespace qualifies it
+  # on its own side.
+  #
+  # This realization serves one replica (see the assertions), so its metrics
+  # are always one address: /v1/metrics on the serving port, as NVIDIA
+  # documents for its LLM images, on the operator's Service. The keys naming a
+  # Service to discover replicas behind are always empty.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}/v1"
+    model: "{{ .values.model }}"
+    protocol: "http"
+    metrics_endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}/v1/metrics"
+    metrics_service: ""
+    metrics_service_port: ""
+    metrics_path: ""
+
+  assertions:
+    # NVIDIA's NIM Operator must exist in the target cluster before a
+    # NIMService can reconcile. The compiler cannot inspect cluster state, so
+    # the prerequisite is declared: an operator affirms it in the Release, and
+    # an unaffirmed build halts here rather than emitting an orphan custom
+    # resource.
+    nim_operator_prerequisite: >-
+      {{- if not .infra.control_plane_present -}}
+      {{- fail "NVIDIA's NIM Operator must be installed in the target cluster before this realization emits its NIMService; install it, or declare core/ai-model/nvidia-nim-operator beside this component in the Aggregate, then affirm the prerequisite by setting infra.control_plane_present to true in the Release" -}}
+      {{- end -}}
+    image_supplied: >-
+      {{- if not (optional .infra "image" "") -}}
+      {{- fail "this realization runs the NIM image the Release names, because NIM images are distributed under NVIDIA's own terms and the catalog names none: set infra.image in the Release to the full reference, tag included, of a NIM image you are entitled to pull" -}}
+      {{- end -}}
+    # The NIMService carries the image as a repository and a tag, both
+    # required, which the operator joins with a colon.
+    image_carries_a_tag: >-
+      {{- with optional .infra "image" "" -}}
+      {{- if not (contains ":" (last (splitList "/" .))) -}}
+      {{- fail (printf "infra.image is %q, which names no tag or digest, and a NIMService requires the image's tag: set infra.image to the full reference of the NIM image, tag or digest included" .) -}}
+      {{- end -}}
+      {{- end -}}
+    # The operator gives a NIMService one model-cache claim, which every
+    # replica of its Deployment mounts, and a claim of the access mode this
+    # Recipe asks for admits a single node. The Component describes a cache per
+    # replica, so this realization refuses the case it cannot serve and names
+    # the realizations that can.
+    single_replica_only: >-
+      {{- if gt (int .infra.replicas) 1 -}}
+      {{- fail (printf "infra.replicas is %v, but NVIDIA's NIM Operator gives a NIMService one model-cache claim shared by every replica, and this realization serves one replica only: leave infra.replicas at 1, or select helm/nvidia-nim or helm/nvidia-nim-chart in the Manifest, which give each replica its own cache" .infra.replicas) -}}
+      {{- end -}}
+    # The operator reads the NGC API key on every NIMService from the Secret
+    # spec.authSecret names, under the data key NGC_API_KEY alone; a NIMService
+    # without that Secret is not accepted, so the slot is required here. What
+    # the attached credential publishes is checked where the resource is
+    # written, below.
+    ngc_api_key_attached: >-
+      {{- if not (hasKey (default dict .features) "ngc_api_key") -}}
+      {{- fail "NVIDIA's NIM Operator reads the NGC API key of every NIMService from a Secret, so this realization needs the ngc_api_key slot: attach a credential to it that names the Secret holding the key under the data key NGC_API_KEY, or select helm/nvidia-nim or helm/nvidia-nim-chart in the Manifest, which run without one" -}}
+      {{- end -}}
+
+  # This Recipe reads no infra.overrides keys.
+  #
+  # The NIMService below is authored against the definition NVIDIA's NIM
+  # Operator chart installs at 3.1.2, apps.nvidia.com/v1alpha1, and the
+  # operator's own type at that release; every field written here is one that
+  # definition declares, in the shape it declares it. Custom-resource schemas
+  # evolve independently of the catalog.
+  #
+  # The image. infra.image is cut at the last colon after its last slash into
+  # the resource's repository and tag, which the operator joins back into
+  # exactly the reference the Release names, a digest reference included.
+  # infra.image_pull_secret, when set, is the image's one pull Secret.
+  #
+  # The key. spec.authSecret names the Secret the ngc_api_key credential
+  # publishes; the operator hands the serving container the key from it as
+  # NGC_API_KEY by a secretKeyRef, so no key is written here. This Recipe
+  # renders an artifact set alone, for which the helm provider reports no
+  # rendered name, so the slot takes a credential naming a Secret that already
+  # exists or one a secret-store operator fetches; a credential realization
+  # composing its Secret's name from the rendered name halts the build here.
+  #
+  # The cache. The operator creates one claim, named after the NIMService
+  # followed by -pvc, of infra.model_cache.size, under infra.model_cache.class
+  # when one is named, and mounts it as the model store.
+  #
+  # The size. infra.compute sizes the serving container, requests and limits
+  # alike, and its GPU limit is infra.gpu.count, as on the synthesis; the
+  # runtime class, when named, is the pod's.
+  #
+  # The operator's own defaults stand for everything else: the serving
+  # container's probes, which are the timings the synthesis gives its own, and
+  # the operator-managed Deployment the service runs in. infra.min_replicas,
+  # infra.max_replicas and infra.model_artifact are read here no more than the
+  # synthesis reads them.
+  #
+  # The NIMService is written into the namespace the Release names for this
+  # component through the aggrega.ai/namespace annotation, on its boundary or
+  # its own entry, so the Service the operator creates beside it lands where a
+  # caller reads that it runs; the provider does not place an artifact on its
+  # own. Where no namespace is named the field is omitted, and the resource
+  # lands wherever the applying tool puts it.
+  artifacts:
+    nimservice.yaml: |
+      {{- if not (regexMatch "^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$" .context.instance_id) }}
+      {{- fail (printf "the component %q names the NIMService, and the NIM Operator names its Service after it, so it must be a valid Kubernetes Service name: lower-case letters, digits and hyphens, beginning with a letter, at most 63 characters; rename the component in the Aggregate" .context.instance_id) }}
+      {{- end }}
+      {{- $key := .features.ngc_api_key.provides }}
+      {{- if not $key.name }}
+      {{- fail (printf "the ngc_api_key slot of %q is filled by a realization that publishes no Secret name, so the NIMService would name no Secret for the NGC API key: bind that slot's Feature to a realization that names the Secret it holds" .context.instance_id) }}
+      {{- end }}
+      {{- if ne $key.key "NGC_API_KEY" }}
+      {{- fail (printf "the ngc_api_key slot of %q publishes the data key %q, but NVIDIA's NIM Operator reads the NGC API key from the data key NGC_API_KEY alone: publish the key under NGC_API_KEY" .context.instance_id $key.key) }}
+      {{- end }}
+      {{- $tag := last (splitList ":" (last (splitList "/" .infra.image))) }}
+      {{- $repository := trimSuffix (printf ":%s" $tag) .infra.image }}
+      apiVersion: apps.nvidia.com/v1alpha1
+      kind: NIMService
+      metadata:
+        name: {{ .context.instance_id }}
+        {{- $ns := "" }}
+        {{- if .context.annotations }}
+          {{- if .context.annotations.release }}
+            {{- $raw := optional .context.annotations.release "aggrega.ai/namespace" "" }}
+            {{- if $raw }}{{- $ns = $raw }}{{- end }}
+          {{- end }}
+        {{- end }}
+        {{- with $ns }}
+        namespace: "{{ . }}"
+        {{- end }}
+      spec:
+        image:
+          repository: "{{ $repository }}"
+          tag: "{{ $tag }}"
+          pullPolicy: IfNotPresent
+          {{- with .infra.image_pull_secret }}
+          pullSecrets:
+            - "{{ . }}"
+          {{- end }}
+        authSecret: "{{ $key.name }}"
+        replicas: {{ .infra.replicas }}
+        {{- with optional (default dict .infra.gpu) "runtime_class" "" }}
+        runtimeClassName: "{{ . }}"
+        {{- end }}
+        storage:
+          pvc:
+            create: true
+            size: "{{ .infra.model_cache.size }}"
+            volumeAccessMode: ReadWriteOnce
+            {{- with .infra.model_cache.class }}
+            storageClass: "{{ . }}"
+            {{- end }}
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+            nvidia.com/gpu: "{{ (default dict .infra.gpu).count | default 1 }}"
+        expose:
+          service:
+            type: ClusterIP
+            port: {{ .infra.port }}

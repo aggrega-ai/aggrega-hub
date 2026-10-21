@@ -1,0 +1,240 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: nvidia-nim-chart
+  version: 1.0.0
+  # No licence identifier is stated: the chart's own licence file names
+  # LicenseRef-NvidiaProprietary, and the NIM image it runs is the one the
+  # Release names, under NVIDIA's terms, so no single identifier names the
+  # software this Recipe realizes.
+  description: >
+    NVIDIA Inference Microservice as a self-hosted, GPU-native inference server
+    on Kubernetes through NVIDIA's own `nim-llm` Helm chart, pulled from
+    NVIDIA's chart repository at helm.ngc.nvidia.com. Using it needs an NVIDIA
+    account and an NGC API key, under NVIDIA's licence terms: the chart's
+    licence file names LicenseRef-NvidiaProprietary, and it runs the NIM image
+    infra.image names, which the reader must be entitled to pull. The catalog
+    names no image, and the build halts until infra.image is set.
+
+    The chart renders a StatefulSet giving each replica its own model-cache
+    claim, its Service on infra.port and the headless Service beside it. An
+    attached ngc_api_key reaches the chart as the name and data key of its
+    Secret, so no key is rendered. The chart's connection-test Pods are left
+    out, and its autoscaler, ingress and monitor stay off.
+
+    Reach for this realization where NVIDIA's chart is wanted and its
+    repository is reachable from the build. Reach for `nvidia-nim`, the
+    workload synthesis, where the build must fetch nothing or a GPU runtime
+    class is named, which this chart cannot set; reach for `nvidia-nim-service`
+    where the NIM Operator runs.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-model/nvidia-nim:1.0.0
+
+  # The chart. NVIDIA publishes nim-llm from its own chart repository, so it
+  # is official; the repository carries a long run of its releases up to the
+  # one pinned here, so it is maintained; and it renders the serving
+  # workload, its per-replica cache, both Services and the key reference this
+  # Component describes, so it is complete. The one surface it lacks is a
+  # runtime class, refused below by name. The repository answers a chart
+  # request with no credential.
+  #
+  # The default version is 2.1.4, whose appVersion is 2.0.0. The chart's
+  # templates do not depend on the NIM image's version, which the Release
+  # names in infra.image; infra.source_version picks another chart release.
+  source:
+    kind: helm-https-chart
+    url: https://helm.ngc.nvidia.com/nim
+    chart: nim-llm
+    # Default chart version. Override via infra.source_version; a version
+    # other than this one may need a different value mapping.
+    version: "{{ optional .infra `source_version` \"2.1.4\" }}"
+
+  # provides.host is the chart's Service. The value mapping pins the chart's
+  # fullnameOverride to the rendered name, the release name the helm provider
+  # gives the chart, which spells the Component's name in the alphabet a
+  # Kubernetes name allows; under the pin the chart names its StatefulSet and
+  # its Service by that name, read from a render made with and without the
+  # pin, and its headless Service by that name followed by -sts. The Service
+  # listens on infra.port, the port the server is told to listen on. The name
+  # carries no namespace, so a consumer in another namespace qualifies it on
+  # its own side.
+  #
+  # The metrics keys say where the server serves its Prometheus metrics:
+  # /v1/metrics on the serving port, as NVIDIA documents for its LLM images.
+  # While infra.replicas is 1, metrics_endpoint is that address on the
+  # chart's Service; above 1 it is empty, and metrics_service,
+  # metrics_service_port and metrics_path name the same Service, the name the
+  # chart gives its port, http-openai, and the path, for a scraper that
+  # discovers each replica behind it. A provides entry cannot read another, so
+  # the name is spelled out in each.
+  provides:
+    host: "{{ .context.rendered_name }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.rendered_name }}:{{ .infra.port }}/v1"
+    model: "{{ .values.model }}"
+    protocol: "http"
+    metrics_endpoint: "{{ if le (int .infra.replicas) 1 }}http://{{ .context.rendered_name }}:{{ .infra.port }}/v1/metrics{{ end }}"
+    metrics_service: "{{ if gt (int .infra.replicas) 1 }}{{ .context.rendered_name }}{{ end }}"
+    metrics_service_port: "{{ if gt (int .infra.replicas) 1 }}http-openai{{ end }}"
+    metrics_path: "{{ if gt (int .infra.replicas) 1 }}/v1/metrics{{ end }}"
+
+  assertions:
+    # The image is the Release's: the chart's own default names an image the
+    # catalog does not offer, so a build that names none halts here rather
+    # than rendering it.
+    image_supplied: >-
+      {{- if not (optional .infra "image" "") -}}
+      {{- fail "this realization runs the NIM image the Release names, because NIM images are distributed under NVIDIA's own terms and the catalog names none: set infra.image in the Release to the full reference, tag included, of a NIM image you are entitled to pull" -}}
+      {{- end -}}
+    # The chart composes the image as repository:tag and puts its own
+    # application version in place of an empty tag, so a reference with no tag
+    # or digest would run an image the Release did not name.
+    image_carries_a_tag: >-
+      {{- with optional .infra "image" "" -}}
+      {{- if not (contains ":" (last (splitList "/" .))) -}}
+      {{- fail (printf "infra.image is %q, which names no tag or digest, and NVIDIA's nim-llm chart puts its own default tag in place of a missing one: set infra.image to the full reference of the NIM image, tag or digest included" .) -}}
+      {{- end -}}
+      {{- end -}}
+    # The chart offers no runtime-class setting anywhere in its templates, so
+    # a runtime class cannot reach its pod; it is refused rather than dropped.
+    runtime_class_unsupported: >-
+      {{- with optional (default dict .infra.gpu) "runtime_class" "" -}}
+      {{- fail (printf "infra.gpu.runtime_class is %q, but NVIDIA's nim-llm chart has no runtime-class setting, so this realization cannot schedule the pod under it: remove infra.gpu.runtime_class, or select helm/nvidia-nim or helm/nvidia-nim-service in the Manifest, which both set it" .) -}}
+      {{- end -}}
+
+  # The chart's three connection checks, Pods carrying the helm.sh/hook: test
+  # annotation, run a second image, curlimages/curl, which this Recipe would
+  # otherwise owe a pin for, and check what the serving probes already check.
+  # They are left out of the render.
+  omits:
+    - kind: Pod
+      name: "{{ .context.rendered_name }}-test-models"
+    - kind: Pod
+      name: "{{ .context.rendered_name }}-test-compl"
+    - kind: Pod
+      name: "{{ .context.rendered_name }}-test-stream"
+
+  # This Recipe reads no infra.overrides keys.
+  #
+  # The chart is read for the values below; everything else stays the chart's
+  # own default at its release, its probes, its pod security context and its
+  # toleration of the nvidia.com/gpu taint among them. Under this
+  # configuration it renders the StatefulSet, its Service and headless
+  # Service, and the ConfigMap holding the model-download script its pod
+  # mounts, which runs only in an init container this Recipe does not enable.
+  # Its autoscaler, ingress, ServiceMonitor, ServiceAccount, multi-node and
+  # OpenShift renderings stay off, as the Component describes none of them;
+  # min_replicas and max_replicas are therefore read here no more than the
+  # synthesis reads them, and neither is infra.model_artifact.
+  #
+  # THE IMAGE. infra.image is cut at the last colon after its last slash into
+  # the chart's repository and tag, which the chart joins back into exactly
+  # the reference the Release names, a digest reference included. This is the
+  # only image the render runs.
+  #
+  # THE KEY. With ngc_api_key attached, the chart's ngcAPISecret and
+  # ngcAPISecretKey name the Secret and data key the credential publishes, and
+  # the chart reads the key from it as NGC_API_KEY by a secretKeyRef; a
+  # credential publishing no Secret name halts the build naming the slot.
+  # Unattached, ngcAPISecret is emptied, and the chart then renders no key
+  # reference, as the synthesis renders none. The chart's literal-key value
+  # stays empty on every build, so the chart never renders a Secret of its own.
+  #
+  # THE PULL SECRET. The chart's own default names a pull Secret, ngc-secret,
+  # which nothing creates, so the list is always written: the Secret
+  # infra.image_pull_secret names, or an empty list.
+  #
+  # THE CACHE AND THE SIZE. Persistence is on, so the StatefulSet gives each
+  # replica its own claim, model-store, of infra.model_cache.size, under
+  # infra.model_cache.class when one is named. infra.compute sizes the serving
+  # container, requests and limits alike, and its GPU limit is infra.gpu.count,
+  # as on the synthesis.
+  #
+  # THE NAME'S LENGTH. The chart cuts every name it composes to 51
+  # characters, so a longer rendered name would give the Service a name
+  # provides.host does not carry; the mapping halts on one, naming it.
+  valuesMapping: |
+    {{- if gt (len .context.rendered_name) 51 }}
+    {{- fail (printf "the rendered name %q is %d characters, and NVIDIA's nim-llm chart cuts the names it gives the Service and the StatefulSet to 51, so the published host would name no Service: give the component a shorter name" .context.rendered_name (len .context.rendered_name)) }}
+    {{- end }}
+    {{- $features := default dict .features }}
+    {{- with $features.ngc_api_key }}
+    {{- if not .provides.name }}
+    {{- fail (printf "the ngc_api_key slot of %q is filled by a realization that publishes no Secret name, so NVIDIA's nim-llm chart would read the key from no Secret: bind that slot's Feature to a realization that names the Secret it holds" $.context.instance_id) }}
+    {{- end }}
+    {{- end }}
+    {{- $tag := last (splitList ":" (last (splitList "/" .infra.image))) }}
+    {{- $repository := trimSuffix (printf ":%s" $tag) .infra.image }}
+
+    ## ── Pin the chart's resource names to the rendered name ────
+    fullnameOverride: "{{ .context.rendered_name }}"
+
+    ## ── The NIM image the Release names ───────────────────────
+    image:
+      repository: "{{ $repository }}"
+      tag: "{{ $tag }}"
+      pullPolicy: IfNotPresent
+    {{- with .infra.image_pull_secret }}
+    imagePullSecrets:
+      - name: "{{ . }}"
+    {{- else }}
+    imagePullSecrets: []
+    {{- end }}
+
+    ## ── The model, the key and the port ───────────────────────
+    model:
+      openaiPort: {{ .infra.port }}
+      ngcAPIKey: ""
+      {{- with $features.ngc_api_key }}
+      ngcAPISecret: "{{ .provides.name }}"
+      ngcAPISecretKey: "{{ .provides.key }}"
+      {{- else }}
+      ngcAPISecret: ""
+      {{- end }}
+    service:
+      type: ClusterIP
+      openaiPort: {{ .infra.port }}
+
+    ## ── Replicas, each with its own model cache ───────────────
+    replicaCount: {{ .infra.replicas }}
+    statefulSet:
+      enabled: true
+    persistence:
+      enabled: true
+      accessMode: ReadWriteOnce
+      size: "{{ .infra.model_cache.size }}"
+      {{- with .infra.model_cache.class }}
+      storageClass: "{{ . }}"
+      {{- end }}
+
+    ## ── Serving resources and the GPU ─────────────────────────
+    resources:
+      requests:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+        nvidia.com/gpu: {{ (default dict .infra.gpu).count | default 1 }}
+
+    ## ── What the Component describes none of, off ─────────────
+    autoscaling:
+      enabled: false
+    ingress:
+      enabled: false
+    metrics:
+      serviceMonitor:
+        enabled: false
+    serviceAccount:
+      create: false
+    multiNode:
+      enabled: false
+    openshift:
+      enabled: false

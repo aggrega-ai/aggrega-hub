@@ -6,32 +6,51 @@ kind: Component
 metadata:
   name: core/ai-model/nvidia-nim
   version: 1.0.0
+  # On every realization the NIM container resolves the model profile into a
+  # model-cache volume at start. The model value is a deterministic pointer the
+  # container resolves there, never fetched at compile time. The serving
+  # container always requests at least one GPU, so Kubernetes needs a
+  # GPU-capable cluster, and Docker Compose a host whose NVIDIA GPUs Docker can
+  # hand to containers through the NVIDIA Container Toolkit, serving the model
+  # on the compose network. Where pulling the image needs
+  # credentials, Kubernetes pulls it with the Secret infra.image_pull_secret
+  # names, and Docker Compose with the Docker host's own registry login.
+  #
+  # Each Kubernetes realization runs the image the Release names and nothing
+  # the catalog names in its place: NIM images are distributed under NVIDIA's
+  # own terms, so the Release names an image its reader is entitled to pull.
+  # NVIDIA's NIM Operator documentation lists the NIM container under the
+  # NVIDIA AI Enterprise Software License Agreement, and NVIDIA's nim-llm chart
+  # carries the licence identifier LicenseRef-NvidiaProprietary; each build
+  # fetches the chart from NVIDIA, and the catalog distributes neither.
+  #
+  # On a cluster running the Prometheus Operator, core/prometheus-exporter
+  # attached to the synthesized Kubernetes realization, with its port set to
+  # http and its path to /v1/metrics, emits a ServiceMonitor for it in place of
+  # the published metrics keys; on the chart realization that port is named
+  # http-openai.
   description: >
     NVIDIA Inference Microservice (NIM) as a self-hosted, GPU-native inference
-    server. Two Recipes realize it, each synthesizing the runtime directly: the
-    NIM container resolves the model profile into a model-cache volume at start
-    and serves the OpenAI-compatible API. On Kubernetes, `helm/nvidia-nim`
-    serves it behind a ClusterIP Service and needs a GPU-capable cluster; on a
-    single Docker host, `compose/nvidia-nim` serves it on the compose network
-    and needs a host whose NVIDIA GPUs Docker can hand to containers through the
-    NVIDIA Container Toolkit. The model value is a deterministic pointer the
-    container resolves at start, never fetched at compile time. GPU-native — the
-    serving container always requests a GPU on either target. The serving image
-    is supplied by the operator: NIM images are distributed under NVIDIA's own
-    terms, so the Release names an image the operator is entitled to pull rather
-    than one from the catalog. Where pulling it needs credentials, Kubernetes
-    pulls it with the Secret `infra.image_pull_secret` names, and Docker
-    Compose with the Docker host's own registry login. Nothing renders
-    until the Release sets `infra.image`. Exports its host, port, endpoint,
-    model, and protocol to consumers via the uses topology, so an agent reaches
-    the model without hardcoding an endpoint.
+    server serving the OpenAI-compatible API. Using it needs an NVIDIA account
+    and an NGC API key, under NVIDIA's licence terms: every realization runs a
+    NIM image the reader must be entitled to pull, named by the Release in
+    `infra.image`. The catalog names none, and nothing renders until it is set.
 
-    It also publishes where Prometheus finds the server's metrics: one address
-    as `metrics_endpoint`, or, while it runs more than one replica on
-    Kubernetes, the Service a scraper discovers every replica behind. On a
-    cluster running the Prometheus Operator, `core/prometheus-exporter` attached
-    with its port set to `http` and its path to `/v1/metrics` emits a
-    ServiceMonitor for it instead.
+    On Kubernetes three Recipes realize it. `helm/nvidia-nim` assembles the
+    workload itself and fetches nothing at build time: reach for it where no
+    NIM Operator runs. `helm/nvidia-nim-chart` renders NVIDIA's `nim-llm`
+    chart: reach for it where that chart is wanted and NVIDIA's chart
+    repository is reachable from the build. `helm/nvidia-nim-service` emits a
+    `NIMService` for NVIDIA's NIM Operator: reach for it where the operator
+    runs, or is declared beside it as `core/ai-model/nvidia-nim-operator`,
+    and affirm that with `infra.control_plane_present`. On a single Docker
+    host, `compose/nvidia-nim` serves it through the NVIDIA Container Toolkit.
+
+    Exports its host, port, endpoint, model, and protocol to consumers via the
+    uses topology, so an agent reaches the model without hardcoding an
+    endpoint, and where Prometheus finds the server's metrics: one address as
+    `metrics_endpoint`, or, while it runs more than one replica on Kubernetes,
+    the Service a scraper discovers every replica behind.
   labels:
     component.aggrega.ai/type: server
     component.aggrega.ai/category: ai-model
@@ -60,11 +79,16 @@ spec:
     # Secret by reference; on Docker Compose it takes one whose value is
     # delivered, written into the compose file as delivered, so a Compose
     # variable reference such as ${NGC_API_KEY} keeps the key out of the file.
+    # NVIDIA's chart takes the Secret's name and data key and reads the key
+    # from it as the synthesis does. The NIM Operator's NIMService names one
+    # Secret on every service and reads the key from it under the data key
+    # NGC_API_KEY alone, so that realization halts the build while the slot is
+    # unattached, or while the credential publishes another data key.
     ngc_api_key:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [env]
-      description: "Optional NGC API key for authenticating the model-profile download. When attached, the serving container receives it as the NGC_API_KEY environment variable — on Kubernetes read from a Secret by reference, on Docker Compose written into the compose file as delivered, so attach a Compose variable reference such as ${NGC_API_KEY} there to keep the key out of the file. Unattached, the container starts without it."
+      description: "Optional NGC API key for authenticating the model-profile download. When attached, the serving container receives it as the NGC_API_KEY environment variable — on Kubernetes read from a Secret by reference, on Docker Compose written into the compose file as delivered, so attach a Compose variable reference such as ${NGC_API_KEY} there to keep the key out of the file. Unattached, the container starts without it. The NIM Operator realization requires it, published under the data key NGC_API_KEY."
   schema:
     values:
       # Developer Intent — filled by the Developer in the Aggregate. `model` is
@@ -87,7 +111,7 @@ spec:
         type: integer
         min: 1
         default: 1
-        description: Number of serving replicas on Kubernetes, where each replica holds its own model-cache volume and resolves the model profile independently. Docker Compose runs one instance, and the build reports a replica count there as a setting the target omitted.
+        description: Number of serving replicas on Kubernetes, where each replica holds its own model-cache volume and resolves the model profile independently. The NIM Operator realization gives its service one model-cache claim, so it serves one replica and halts the build on more. Docker Compose runs one instance, and the build reports a replica count there as a setting the target omitted.
       min_replicas:
         type: integer
         min: 1
@@ -126,10 +150,25 @@ spec:
             description: Number of GPUs requested for the serving container, delivered as the extended resource nvidia.com/gpu on Kubernetes and as a reservation of that many NVIDIA GPUs on Docker Compose. Defaults to 1 GPU.
           runtime_class:
             type: string
-            description: Name of the RuntimeClass selecting the GPU-enabled container runtime (for example nvidia). Omit to use the cluster default runtime. Docker Compose has no runtime class, and the build reports one set there as a setting the target omitted.
+            description: Name of the RuntimeClass selecting the GPU-enabled container runtime (for example nvidia). Omit to use the cluster default runtime. NVIDIA's nim-llm chart offers no runtime-class setting, so the chart realization halts the build while this is set. Docker Compose has no runtime class, and the build reports one set there as a setting the target omitted.
       image_pull_secret:
         type: string
         description: Name of a pre-created Kubernetes image-pull Secret granting access to the NIM container registry. Set this when the NIM image is pulled from a private registry; omit when the cluster can pull it without credentials. On Docker Compose the host pulls with its own registry login, so a Release setting this halts the build there.
+      # Read by the chart realization alone; the others pull no chart.
+      source_version:
+        type: string
+        description: Version of NVIDIA's nim-llm chart the `nvidia-nim-chart` realization pulls. Changing it away from that Recipe's default does not guarantee value-mapping compatibility with the new chart. The other realizations pull no chart and ignore it.
+      control_plane_present:
+        type: boolean
+        default: false
+        description: >
+          Operator affirmation that NVIDIA's NIM Operator (its controller and
+          its custom-resource definitions) is installed in the target cluster,
+          or is declared beside this component as
+          core/ai-model/nvidia-nim-operator. The NIMService realization halts
+          the build unless this is set true, so a NIMService is never emitted
+          as an orphan into a cluster that cannot reconcile it. The synthesis
+          and chart realizations ignore this flag.
       overrides:
         type: object
         additionalProperties: true
@@ -199,8 +238,9 @@ spec:
       metrics_service_port:
         type: string
         description: >
-          Name of the port of `metrics_service` that carries the metrics,
-          `http`. Set and empty together with `metrics_service`.
+          Name of the port of `metrics_service` that carries the metrics:
+          `http` on the synthesis, `http-openai` on NVIDIA's chart. Set and
+          empty together with `metrics_service`.
       metrics_path:
         type: string
         description: >
