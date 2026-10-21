@@ -21,9 +21,15 @@ resource "aws_db_instance" "this" {
   engine_version       = var.engine_version
   instance_class       = var.instance_class
   allocated_storage    = var.allocated_storage
+  storage_type         = var.storage_type
   port                 = var.port
   multi_az             = var.multi_az
   db_subnet_group_name = var.subnet_id
+
+  # A retention of zero turns automated backups off, and the caller then skips
+  # the final snapshot as well.
+  backup_retention_period = var.backup_retention_period
+  skip_final_snapshot     = var.skip_final_snapshot
 
   db_name  = var.db_name
   username = "admin"

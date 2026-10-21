@@ -3613,10 +3613,11 @@ copying whichever sibling happens to be nearest.
   wrote, so it does not read them rather than refusing them. Each of those keys'
   descriptions on the Component says so, and names the `overrides` key the managed
   Recipes size the instance by. A value a managed service cannot honour and that a
-  Recipe can tell apart from a default — an initialisation script, a raw
-  configuration file, a replica count a Recipe does not provision — is refused by
-  name instead. The key stays single-named and single-homed rather than split per
-  target: the size means the same thing everywhere, and a stateful member needs its
+  Recipe can tell apart from a default — an application user the service does not
+  create, an initialisation script, a raw configuration file, a replica count a
+  Recipe does not provision — is refused by name instead. The key stays
+  single-named and single-homed rather than split per target: the size means the
+  same thing everywhere, and a stateful member needs its
   volume on the local target too or it would not be the same datastore the Kubernetes
   target deploys. **`storage.type` declares no default: the class defaults to the
   cluster's own.** On a Kubernetes realization it is the volume's storage class, and

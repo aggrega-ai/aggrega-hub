@@ -18,6 +18,21 @@ variable "allocated_storage" {
   default = 20
 }
 
+variable "storage_type" {
+  type        = string
+  description = "RDS storage type, such as gp3; supplied by the caller."
+}
+
+variable "backup_retention_period" {
+  type        = number
+  description = "Days of automated backups to keep, zero for none; supplied by the caller."
+}
+
+variable "skip_final_snapshot" {
+  type        = bool
+  description = "Whether deleting the instance skips its final snapshot; supplied by the caller."
+}
+
 variable "port" {
   type        = number
   description = "Port the database listens on; supplied by the caller."
