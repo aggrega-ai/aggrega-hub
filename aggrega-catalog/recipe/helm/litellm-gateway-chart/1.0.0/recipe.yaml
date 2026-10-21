@@ -1,0 +1,580 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: litellm-gateway-chart
+  version: 1.0.0
+  license: MIT
+  description: >
+    An AI gateway on Kubernetes via BerriAI's own litellm-helm chart, pulled
+    from its OCI registry, running the official upstream proxy image at
+    infra.engine_version. The chart's README calls it community maintained;
+    it was checked for being official, complete and maintained against the
+    chart itself. Its bundled PostgreSQL and Redis stay off, and its
+    schema-migration Job renders only with database_url attached. It is
+    proven at LiteLLM v1.103.1 and halts on any other engine_version.
+
+    The gateway's configuration, its routing table and the modules Features
+    rely on, comes from the LiteLLMGatewayConfig bundle, and the request guard
+    and the path allowlist in front of the gateway from the LiteLLMGuard
+    bundle, exactly as on the synthesis, the allowlist as a second container
+    of the chart's pod. Every credential reaches the gateway as a
+    secretKeyRef, so no credential value is rendered; unattached, api_key
+    leaves the gateway with no master key, as on the synthesis.
+
+    With `values.metrics_enabled` true the allowlist forwards a GET of
+    /metrics alone from port 9090, on the chart's metrics Service, published
+    as provides.metrics_endpoint; false leaves that key empty.
+
+    Reach for this realization where a chart registry is reachable at build
+    time; reach for `litellm-gateway`, the workload synthesis, where the build
+    must complete with nothing fetched.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/gateway/litellm:1.0.0
+
+  # The chart. BerriAI publishes it from its own repository, LiteLLM's deploy
+  # documentation installs the proxy with it, and a chart release follows
+  # every proxy release under the same version number, with patch releases on
+  # older lines as well; so it is maintained. Its README says "This is
+  # community maintained, Please make an issue if you run into a bug", which
+  # decides nothing on its own: an unofficial chart that is complete and
+  # maintained qualifies. It is complete for this Component: its pod takes
+  # further containers, volumes and mounts beside the proxy's, its arguments
+  # can be replaced, and its list of environment entries takes a reference to
+  # a Secret, which is what the request guard, the path allowlist, the
+  # gateway's modules, the loopback listen address and every credential need.
+  # Those were the three checks a chart is held to before a Recipe points at
+  # it.
+  #
+  # The default version is the chart release whose appVersion is 1.103.1, the
+  # release the Component's engine_version defaults to and the code this
+  # Recipe delivers into the proxy is proven at, so the chart's templates and
+  # the image they run agree.
+  source:
+    kind: helm-oci-chart
+    url: oci://ghcr.io/berriai/litellm-helm
+    # Default chart version. Override via infra.source_version; a version
+    # other than this one may need a different value mapping.
+    version: "{{ optional .infra `source_version` \"1.103.1\" }}"
+
+  # This Recipe reads no infra.overrides keys. The image is not offered for
+  # replacement: the gateway is admitted to this catalog because its Recipes
+  # run the open-core image ghcr.io/berriai/litellm, and a replaceable image
+  # block would let a Release run another build in its place.
+  #
+  # The locals are the workload-synthesis Recipe's, with the values it gives
+  # them, and what each one is for is stated beside it there. The two bundles
+  # imported below read them, and so do the realizations of the Features
+  # attached to the gateway, which read the locals of whichever Recipe
+  # renders it; so every name a realization writes into the configuration —
+  # a module, a class, a variable — is one this Recipe's pod delivers, and
+  # every list a realization checks an attachment against is the one the
+  # synthesis checks it against. The LiteLLMGuard bundle holds its own side
+  # of the names, the address and the ports it shares and stops the build when
+  # a local differs; the LiteLLMGatewayConfig bundle stops the build naming
+  # any local it reads that is not declared.
+  #
+  # Five entries are lists rather than names, and each moves with the
+  # synthesis's: proven_engine_versions, analyzer_entity_types, and the three
+  # published from the component's values (model_aliases, model_entries,
+  # published_model). A release or an entity type added to one is added to the
+  # other in the same change. The code the masking modules run, the check in
+  # front of the Presidio integration included, lives in the configuration
+  # bundle alone.
+  locals:
+    config_file: config.yaml
+    provider_key_variable: LITELLM_PROVIDER_API_KEY
+    connection_key_variable_prefix: LITELLM_MODEL_
+    connection_key_variable_suffix: _API_KEY
+    guard_api_key: the-guard-holds-the-upstream-credential
+    caller_identity_module: caller_identity
+    masking_module: data_masking
+    field_entity_masking_class: FieldEntityMasking
+    reply_masking_class: ReplyMasking
+    buffered_reply_masking_class: BufferedReplyMasking
+    field_pattern_masking_class: FieldPatternMasking
+    held_reply_class: HeldStreamedReply
+    log_masking_module: log_masking
+    log_masking_class: LogMasking
+    log_masking_failure_callback: withhold_failed_calls
+    request_filter_module: request_field_filter
+    # The proxy listens on the pod's loopback address, on the port after
+    # infra.port, or the one before it when infra.port is the highest there
+    # is, and the path allowlist listens on infra.port, the port the chart's
+    # Service targets. No field of the source above reads gateway_port or the
+    # three lists published from the component's values below, so they are
+    # evaluated when the Recipe renders, with the functions a render has.
+    gateway_address: 127.0.0.1
+    gateway_port: '{{ if eq (int .infra.port) 65535 }}65534{{ else }}{{ add1 (int .infra.port) }}{{ end }}'
+    metrics_port: "9090"
+    gateway_metrics_port: "9091"
+    path_allowlist_file: path-allowlist.conf
+    # The nginx tag the workload-synthesis Recipe and core/gateway/nginx run,
+    # written here rather than taken from infra because the allowlist is part
+    # of how this Recipe realizes the gateway and no Release setting chooses
+    # it.
+    path_allowlist_image_tag: 1.27.5-alpine
+    request_guard_config_map_name: "{{ .context.instance_id }}-request-guard"
+    request_guard_dir: /etc/litellm-request-guard
+    request_guard_delivery: config_map
+    forward_organization_routes: "false"
+    model_aliases: '{{ $aliases := list }}{{ range (optional .values "models" list) }}{{ $aliases = append $aliases .name }}{{ end }}{{ toJson $aliases }}'
+    model_entries: '{{ toJson (optional .values "models" list) }}'
+    published_model: '{{ with optional .values "model" "" }}{{ . }}{{ else }}{{ with optional .values "models" list }}{{ (index . 0).name }}{{ end }}{{ end }}'
+    analyzer_entity_types: '["CREDIT_CARD", "CRYPTO", "DATE_TIME", "EMAIL_ADDRESS", "IBAN_CODE", "IP_ADDRESS", "LOCATION", "MAC_ADDRESS", "MEDICAL_LICENSE", "NRP", "PERSON", "PHONE_NUMBER", "UK_NHS", "URL", "US_BANK_NUMBER", "US_DRIVER_LICENSE", "US_ITIN", "US_PASSPORT", "US_SSN"]'
+    # The LiteLLM releases the code this Recipe delivers into the proxy is
+    # proven at, as a JSON list — the same list as the workload-synthesis
+    # Recipe's, which it moves with: the code is the same on both, from the
+    # same two bundles. The assertion engine_version_is_proven reads it.
+    proven_engine_versions: '["v1.103.1"]'
+    cache_store_host_variable: SEMANTIC_CACHE_STORE_HOST
+    cache_store_port_variable: SEMANTIC_CACHE_STORE_PORT
+    cache_store_password_variable: REDIS_PASSWORD
+
+  # provides.host is the chart's Service. The value mapping pins the chart's
+  # fullnameOverride to the rendered name, the release name the helm provider
+  # gives the chart, which spells the Component's name in the alphabet a
+  # Kubernetes name allows; under the pin the chart names its Deployment and
+  # its Service by that name, read from a render made with and without the
+  # pin, and the configuration's ConfigMap takes the same name followed by
+  # -config. The chart's Service listens on infra.port, where the path
+  # allowlist answers. The name carries no namespace, so a consumer in another
+  # namespace qualifies it on its own side.
+  #
+  # model is the alias a component wired to the gateway sends as its model
+  # name, held in the published_model local above.
+  #
+  # metrics_endpoint is the chart's own metrics Service, named after the same
+  # name followed by -metrics, which the chart renders on port 9090 while
+  # values.metrics_enabled is true; the path allowlist answers there. Empty
+  # while the value is false. A provides entry cannot read another, so the
+  # name is spelled out in each.
+  provides:
+    host: "{{ .context.rendered_name }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.rendered_name }}:{{ .infra.port }}/v1"
+    model: "{{ .locals.published_model }}"
+    protocol: "http"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-metrics:{{ .locals.metrics_port }}/metrics{{ end }}"
+
+  # The halts the workload-synthesis Recipe makes, with its messages, for the
+  # reasons stated beside each there: an infra.external_base_url carrying a
+  # path; one of the two recognizer sockets wired without the other; an
+  # entity type values.log_masking lists that the analyzer does not recognize
+  # in English, or entities listed with the recognizer sockets unwired; and an
+  # engine_version outside proven_engine_versions, because the request guard
+  # this Recipe delivers on every Release, and the masking it delivers while
+  # core/data-masking is attached or values.log_masking lists something, run
+  # inside the proxy and rest on its internals.
+  assertions:
+    external_base_url_is_an_origin: >-
+      {{- with optional .infra "external_base_url" "" -}}
+      {{- $u := urlParse . -}}
+      {{- if and $u.host $u.path (ne $u.path "/") -}}
+      {{- fail (printf "infra.external_base_url %q carries the path %q, but the gateway takes its public address as an origin only, so the links it composes would point where it is not served; set it to the scheme, host and port alone, for example https://llm.example.com" . $u.path) -}}
+      {{- end -}}
+      {{- end -}}
+    recognizer_sockets_wired_together: >-
+      {{- $analyzer := hasKey .uses "pii_analyzer" -}}
+      {{- $anonymizer := hasKey .uses "pii_anonymizer" -}}
+      {{- if and $analyzer (not $anonymizer) -}}
+      {{- fail "the pii_analyzer socket is wired and the pii_anonymizer socket is not, but the gateway's Presidio integration hands every text the analyzer reports on to the anonymizer and cannot use either service alone; wire a core/security/presidio-anonymizer to pii_anonymizer as well, or remove the pii_analyzer edge" -}}
+      {{- end -}}
+      {{- if and $anonymizer (not $analyzer) -}}
+      {{- fail "the pii_anonymizer socket is wired and the pii_analyzer socket is not, but the gateway's Presidio integration replaces only the spans the analyzer reports and cannot use either service alone; wire a core/security/presidio-analyzer to pii_analyzer as well, or remove the pii_anonymizer edge" -}}
+      {{- end -}}
+    entity_types_the_analyzer_knows: >-
+      {{- $known := fromJson (optional .locals "analyzer_entity_types" "[]") -}}
+      {{- range $e := optional (optional .values "log_masking" dict) "entities" list -}}
+      {{- if not (has $e $known) -}}
+      {{- fail (printf "values.log_masking on %q lists the entity type %q, which the Presidio analyzer core/gateway/litellm calls does not recognize in English; listed beside types it does recognize it would mask nothing in the logs and say nothing. List only types from: %s" $.metadata.instance_id $e (join ", " $known)) -}}
+      {{- end -}}
+      {{- end -}}
+    entities_need_the_recognizer: >-
+      {{- if optional (optional .values "log_masking" dict) "entities" list -}}
+      {{- $analyzer := hasKey .uses "pii_analyzer" -}}
+      {{- $anonymizer := hasKey .uses "pii_anonymizer" -}}
+      {{- if not (and $analyzer $anonymizer) -}}
+      {{- $unwired := "neither its pii_analyzer socket nor its pii_anonymizer socket is wired" -}}
+      {{- if $analyzer }}{{ $unwired = "its pii_anonymizer socket is not wired" }}{{ end -}}
+      {{- if $anonymizer }}{{ $unwired = "its pii_analyzer socket is not wired" }}{{ end -}}
+      {{- fail (printf "values.log_masking on %q lists entities, which core/gateway/litellm finds and replaces in its logs through the Presidio analyzer and anonymizer it calls, but %s; wire a core/security/presidio-analyzer to pii_analyzer and a core/security/presidio-anonymizer to pii_anonymizer on %q, or list patterns instead of entities" .metadata.instance_id $unwired .metadata.instance_id) -}}
+      {{- end -}}
+      {{- end -}}
+    engine_version_is_proven: >-
+      {{- $proven := fromJson .locals.proven_engine_versions -}}
+      {{- if not (has .infra.engine_version $proven) -}}
+      {{- fail (printf "infra.engine_version %q is not a LiteLLM release this Recipe is proven at: the request guard it delivers on every Release, and the masking it delivers while core/data-masking is attached or values.log_masking lists something, are code the proxy loads that relies on the proxy's own internals, and they are proven only at %s. Set infra.engine_version to one of these, or leave it unset for the default" .infra.engine_version (join ", " $proven)) -}}
+      {{- end -}}
+
+  # The chart's two connection checks, Pods carrying the helm.sh/hook: test
+  # annotation, run busybox written with no tag, which no chart setting pins,
+  # so what a cluster pulls for them would move under unchanged rendered
+  # bytes. They are left out of the render; the gateway's own probes cover
+  # the address the first one fetches, and the second checks variables this
+  # Recipe does not set.
+  omits:
+    - kind: Pod
+      name: "{{ .context.rendered_name }}-test-connection"
+    - kind: Pod
+      name: "{{ .context.rendered_name }}-env-test"
+
+  artifacts:
+    # The gateway's configuration — its routing table, the request guard's
+    # registration and the settings the component's values turn on — and the
+    # modules delivered beside it as attachments ask, from the bundle every
+    # Recipe realizing this gateway imports, so the configuration has one text
+    # and every Feature realized on the gateway reads and edits the same body.
+    # What the body holds, and what each attachment adds to it, is stated on
+    # the bundle. It renders one ConfigMap, "<rendered_name>-config", consumed
+    # under the name it is rendered as. The chart's own configuration
+    # ConfigMap is switched off below and the pod mounts this one.
+    litellm-gateway-config.configmap.yaml:
+      $import: LiteLLMGatewayConfig#/artifacts/GatewayConfig
+    # The request guard and the path allowlist, from the bundle the
+    # workload-synthesis Recipe imports as well, so the line they draw — which
+    # request fields a caller may send and which paths it may reach — has one
+    # text on every Recipe running this proxy. The bundle emits one ConfigMap,
+    # named by request_guard_config_map_name, carrying the guard module and the
+    # allowlist's nginx configuration; the value mapping below mounts it at
+    # request_guard_dir in the proxy's container and in the allowlist's. It
+    # stops the build when a Release admits in infra.admitted_request_fields a
+    # field the guard refuses on every Release, and when a local above differs
+    # from its own. What the guard and the allowlist do is stated on the bundle
+    # and on the Component.
+    request-guard:
+      $import: LiteLLMGuard#/artifacts/RequestGuard
+
+  # Under this configuration the chart renders one Deployment, its Service on
+  # infra.port and, while api_key is unattached, the Secret its master-key
+  # variable names; while values.metrics_enabled is true its metrics Service
+  # as well; and while database_url is attached its schema-migration Job. Its
+  # Ingress, autoscalers, disruption budget, service monitor, ServiceAccount
+  # and request collector stay off, because the Component describes none of
+  # them.
+  #
+  # NO BUNDLED DATABASE OR CACHE. The chart can stand up a PostgreSQL server
+  # beside the gateway, and does in its own defaults, and a Redis server; both
+  # are switched off below, because the bookkeeping database is the one
+  # database_url names, the semantic cache's store is the one wired to
+  # cache_store, and neither is compute the Aggregate declared. With
+  # database_url attached the chart's migration Job applies the proxy's schema
+  # to that database before the proxy uses it, and the proxy is told not to
+  # apply it itself, which is how the chart orders the two; with none attached
+  # there is no database to migrate and no Job.
+  #
+  # THE CONFIGURATION. The chart can write the proxy's configuration into a
+  # ConfigMap of its own from its proxy_config value, which it merges over a
+  # default configuration naming a master key read from PROXY_MASTER_KEY; a
+  # value mapping can add to that default but not take that entry out of it.
+  # So the chart's ConfigMap is switched off and its configuration setting
+  # names the bundle's ConfigMap instead. The chart mounts the configuration
+  # file of that ConfigMap alone, at /etc/litellm/config.yaml, and the modules
+  # the bundle carries beside it would not be there; the proxy loads a module
+  # its configuration names without a directory from the directory its
+  # configuration file sits in. So the pod also mounts the whole ConfigMap as
+  # a directory of its own, and the --config argument points the proxy at the
+  # configuration file there, where every module the bundle delivers sits
+  # beside it. The chart's own mount of the file stays, read by nothing.
+  #
+  # THE CREDENTIALS. Each attached slot is written into the chart's list of
+  # environment entries as a secretKeyRef to the Secret its realization names,
+  # with that realization's key: api_key as LITELLM_MASTER_KEY, the variable
+  # the proxy reads its master key from; provider_key under
+  # provider_key_variable, the variable the hand-typed entries of the routing
+  # table name; database_url as DATABASE_URL. Each models connection carrying
+  # a credential delivers it the same way under the variable its routing-table
+  # entry names, derived from its alias by the rule the workload-synthesis
+  # Recipe states, and two aliases the rule maps to one variable halt the
+  # build, naming both. The cache_store connection's credential is delivered
+  # as REDIS_PASSWORD, the variable the semantic cache reads, and with none on
+  # that connection the variable is written empty, which connects without a
+  # password. A slot or a connection credential whose realization publishes no
+  # Secret name halts the build naming it. The chart gives that list to its
+  # migration Job as well, so the Job, which runs only with database_url
+  # attached, reads DATABASE_URL from it and carries the other references
+  # unread.
+  #
+  # THE MASTER-KEY SECRET. Whatever is attached, the chart gives the proxy the
+  # variable PROXY_MASTER_KEY from a Secret, and with no Secret named it
+  # renders one holding a key it generates on every render, which would make
+  # two builds of one Release differ. So the Secret is always supplied. With
+  # api_key attached, the chart's master-key Secret setting names api_key's
+  # Secret and key, and the chart renders no Secret of its own. Unattached,
+  # the chart renders its Secret from the fixed literal below, which nothing
+  # reads: the configuration names no master key and PROXY_MASTER_KEY is not
+  # a variable the proxy reads, so the gateway starts with no administrative
+  # key, exactly as the synthesis does with the slot unattached.
+  #
+  # THE ADDRESSES. infra.external_base_url, when set, reaches the proxy, and
+  # the migration Job beside it, as PROXY_BASE_URL; unset, the variable is not
+  # written. With the pii_analyzer and pii_anonymizer sockets wired, the
+  # endpoint each service publishes reaches the proxy as
+  # PRESIDIO_ANALYZER_API_BASE and PRESIDIO_ANONYMIZER_API_BASE. With the
+  # cache_store socket wired, the store's published host and port reach it
+  # under the two variables the locals above name, and the build halts when
+  # the store publishes no vector_search. A second component wired to one of
+  # those three sockets halts the build naming the socket, because the
+  # gateway reads one address from each. With none wired, none of them is
+  # written. The chart's own LITELLM_LOG setting is emptied, so the proxy logs
+  # at its own default level, as on the synthesis.
+  #
+  # THE POD. The proxy's arguments are replaced, so it reads the configuration
+  # file in the directory mounted above and listens on the loopback address on
+  # gateway_port, with its own metrics listener on gateway_metrics_port while
+  # values.metrics_enabled is true; the chart's HOST variable is set to the
+  # same address, and its PORT variable, which follows the Service port, is
+  # overridden by the --port argument. The path allowlist is a second
+  # container of the pod, the official nginx image (BSD-2-Clause) at the tag
+  # above, started on the configuration the bundle carries in the foreground
+  # in place of the image's own start-up scripts, and sized as on the
+  # synthesis. It listens on infra.port, which the chart declares as the proxy
+  # container's http port and its Service targets, so every caller reaches the
+  # gateway through it, and on metrics_port while values.metrics_enabled is
+  # true, which the chart declares as the proxy container's metrics port and
+  # its metrics Service targets; the chart also hands the proxy that port as
+  # PROMETHEUS_METRICS_PORT, which the --prometheus_metrics_port argument
+  # overrides, so the proxy's listener stays on the loopback address on
+  # gateway_metrics_port. Neither port asks a caller for a key, and the
+  # metrics name the hashed keys, key aliases and user emails the gateway
+  # attributes spend to. The chart's probes ask /health/readiness and
+  # /health/liveliness on that http port, with the timings the synthesis
+  # gives them, so they are answered through the allowlist, which forwards
+  # both. The bundle's ConfigMap is a volume of the pod, mounted read-only at
+  # request_guard_dir in both containers; the chart mounts the volumes it is
+  # given in its migration Job too, which reads nothing there.
+  valuesMapping: |
+    {{- $features := default dict .features }}
+    {{- $configDir := "/etc/litellm-gateway" }}
+    {{- range $slot := list "api_key" "provider_key" "database_url" }}
+    {{- if and (hasKey $features $slot) (not (index $features $slot).provides.name) }}
+    {{- fail (printf "the %s slot of the LiteLLM gateway %q is filled by a realization that publishes no Secret name, so the gateway would read its credential from no Secret: bind that slot's Feature to a realization that names the Secret it holds" $slot $.context.instance_id) }}
+    {{- end }}
+    {{- end }}
+    {{- $analyzer := dict }}
+    {{- $anonymizer := dict }}
+    {{- $store := dict }}
+    {{- $modelKeys := dict }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- $edgeFeatures := default dict $edge.features }}
+    {{- if and (has $edge.socket (list "models" "cache_store")) (hasKey $edgeFeatures "credential") (not (optional (default dict $edgeFeatures.credential.provides) "name" "")) }}
+    {{- fail (printf "the credential on the %s connection %s of %q is filled by a realization that publishes no Secret name, so the gateway would read it from no Secret: bind that credential's Feature to a realization that names the Secret it holds" $edge.socket $alias $.context.instance_id) }}
+    {{- end }}
+    {{- if has $edge.socket (list "pii_analyzer" "pii_anonymizer" "cache_store") }}
+    {{- if or (and (eq $edge.socket "pii_analyzer") $analyzer) (and (eq $edge.socket "pii_anonymizer") $anonymizer) (and (eq $edge.socket "cache_store") $store) }}
+    {{- fail (printf "more than one component is wired to the %s socket of %q, but the gateway reads one address from it; keep one connection on that socket" $edge.socket $.context.instance_id) }}
+    {{- end }}
+    {{- if eq $edge.socket "pii_analyzer" }}{{ $analyzer = $edge }}{{ end }}
+    {{- if eq $edge.socket "pii_anonymizer" }}{{ $anonymizer = $edge }}{{ end }}
+    {{- if eq $edge.socket "cache_store" }}
+    {{- if not (toString (optional (default dict $edge.provides) "vector_search" "")) }}
+    {{- fail (printf "the cache_store socket is wired to %q, a %s publishing no vector_search, but the gateway's semantic cache stores and searches its replies with the Redis query engine's vector search; a store without it would cache nothing while every request still succeeds. Wire a store publishing vector_search to cache_store: a core/datastore/redis on an infra.engine_version from 8.0.0 on, or one whose infra.overrides.image names an image serving that search, with infra.image_serves_vector_search: true set on it in the Release" $edge.target (first (splitList ":" (toString $edge.component)))) }}
+    {{- end }}
+    {{- $store = $edge }}
+    {{- end }}
+    {{- end }}
+    {{- if and (eq $edge.socket "models") (hasKey $edgeFeatures "credential") }}
+    {{- $variable := printf "%s%s%s" $.locals.connection_key_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_") $.locals.connection_key_variable_suffix }}
+    {{- with get $modelKeys $variable }}{{ fail (printf "the models connections %s and %s of %q would each deliver their credential as %s, because the gateway names a connection's variable after its alias in capitals, with every character other than a letter or a digit as an underscore; rename one of the two connections" . $alias $.context.instance_id $variable) }}{{ end }}
+    {{- $_ := set $modelKeys $variable $alias }}
+    {{- end }}
+    {{- end }}
+    {{- $storeCredential := "" }}
+    {{- if $store }}{{ if hasKey (default dict $store.features) "credential" }}{{ $storeCredential = $store.features.credential.provides }}{{ end }}{{ end }}
+
+    ## ── Pin the chart's resource names to the rendered name ────
+    ## Names the gateway's Service exactly "<rendered_name>", matching
+    ## provides.host, and its metrics Service "<rendered_name>-metrics".
+    fullnameOverride: "{{ .context.rendered_name }}"
+
+    ## ── Proxy image pin ────────────────────────────────────────
+    ## The chart's own default tag is its appVersion, which moves with the
+    ## chart; the image is pinned to the Component's engine_version, the tag
+    ## the workload-synthesis Recipe runs.
+    image:
+      repository: ghcr.io/berriai/litellm
+      tag: "{{ .infra.engine_version }}"
+      pullPolicy: IfNotPresent
+
+    replicaCount: 1
+
+    ## ── The chart's bundled services and extras, all declined ──
+    db:
+      useExisting: false
+      deployStandalone: false
+    redis:
+      enabled: false
+    migrationJob:
+      enabled: {{ hasKey $features "database_url" }}
+    ingress:
+      enabled: false
+    autoscaling:
+      enabled: false
+    keda:
+      enabled: false
+    pdb:
+      enabled: false
+    serviceMonitor:
+      enabled: false
+    serviceAccount:
+      create: false
+    collector:
+      enabled: false
+    logLevel: ""
+
+    ## ── The master-key Secret the chart always reads ───────────
+    {{- with $features.api_key }}
+    masterkeySecretName: "{{ .provides.name }}"
+    masterkeySecretKey: "{{ .provides.key }}"
+    {{- else }}
+    masterkeySecretName: ""
+    masterkey: "unread-the-gateway-runs-without-a-master-key"
+    {{- end }}
+
+    ## ── The configuration: the bundle's ConfigMap ──────────────
+    proxyConfigMap:
+      create: false
+      name: "{{ .context.rendered_name }}-config"
+      key: "{{ .locals.config_file }}"
+
+    ## ── The proxy's listen address and arguments ───────────────
+    listen: "{{ .locals.gateway_address }}"
+    args:
+      - "--config"
+      - "{{ $configDir }}/{{ .locals.config_file }}"
+      - "--host"
+      - "{{ .locals.gateway_address }}"
+      - "--port"
+      - "{{ .locals.gateway_port }}"
+      {{- if .values.metrics_enabled }}
+      - "--prometheus_metrics_port"
+      - "{{ .locals.gateway_metrics_port }}"
+      {{- end }}
+
+    ## ── Service: the allowlist's port, and the metrics Service ─
+    service:
+      type: ClusterIP
+      port: {{ .infra.port }}
+    metricsServer:
+      enabled: {{ .values.metrics_enabled }}
+      port: {{ .locals.metrics_port }}
+
+    ## ── Credentials, each by reference to its own Secret ───────
+    {{- if or (hasKey $features "api_key") (hasKey $features "provider_key") (hasKey $features "database_url") $storeCredential $modelKeys }}
+    extraEnvVars:
+      {{- with $features.api_key }}
+      - name: LITELLM_MASTER_KEY
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .provides.name }}"
+            key: "{{ .provides.key }}"
+      {{- end }}
+      {{- with $features.provider_key }}
+      - name: "{{ $.locals.provider_key_variable }}"
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .provides.name }}"
+            key: "{{ .provides.key }}"
+      {{- end }}
+      {{- with $features.database_url }}
+      - name: DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .provides.name }}"
+            key: "{{ .provides.key }}"
+      {{- end }}
+      {{- with $storeCredential }}
+      - name: "{{ $.locals.cache_store_password_variable }}"
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .name }}"
+            key: "{{ .key }}"
+      {{- end }}
+      {{- range $variable, $alias := $modelKeys }}
+      {{- $credential := (get $.context.uses $alias).features.credential.provides }}
+      - name: "{{ $variable }}"
+        valueFrom:
+          secretKeyRef:
+            name: "{{ $credential.name }}"
+            key: "{{ $credential.key }}"
+      {{- end }}
+    {{- else }}
+    extraEnvVars: []
+    {{- end }}
+
+    ## ── The addresses the gateway reads, as plain variables ────
+    {{- if or .infra.external_base_url $analyzer $anonymizer $store }}
+    envVars:
+      {{- with .infra.external_base_url }}
+      PROXY_BASE_URL: "{{ . }}"
+      {{- end }}
+      {{- with $analyzer }}
+      PRESIDIO_ANALYZER_API_BASE: "{{ .provides.endpoint }}"
+      {{- end }}
+      {{- with $anonymizer }}
+      PRESIDIO_ANONYMIZER_API_BASE: "{{ .provides.endpoint }}"
+      {{- end }}
+      {{- with $store }}
+      {{ $.locals.cache_store_host_variable }}: "{{ .provides.host }}"
+      {{ $.locals.cache_store_port_variable }}: "{{ .provides.port }}"
+      {{- if not $storeCredential }}
+      {{ $.locals.cache_store_password_variable }}: ""
+      {{- end }}
+      {{- end }}
+    {{- else }}
+    envVars: {}
+    {{- end }}
+
+    ## ── The path allowlist, a second container of the pod ──────
+    extraContainers:
+      - name: path-allowlist
+        image: "nginx:{{ .locals.path_allowlist_image_tag }}"
+        command:
+          - nginx
+          - -c
+          - "{{ .locals.request_guard_dir }}/{{ .locals.path_allowlist_file }}"
+          - -g
+          - "daemon off;"
+        resources:
+          requests:
+            cpu: 250m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 128Mi
+        volumeMounts:
+          - name: request-guard
+            mountPath: "{{ .locals.request_guard_dir }}"
+            readOnly: true
+
+    ## ── The configuration directory and the request guard ──────
+    volumes:
+      - name: gateway-config
+        configMap:
+          name: "{{ .context.rendered_name }}-config"
+      - name: request-guard
+        configMap:
+          name: "{{ .locals.request_guard_config_map_name }}"
+    volumeMounts:
+      - name: gateway-config
+        mountPath: "{{ $configDir }}"
+        readOnly: true
+      - name: request-guard
+        mountPath: "{{ .locals.request_guard_dir }}"
+        readOnly: true
+
+    ## ── Proxy resources ────────────────────────────────────────
+    ## Quoted so a whole-core quantity stays a string.
+    resources:
+      requests:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"

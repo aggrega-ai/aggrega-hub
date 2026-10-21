@@ -347,8 +347,8 @@ component can send its traffic through: `core/gateway/litellm` and
 The selector admits both guards that carry the value, and each gateway's
 realization of the shield halts the build on any guard but
 `core/security/nemo-guardrails`, the one its two sensitivities are measured
-on. `cache_store`'s selector admits the key-value stores too, and its Recipe
-halts on a store that publishes no `vector_search`.
+on. `cache_store`'s selector admits the key-value stores too, and each of its
+Recipes halts on a store that publishes no `vector_search`.
 
 ### The `security.aggrega.ai/text-anonymization` label
 
@@ -4044,11 +4044,13 @@ guardrail and its content filter among them, so it rests on internals no
 LiteLLM setting describes. What it refuses and withholds is proven by running it
 at LiteLLM v1.103.1, the release the gateway's `engine_version` defaults to; at
 another release the import may fail and stop the proxy, or succeed over changed
-internals and keep less. So the gateway's Recipe holds the releases its code is
-proven at in one local, and an assertion reading it halts the build on any other
-`engine_version`, naming them. The halt holds on every Release of that Recipe,
-masking attached or not, because the request guard it delivers on every Release
-is code of the same kind.
+internals and keep less. So each of the gateway's Recipes — the workload
+synthesis and the chart Recipe, which deliver the same code from the same two
+bundles — holds the releases that code is proven at in one local of its own,
+the two lists changed together, and an assertion reading it halts the build on
+any other `engine_version`, naming them. The halt holds on every Release of
+either Recipe, masking attached or not, because the request guard each delivers
+on every Release is code of the same kind.
 
 ### Who writes each input, and where a Feature is attached
 

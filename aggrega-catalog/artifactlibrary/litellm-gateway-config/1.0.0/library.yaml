@@ -289,6 +289,27 @@ spec:
     # precedes it; it records the metrics the gateway's own metrics listener
     # serves.
     #
+    # The analyzer answer check. Both masking modules this bundle delivers put
+    # one check in front of the gateway's Presidio integration, bound once as
+    # $analyzerAnswerCheck at the top of the file and written into whichever of
+    # the two is delivered, so the two cannot accept different answers. The
+    # integration fails a call when the analyzer answers with an HTTP error,
+    # with a body that is not JSON, with an error object or with neither a list
+    # nor an object; but it skips, with a warning, every item of a list it
+    # cannot read as a detection, so a list holding only such items reads as
+    # finding nothing and the text would pass on unmasked. The check accepts an
+    # answer that is a list, or an object other than an error, only when every
+    # item in it is a detection — an entity type, where it starts and where it
+    # ends, and a score — and otherwise fails the call as the integration fails
+    # it for an answer it cannot read, so a request or a reply carrying the
+    # text fails rather than travel on, and a logged copy has its text
+    # withheld. It wraps the one function the integration reads the analyzer's
+    # answer through, for every guardrail calling the analyzer, the gateway's
+    # own Presidio guardrail included, once per process however often the
+    # proxy runs the module. An empty list is a legitimate answer, finding
+    # nothing, and passes. It is code of the same kind as the modules, so it is
+    # proven at the releases each importing Recipe lists.
+    #
     # What the importing Recipe declares. The configuration names files,
     # modules, classes and variables that the importing Recipe's workload, or
     # an attachment's realization, reads as well, so the Recipe holds each as
@@ -314,6 +335,36 @@ spec:
           realization, reads as well. One the Recipe does not declare reads as empty here, so each is checked before
           anything is written, and an absent or empty one stops the build naming it. */}}
         {{- $bundle := "LiteLLMGatewayConfig#/artifacts/GatewayConfig" }}
+        {{- $analyzerAnswerCheck := `from litellm.exceptions import GuardrailRaisedException
+        from litellm.proxy.guardrails.guardrail_hooks import presidio as _presidio_integration
+        ANALYZER_ANSWER_UNREADABLE = (
+            "Presidio analyzer returned invalid response; cannot verify PII when PII protection is configured: "
+            "its answer holds an item that is not a detection result"
+        )
+        def _is_detection(item):
+            # One detection as the analyzer reports it: the entity type, where it starts and ends, and a score.
+            if not isinstance(item, dict) or not isinstance(item.get("entity_type"), str) or not item["entity_type"]:
+                return False
+            start, end, score = item.get("start"), item.get("end"), item.get("score")
+            placed = all(isinstance(value, int) and not isinstance(value, bool) for value in (start, end))
+            scored = isinstance(score, (int, float)) and not isinstance(score, bool)
+            return placed and scored and 0 <= start <= end
+        def _checked_analyzer_answer(read):
+            async def checked(response):
+                answer = await read(response)
+                if isinstance(answer, list):
+                    items = answer
+                elif isinstance(answer, dict) and "error" not in answer:
+                    items = [answer]
+                else:
+                    items = []
+                if not all(_is_detection(item) for item in items):
+                    raise GuardrailRaisedException(message=ANALYZER_ANSWER_UNREADABLE, should_wrap_with_default_message=False)
+                return answer
+            checked.checks_analyzer_answer = True
+            return checked
+        if not getattr(_presidio_integration._json_body, "checks_analyzer_answer", False):
+            _presidio_integration._json_body = _checked_analyzer_answer(_presidio_integration._json_body)` }}
         {{- if not (optional .locals "config_file" "") }}{{ fail (printf "the Recipe importing %s does not declare the local config_file, which is the data key the gateway's configuration is carried under and the file its proxy is pointed at; declare it among the Recipe's locals" $bundle) }}{{ end }}
         {{- if not (optional .locals "provider_key_variable" "") }}{{ fail (printf "the Recipe importing %s does not declare the local provider_key_variable, which is the variable the hand-typed entries of the model map name for their upstream credential and the one the provider_key slot is delivered under; declare it among the Recipe's locals" $bundle) }}{{ end }}
         {{- if not (optional .locals "connection_key_variable_prefix" "") }}{{ fail (printf "the Recipe importing %s does not declare the local connection_key_variable_prefix, which is the fixed part before a models connection's alias in the variable its credential is delivered under and its entry names; declare it among the Recipe's locals" $bundle) }}{{ end }}
@@ -331,7 +382,6 @@ spec:
         {{- if not (optional .locals "log_masking_module" "") }}{{ fail (printf "the Recipe importing %s does not declare the local log_masking_module, which is the module the log-masking guardrail is loaded from while values.log_masking lists something; declare it among the Recipe's locals" $bundle) }}{{ end }}
         {{- if not (optional .locals "log_masking_class" "") }}{{ fail (printf "the Recipe importing %s does not declare the local log_masking_class, which is the class the log-masking module defines and its guardrail entry names; declare it among the Recipe's locals" $bundle) }}{{ end }}
         {{- if not (optional .locals "log_masking_failure_callback" "") }}{{ fail (printf "the Recipe importing %s does not declare the local log_masking_failure_callback, which is the callback the log-masking module defines to withhold a failed call's text and the configuration registers; declare it among the Recipe's locals" $bundle) }}{{ end }}
-        {{- if not (optional .locals "analyzer_answer_check" "") }}{{ fail (printf "the Recipe importing %s does not declare the local analyzer_answer_check, which is the check both masking modules put in front of the gateway's Presidio integration; declare it among the Recipe's locals" $bundle) }}{{ end }}
         {{- $identity := false }}
         {{- $listed := list }}
         {{- $masking := false }}
@@ -666,7 +716,7 @@ spec:
             from litellm.proxy.guardrails.guardrail_hooks.presidio import _OPTIONAL_PresidioPIIMasking
             from litellm.types.guardrails import GuardrailEventHooks
             from litellm.types.utils import Delta, ModelResponse, ModelResponseStream, StreamingChoices
-            {{- .locals.analyzer_answer_check | nindent 4 }}
+            {{- $analyzerAnswerCheck | nindent 4 }}
 
             STREAM_REFUSED = (
                 "This gateway masks the entities in its replies and does not stream a reply "
@@ -1568,7 +1618,7 @@ spec:
             from litellm.proxy.guardrails.guardrail_hooks.litellm_content_filter.content_filter import ContentFilterGuardrail
             from litellm.proxy.guardrails.guardrail_hooks.presidio import _OPTIONAL_PresidioPIIMasking
             from litellm.types.guardrails import GuardrailEventHooks
-            {{- .locals.analyzer_answer_check | nindent 4 }}
+            {{- $analyzerAnswerCheck | nindent 4 }}
 
             # What each text a caller or a model wrote becomes, in every copy of a call whose texts could not all be masked:
             # one fixed word that carries no part of any text.
