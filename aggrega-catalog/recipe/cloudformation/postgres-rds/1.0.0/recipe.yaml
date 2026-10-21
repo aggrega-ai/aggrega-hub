@@ -14,6 +14,16 @@ metadata:
     fragments into one stack template. The managed-service realization: the
     operator's ha and backup sizing map onto the instance's native MultiAZ and
     backup-retention settings, and RDS owns the master password.
+
+    host publishes a CloudFormation reference to the instance's address, which
+    resolves inside the stack and through its export; port publishes the port
+    infra.port configures, which a consumer on any target can use. Set
+    infra.overrides.host in the Release to the DNS name or IP literal the
+    instance is reached at, and host publishes that name instead. The Recipe
+    emits nothing for it — no DNS record, no alias — so pointing the name at
+    the instance is the operator's. A consumer in the same stack then receives
+    the name too, and CloudFormation no longer creates it after the instance:
+    order the two with the boundaries' syncWave.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -31,27 +41,47 @@ spec:
   # the terraform realization of this database uses.
   locals:
     logical_id: '{{ capitalizedWords .context.instance_id }}'
+    # The name the Release gives the instance under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
 
-  # The String Pipe: CloudFormation intrinsic function references. The compiler
-  # pipes these strings verbatim into a consumer's injection context when it uses
-  # this database — it does not resolve them. CloudFormation resolves them at
-  # stack creation time. The provider projects the matching provides block inside
-  # the fragment below into the assembled stack Outputs; this recipe-level provides
-  # is the value-pipe contract, the fragment provides is the Outputs source, and
-  # they carry the same references. user/database mirror the developer values.
+  # The String Pipe: the compiler pipes each of these strings verbatim into a
+  # consumer's injection context when it uses this database, and resolves none
+  # of them. host is a CloudFormation intrinsic function reference, which
+  # CloudFormation resolves at stack creation time. The provider projects the
+  # matching provides block inside the fragment below into the assembled stack
+  # Outputs; this recipe-level provides is the value-pipe contract, the fragment
+  # provides is the Outputs source, and they carry the same values. user/database
+  # mirror the developer values.
   #
-  # host/port read locals.logical_id rather than repeating the derivation it
-  # holds. A node's locals resolve before its provides, so a provides template
-  # reads .locals and receives the resolved value: the logical id is derived once,
-  # and the fragment below and these two entries all follow that one definition.
+  # host reads locals.logical_id rather than repeating the derivation it holds.
+  # A node's locals resolve before its provides, so a provides template reads
+  # .locals and receives the resolved value: the logical id is derived once, and
+  # the fragment below and this entry all follow that one definition.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name in
+  # both provides blocks instead of the reference. It is the operator's
+  # deterministic pointer: the compiler pipes it as text and looks nothing up,
+  # and this Recipe emits no DNS record or alias for it, so the operator points
+  # the name at the instance outside the Release. A consumer in the same
+  # stack receives the name as well, and a name carries no reference for
+  # CloudFormation to create that consumer after this instance by; a later
+  # syncWave on the consumer's boundary, sharing this boundary's directory,
+  # orders the two. A consumer in another stack imports the name through the
+  # same export it imports the reference through.
+  #
+  # port is the value the fragment sets on the instance's Port property, so it
+  # is known ahead of time and published as that value in both blocks: a
+  # consumer on any target can use it.
   #
   # The metrics keys are published empty, here and not in the fragment's own
   # provides, which carries only the outputs the stack exports: the instance is
   # a managed service with no pods to discover, and RDS publishes its metrics to
   # the cloud provider's own monitoring rather than to a Prometheus endpoint.
   provides:
-    host: "!GetAtt {{ .locals.logical_id }}.Endpoint.Address"
-    port: "!GetAtt {{ .locals.logical_id }}.Endpoint.Port"
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}!GetAtt {{ .locals.logical_id }}.Endpoint.Address{{ end }}"
+    port: "{{ .infra.port }}"
     user: "{{ .values.user }}"
     database: "{{ .values.database }}"
     protocol: "postgres"
@@ -68,13 +98,33 @@ spec:
   #   DBParameterGroupName - string (Properties.DBParameterGroupName)
   #   StorageEncrypted     - bool (Properties.StorageEncrypted)
   #   KmsKeyId             - string (Properties.KmsKeyId; emitted only when StorageEncrypted is set)
+  #   host                 - string (published as provides.host; renders nothing)
   #
   # The key names are the CloudFormation property names rather than a separate
   # Aggrega spelling, because each is passed through to the resource unchanged and
   # the property name is what a reader matches against the resource
   # documentation. The first three carry defaults; the rest emit nothing when
-  # unset.
+  # unset. host is the exception to the naming: it is no property of the
+  # resource but the address a consumer reaches the database at, under the name
+  # the catalog's referenced realization, helm/postgres-external, reads for the
+  # same address.
   #
+  # host is a bare DNS name or IP literal. The assertion below refuses a value
+  # carrying a scheme, a path, a user, a port or whitespace, because a consumer
+  # composes its connection from host and port and would compose a broken one;
+  # the port is infra.port. A value carrying exactly one colon is a name or an
+  # IPv4 literal with a port; an IPv6 literal carries several and is accepted.
+  assertions:
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this database reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the port is infra.port` $h) -}}
+      {{- end -}}
+      {{- end -}}
+
   # infra.storage.type is the RDS storage type here, not a storage class. The
   # Component declares no default for it, because on Kubernetes an unset class
   # leaves the volume to the cluster's default storage class; this Recipe
@@ -130,8 +180,8 @@ spec:
       # cross-stack consumer imports the host entry; an intra-stack consumer
       # receives it through the value-pipe above.
       provides:
-        host: !GetAtt {{ .locals.logical_id }}.Endpoint.Address
-        port: !GetAtt {{ .locals.logical_id }}.Endpoint.Port
+        host: {{ if .locals.operator_host }}"{{ .locals.operator_host }}"{{ else }}!GetAtt {{ .locals.logical_id }}.Endpoint.Address{{ end }}
+        port: "{{ .infra.port }}"
         user: "{{ .values.user }}"
         database: "{{ .values.database }}"
         protocol: postgres

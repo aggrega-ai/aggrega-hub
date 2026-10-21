@@ -3531,7 +3531,9 @@ copying whichever sibling happens to be nearest.
   `endpoint`, joined from those parts and carrying no credential:
   `core/datastore/pgvector` publishes
   `postgresql://<user>@<host>:<port>/<database>`, its password staying the
-  credential attached to the component.
+  credential attached to the component. A managed realization publishes `host`
+  and `port` as "The name a managed datastore is reached at from another
+  target" below sets out.
 - **`featuresSchema`** — an optional transparent `password` slot carrying an inline
   development default when nothing is attached, so an unattached slot stays
   byte-identical to its pre-slot output; plus an optional `app_user_password` where
@@ -3548,6 +3550,58 @@ copying whichever sibling happens to be nearest.
   `mixed` where the member is realized both self-hosted (helm, compose) and
   managed (the Terraform/CloudFormation equivalents). These are selector-only
   identity; the family's Recipes do not stamp them onto rendered output.
+
+### The name a managed datastore is reached at from another target
+
+A managed datastore's address — an RDS instance's, say — does not exist until the
+instance is created, so a Terraform or CloudFormation realization publishes `host`
+as a pointer that target resolves inside its own output:
+`${module.<instance>.address}` on Terraform, `!GetAtt <LogicalId>.Endpoint.Address`
+on CloudFormation. A consumer rendered to another target — a helm Deployment, a
+compose service — receives that pointer as text. **Every managed datastore
+realization therefore lets the operator supply the name to publish instead.** This
+is a catalog convention, not something the compiler checks: the compiler pipes the
+operator's string and resolves nothing about it.
+
+- **The key is `infra.overrides.host`**, the name the referenced realization
+  `recipe/helm/postgres-external` reads for the same concept — the address a
+  consumer reaches the server at, supplied by the Release. It sits in the open
+  `overrides` bag, so the Component's schema does not list it; each Recipe's
+  comment listing the `overrides` keys it reads does, and this section is the rule.
+- **Set, `host` publishes the name; unset, it publishes the pointer exactly as
+  before.** On CloudFormation the name goes into both `provides` blocks — the
+  Recipe-level one a consumer's value pipe reads, and the fragment's own that the
+  stack Outputs are projected from — so a consumer in another stack imports the
+  name through the same export it would import the pointer through. A Release that
+  does not set the key renders byte for byte as it did before the option existed.
+- **`port` publishes the configured `infra.port`, set or unset.** The Recipe sets
+  the instance's port from it, so the value is known ahead of time and a consumer
+  on any target can use it, where a port pointer would reach another target as
+  text exactly as the host's does.
+- **The Recipe emits nothing for the name** — no DNS record, no alias. The operator
+  points the name at the instance outside the Release, and the build cannot check
+  that it does: resolving the name is the runtime's, and a record the Release never
+  declared would be infrastructure nobody authored.
+- **The value is a bare host: a DNS name or an IP literal**, as
+  `recipe/helm/postgres-external` accepts. A value carrying a scheme (`://`), a
+  path (`/`), a user (`@`), a port (one `:` after a name or an IPv4 literal, `]:`
+  after a bracketed IPv6 one) or whitespace, or one that is not a string, is
+  refused by a build-time `assertions` entry naming the key and saying that the
+  port is `infra.port`. An IPv6 literal carries several colons and is accepted.
+- **A consumer on the same target receives the name too, and loses the ordering
+  the pointer gave it.** Terraform acts on a module after the module it references,
+  and CloudFormation creates a resource after the one its `Fn::GetAtt` names; a
+  name references nothing. Each Recipe's description says so. The operator orders
+  the two with `syncWave:` — the consumer in its own boundary, sharing the
+  database's `directory:`, with a later wave, since every component of one boundary
+  carries that boundary's wave. The terraform and cloudformation provider pages'
+  "Deployment ordering" sections set out what a wave expresses on each target.
+
+The terraform RDS Recipes (`recipe/terraform/postgres-rds`, `mysql-rds`,
+`mariadb-rds` and the two `-module` Recipes) and the CloudFormation ones
+(`recipe/cloudformation/postgres-rds`, `mysql-rds` and `mariadb-rds`) follow it.
+A managed datastore Recipe added later follows this section rather than a sibling
+Recipe.
 
 ### The pipeline family template
 

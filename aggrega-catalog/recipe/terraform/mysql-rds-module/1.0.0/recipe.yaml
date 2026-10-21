@@ -20,6 +20,14 @@ metadata:
     receives it as text. It names this component's module, so it resolves only
     where the Aggregate the Release deploys declares this component, not where
     it is composed in from another Aggregate.
+
+    Set infra.overrides.host in the Release to the DNS name or IP literal the
+    instance is reached at, and host publishes that name instead, which a
+    consumer on any target can use. The Recipe emits nothing for it — no DNS
+    record, no alias — so pointing the name at the instance is the operator's.
+    A consumer in the same root configuration then receives the name too, and
+    Terraform no longer orders it after the instance: order the two with the
+    boundaries' syncWave.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -29,10 +37,11 @@ spec:
   # This Recipe reads from infra.overrides:
   #   instance_class      - string (instance_class; default "db.t3.small")
   #   subnet_group        - string (db_subnet_group_name), required
+  #   host                - string (published as provides.host; not passed to the module)
   #
-  # Both key names are the ones the inline RDS Recipes already use for these
-  # values, so an operator states each once under one spelling whichever shape of
-  # Recipe renders it. instance_class has a default, and the default lives here
+  # instance_class and subnet_group are the names the inline RDS Recipes already
+  # use for these values, so an operator states each once under one spelling
+  # whichever shape of Recipe renders it. instance_class has a default, and the default lives here
   # rather than on the module's own variable: the module is also consumable
   # directly by a Terraform author, and a default in both places would be two
   # homes for one value.
@@ -46,10 +55,28 @@ spec:
   # the argument out and let the service pick the account default, while a mapping
   # always renders the key and would render it empty. The assertion below is what
   # makes that omission a halt instead of an empty group name reaching the plan.
+  #
+  # host is no input of the module but the address a consumer reaches the
+  # database at, under the name the inline RDS Recipes and the catalog's
+  # referenced realization, helm/postgres-external, read for the same address.
+  # It is a bare DNS name or IP literal: the assertion below refuses a value
+  # carrying a scheme, a path, a user, a port or whitespace, because a consumer
+  # composes its connection from host and port and would compose a broken one;
+  # the port is infra.port. A value carrying exactly one colon is a name or an
+  # IPv4 literal with a port; an IPv6 literal carries several and is accepted.
   assertions:
     subnet_group_supplied: >-
       {{- if not (and (hasKey .infra "overrides") (optional .infra.overrides "subnet_group" "")) -}}
       {{- fail "this Release places its database in a DB subnet group that already exists in the target account, and the Terraform module it renders requires that group's name, but infra.overrides.subnet_group carries none: set infra.overrides.subnet_group in the Release to the name of an existing DB subnet group" -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this database reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the port is infra.port` $h) -}}
+      {{- end -}}
       {{- end -}}
 
   # The vendored module lives beside this Recipe. A local source is copied
@@ -57,6 +84,12 @@ spec:
   # hashicorp/aws by the one range every AWS body in this catalog declares, and
   # says why.
   source: ./module
+
+  locals:
+    # The name the Release gives the instance under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
 
   # The String Pipe: the compiler does not interpret these strings. It pipes
   # whatever the module's outputs name; Terraform resolves them at apply time.
@@ -71,8 +104,17 @@ spec:
   # address is the instance's bare hostname; the module's endpoint output is
   # address:port. port is the value the mapping below passes to the module, so
   # it is known ahead of time and published as that value.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record or alias for it, so the operator points the name at the instance
+  # outside the Release. A consumer in the same root configuration receives
+  # the name as well, and a name carries no reference for Terraform to order
+  # its module after this one by; a later syncWave on the consumer's boundary,
+  # sharing this boundary's directory, orders the two.
   provides:
-    host: "${module.{{ .context.instance_id }}.address}"
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.address}{{ end }}"
     port: "{{ .infra.port }}"
     user: "admin"
     database: "{{ .values.database }}"
