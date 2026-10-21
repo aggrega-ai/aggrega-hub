@@ -1,0 +1,225 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: fluentd-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Fluentd log aggregator on Kubernetes via the Fluent project's own fluentd
+    Helm chart, served from that project's HTTPS chart repository. The chart
+    deploys a log-collecting DaemonSet by default; here its values configure
+    it as the aggregator the Component describes: one replica running the
+    official fluent/fluentd image at infra.engine_version, a `forward` input
+    on the infra port, the records the developer's output match selects
+    routed to standard output, no host log mounts and no cluster read grants.
+    The chart was checked for being official, complete and maintained against
+    the chart itself.
+
+    The buffer is in-memory by default, so the chart renders a Deployment with
+    no persistent volume. When infra.storage.size is set the chart renders a
+    StatefulSet whose claim of that size backs a file buffer mounted at
+    /fluentd/log, as on the synthesis. provides.host is the chart's Service,
+    with no namespace; it carries the forward port beside the chart's own
+    metrics port.
+
+    Reach for this realization where a chart repository is reachable at build
+    time; reach for `fluentd`, the workload-synthesis realization, where the
+    build must complete with nothing fetched. Default chart version in
+    source.version; override via infra.source_version. The Fluentd server is
+    Apache-2.0.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/observability/fluentd:1.0.0
+
+  # The chart. The Fluent project publishes it from its own fluent/helm-charts
+  # repository, under the Apache-2.0 licence, and its maintainers are that
+  # project's own, so it is official. It is complete for this Component: the
+  # controller kind, the replica count, the image, every configuration file, a
+  # persistence claim sized by value, the Service's ports and the container's
+  # resources and probes are all values. It is maintained: the version pinned
+  # below is the latest it has published, and it packages Fluentd 1.19.3, the
+  # release the Component's engine_version defaults to. Those were the three
+  # checks a chart is held to before a Recipe points at it.
+  source:
+    kind: helm-https-chart
+    url: https://fluent.github.io/helm-charts
+    chart: fluentd
+    # Default chart version. Override via infra.source_version; a version
+    # other than this one may need a different value mapping.
+    version: "{{ optional .infra `source_version` \"0.6.0\" }}"
+
+  # provides.host is the chart's Service. The value mapping pins the chart's
+  # fullnameOverride to the rendered name, the release name the helm provider
+  # gives the chart, which spells the Component's name in the alphabet a
+  # Kubernetes name allows. Under the pin the chart names its Service and its
+  # Deployment or StatefulSet by exactly that name, with no suffix, read from
+  # a render made with and without the pin. The name carries no namespace, so
+  # the Recipe is independent of where it is deployed; a same-namespace
+  # consumer reaches it under this name directly and a cross-namespace
+  # consumer qualifies it caller-side. port is the forward input port that
+  # Service carries, and protocol is "forward", the wire protocol upstream
+  # forwarders ship records on — the keys the workload-synthesis Recipe
+  # publishes.
+  provides:
+    host: "{{ .context.rendered_name }}"
+    port: "{{ .infra.port }}"
+    protocol: "forward"
+
+  # This Recipe reads no infra.overrides keys, so a Release setting one would
+  # otherwise see it dropped without a word; it halts here instead, naming the
+  # keys. The image is not offered for replacement: engine_version already
+  # chooses its tag, and the image is the one the workload-synthesis Recipe
+  # runs.
+  assertions:
+    overrides_not_read: >-
+      {{- $overrides := optional .infra "overrides" dict | default dict -}}
+      {{- if $overrides -}}
+      {{- fail (printf "infra.overrides sets %s on %q, but the fluentd-chart realization of core/observability/fluentd reads no infra.overrides keys; remove them, and set the port, image tag, sizing and buffer volume through infra.port, infra.engine_version, infra.compute and infra.storage.size" (keys $overrides | sortAlpha | join ", ") .metadata.instance_id) -}}
+      {{- end -}}
+
+  # The chart renders two ConfigMaps whatever its values say, holding a
+  # Prometheus input and a systemd journal input for its node-collector shape.
+  # Nothing mounts them while no extra configuration ConfigMap is named, and
+  # the Component describes neither input, so they are left out of the render.
+  # The chart names them after the release name cut to 35 characters.
+  omits:
+    - kind: ConfigMap
+      name: "fluentd-prometheus-conf-{{ trunc 35 .context.rendered_name | trimSuffix `-` }}"
+    - kind: ConfigMap
+      name: "fluentd-systemd-conf-{{ trunc 35 .context.rendered_name | trimSuffix `-` }}"
+
+  # THE SHAPE. The buffer is in-memory unless infra.storage.size is set, so
+  # the chart renders a single-replica Deployment with no persistent volume.
+  # With the size set it renders a StatefulSet whose claim template of that
+  # size is named after the rendered name followed by -buffer; the chart
+  # mounts that claim at a path of its own, /var/log/fluent, and the value
+  # mapping mounts it again at /fluentd/log, where the configuration below
+  # writes the file buffer, the path the workload-synthesis Recipe mounts its
+  # buffer volume at. Nothing is written at the chart's own path.
+  #
+  # THE IMAGE is the official fluent/fluentd image at infra.engine_version, the
+  # image the workload-synthesis Recipe runs, never the chart's own
+  # fluentd-kubernetes-daemonset default, which bundles the output plugins of
+  # its node-collector shape. The image's start-up script reads the
+  # configuration file named by the FLUENTD_CONF variable the chart sets, which
+  # points at the chart's mounted main file, so no command is given. The
+  # chart's plugin-install setting stays empty, as it starts a script this
+  # image does not carry.
+  #
+  # THE CONFIGURATION. The chart writes a main file that drops Fluentd's own
+  # log events and then includes every file of its configuration ConfigMap.
+  # All four of the chart's default files are replaced — its container-log
+  # tail source, its Kubernetes metadata filter, its dispatch label and its
+  # Elasticsearch output — so the configuration is the forward source and the
+  # stdout match below and nothing else.
+  #
+  # NOTHING ELSE. The host log mounts, the ServiceAccount, the cluster read
+  # grants, the pod security policy and the Grafana dashboard are switched
+  # off, as the aggregator reads no host files and no cluster API. The chart
+  # tests the dashboard switch for truthiness, so it is written as the boolean
+  # false. The chart's connection test renders only while the Service carries
+  # no extra port, so it is not rendered here. The Service and the container
+  # always carry the chart's metrics port, 24231, on which nothing listens:
+  # the fluent/fluentd image ships no Prometheus input.
+  valuesMapping: |
+    {{- $buffered := and .infra.storage .infra.storage.size }}
+    ## ── Pin the chart's resource names to the rendered name ────
+    ## The chart's fullname helper reads the top-level override, and its
+    ## Service and its Deployment or StatefulSet take that name with no suffix.
+    fullnameOverride: "{{ .context.rendered_name }}"
+
+    ## ── Controller shape, driven by the buffer volume ──────────
+    kind: {{ if $buffered }}StatefulSet{{ else }}Deployment{{ end }}
+    replicaCount: 1
+    {{- if $buffered }}
+    persistence:
+      enabled: true
+      size: "{{ .infra.storage.size }}"
+    volumeMounts:
+      - name: {{ .context.rendered_name }}-buffer
+        mountPath: /fluentd/log
+    {{- end }}
+
+    ## ── Aggregator image pin ───────────────────────────────────
+    image:
+      repository: fluent/fluentd
+      tag: "{{ .infra.engine_version }}"
+
+    ## ── Chart extras this Component does not describe ──────────
+    mountVarLogDirectory: false
+    mountDockerContainersDirectory: false
+    serviceAccount:
+      create: false
+    rbac:
+      create: false
+    podSecurityPolicy:
+      enabled: false
+    dashboards:
+      enabled: false
+
+    ## ── Forward input port ─────────────────────────────────────
+    ## The port the forward source binds, the container port and the Service
+    ## port move together on infra.port.
+    service:
+      type: ClusterIP
+      ports:
+        - name: forward
+          protocol: TCP
+          containerPort: {{ .infra.port }}
+
+    ## ── Probes ─────────────────────────────────────────────────
+    ## Fluentd documents no health endpoint for its forward input, so both
+    ## probes open a TCP connection to that port, replacing the chart's HTTP
+    ## probes of a metrics endpoint this configuration does not serve; the
+    ## liveness probe waits 10 s before its first check, as on the synthesis.
+    livenessProbe:
+      httpGet: null
+      tcpSocket:
+        port: {{ .infra.port }}
+      initialDelaySeconds: 10
+    readinessProbe:
+      httpGet: null
+      tcpSocket:
+        port: {{ .infra.port }}
+
+    ## ── Resources ──────────────────────────────────────────────
+    resources:
+      requests:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+
+    ## ── Configuration ──────────────────────────────────────────
+    ## DELIBERATE NEAR-DUPLICATE: the two files below are the configuration the
+    ## workload-synthesis Recipe, recipe/helm/fluentd, writes at start-up, line
+    ## for line — the forward source, then the match with its file buffer when
+    ## infra.storage.size is set. A Recipe's start-up configuration cannot be
+    ## imported by another Recipe, so a line changed in one is changed in the
+    ## other. The chart's other two default files are written empty.
+    fileConfigs:
+      01_sources.conf: |-
+        <source>
+            @type forward
+            bind 0.0.0.0
+            port {{ .infra.port }}
+        </source>
+      02_filters.conf: ""
+      03_dispatch.conf: ""
+      04_outputs.conf: |-
+        <match {{ .values.output_match }}>
+            @type stdout
+        {{- if $buffered }}
+            <buffer>
+                @type file
+                path /fluentd/log/buffer
+            </buffer>
+        {{- end }}
+        </match>
