@@ -1,0 +1,250 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: mariadb-rds-terraform-aws-modules
+  version: 1.0.0
+  # The licence of the vendored module, the terraform-aws-modules project's RDS
+  # module: the third-party code this Recipe pins and writes into the output.
+  # The RDS instance it provisions is a service the reader contracts for
+  # directly with AWS, under AWS's terms.
+  license: Apache-2.0
+  description: >
+    MariaDB via AWS RDS, realized by the published RDS module of the
+    terraform-aws-modules project, terraform-aws-modules/rds/aws at v7.2.2,
+    Apache-2.0. The module is fetched from its git repository at that tag and
+    vendored into the component's own directory; the pin is the git commit the
+    tag names and the digest of its archive, recorded in the entity.lock
+    beside this Recipe. RDS owns the master password, so the Release binds
+    root_password with core/generated-secret.
+
+    Reach for this realization where the pull may fetch the module from its
+    git repository; reach for terraform/mariadb-rds, which authors its own body
+    and fetches nothing, where nothing may be fetched or where the instance
+    needs read replicas, which one call of this module does not provision.
+    Unlike the authored Recipes, it sets charset and collation, in the
+    parameter group the module creates for the instance.
+
+    host publishes a Terraform reference to the module's db_instance_address
+    output, which resolves for a consumer authored as a source: Recipe in the
+    same root configuration, and port the configured infra.port. Set
+    infra.overrides.host to publish the DNS name the operator points at the
+    instance instead. infra.overrides.subnet_group is required. A value RDS
+    cannot apply — an application user, init scripts, a raw configuration
+    file, read replicas — halts the build naming the key; compute.cpu and
+    compute.memory are not read, because the instance class sizes the
+    instance.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/mariadb:1.0.0
+
+  # The published module, at the tag the registry publishes as version 7.2.2.
+  # A registry version of a module is a tag of its git repository, and the
+  # registry's own download for this version answers with a git source at the
+  # commit that tag names; Terraform's dependency lock file records providers
+  # and no module. So the pin is taken here: `aggrega pin` resolves the tag to
+  # its commit and records that commit and the archive's digest in entity.lock,
+  # and every build vendors exactly those bytes.
+  #
+  # The source names the repository root: the root module calls five of its own
+  # ./modules/ directories, which a sub-directory source would leave behind. The
+  # configuration Terraform loads from it — the root and each directory a local
+  # source reaches — calls no registry module, so initialising it fetches
+  # providers and nothing else. The repository's examples/ and wrappers/
+  # directories are vendored with it and never loaded.
+  #
+  # The module declares hashicorp/aws >= 6.28 in its own required_providers and
+  # is vendored byte for byte, so this Recipe adds no provider constraint of its
+  # own; the catalog conventions' "One AWS provider constraint for every AWS
+  # body" section says how it composes with the catalog's authored AWS bodies.
+  #
+  # The tag is written out rather than read from infra.source_version: a source
+  # whose coordinates come from a template is pinned per Release instead of in
+  # this Recipe's own entity.lock, and this Recipe's pin is the one stated
+  # above.
+  source:
+    kind: git-repository
+    url: https://github.com/terraform-aws-modules/terraform-aws-rds.git
+    ref: v7.2.2
+
+  locals:
+    # The engine's major version, the first two parts of infra.engine_version
+    # (11.4 for 11.4.8), or empty where it carries fewer, which the assertion
+    # below refuses. The module derives the instance's parameter group family
+    # and its option group's engine version from it.
+    major_version: '{{ $p := splitList "." (toString .infra.engine_version) }}{{ if ge (len $p) 2 }}{{ index $p 0 }}.{{ index $p 1 }}{{ end }}'
+    # The name the Release gives the instance under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   instance_class      - string (instance_class; default "db.t3.small")
+  #   multi_az            - bool (multi_az; defaults to infra.ha.enabled)
+  #   subnet_group        - string (db_subnet_group_name), required
+  #   parameter_group     - string (parameter_group_name; the module then creates no parameter group)
+  #   vpc_security_groups - []string (vpc_security_group_ids)
+  #   kms_key_id          - string (kms_key_id)
+  #   deletion_protection - bool (deletion_protection)
+  #   tags                - map[string]string (tags)
+  #   host                - string (published as provides.host; not passed to the module)
+  #
+  # These are the keys, under the same names, that terraform/mariadb-rds reads, so
+  # a Release written for that Recipe carries over unchanged. Each is passed to
+  # the module input named in brackets. subnet_group is the one that becomes
+  # required: the module would otherwise place the instance in the account's
+  # default VPC, and this Recipe never chooses a network for the operator.
+  #
+  # The module's own defaults stand for every input this mapping leaves out.
+  # Three are worth knowing: it encrypts the instance's storage whether or not
+  # kms_key_id is set, with the account's default key when none is named; it
+  # creates a parameter group of its own for the instance unless
+  # parameter_group names an existing one; and it creates an option group with
+  # no options.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read:
+  #   honoured — values.database, values.charset and values.collation (as the
+  #     character_set_server and collation_server parameters of the parameter
+  #     group the module creates; a Release naming parameter_group leaves them
+  #     to that group), infra.port, infra.engine_version, infra.storage.size,
+  #     infra.storage.type (gp3 when unset), infra.ha.enabled,
+  #     infra.backup.enabled (no automated backups and no final snapshot when
+  #     false), infra.backup.retention_days, and the overrides above.
+  #   refused — values.user, values.init_scripts, values.custom_config,
+  #     infra.ha.read_replicas above zero, and an infra.engine_version that
+  #     names no minor version.
+  #   not read — infra.compute.cpu and infra.compute.memory, whose Component
+  #     defaults would size a container: RDS sizes the instance by
+  #     infra.overrides.instance_class, and a Recipe cannot tell those defaults
+  #     from a value the Release wrote, so the Component's description says so
+  #     instead. infra.control_plane_present, infra.credentials and
+  #     infra.credentials_secret configure the controller-driven realization,
+  #     as their descriptions say.
+  assertions:
+    subnet_group_supplied: >-
+      {{- if not (and (hasKey .infra "overrides") (optional .infra.overrides "subnet_group" "")) -}}
+      {{- fail "this Release places its database in a DB subnet group that already exists in the target account, and the published RDS module this Recipe sources would otherwise place it in the account's default VPC, but infra.overrides.subnet_group carries none: set infra.overrides.subnet_group in the Release to the name of an existing DB subnet group" -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this database reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the port is infra.port` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    engine_version_names_minor: >-
+      {{- if not .locals.major_version -}}
+      {{- fail (printf `infra.engine_version is "%v", and the published RDS module this Recipe sources creates the instance's parameter group and option group for a major and minor version, such as 11.4: set infra.engine_version in the Release to at least the major and minor version` .infra.engine_version) -}}
+      {{- end -}}
+    # One module call provisions one instance, so a replica count is refused
+    # rather than dropped. terraform/mariadb-rds provisions replicas beside the
+    # primary.
+    no_read_replicas: >-
+      {{- if gt (int .infra.ha.read_replicas) 0 -}}
+      {{- fail (printf "infra.ha.read_replicas is %v, and this Recipe provisions the one instance a call of the published RDS module creates: set infra.ha.read_replicas to 0, or map this component to terraform/mariadb-rds, which provisions read replicas beside the primary" .infra.ha.read_replicas) -}}
+      {{- end -}}
+    # RDS creates the database and its master user, admin, itself, and runs no
+    # initialisation scripts and no configuration file of the reader's; its
+    # server settings come from the instance's parameter group.
+    values_rds_cannot_apply: >-
+      {{- if optional .values "user" "" -}}
+      {{- fail "values.user asks for an application user beside the administrator, and RDS creates only the master user, admin, whose password it manages: remove values.user from the Aggregate and connect as admin, or create the user against the instance once it exists" -}}
+      {{- end -}}
+      {{- if optional .values "init_scripts" "" -}}
+      {{- fail "values.init_scripts asks for scripts run when the database is first initialised, and an RDS instance runs none: remove values.init_scripts from the Aggregate and run them against the instance once it exists, or map this component to a realization that initialises the database itself" -}}
+      {{- end -}}
+      {{- if optional .values "custom_config" "" -}}
+      {{- fail "values.custom_config asks for a server configuration file, and an RDS instance reads none: its server settings come from a DB parameter group, which the Release names in infra.overrides.parameter_group; remove values.custom_config from the Aggregate" -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the module's db_instance_address output — the instance's bare hostname;
+  # db_instance_endpoint is address:port — through this component's module
+  # call, which the boundary's root configuration declares under
+  # .context.instance_id for a component declared in the Aggregate the Release
+  # deploys. Terraform resolves it at apply time, so it resolves only for a
+  # consumer authored as a source: Recipe in the same root configuration; a
+  # consumer on another target receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record or alias for it, so the operator points the name at the instance
+  # outside the Release. A consumer in the same root configuration receives the
+  # name as well, and a name carries no reference for Terraform to order its
+  # module after this one by; a later syncWave on the consumer's boundary,
+  # sharing this boundary's directory, orders the two.
+  #
+  # port is the value the mapping below passes to the module, so it is known
+  # ahead of time and published as that value. user is the master user the
+  # mapping creates, as terraform/mariadb-rds names it; database is the developer
+  # value the module creates.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.db_instance_address}{{ end }}"
+    port: "{{ .infra.port }}"
+    user: "admin"
+    database: "{{ .values.database }}"
+    protocol: "mariadb"
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # instance identifier is the component's name, as terraform/mariadb-rds names
+  # its instance. The master password is RDS's: manage_master_user_password has
+  # RDS generate it and keep it in AWS Secrets Manager, so no password reaches
+  # the rendered output. The module's own DB subnet group creation is left off,
+  # because the group is the operator's, named in subnet_group.
+  #
+  # infra.storage.type is the RDS storage type here, not a storage class; the
+  # Component declares no default for it, so this mapping supplies gp3.
+  valuesMapping: |
+    identifier: "{{ .context.instance_id }}"
+    engine: "mariadb"
+    engine_version: "{{ .infra.engine_version }}"
+    family: "mariadb{{ .locals.major_version }}"
+    major_engine_version: "{{ .locals.major_version }}"
+    instance_class: "{{ optional .infra.overrides "instance_class" "db.t3.small" }}"
+    allocated_storage: {{ trimSuffix "Gi" .infra.storage.size }}
+    storage_type: "{{ .infra.storage.type | default "gp3" }}"
+    db_name: "{{ .values.database }}"
+    username: "admin"
+    manage_master_user_password: true
+    port: "{{ .infra.port }}"
+    multi_az: {{ optional .infra.overrides "multi_az" .infra.ha.enabled }}
+    backup_retention_period: {{ if .infra.backup.enabled }}{{ .infra.backup.retention_days }}{{ else }}0{{ end }}
+    skip_final_snapshot: {{ not .infra.backup.enabled }}
+    create_db_subnet_group: false
+    db_subnet_group_name: "{{ .infra.overrides.subnet_group }}"
+    {{- with optional .infra.overrides "parameter_group" "" }}
+    create_db_parameter_group: false
+    parameter_group_name: "{{ . }}"
+    {{- else }}
+    parameters:
+      {{- with optional .values "charset" "" }}
+      - name: character_set_server
+        value: "{{ . }}"
+      {{- end }}
+      {{- with optional .values "collation" "" }}
+      - name: collation_server
+        value: "{{ . }}"
+      {{- end }}
+    {{- end }}
+    {{- with optional .infra.overrides "vpc_security_groups" "" }}
+    vpc_security_group_ids: {{ toJson . }}
+    {{- end }}
+    {{- with optional .infra.overrides "kms_key_id" "" }}
+    kms_key_id: "{{ . }}"
+    {{- end }}
+    {{- with optional .infra.overrides "deletion_protection" "" }}
+    deletion_protection: {{ . }}
+    {{- end }}
+    {{- with optional .infra.overrides "tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}

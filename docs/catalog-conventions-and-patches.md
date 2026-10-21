@@ -728,6 +728,15 @@ about. The two also sit on different kinds. The label is a Component-identity
 key, while `metadata.license` is stated on Recipes as well, where it is the only
 surface naming the terms of the software the Recipe realizes.
 
+**A Recipe that vendors a published Terraform module names the module's
+licence.** The service such a module provisions — a managed database, say — is
+one the reader contracts for directly with its provider and never possesses, so
+no identifier names its terms; what the Recipe does carry is third-party code,
+the module it pins and writes into the output. So `metadata.license` carries the
+module's SPDX identifier, with a comment beside it saying that it is the licence
+of the vendored module and that the provisioned service is contracted for
+directly. `recipe/terraform/postgres-rds-terraform-aws-modules` is the shape.
+
 **The catalog file's own licence is a third surface: the per-file
 `# SPDX-License-Identifier:` header.** It states the terms the YAML itself is
 published under, which is a different question again from the licence, or the
@@ -1110,6 +1119,7 @@ invented for the name:
 | The operator-managed instance it reconciles, where the controller carries the product's own name and repeating that would say nothing | what that instance is | `rabbitmq-cluster`, `mariadb-cluster` |
 | The managed product it provisions | the product's name | `mariadb-rds`, `mysql-rds` |
 | The artifact the Recipe sources | the artifact kind | `mariadb-rds-module`, `prometheus-chart` |
+| The publisher of a published artifact it sources, beside one of the same kind the catalog wrote | the publisher's name | `postgres-rds-terraform-aws-modules` |
 | That the resource lives outside the Release | `external` | `postgres-external` |
 
 A chart realization added beside an authored one is the common case of the
@@ -1118,6 +1128,12 @@ and the chart realization takes `-chart` — `prometheus-chart` beside `promethe
 Where a component comes to carry two chart realizations from different publishers, the
 later one is distinguished by what actually tells them apart rather than by a second
 generic suffix.
+
+The publisher row is that case for a module. `mariadb-rds-module` vendors a module
+the catalog wrote and keeps beside the Recipe; a Recipe that sources the RDS module
+the terraform-aws-modules project publishes is told apart from it by that publisher,
+after the managed product's own stem, so the RDS realizations still sort together:
+`mariadb-rds`, `mariadb-rds-module`, `mariadb-rds-terraform-aws-modules`.
 
 **Where no realization stands the component up with nothing already in place, none
 of them takes the bare name and every one carries a distinguisher.**
@@ -1653,6 +1669,11 @@ spec:
       source_version: { type: string }
 ```
 
+A Recipe that sources a published Terraform module from its git repository writes
+the tag out and reads no `source_version`, because a templated reference would
+move the module's pin out of the Recipe's own `entity.lock` — "A published
+Terraform module" under "Recipe Pattern" sets out why.
+
 A Recipe that delivers code holding a Feature's guarantee into the product
 honours `engine_version` only at the versions that code was proven at, as "A
 guarantee held in catalog code pins the product version it was proven at" under
@@ -1823,6 +1844,72 @@ clean result there means *not examined*, never *examined and fine*. A sourced
 Recipe is proven by a real build with the rendered output read, and by nothing
 short of one.
 
+#### A published Terraform module
+
+**The same default holds on terraform.** A terraform Recipe sources an official —
+or good, complete and maintained — published module wherever one exists and the
+configuration Terraform loads from it calls no module from a registry. That
+configuration is the module's root and each directory a local `source` (`./`,
+`../`) reaches from it. The Recipe names the module by its git repository with the
+`git-repository` source kind, at the tag the module is published under. It writes
+the body otherwise — as an `artifacts:` body, or as a module kept beside the Recipe
+— and its `description` says which test failed: not official, not complete, not
+maintained, or calling a registry module.
+
+- **The pin is the git commit.** A registry publishes each version of a module as a
+  tag of the module's own git repository, and what it answers when asked to download
+  a version is a git source at the commit that tag names. Terraform's dependency lock
+  file records the providers a configuration selected and no module. So the pin is
+  the one `aggrega pin` takes: it resolves the tag to its commit and records that
+  commit and the digest of the repository's archive in the Recipe's `entity.lock`,
+  and every build vendors exactly those bytes. The tag is written out: a `ref:`
+  filled in from a template is pinned in each Release's lockfile rather than in the
+  Recipe's own, so a module-sourcing Recipe offers no `source_version` knob.
+- **A registry call is refused because `terraform init` would fetch it outside the
+  pin.** A `module` block in the loaded configuration whose `source` is a registry
+  address, or any other remote one, names a module Terraform downloads when the
+  configuration is initialised, at whatever version it then selects, and neither the
+  entity's lock nor Terraform's covers it. The build reports each such call as a
+  warning; this catalog does not source a module that makes one. Calls made only from
+  directories nothing loads — a repository's `examples/` or `wrappers/` — do not
+  count. Those directories are vendored with the module all the same, because
+  neither a repository's `.terraformignore` nor an `.aggregaignore` beside the Recipe
+  narrows a fetched source.
+- **A consuming terraform Recipe is a `source:` Recipe.** A sourced module publishes
+  what a consumer reads through its `output` blocks, as `${module.<instance>.<output>}`,
+  and that reference resolves only in the boundary's root configuration, where a
+  consuming Recipe's `valuesMapping:` becomes the arguments of its own module block.
+  An `artifacts:` body renders inside the component's own directory, where no
+  module call is declared.
+
+The module's own `required_providers` stays as its publisher wrote it, since a
+vendored module is copied byte for byte; "One AWS provider constraint for every AWS
+body" below covers how it composes with the catalog's own AWS bodies. Its licence is
+recorded as "The `component.aggrega.ai/upstream-licensing` label" sets out for a
+vendored module. `recipe/terraform/postgres-rds-terraform-aws-modules` and its MySQL
+and MariaDB siblings are the shape: they source the terraform-aws-modules project's
+RDS module, whose root calls only its own `./modules/` directories.
+
+#### A CloudFormation template
+
+**CloudFormation Recipes are written as fragments by default.** The reusable
+CloudFormation units AWS publishes do not fit a build that pins what it reads: a
+public extension or a registry module must first be activated or registered in the
+account and Region that deploys it; a nested stack's `TemplateURL`, in AWS's
+words, "must point to a template … located in an Amazon S3 bucket", which the build
+does not read; and AWS's own samples repository says "these templates are not meant
+to be production-ready". A
+fragment carries only the resources the component contributes, and the provider
+assembles it into the boundary's stack.
+
+**A template worth reusing may still be sourced**, named as an exception by the
+Recipe that sources it, with the reason in its `description`. The cloudformation
+provider binds such a template's declared `Parameters` from the Recipe's
+`valuesMapping`, at every `Ref` and `Fn::Sub` that reads them, and carries the
+`Transform`s its contributors declare in the assembled stack where the stack can
+carry them — as the provider page's "Values for a sourced template's parameters"
+and "Top-level sections in the assembled stack" set out.
+
 ### Target-expected names are the Recipe's translation
 
 A Component publishes a value once, under the name that reads best on Aggrega's
@@ -1958,6 +2045,13 @@ section is the one statement of the rule. The terraform RDS Recipes
 (`recipe/terraform/postgres-rds`, `mysql-rds`, `mariadb-rds` and the two
 `-module` Recipes) follow it. This is a catalog convention: the compiler pipes
 the block as text and reads nothing in it.
+
+A published module a Recipe sources is not a body the catalog authors, and it
+keeps its publisher's own constraint: the terraform-aws-modules RDS module the
+`-rds-terraform-aws-modules` Recipes vendor declares `hashicorp/aws >= 6.28`.
+That floor is why the constraint above may not drop below it — in a boundary
+holding both, Terraform installs one provider satisfying the catalog's range and
+the module's floor together.
 
 ### Optional credential slots for self-managed datastores
 
@@ -3511,8 +3605,17 @@ copying whichever sibling happens to be nearest.
   `backup.{enabled,retention_days}`; and `overrides` as the open bag for the
   operational side. **`storage.{size,type}` is scoped to the targets that have a
   volume-size concept — the `compose` realization creates the volume and honors
-  neither number, which is this template's one named exception to the knob rule, not
-  a silent drop.** The key stays single-named and single-homed rather than split per
+  neither number, which is one of this template's two named exceptions to the knob
+  rule, not a silent drop.** **The other is `compute.{cpu,memory}` on a managed
+  realization:** a managed service sizes the instance by its own instance class
+  rather than by a CPU and memory figure, and because the Component's defaults
+  reach every Recipe, a managed Recipe cannot tell them from a value a Release
+  wrote, so it does not read them rather than refusing them. Each of those keys'
+  descriptions on the Component says so, and names the `overrides` key the managed
+  Recipes size the instance by. A value a managed service cannot honour and that a
+  Recipe can tell apart from a default — an initialisation script, a raw
+  configuration file, a replica count a Recipe does not provision — is refused by
+  name instead. The key stays single-named and single-homed rather than split per
   target: the size means the same thing everywhere, and a stateful member needs its
   volume on the local target too or it would not be the same datastore the Kubernetes
   target deploys. **`storage.type` declares no default: the class defaults to the
@@ -3598,7 +3701,9 @@ operator's string and resolves nothing about it.
   "Deployment ordering" sections set out what a wave expresses on each target.
 
 The terraform RDS Recipes (`recipe/terraform/postgres-rds`, `mysql-rds`,
-`mariadb-rds` and the two `-module` Recipes) and the CloudFormation ones
+`mariadb-rds`, the two `-module` Recipes and the three
+`-rds-terraform-aws-modules` Recipes, whose pointer names the module's
+`db_instance_address` output) and the CloudFormation ones
 (`recipe/cloudformation/postgres-rds`, `mysql-rds` and `mariadb-rds`) follow it.
 A managed datastore Recipe added later follows this section rather than a sibling
 Recipe.
