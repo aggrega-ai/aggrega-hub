@@ -1,0 +1,456 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: litellm-chart
+  version: 1.0.0
+  license: MIT
+  description: >
+    LiteLLM as a self-hosted, OpenAI-compatible model proxy on Kubernetes via
+    BerriAI's own litellm-helm chart, pulled from its OCI registry, running the
+    official upstream image at infra.engine_version. The chart's README calls
+    it community maintained; it was checked for being official, complete and
+    maintained against the chart itself. Its bundled PostgreSQL and Redis stay
+    off, and its schema-migration Job renders only with database_url attached.
+
+    A ConfigMap of the Recipe's own, mounted by the chart, carries the proxy's
+    configuration, publishing the alias in values.model and pointing it at
+    values.upstream_model. An
+    attached api_key, provider_key or database_url reaches the proxy by a
+    secretKeyRef to its slot's Secret, so no credential value is rendered.
+    Unattached, api_key leaves the proxy with no master key, as on the
+    synthesis.
+
+    The request guard and the path allowlist in front of the proxy come from
+    the LiteLLMGuard bundle, exactly as on the synthesis, the allowlist as a
+    second container of the chart's pod.
+
+    With `values.metrics_enabled` true the allowlist forwards a GET of
+    /metrics alone from port 9090, on the chart's metrics Service, published
+    as provides.metrics_endpoint; false leaves that key empty.
+
+    Reach for this realization where a chart registry is reachable at build
+    time; reach for `litellm`, the workload synthesis, where the build must
+    complete with nothing fetched or infra.port is not 4000, since this one
+    serves on port 4000 alone and halts the build on any other.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-model/litellm:1.0.0
+
+  # The chart. BerriAI publishes it from its own repository, LiteLLM's deploy
+  # documentation installs the proxy with it, and a chart release follows
+  # every proxy release under the same version number, with patch releases on
+  # older lines as well; so it is maintained. Its README says "This is
+  # community maintained, Please make an issue if you run into a bug", which
+  # decides nothing on its own: an unofficial chart that is complete and
+  # maintained qualifies. It is complete for this Component: its pod takes
+  # further containers, volumes and mounts beside the proxy's, its arguments
+  # can be replaced, and its list of environment entries takes a reference to
+  # a Secret, which is what the request guard, the path allowlist, the loopback
+  # listen address and every credential slot need. Those were the three checks
+  # a chart is held to before a Recipe points at it.
+  #
+  # The default version is the chart release whose appVersion is 1.103.1, the
+  # release the Component's engine_version defaults to and the request guard is
+  # authored against, so the chart's templates and the image they run agree.
+  source:
+    kind: helm-oci-chart
+    url: oci://ghcr.io/berriai/litellm-helm
+    # Default chart version. Override via infra.source_version; a version
+    # other than this one may need a different value mapping.
+    version: "{{ optional .infra `source_version` \"1.103.1\" }}"
+
+  # Each entry below is a value this Recipe's value mapping and the
+  # LiteLLMGuard bundle imported below both read; the bundle holds each as
+  # well and stops the build when a local differs from its own, so the guard
+  # module, the allowlist's configuration and the pod that runs them cannot
+  # disagree. They are the locals the workload-synthesis Recipe declares, with
+  # the values it gives them: the proxy listens on the pod's loopback address,
+  # on the port after infra.port, and the allowlist listens on infra.port, the
+  # port the chart's Service targets.
+  #
+  # gateway_port is written out, as the port after 4000, because this Recipe
+  # takes infra.port at that default alone. A Recipe naming a chart has its
+  # locals evaluated when the chart is resolved, before the build, with the
+  # compiler's own template helpers and without the Sprig functions a render
+  # has, so a local doing arithmetic on infra.port does not parse there and the
+  # pull halts; the synthesis computes the same port from infra.port with Sprig
+  # at render time. The assertion port_is_the_default below refuses any other
+  # infra.port by name before the bundle's own check is reached.
+  #
+  # While values.metrics_enabled is true the proxy's own metrics listener is on
+  # gateway_metrics_port of the loopback address and the allowlist forwards a
+  # scrape to it from metrics_port. The bundle's ConfigMap name is the
+  # instance name followed by -request-guard,
+  # which is the bundle's own rule. The organization routes stay off, because
+  # nothing this Component offers reads a key's organization.
+  #
+  # The nginx tag is the one the workload-synthesis Recipe and
+  # core/gateway/nginx run, written here rather than taken from infra because
+  # the allowlist is part of how this Recipe realizes the proxy and no Release
+  # setting chooses it.
+  locals:
+    request_filter_module: request_field_filter
+    gateway_address: 127.0.0.1
+    gateway_port: "4001"
+    metrics_port: "9090"
+    gateway_metrics_port: "9091"
+    path_allowlist_file: path-allowlist.conf
+    path_allowlist_image_tag: 1.27.5-alpine
+    request_guard_config_map_name: "{{ .context.instance_id }}-request-guard"
+    request_guard_dir: /etc/litellm-request-guard
+    request_guard_delivery: config_map
+    forward_organization_routes: "false"
+
+  # provides.host is the chart's Service. The value mapping pins the chart's
+  # fullnameOverride to the rendered name, the release name the helm provider
+  # gives the chart, which spells the Component's name in the alphabet a
+  # Kubernetes name allows; under the pin the chart names its Deployment and
+  # its Service by that name, read from a render made with and without the
+  # pin, and the configuration's ConfigMap below takes the same name followed
+  # by -config. The chart's Service listens on
+  # infra.port, where the path allowlist answers. The name carries no
+  # namespace, so a consumer in another namespace qualifies it on its own side.
+  #
+  # metrics_endpoint is the chart's own metrics Service, named after the same
+  # name followed by -metrics, which the chart renders on port 9090 while
+  # values.metrics_enabled is true; the path allowlist answers there. Empty
+  # while the value is false. A provides entry cannot read another, so the
+  # name is spelled out in each.
+  provides:
+    host: "{{ .context.rendered_name }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.rendered_name }}:{{ .infra.port }}/v1"
+    model: "{{ .values.model }}"
+    protocol: "http"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-metrics:{{ .locals.metrics_port }}/metrics{{ end }}"
+
+  # The proxy takes its public address as an origin, scheme, host and port, and
+  # joins its own routes onto it, so an address carrying a path would give it
+  # links that point somewhere it is not served. The same halt the
+  # workload-synthesis Recipe makes, with its message.
+  assertions:
+    external_base_url_is_an_origin: >-
+      {{- with optional .infra "external_base_url" "" -}}
+      {{- $u := urlParse . -}}
+      {{- if and $u.host $u.path (ne $u.path "/") -}}
+      {{- fail (printf "infra.external_base_url %q carries the path %q, but the proxy takes its public address as an origin only, so the links it composes would point where it is not served; set it to the scheme, host and port alone, for example https://llm.example.com" . $u.path) -}}
+      {{- end -}}
+      {{- end -}}
+    # The proxy listens on the port after infra.port behind the allowlist, and
+    # this Recipe can write that port only for the default infra.port (see
+    # gateway_port above), so another value halts here, naming the key.
+    port_is_the_default: >-
+      {{- if ne (print .infra.port) "4000" -}}
+      {{- fail (printf "infra.port is %v on %q, but the litellm-chart realization of core/ai-model/litellm serves on the default port 4000 alone; omit infra.port or set it to 4000, or map core/ai-model/litellm to helm/litellm, the workload synthesis, which serves on any port" .infra.port .metadata.instance_id) -}}
+      {{- end -}}
+
+  # The chart's two connection checks, Pods carrying the helm.sh/hook: test
+  # annotation, run busybox written with no tag, which no chart setting pins,
+  # so what a cluster pulls for them would move under unchanged rendered
+  # bytes. They are left out of the render; the proxy's own probes cover the
+  # address the first one fetches, and the second checks variables this
+  # Recipe does not set.
+  omits:
+    - kind: Pod
+      name: "{{ .context.rendered_name }}-test-connection"
+    - kind: Pod
+      name: "{{ .context.rendered_name }}-env-test"
+
+  # The request guard and the path allowlist, from the bundle the
+  # workload-synthesis Recipe imports as well, so the line they draw — which
+  # request fields a caller may send and which paths it may reach — has one
+  # text on every Recipe running this proxy. The bundle emits one ConfigMap,
+  # named by request_guard_config_map_name, carrying the guard module and the
+  # allowlist's nginx configuration; the value mapping below mounts it at
+  # request_guard_dir in the proxy's container and in the allowlist's. It stops
+  # the build when a Release admits in infra.admitted_request_fields a field
+  # the guard refuses on every Release, and when a local above differs from
+  # its own. What the guard and the allowlist do is stated on the bundle and on
+  # the Component.
+  #
+  # The proxy's configuration body, which the chart's pod reads in place of a
+  # ConfigMap of the chart's own (see THE CONFIGURATION below): the alias in
+  # values.model published for the provider-qualified target in
+  # values.upstream_model, which names the variable provider_key is delivered
+  # under through the proxy's environment indirection while that slot is
+  # attached, and, on every Release, the request guard registered under
+  # litellm_settings.callbacks by the full path of its module, followed by the
+  # Prometheus callback while values.metrics_enabled is true. No credential
+  # value appears here, and the master key is not named at all: the proxy
+  # reads it from LITELLM_MASTER_KEY.
+  #
+  # DELIBERATE NEAR-DUPLICATE: this body is the workload-synthesis Recipe's,
+  # byte for byte, because a Recipe's own artifact cannot be imported by
+  # another Recipe. A setting added to one is added to the other.
+  artifacts:
+    litellm-config.configmap.yaml: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-config
+      data:
+        config.yaml: |
+          model_list:
+            - model_name: {{ .values.model }}
+              litellm_params:
+                model: {{ .values.upstream_model }}
+      {{- if hasKey (default dict .features) "provider_key" }}
+                api_key: os.environ/{{ .values.provider_key_variable }}
+      {{- end }}
+          litellm_settings:
+            callbacks:
+              - {{ .locals.request_guard_dir }}/{{ .locals.request_filter_module }}.filter
+      {{- if .values.metrics_enabled }}
+              - prometheus
+      {{- end }}
+    request-guard:
+      $import: LiteLLMGuard#/artifacts/RequestGuard
+
+  # This Recipe reads no infra.overrides keys. The image is not offered for
+  # replacement: the proxy is admitted to this catalog because its Recipes run
+  # the open-core image ghcr.io/berriai/litellm, and a replaceable image block
+  # would let a Release run another build in its place.
+  #
+  # Under this configuration the chart renders one Deployment, its Service on
+  # infra.port and, while api_key is unattached, the Secret its master-key
+  # variable names; while values.metrics_enabled is true
+  # its metrics Service as well; and while database_url is attached its
+  # schema-migration Job. Its Ingress, autoscalers, disruption budget, service
+  # monitor, ServiceAccount and request collector stay off, because the
+  # Component describes none of them.
+  #
+  # NO BUNDLED DATABASE OR CACHE. The chart can stand up a PostgreSQL server
+  # beside the proxy, and does in its own defaults, and a Redis server; both
+  # are switched off below, because the bookkeeping database is the one
+  # database_url names and neither is compute the Aggregate declared. With
+  # database_url attached the chart's migration Job applies the proxy's schema
+  # to that database before the proxy uses it, and the proxy is told not to
+  # apply it itself, which is how the chart orders the two; with none attached
+  # there is no database to migrate and no Job.
+  #
+  # THE CONFIGURATION. The chart can write the proxy's configuration into a
+  # ConfigMap of its own from its proxy_config value, which it merges over a
+  # default configuration naming a master key read from PROXY_MASTER_KEY; a
+  # value mapping can add to that default but not take that entry out of it.
+  # So the chart's ConfigMap is switched off and the chart mounts the
+  # configuration body above in its place, at the path its pod points the
+  # proxy at with the --config flag, and the proxy reads its master key from
+  # LITELLM_MASTER_KEY, as on the synthesis.
+  #
+  # THE CREDENTIALS. Each attached slot is written into the chart's list of
+  # environment entries as a secretKeyRef to the Secret its realization names,
+  # with that realization's key: api_key as LITELLM_MASTER_KEY, the variable
+  # the proxy reads its master key from; provider_key under the variable
+  # values.provider_key_variable names; database_url as DATABASE_URL. A slot
+  # whose realization publishes no Secret name halts the build naming it. The
+  # chart gives that list to its migration Job as well, so the Job, which runs
+  # only with database_url attached, reads DATABASE_URL from it and carries the
+  # other references unread.
+  #
+  # THE MASTER-KEY SECRET. Whatever is attached, the chart gives the proxy the
+  # variable PROXY_MASTER_KEY from a Secret, and with no Secret named it
+  # renders one holding a key it generates on every render, which would make
+  # two builds of one Release differ. So the Secret is always supplied. With
+  # api_key attached, the chart's master-key Secret setting names api_key's
+  # Secret and key, and the chart renders no Secret of its own. Unattached,
+  # the chart renders its Secret from the fixed literal below, which nothing
+  # reads: the configuration names no master key and PROXY_MASTER_KEY is not a
+  # variable the proxy reads, so the proxy starts with no administrative key,
+  # exactly as the synthesis does with the slot unattached.
+  #
+  # THE POD. The proxy's arguments are replaced, so it reads the configuration
+  # file the chart mounts and listens on the loopback address on gateway_port,
+  # with its own metrics listener on gateway_metrics_port while
+  # values.metrics_enabled is true; the chart's HOST variable is set to the
+  # same address, and its PORT variable, which follows the Service port, is
+  # overridden by the --port argument. The path allowlist is a second
+  # container of the pod, the official nginx image (BSD-2-Clause) at the tag
+  # above, started on the configuration the bundle carries in the foreground
+  # in place of the image's own start-up scripts, and sized as on the
+  # synthesis. It listens on infra.port, which the chart declares as the proxy
+  # container's http port and its Service targets, so every caller reaches the
+  # proxy through it, and on metrics_port while values.metrics_enabled is true,
+  # which the chart declares as the proxy container's metrics port and its
+  # metrics Service targets; the chart also hands the proxy that port as
+  # PROMETHEUS_METRICS_PORT, which the --prometheus_metrics_port argument
+  # overrides, so the proxy's listener stays on the loopback address on
+  # gateway_metrics_port. Neither port asks a caller for a key, and the
+  # metrics name the hashed keys, key aliases and user emails the proxy
+  # attributes spend to. The chart's probes ask
+  # /health/liveliness and /health/readiness on that http port, so they are
+  # answered through the allowlist, which forwards both, with the timings the
+  # synthesis gives them. The bundle's ConfigMap is a volume of the pod,
+  # mounted read-only at request_guard_dir in both containers; the chart mounts
+  # the volumes it is given in its migration Job too, which reads nothing
+  # there.
+  #
+  # infra.external_base_url, when set, reaches the proxy, and the migration Job
+  # beside it, as PROXY_BASE_URL; unset, the variable is not written. The
+  # chart's own LITELLM_LOG setting is
+  # emptied, so the proxy logs at its own default level, as on the synthesis.
+  valuesMapping: |
+    {{- $features := default dict .features }}
+    {{- range $slot := list "api_key" "provider_key" "database_url" }}
+    {{- if and (hasKey $features $slot) (not (index $features $slot).provides.name) }}
+    {{- fail (printf "the %s slot of the LiteLLM proxy %q is filled by a realization that publishes no Secret name, so the proxy would read its credential from no Secret: bind that slot's Feature to a realization that names the Secret it holds" $slot $.context.instance_id) }}
+    {{- end }}
+    {{- end }}
+
+    ## ── Pin the chart's resource names to the rendered name ────
+    ## Names the proxy's Service exactly "<rendered_name>", matching
+    ## provides.host, and its metrics Service "<rendered_name>-metrics".
+    fullnameOverride: "{{ .context.rendered_name }}"
+
+    ## ── Proxy image pin ────────────────────────────────────────
+    ## The chart's own default tag is its appVersion, which moves with the
+    ## chart; the image is pinned to the Component's engine_version, the tag
+    ## the workload-synthesis Recipe runs.
+    image:
+      repository: ghcr.io/berriai/litellm
+      tag: "{{ .infra.engine_version }}"
+      pullPolicy: IfNotPresent
+
+    replicaCount: 1
+
+    ## ── The chart's bundled services and extras, all declined ──
+    db:
+      useExisting: false
+      deployStandalone: false
+    redis:
+      enabled: false
+    migrationJob:
+      enabled: {{ hasKey $features "database_url" }}
+    ingress:
+      enabled: false
+    autoscaling:
+      enabled: false
+    keda:
+      enabled: false
+    pdb:
+      enabled: false
+    serviceMonitor:
+      enabled: false
+    serviceAccount:
+      create: false
+    collector:
+      enabled: false
+    logLevel: ""
+
+    ## ── The master-key Secret the chart always reads ───────────
+    {{- with $features.api_key }}
+    masterkeySecretName: "{{ .provides.name }}"
+    masterkeySecretKey: "{{ .provides.key }}"
+    {{- else }}
+    masterkeySecretName: ""
+    masterkey: "unread-the-proxy-runs-without-a-master-key"
+    {{- end }}
+
+    ## ── The proxy's configuration: this Recipe's own ConfigMap ─
+    proxyConfigMap:
+      create: false
+      name: "{{ .context.rendered_name }}-config"
+      key: config.yaml
+
+    ## ── The proxy's listen address and arguments ───────────────
+    listen: "{{ .locals.gateway_address }}"
+    args:
+      - "--config"
+      - "/etc/litellm/config.yaml"
+      - "--host"
+      - "{{ .locals.gateway_address }}"
+      - "--port"
+      - "{{ .locals.gateway_port }}"
+      {{- if .values.metrics_enabled }}
+      - "--prometheus_metrics_port"
+      - "{{ .locals.gateway_metrics_port }}"
+      {{- end }}
+
+    ## ── Service: the allowlist's port, and the metrics Service ─
+    service:
+      type: ClusterIP
+      port: {{ .infra.port }}
+    metricsServer:
+      enabled: {{ .values.metrics_enabled }}
+      port: {{ .locals.metrics_port }}
+
+    ## ── Credentials, each by reference to its own slot's Secret ─
+    {{- if or (hasKey $features "api_key") (hasKey $features "provider_key") (hasKey $features "database_url") }}
+    extraEnvVars:
+      {{- with $features.api_key }}
+      - name: LITELLM_MASTER_KEY
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .provides.name }}"
+            key: "{{ .provides.key }}"
+      {{- end }}
+      {{- with $features.provider_key }}
+      - name: "{{ $.values.provider_key_variable }}"
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .provides.name }}"
+            key: "{{ .provides.key }}"
+      {{- end }}
+      {{- with $features.database_url }}
+      - name: DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: "{{ .provides.name }}"
+            key: "{{ .provides.key }}"
+      {{- end }}
+    {{- else }}
+    extraEnvVars: []
+    {{- end }}
+    {{- with .infra.external_base_url }}
+    envVars:
+      PROXY_BASE_URL: "{{ . }}"
+    {{- else }}
+    envVars: {}
+    {{- end }}
+
+    ## ── The path allowlist, a second container of the pod ──────
+    extraContainers:
+      - name: path-allowlist
+        image: "nginx:{{ .locals.path_allowlist_image_tag }}"
+        command:
+          - nginx
+          - -c
+          - "{{ .locals.request_guard_dir }}/{{ .locals.path_allowlist_file }}"
+          - -g
+          - "daemon off;"
+        resources:
+          requests:
+            cpu: 250m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 128Mi
+        volumeMounts:
+          - name: request-guard
+            mountPath: "{{ .locals.request_guard_dir }}"
+            readOnly: true
+
+    ## ── The request guard's ConfigMap, mounted in both containers
+    volumes:
+      - name: request-guard
+        configMap:
+          name: "{{ .locals.request_guard_config_map_name }}"
+    volumeMounts:
+      - name: request-guard
+        mountPath: "{{ .locals.request_guard_dir }}"
+        readOnly: true
+
+    ## ── Proxy resources ────────────────────────────────────────
+    ## Quoted so a whole-core quantity stays a string.
+    resources:
+      requests:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
