@@ -13,9 +13,8 @@ metadata:
     Valkey Helm chart, served from that project's HTTPS chart repository. The
     chart is configured for the shape this Component describes: one cache
     process behind a ClusterIP Service, with replication, network policy,
-    disruption budget, metrics and transport security left off. It renders a
-    Deployment, that Service, two ConfigMaps carrying the cache directives and
-    the start-up script, and a ServiceAccount. With a password attached it also
+    disruption budget and metrics left off, and transport security off unless
+    infra.client_tls turns it on. With a password attached it also
     renders the chart's own connection check, a Pod carrying the helm test
     annotation that confirms an unauthenticated connection is refused; the chart
     offers no setting to decline it, and it is harmless as it stands — it runs
@@ -31,12 +30,13 @@ metadata:
     time; reach for `valkey`, the workload-synthesis realization, where the
     build must complete with nothing fetched.
 
-    The chart writes no namespace; the helm provider places its resources in
-    the one the Release declares, and with none declared they land where the
-    applying tool puts them.
     The cache image and the chart version are pinned. provides.host is the bare
     in-cluster Service name; a consumer in another namespace qualifies it on its
     own side.
+
+    With infra.client_tls true, the chart's transport security serves TLS alone
+    on the operator's port from the Secret attached to server_certificate, the
+    probes ping over TLS, and protocol is published as valkey-tls.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -63,7 +63,8 @@ spec:
   # container port and — through the directive appended below — the port the
   # server actually binds, so the published address and the listener move
   # together. protocol is "valkey", naming the server on the other end; a
-  # consumer reaches it with a Redis-protocol client.
+  # consumer reaches it with a Redis-protocol client. While infra.client_tls is
+  # on it is "valkey-tls", since the port then accepts TLS alone.
   #
   # A same-namespace consumer reaches the cache under this name directly; a
   # cross-namespace consumer qualifies it caller-side. The host is the bare,
@@ -72,7 +73,7 @@ spec:
   provides:
     host: "{{ .context.rendered_name }}"
     port: "{{ .infra.port }}"
-    protocol: "valkey"
+    protocol: "{{ if .infra.client_tls }}valkey-tls{{ else }}valkey{{ end }}"
 
   # This Recipe reads from infra.overrides:
   #   image          - map[string]string (image.* fields; overrides the tag pin)
@@ -82,8 +83,9 @@ spec:
   #   tolerations    - []object (pod scheduling)
   #
   # The chart's replication mode, network policy, disruption budget, metrics
-  # exporter, Prometheus-operator resources and transport security are all left
-  # at their own off-by-default setting. Under this configuration it renders a
+  # exporter and Prometheus-operator resources are all left at their own
+  # off-by-default setting, and so is its transport security unless
+  # infra.client_tls turns it on (below). Under this configuration it renders a
   # Deployment, the ClusterIP Service, a ConfigMap carrying the cache
   # directives, a second ConfigMap carrying the start-up script that assembles
   # the running configuration, and the ServiceAccount the pod runs under.
@@ -109,6 +111,18 @@ spec:
   # reaches the rendered artifact. The cache image is pinned to a resolvable
   # release tag for reproducible renders.
   valuesMapping: |
+    {{- $tls := .infra.client_tls }}
+    {{- $cert := hasKey (default dict .features) "server_certificate" }}
+    {{- if and $tls (not $cert) }}
+    {{- fail (printf "infra.client_tls is true on %q, so the cache serves TLS alone, but nothing is attached to its server_certificate slot, so the server has no certificate to present; attach to server_certificate a Secret holding tls.crt and tls.key, through core/referenced-secret, or set infra.client_tls to false" .context.instance_id) }}
+    {{- end }}
+    {{- if and $cert (not $tls) }}
+    {{- fail (printf "a certificate is attached to the server_certificate slot of %q, but infra.client_tls is false, so the cache serves plaintext and nothing presents the certificate; set infra.client_tls to true to serve TLS from it, or remove the attachment" .context.instance_id) }}
+    {{- end }}
+    {{- $certProvides := optional (optional (default dict .features) "server_certificate" dict) "provides" dict }}
+    {{- if and $tls (not (and (kindIs "map" $certProvides) (optional $certProvides "name" ""))) }}
+    {{- fail (printf "the server_certificate slot of %q is filled by an attachment that publishes no Secret name, but the Valkey chart mounts the certificate from a Secret it names; bind the slot to core/referenced-secret, whose k8s-existing-secret realization names a Secret that already exists" .context.instance_id) }}
+    {{- end }}
     ## ── Pin the chart's resource names to the rendered name ────
     ## Names the cache's Service exactly "<rendered_name>", matching
     ## provides.host. Every object this chart emits derives its name from this
@@ -161,8 +175,20 @@ spec:
     ## Every developer knob below is emitted only when the Aggregate set it, so a
     ## bare declaration renders no redundant directive and the cache keeps its own
     ## built-in default.
+    ##
+    ## With infra.client_tls on, the chart's base configuration closes the
+    ## plaintext port and binds TLS on a literal port of its own, so the same
+    ## last-occurrence override applies to both: this block closes the plaintext
+    ## port again and moves the TLS port to infra.port. Appending the plaintext
+    ## directive there instead would reopen a plaintext listener beside the TLS
+    ## one, verified by running the assembled configuration.
     valkeyConfig: |
+      {{- if $tls }}
+      port 0
+      tls-port {{ .infra.port }}
+      {{- else }}
       port {{ .infra.port }}
+      {{- end }}
       {{- with .values.maxmemory }}
       maxmemory {{ . }}
       {{- end }}
@@ -184,12 +210,15 @@ spec:
     ## timing, and the probes keep asking the port the server listens on wherever
     ## an operator moves it. The chart ships its readiness probe switched off; it
     ## is switched on so the Service sends traffic to the pod only once the cache
-    ## answers. Transport security stays off in this realization, so the handler
-    ## needs none of the chart's certificate arguments.
+    ## answers. With infra.client_tls on, a plaintext PING to the TLS port is
+    ## reset and fails, so each probe adds --tls and --insecure rather than the
+    ## chart's own certificate arguments: the probe dials the loopback address,
+    ## which the certificate need not name, and it checks that the server
+    ## answers, not who it is.
     startupProbe:
       customProbe:
         exec:
-          command: ["valkey-cli", "-p", "{{ .infra.port }}", "ping"]
+          command: ["valkey-cli",{{ if $tls }} "--tls", "--insecure",{{ end }} "-p", "{{ .infra.port }}", "ping"]
         initialDelaySeconds: 0
         periodSeconds: 10
         timeoutSeconds: 1
@@ -197,7 +226,7 @@ spec:
     livenessProbe:
       customProbe:
         exec:
-          command: ["valkey-cli", "-p", "{{ .infra.port }}", "ping"]
+          command: ["valkey-cli",{{ if $tls }} "--tls", "--insecure",{{ end }} "-p", "{{ .infra.port }}", "ping"]
         initialDelaySeconds: 0
         periodSeconds: 10
         timeoutSeconds: 1
@@ -206,7 +235,7 @@ spec:
       enabled: true
       customProbe:
         exec:
-          command: ["valkey-cli", "-p", "{{ .infra.port }}", "ping"]
+          command: ["valkey-cli",{{ if $tls }} "--tls", "--insecure",{{ end }} "-p", "{{ .infra.port }}", "ping"]
         initialDelaySeconds: 0
         periodSeconds: 10
         timeoutSeconds: 1
@@ -246,6 +275,34 @@ spec:
         default:
           permissions: "~* &* +@all"
           passwordKey: "{{ .features.password.provides.key }}"
+    {{- end }}
+
+    ## ── Transport security ─────────────────────────────────────
+    ## Off unless infra.client_tls is on. On, the chart mounts the Secret the
+    ## server_certificate slot names at /tls and writes the server's TLS
+    ## directives from three of its data keys, named here after the two keys a
+    ## kubernetes.io/tls Secret holds. The chart always names a CA file as well,
+    ## and the server refuses to start where that file is missing, so it is
+    ## pointed at tls.crt, the one certificate file the slot's Secret always
+    ## holds; with client certificates not requested, which the chart writes
+    ## while requireClientCertificate is false, the server verifies nothing
+    ## against it. Verified by running the assembled configuration.
+    ##
+    ## With a password attached as well, the chart's connection check verifies
+    ## the server against that same CA file, so it passes for a self-signed
+    ## certificate and fails for one a separate authority issued; the cache
+    ## itself is unaffected. An attached password is enforced over TLS as it is
+    ## without it. The build halts naming server_certificate when client_tls is
+    ## true and nothing is attached, or the attachment publishes no Secret name,
+    ## and naming client_tls when a certificate is attached while it is false.
+    {{- if $tls }}
+    tls:
+      enabled: true
+      existingSecret: "{{ .features.server_certificate.provides.name }}"
+      serverPublicKey: tls.crt
+      serverKey: tls.key
+      caPublicKey: tls.crt
+      requireClientCertificate: false
     {{- end }}
 
     ## ── Cache resources ────────────────────────────────────────

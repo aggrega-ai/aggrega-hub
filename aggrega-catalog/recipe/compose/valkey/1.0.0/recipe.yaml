@@ -17,6 +17,11 @@ metadata:
     authentication from it; the plain upstream image expects the password
     through its configuration and ignores the variable.
     provides.host is the bare service name, resolved on the compose network.
+    Encrypted client connections are not served here: infra.client_tls set to
+    true, or a certificate attached to server_certificate, halts the build by
+    name, because the server reads its certificate from files and no credential
+    Feature realized on Compose names a secret a service can mount. The helm
+    realizations valkey and valkey-chart serve TLS from that slot.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -30,7 +35,20 @@ spec:
     port: "{{ .infra.port }}"
     protocol: "valkey"
 
+  # Encrypted client connections are refused by name here. The image serves TLS,
+  # but the server reads its certificate and key from files, and a Compose
+  # service mounts a file attachment only from a credential that names a secret
+  # resource — which no Compose realization of the catalog's credential Features
+  # does — so this realization has no way to hand the server its certificate.
+  # Both directions halt: client_tls true, and a certificate attached while it is
+  # false, since nothing here would present it.
   workload: |
+    {{- if .infra.client_tls }}
+    {{- fail (printf "infra.client_tls is true on %q, but this Compose realization of core/datastore/valkey cannot serve TLS: the server reads its certificate and key from files, and no credential Feature the catalog realizes on Compose names a secret a service can mount as files; set infra.client_tls to false, or map the component to helm/valkey or helm/valkey-chart in the Manifest, which serve TLS from the server_certificate slot" .context.instance_id) }}
+    {{- end }}
+    {{- if hasKey (default dict .features) "server_certificate" }}
+    {{- fail (printf "a certificate is attached to the server_certificate slot of %q, but infra.client_tls is false and this Compose realization of core/datastore/valkey serves plaintext alone, since no credential Feature the catalog realizes on Compose delivers a certificate as files, so nothing would present it; remove the attachment, or map the component to helm/valkey or helm/valkey-chart in the Manifest and set infra.client_tls to true there" .context.instance_id) }}
+    {{- end }}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     containers:
@@ -43,7 +61,14 @@ spec:
         # realization; this local-dev Compose flavor is ephemeral and declares no
         # data volume, mirroring how the Compose postgres flavor leaves storage
         # to the helm target.
-    {{- if or .values.maxmemory .values.maxmemory_policy .values.databases .values.appendonly }}
+        #
+        # The server is told its port (--port) only when infra.port differs from
+        # 6379, the port the Valkey server listens on when it is given none — a
+        # fact about the server, not a copy of the Component's default. So a
+        # cache at the default port renders no flag, and one an operator moved
+        # listens where its healthcheck and the published port point.
+    {{- $portFlag := ne (toString .infra.port) "6379" }}
+    {{- if or .values.maxmemory .values.maxmemory_policy .values.databases .values.appendonly $portFlag }}
         args:
     {{- with .values.databases }}
           - "--databases"
@@ -60,6 +85,10 @@ spec:
     {{- if .values.appendonly }}
           - "--appendonly"
           - "yes"
+    {{- end }}
+    {{- if $portFlag }}
+          - "--port"
+          - "{{ .infra.port }}"
     {{- end }}
     {{- end }}
         # Authentication is wired through the optional `password` credential

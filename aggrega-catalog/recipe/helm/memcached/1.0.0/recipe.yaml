@@ -22,6 +22,16 @@ metadata:
     namespace, so the recipe is independent of where it is deployed. A consumer
     in another namespace qualifies the host with the target namespace on its own
     side (caller-side routing).
+
+    With infra.client_tls set to true the cache serves TLS alone on its port:
+    the Secret attached to server_certificate is mounted as files, the server
+    is started with -Z and presents its tls.crt and tls.key, requests no client
+    certificate, and protocol is published as memcached-tls; the TCP probes are
+    unchanged, since a connection opens before any handshake. client_tls true
+    with nothing attached to server_certificate halts the build naming the
+    slot, a certificate attached while client_tls is false halts it naming the
+    setting, and an attachment publishing no Secret name halts it naming the
+    slot.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -34,12 +44,26 @@ spec:
   # provider names the synthesized ClusterIP Service "<rendered_name>-<service-key>"
   # (here "<rendered_name>-default"), with no namespace segment. A same-namespace
   # consumer reaches it under this name directly; a cross-namespace consumer
-  # qualifies it with the target namespace caller-side.
+  # qualifies it with the target namespace caller-side. protocol is
+  # "memcached", and "memcached-tls" while infra.client_tls is on, when the port
+  # accepts TLS alone.
   provides:
     host: "{{ .context.rendered_name }}-default"
     port: "{{ .infra.port }}"
-    protocol: "memcached"
+    protocol: "{{ if .infra.client_tls }}memcached-tls{{ else }}memcached{{ end }}"
   workload: |
+    {{- $tls := .infra.client_tls }}
+    {{- $cert := hasKey (default dict .features) "server_certificate" }}
+    {{- if and $tls (not $cert) }}
+    {{- fail (printf "infra.client_tls is true on %q, so the cache serves TLS alone, but nothing is attached to its server_certificate slot, so the server has no certificate to present; attach to server_certificate a Secret holding tls.crt and tls.key, through core/referenced-secret, or set infra.client_tls to false" .context.instance_id) }}
+    {{- end }}
+    {{- if and $cert (not $tls) }}
+    {{- fail (printf "a certificate is attached to the server_certificate slot of %q, but infra.client_tls is false, so the cache serves plaintext and nothing presents the certificate; set infra.client_tls to true to serve TLS from it, or remove the attachment" .context.instance_id) }}
+    {{- end }}
+    {{- $certProvides := optional (optional (default dict .features) "server_certificate" dict) "provides" dict }}
+    {{- if and $tls (not (and (kindIs "map" $certProvides) (optional $certProvides "name" ""))) }}
+    {{- fail (printf "the server_certificate slot of %q is filled by an attachment that publishes no Secret name, but the server's certificate is mounted from a Secret named here; bind the slot to core/referenced-secret, whose k8s-existing-secret realization names a Secret that already exists" .context.instance_id) }}
+    {{- end }}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # A cache holds no durable state, so the default stateless form (a
@@ -63,7 +87,20 @@ spec:
         # entrypoint prepends `memcached` to a flag-leading argument list. The
         # block is emitted only when a knob is set, so a bare cache renders no
         # args and matches the un-thickened recipe exactly.
-    {{- if or .values.memory_limit .values.max_connections .values.threads .values.max_item_size }}
+        #
+        # With infra.client_tls on, the server binds infra.port (-p) and serves
+        # TLS on it (-Z) from the certificate and key the server_certificate
+        # slot's Secret holds, mounted below as files (ssl_chain_cert,
+        # ssl_key). Every listener then serves TLS, and the server requests no
+        # client certificate, its ssl_verify_mode default.
+        #
+        # With client_tls off, the server is told its port (-p) only when
+        # infra.port differs from 11211, the port the Memcached server listens
+        # on when it is given none — a fact about the server, not a copy of the
+        # Component's default. So a cache at the default port renders no flag,
+        # and one an operator moved listens where its Service and probes point.
+    {{- $portFlag := and (not $tls) (ne (toString .infra.port) "11211") }}
+    {{- if or .values.memory_limit .values.max_connections .values.threads .values.max_item_size $tls $portFlag }}
         args:
     {{- with .values.memory_limit }}
           - "-m"
@@ -81,6 +118,17 @@ spec:
           - "-I"
           - "{{ . }}"
     {{- end }}
+    {{- if $portFlag }}
+          - "-p"
+          - "{{ .infra.port }}"
+    {{- end }}
+    {{- if $tls }}
+          - "-p"
+          - "{{ .infra.port }}"
+          - "-Z"
+          - "-o"
+          - "ssl_chain_cert=/etc/memcached/tls/tls.crt,ssl_key=/etc/memcached/tls/tls.key"
+    {{- end }}
     {{- end }}
     {{- if hasKey (default dict .features) "password" }}
         variables:
@@ -90,7 +138,9 @@ spec:
           memcached: {{ .infra.port }}
         # Memcached documents no health endpoint, so both probes open a TCP
         # connection to the port the Service targets. No start-up time is
-        # documented; the liveness probe waits 10 s before its first check.
+        # documented; the liveness probe waits 10 s before its first check. A
+        # TCP connection opens on a TLS listener before any handshake, so the
+        # probes are the same with infra.client_tls on.
         health:
           ready:
             tcp: {{ .infra.port }}
@@ -109,6 +159,24 @@ spec:
           MEMCACHED_PASSWORD:
             from: password
             as: env
+    {{- end }}
+    {{- if $tls }}
+        # The certificate Secret mounts whole, read-only, one file per data key,
+        # so the server reads tls.crt and tls.key from this directory. It is a
+        # secret volume this Recipe names rather than a file attachment,
+        # because a pod volume is named after a file attachment's slot, and the
+        # underscore in server_certificate is not a character a Kubernetes
+        # volume name may hold.
+        volumeMounts:
+          - name: tls
+            path: /etc/memcached/tls
+            readonly: true
+    {{- end }}
+    {{- if $tls }}
+    volumes:
+      tls:
+        secret:
+          source: "{{ .features.server_certificate.provides.name }}"
     {{- end }}
     services:
       default:

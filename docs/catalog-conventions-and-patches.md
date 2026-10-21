@@ -3655,6 +3655,46 @@ copying whichever sibling happens to be nearest.
   managed (the Terraform/CloudFormation equivalents). These are selector-only
   identity; the family's Recipes do not stamp them onto rendered output.
 
+### Encrypted client connections to a cache
+
+`core/datastore/valkey` and `core/datastore/memcached` serve their clients over TLS
+when the operator turns it on. It is a setting on the Component rather than a
+Feature, because TLS reconfigures the server's own listener, which only the
+cache's Recipe controls. This is a catalog convention upheld by each Recipe's
+template, not something the compiler checks: the compiler pipes the published
+`protocol` as a string and does not interpret it.
+
+- **The setting is `infra.client_tls`**, a boolean that defaults to false. Off, the
+  Component's contract and every render are exactly what they are without the
+  setting.
+- **On, the published `protocol` says so** — `valkey-tls` for `valkey`,
+  `memcached-tls` for `memcached`: the product's name and the word its own
+  documentation uses for the feature. The port then accepts TLS alone, and `host`
+  and `port` are unchanged, so `protocol` is what tells a consumer that TLS is
+  required; a plaintext client reaching the port fails its handshake and exchanges
+  no command. A consumer Recipe that checks `protocol` against the values it
+  supports refuses one it does not list, naming the connection, so such a consumer
+  not yet taught the TLS value is refused at build time rather than reaching a TLS
+  port in plaintext.
+- **A self-hosted realization presents the certificate attached to the slot
+  `server_certificate`**, declared optional with `selector:
+  "feature.aggrega.ai/kind=secret"`, `sensitive: true` and `inject: [file]`. Its
+  Secret holds `tls.crt`, the certificate followed by any intermediate
+  certificates, and `tls.key`, its private key — the two keys a
+  `kubernetes.io/tls` Secret holds — and the certificate names every address a
+  client dials. The Secret is mounted into the server's container as files, so the
+  slot is filled by a Feature that names an existing Secret, `core/referenced-secret`.
+  The server asks no client for a certificate.
+- **Two halts, each naming what to change:** `client_tls` true with nothing attached
+  to `server_certificate`, since the server would have no certificate to present;
+  and a certificate attached while `client_tls` is false, since nothing would
+  present it. An attachment that publishes no Secret name halts naming the slot.
+- **A realization that cannot serve TLS refuses `client_tls` by name and names one
+  that can.** The Compose realizations do: both servers read their certificate
+  from files, and no credential Feature realized on Compose names a secret a
+  service can mount, so they refuse the setting, and a certificate attached
+  without it, and name the helm realizations.
+
 ### The name a managed datastore is reached at from another target
 
 A managed datastore's address — an RDS instance's, say — does not exist until the
