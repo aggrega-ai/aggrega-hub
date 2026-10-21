@@ -18,6 +18,11 @@ variable "allocated_storage" {
   default = 20
 }
 
+variable "port" {
+  type        = number
+  description = "Port the database listens on; supplied by the caller."
+}
+
 variable "multi_az" {
   type    = bool
   default = false

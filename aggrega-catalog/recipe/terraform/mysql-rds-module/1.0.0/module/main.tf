@@ -1,9 +1,27 @@
+# required_providers pins hashicorp/aws so the engine installs a provider whose
+# resource schema this module was written against. It is a range rather than an
+# exact version because every AWS module in one root configuration shares one
+# installed provider, and two exact pins that differ fail init. The constraint
+# string is the one the Aggrega catalog conventions' "One AWS provider
+# constraint for every AWS body" section states; this file repeats it
+# deliberately, because a vendored module is copied byte for byte and imports
+# nothing.
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.69"
+    }
+  }
+}
+
 resource "aws_db_instance" "this" {
   identifier           = var.db_name
   engine               = "mysql"
   engine_version       = var.engine_version
   instance_class       = var.instance_class
   allocated_storage    = var.allocated_storage
+  port                 = var.port
   multi_az             = var.multi_az
   db_subnet_group_name = var.subnet_id
 
@@ -17,6 +35,10 @@ resource "aws_db_instance" "this" {
   tags = {
     Name = "${var.db_name}-mysql"
   }
+}
+
+output "address" {
+  value = aws_db_instance.this.address
 }
 
 output "endpoint" {

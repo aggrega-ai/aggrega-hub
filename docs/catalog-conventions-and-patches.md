@@ -1909,6 +1909,32 @@ targeting self-managed datastores (Helm Bitnami chart, Compose container) still
 use the credential FeatureRecipe path, because no upstream managed-secret flag
 exists for those targets.
 
+### One AWS provider constraint for every AWS body
+
+Every Terraform body the catalog authors for AWS — an `artifacts:` body, or a
+module a Recipe vendors — declares `hashicorp/aws` in its `required_providers`
+block, so the engine installs a provider whose resource schema the body was
+written against rather than whichever release is latest. The constraint is **one
+string, the same in every AWS body**, and it is a **range of the form
+`~> <major>.<minor>`**, never an exact version: several AWS Recipes compose into
+one boundary's root configuration, Terraform installs one provider version that
+satisfies every module's constraint, and two exact pins that differ fail
+`init`. The major and minor are those of the provider's current release when the
+constraint is set, and never lower than the highest `hashicorp/aws` floor
+declared by a published AWS module a catalog Recipe sources, so one installed
+provider satisfies the catalog's own bodies and those modules together. Moving it
+is one change made to every AWS body at once.
+
+Each body carries the string itself, with a comment naming this section. A
+library import cannot place a block inside an authored body — a MappingLibrary
+entry is consumed by `valuesMapping:`, and an ArtifactLibrary bundle lands in a
+sub-directory of the module, which Terraform does not read as part of it — and a
+vendored module is copied byte for byte, so the repeat is deliberate and this
+section is the one statement of the rule. The terraform RDS Recipes
+(`recipe/terraform/postgres-rds`, `mysql-rds`, `mariadb-rds` and the two
+`-module` Recipes) follow it. This is a catalog convention: the compiler pipes
+the block as text and reads nothing in it.
+
 ### Optional credential slots for self-managed datastores
 
 A self-managed datastore Component declares its password as an **optional**
