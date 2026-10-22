@@ -37,8 +37,8 @@ metadata:
     infra.overrides.subnet_ids is required. infra.engine_version must name a
     version the service offers and infra.storage.size 10Gi or more, so both
     Component defaults halt here; an infra.port other than 9200 halts, the
-    domain serving 443 alone, and so does a T2 instance type, which lacks
-    fine-grained access control.
+    domain serving 443 alone, and so do an io1 volume and any instance or
+    volume type the service cannot serve this domain on.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -83,6 +83,11 @@ spec:
     # Graviton3 m7g.medium.search, a current-generation type that serves every
     # OpenSearch version the service offers.
     instance_type: '{{ optional (optional .infra "overrides" dict) "instance_type" "m7g.medium.search" }}'
+    # The instance family, the instance type's first part: m7g from
+    # m7g.medium.search. The service states what each family supports by family.
+    instance_family: '{{ index (splitList "." .locals.instance_type) 0 }}'
+    # The EBS volume type, infra.storage.type or gp3 while it is unset.
+    volume_type: '{{ default "gp3" (optional .infra.storage "type" "") }}'
     # The name the Release gives the domain under infra.overrides.host, or empty
     # while it gives none. Only a string is read here; any other value is
     # refused by the assertion below rather than published.
@@ -121,13 +126,19 @@ spec:
   # not read, each measured against the service's own documentation:
   #   honoured — infra.engine_version (major and minor, among the versions the
   #     service offers); infra.storage.size, as the data node's EBS volume in
-  #     GiB, 10 or more; infra.storage.type, as its EBS volume type, gp3 when
-  #     unset; and the overrides above.
+  #     GiB, 10 or more; infra.storage.type, as its EBS volume type, gp3, gp2
+  #     or standard, gp3 when unset; and the overrides above.
   #   refused — infra.port other than 9200, the Component's default: the
   #     service serves a domain on 443 alone, which is what this Recipe
-  #     publishes; an instance type of the T2 family, which supports neither
-  #     fine-grained access control nor encryption at rest; and a password as
-  #     set out below.
+  #     publishes; an instance type of the t2, m3 or r3 families, which support
+  #     neither fine-grained access control nor encryption at rest; an instance
+  #     type of a family that takes no EBS volume (i4i, i7i, i8g, i8ge, im4gn,
+  #     r8gd, i4g, r6gd), since this Recipe gives the node one;
+  #     infra.storage.type io1, the Provisioned IOPS volume, whose IOPS figure no
+  #     key carries; a volume type other than gp3 on a family that takes gp3
+  #     alone (c7g, m7g, r7g and r7gd, c7i, m7i, r7i, c8g, m8g, r8g), standard,
+  #     the magnetic volume, on a Graviton2 family (c6g, m6g, r6g) or above
+  #     100 GiB; and a password as set out below.
   #   not read — infra.port while it is 9200; infra.compute.cpu and
   #     infra.compute.memory, whose Component defaults size a container: the
   #     service sizes the node by infra.overrides.instance_type, and a Recipe
@@ -187,13 +198,29 @@ spec:
       {{- if lt (int (trimSuffix "Gi" $size)) 10 -}}
       {{- fail (printf "infra.storage.size is %q, and Amazon OpenSearch Service gives a data node an EBS volume of at least 10 GiB; the Component's default, 8Gi, sizes a container's volume: set infra.storage.size in the Release to 10Gi or more" $size) -}}
       {{- end -}}
-      {{- $t := toString (default "gp3" (optional .infra.storage "type" "")) -}}
-      {{- if not (has $t (list "gp3" "gp2" "io1" "standard")) -}}
-      {{- fail (printf "infra.storage.type is %q, and on Amazon OpenSearch Service it is the data node's EBS volume type, one of gp3, gp2, io1 and standard: set infra.storage.type in the Release to one of them, or leave it unset for gp3" $t) -}}
+      {{- $t := .locals.volume_type -}}
+      {{- if eq $t "io1" -}}
+      {{- fail "infra.storage.type is \"io1\", a Provisioned IOPS volume, which Amazon OpenSearch Service provisions with the IOPS figure the domain is given, and this Recipe has no key to carry one: set infra.storage.type in the Release to gp3, whose 3,000 IOPS baseline every gp3 volume includes, or leave it unset for gp3" -}}
+      {{- end -}}
+      {{- if not (has $t (list "gp3" "gp2" "standard")) -}}
+      {{- fail (printf "infra.storage.type is %q, and on Amazon OpenSearch Service it is the data node's EBS volume type, one of gp3, gp2 and standard here: set infra.storage.type in the Release to one of them, or leave it unset for gp3" $t) -}}
+      {{- end -}}
+      {{- if and (ne $t "gp3") (has .locals.instance_family (list "c7g" "m7g" "r7g" "r7gd" "c7i" "m7i" "r7i" "c8g" "m8g" "r8g")) -}}
+      {{- fail (printf "infra.storage.type is %q, and the instance type %s, from infra.overrides.instance_type or this Recipe's default, belongs to a family Amazon OpenSearch Service gives gp3 volumes alone: set infra.storage.type to gp3, or leave it unset, or set infra.overrides.instance_type to a type that takes %s" $t .locals.instance_type $t) -}}
+      {{- end -}}
+      {{- if and (eq $t "standard") (has .locals.instance_family (list "c6g" "m6g" "r6g")) -}}
+      {{- fail (printf "infra.storage.type is \"standard\", the magnetic volume, and the instance type %s belongs to a Graviton family Amazon OpenSearch Service gives no magnetic storage: set infra.storage.type to gp3 or gp2" .locals.instance_type) -}}
+      {{- end -}}
+      {{- if and (eq $t "standard") (gt (int (trimSuffix "Gi" $size)) 100) -}}
+      {{- fail (printf "infra.storage.type is \"standard\", the magnetic volume, which Amazon OpenSearch Service sizes at 100 GiB at most, and infra.storage.size is %q: set infra.storage.size to 100Gi or less, or infra.storage.type to gp3 or gp2" $size) -}}
       {{- end -}}
     instance_type_serves_fine_grained_access: >-
-      {{- if hasPrefix "t2." .locals.instance_type -}}
-      {{- fail (printf "infra.overrides.instance_type is %q, and the T2 instance types support neither fine-grained access control nor encryption at rest, both of which this Recipe turns on: set infra.overrides.instance_type to another type, such as m7g.medium.search" .locals.instance_type) -}}
+      {{- if has .locals.instance_family (list "t2" "m3" "r3") -}}
+      {{- fail (printf "infra.overrides.instance_type is %q, and the t2, m3 and r3 instance families support neither fine-grained access control nor encryption at rest, both of which this Recipe turns on: set infra.overrides.instance_type to another type, such as m7g.medium.search" .locals.instance_type) -}}
+      {{- end -}}
+    instance_type_takes_ebs: >-
+      {{- if has .locals.instance_family (list "i4i" "i7i" "i8g" "i8ge" "im4gn" "r8gd" "i4g" "r6gd") -}}
+      {{- fail (printf "infra.overrides.instance_type is %q, a type of a family Amazon OpenSearch Service gives no EBS volume, and this Recipe gives the data node one, sized by infra.storage.size: set infra.overrides.instance_type to a type that takes one, such as m7g.medium.search" .locals.instance_type) -}}
       {{- end -}}
     master_password: >-
       {{- $f := default dict .features -}}
@@ -283,7 +310,7 @@ spec:
     ebs_options:
       ebs_enabled: true
       volume_size: {{ trimSuffix "Gi" (toString .infra.storage.size) }}
-      volume_type: "{{ default "gp3" (optional .infra.storage "type" "") }}"
+      volume_type: "{{ .locals.volume_type }}"
     encrypt_at_rest:
       enabled: true
     node_to_node_encryption:

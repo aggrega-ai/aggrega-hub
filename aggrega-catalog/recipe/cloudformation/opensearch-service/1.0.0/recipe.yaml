@@ -1,0 +1,349 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: opensearch-service
+  version: 1.0.0
+  description: >
+    OpenSearch on Amazon OpenSearch Service, rendered as a CloudFormation
+    fragment: one AWS::OpenSearchService::Domain of one data node in the
+    operator's VPC. The cloudformation provider stamps the stack envelope and
+    projects this Recipe's provides into the stack Outputs.
+
+    Reach for this realization where the search engine is an OpenSearch Service
+    domain in a CloudFormation stack; reach for terraform/opensearch-service on
+    terraform, and helm/opensearch-chart or compose/opensearch where it runs as
+    a container.
+
+    The domain serves HTTPS alone on 443, with fine-grained access control on
+    and one account, admin, whose password is the secret core/random-password
+    creates in the stack, handed to the service as a Secrets Manager dynamic
+    reference, so the rendered template carries no password; with no password
+    attached, or another credential, the build halts naming the slot. host
+    publishes a reference to the domain's endpoint, port 443, protocol https,
+    endpoint https://<host> and user admin. Set infra.overrides.host to publish
+    the DNS name the operator points at the domain instead; a client checking
+    the certificate needs a name it carries, which a name of the operator's own
+    gets only from a custom endpoint this Recipe does not configure.
+    infra.overrides.SubnetIds is required. infra.engine_version must name a
+    version the service offers and infra.storage.size 10Gi or more, so both
+    Component defaults halt here; an infra.port other than 9200 halts, the
+    domain serving 443 alone, and so do an io1 volume and any instance or
+    volume type the service cannot serve this domain on.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: cloudformation
+  implements: core/datastore/opensearch:1.0.0
+
+  # The resource's logical id, derived from this instance's own name so that two
+  # search engines deployed into one stack describe two resources rather than
+  # one. A logical id is unique within a CloudFormation template and admits only
+  # letters and digits, so the instance name's separators are read as word
+  # boundaries and each word is capitalised: instance product-search names the
+  # resource ProductSearch.
+  locals:
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+    # The engine version, the major and minor version infra.engine_version
+    # begins with: 3.5 from an image tag 3.5.0. OpenSearch Service runs the
+    # newest patch of that version, and takes it spelled OpenSearch_3.5.
+    engine_version: '{{ regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) }}'
+    # The data node's instance type, infra.overrides.InstanceType or the
+    # Graviton3 m7g.medium.search, a current-generation type that serves every
+    # OpenSearch version the service offers, as terraform/opensearch-service
+    # defaults to.
+    instance_type: '{{ optional (optional .infra "overrides" dict) "InstanceType" "m7g.medium.search" }}'
+    # The instance family, the instance type's first part: m7g from
+    # m7g.medium.search. The service states what each family supports by family.
+    instance_family: '{{ index (splitList "." .locals.instance_type) 0 }}'
+    # The EBS volume type, infra.storage.type or gp3 while it is unset.
+    volume_type: '{{ default "gp3" (optional .infra.storage "type" "") }}'
+    # The name the Release gives the domain under infra.overrides.host, or empty
+    # while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # The String Pipe: the compiler pipes each of these strings verbatim into a
+  # consumer's injection context when it uses this search engine, and resolves
+  # none of them. host is a CloudFormation intrinsic function reference to the
+  # domain's DomainEndpoint, its bare hostname, which CloudFormation resolves
+  # at stack creation time; endpoint is an Fn::Sub joining the scheme to the
+  # same attribute, which CloudFormation resolves the same way. The provider
+  # projects the matching provides block inside the fragment below into the
+  # assembled stack Outputs; this recipe-level provides is the value-pipe
+  # contract, the fragment provides is the Outputs source, and they carry the
+  # same values.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name in
+  # both provides blocks instead of the reference, and endpoint joins the
+  # scheme to it. It is the operator's deterministic pointer: the compiler pipes
+  # it as text and looks nothing up, and this Recipe emits no DNS record or
+  # alias for it, so the operator points the name at the domain outside the
+  # Release. A consumer in the same stack receives the name as well, and a name
+  # carries no reference for CloudFormation to create that consumer after this
+  # domain by; a later syncWave on the consumer's boundary, sharing this
+  # boundary's directory, orders the two. A consumer in another stack imports
+  # the name through the same export it imports the reference through. The
+  # domain serves HTTPS alone, and a client that checks the certificate against
+  # the name it dials needs a certificate carrying that name, which the service
+  # presents for an operator's name only through a custom endpoint; this Recipe
+  # configures none.
+  #
+  # port is 443, where the service serves the domain, and protocol https, the
+  # only scheme the domain accepts. user is admin, the master user.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}!GetAtt {{ .locals.logical_id }}.DomainEndpoint{{ end }}"
+    port: "443"
+    user: "admin"
+    protocol: "https"
+    endpoint: "{{ if .locals.operator_host }}https://{{ .locals.operator_host }}{{ else }}!Sub https://${ {{- .locals.logical_id }}.DomainEndpoint}{{ end }}"
+
+  # This Recipe reads from infra.overrides:
+  #   SubnetIds        - []string (Properties.VPCOptions.SubnetIds), required, one subnet
+  #   SecurityGroupIds - []string (Properties.VPCOptions.SecurityGroupIds)
+  #   InstanceType     - string (Properties.ClusterConfig.InstanceType; default "m7g.medium.search")
+  #   host             - string (published as provides.host; renders nothing)
+  #
+  # The key names are the CloudFormation property names rather than a separate
+  # Aggrega spelling, because each is passed through to the resource unchanged
+  # and the property name is what a reader matches against the resource
+  # documentation, as the CloudFormation RDS and ElastiCache Recipes name
+  # theirs. SubnetIds is required: it places the domain in the operator's VPC,
+  # and this Recipe never chooses a network for the operator. It names exactly
+  # one subnet, because the domain runs one data node in one Availability Zone,
+  # and the service takes one subnet for each Availability Zone a domain uses.
+  # With no security group named, the service attaches the VPC's default
+  # security group; the security groups are the operator's, who opens 443 to the
+  # domain's clients. host is the exception to the naming: it is no property of
+  # the resource but the address a consumer reaches the domain at, under the
+  # name every managed datastore Recipe reads for it.
+  #
+  # The fragment names the domain after the component, as terraform/
+  # opensearch-service does, because the access policy below names the domain
+  # in its Resource and a domain's own attributes cannot be read inside its own
+  # properties; and it sets no DeletionPolicy, so the stack deletes the domain
+  # with it. It emits nothing beyond the domain. The published module the
+  # terraform realization vendors adds, by its own defaults, CloudWatch log
+  # groups for the index and search slow logs with a CloudWatch Logs resource
+  # policy letting the service write them, Auto-Tune, an off-peak window and
+  # automatic service software updates; this fragment declares none of them,
+  # so the service's own defaults stand for each.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation:
+  #   honoured — infra.engine_version (major and minor, among the versions the
+  #     service offers); infra.storage.size, as the data node's EBS volume in
+  #     GiB, 10 or more; infra.storage.type, as its EBS volume type, gp3, gp2
+  #     or standard, gp3 when unset; and the overrides above.
+  #   refused — infra.port other than 9200, the Component's default: the
+  #     service serves a domain on 443 alone, which is what this Recipe
+  #     publishes; an instance type of the t2, m3 or r3 families, which support
+  #     neither fine-grained access control nor encryption at rest; an instance
+  #     type of a family that takes no EBS volume (i4i, i7i, i8g, i8ge, im4gn,
+  #     r8gd, i4g, r6gd), since this Recipe gives the node one;
+  #     infra.storage.type io1, the Provisioned IOPS volume, whose IOPS figure no
+  #     key carries; a volume type other than gp3 on a family that takes gp3
+  #     alone (c7g, m7g, r7g and r7gd, c7i, m7i, r7i, c8g, m8g, r8g), standard,
+  #     the magnetic volume, on a Graviton2 family (c6g, m6g, r6g) or above
+  #     100 GiB; and a password as set out below.
+  #   not read — infra.port while it is 9200; infra.compute.cpu and
+  #     infra.compute.memory, whose Component defaults size a container: the
+  #     service sizes the node by infra.overrides.InstanceType, and a Recipe
+  #     cannot tell those defaults from a value the Release wrote, so the
+  #     Component's descriptions say so instead. infra.source_version, which
+  #     selects the chart another realization pulls.
+  #
+  # A gp3 volume carries Iops and Throughput, which the resource documentation
+  # requires with that type; they are the 3,000 IOPS and 125 MiB/s every gp3
+  # volume delivers as its baseline, so the fragment asks for no performance
+  # beyond what the volume includes. gp2 and standard carry neither; io1, which
+  # takes the IOPS figure the domain is given, is refused, since no key carries
+  # one.
+  #
+  # The domain is served as the service's fine-grained access control requires
+  # it: HTTPS for all traffic, at a minimum of TLS 1.2, encryption at rest with
+  # the service's own key, and node-to-node encryption. Fine-grained access
+  # control keeps its users in the domain's internal user database, which holds
+  # one master user, admin, the Component's one account; a client signs in with
+  # HTTP basic authentication. The service's master user cannot be handed to
+  # AWS Secrets Manager as an RDS master password can, so the password comes
+  # from the attachment.
+  #
+  # The password reaches the service as a Secrets Manager dynamic reference to
+  # the secret core/random-password's cloudformation/random-password
+  # realization creates in the same stack, composed with Fn::Sub from that
+  # secret's published reference, as AWS's own examples compose a database
+  # password: CloudFormation resolves it when it creates the domain, so no
+  # password is written into the rendered template. Another credential either
+  # carries its value as text, which would be written into the template, or
+  # carries none the service could take, so it halts, and so does a JSON key
+  # holding a colon, which a dynamic reference cannot carry. With nothing
+  # attached the build halts too: the Component's development default, apppass,
+  # is shorter than the eight characters the service requires, and a password
+  # every reader of the catalog knows is not left on a managed endpoint.
+  assertions:
+    subnet_ids_supplied: >-
+      {{- $s := optional (optional .infra "overrides" dict) "SubnetIds" "" -}}
+      {{- if not (and (kindIs "slice" $s) (eq (len $s) 1) (typeIs "string" (index $s 0)) (index $s 0)) -}}
+      {{- fail (printf "this Release places its OpenSearch Service domain in a subnet of the operator's VPC, one subnet for the one data node it runs, but infra.overrides.SubnetIds is %v: set infra.overrides.SubnetIds in the Release to a list holding the ID of one existing subnet" (toJson $s)) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this search engine reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the domain serves port 443` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The OpenSearch versions the service offers, read off its supported-versions
+    # list. A version it adds later is refused here until this list names it.
+    engine_version_offered: >-
+      {{- $v := regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) -}}
+      {{- if not (has $v (list "3.5" "3.3" "3.1" "2.19" "2.17" "2.15" "2.13" "2.11" "2.9" "2.7" "2.5" "2.3" "1.3" "1.2" "1.1" "1.0")) -}}
+      {{- fail (printf "infra.engine_version is %q, and Amazon OpenSearch Service runs OpenSearch 3.5, 3.3, 3.1, 2.19, 2.17, 2.15, 2.13, 2.11, 2.9, 2.7, 2.5, 2.3, 1.3, 1.2, 1.1 and 1.0, which this Recipe reads off the major and minor version the value begins with; the Component's default is an image tag naming a release the service does not run: set infra.engine_version in the Release to one of them, such as 3.5" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    port_is_the_service_port: >-
+      {{- if ne (int .infra.port) 9200 -}}
+      {{- fail (printf "infra.port is %v, and Amazon OpenSearch Service serves a domain on port 443 alone, which this Recipe publishes as port: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+    ebs_volume: >-
+      {{- $size := toString .infra.storage.size -}}
+      {{- if not (regexMatch `^[0-9]+Gi$` $size) -}}
+      {{- fail (printf "infra.storage.size is %q, and this Recipe gives the data node an EBS volume sized in whole gibibytes: set infra.storage.size in the Release to a size such as 20Gi" $size) -}}
+      {{- end -}}
+      {{- if lt (int (trimSuffix "Gi" $size)) 10 -}}
+      {{- fail (printf "infra.storage.size is %q, and Amazon OpenSearch Service gives a data node an EBS volume of at least 10 GiB; the Component's default, 8Gi, sizes a container's volume: set infra.storage.size in the Release to 10Gi or more" $size) -}}
+      {{- end -}}
+      {{- $t := .locals.volume_type -}}
+      {{- if eq $t "io1" -}}
+      {{- fail "infra.storage.type is \"io1\", a Provisioned IOPS volume, which Amazon OpenSearch Service provisions with the IOPS figure the domain is given, and this Recipe has no key to carry one: set infra.storage.type in the Release to gp3, whose 3,000 IOPS baseline every gp3 volume includes, or leave it unset for gp3" -}}
+      {{- end -}}
+      {{- if not (has $t (list "gp3" "gp2" "standard")) -}}
+      {{- fail (printf "infra.storage.type is %q, and on Amazon OpenSearch Service it is the data node's EBS volume type, one of gp3, gp2 and standard here: set infra.storage.type in the Release to one of them, or leave it unset for gp3" $t) -}}
+      {{- end -}}
+      {{- if and (ne $t "gp3") (has .locals.instance_family (list "c7g" "m7g" "r7g" "r7gd" "c7i" "m7i" "r7i" "c8g" "m8g" "r8g")) -}}
+      {{- fail (printf "infra.storage.type is %q, and the instance type %s, from infra.overrides.InstanceType or this Recipe's default, belongs to a family Amazon OpenSearch Service gives gp3 volumes alone: set infra.storage.type to gp3, or leave it unset, or set infra.overrides.InstanceType to a type that takes %s" $t .locals.instance_type $t) -}}
+      {{- end -}}
+      {{- if and (eq $t "standard") (has .locals.instance_family (list "c6g" "m6g" "r6g")) -}}
+      {{- fail (printf "infra.storage.type is \"standard\", the magnetic volume, and the instance type %s belongs to a Graviton family Amazon OpenSearch Service gives no magnetic storage: set infra.storage.type to gp3 or gp2" .locals.instance_type) -}}
+      {{- end -}}
+      {{- if and (eq $t "standard") (gt (int (trimSuffix "Gi" $size)) 100) -}}
+      {{- fail (printf "infra.storage.type is \"standard\", the magnetic volume, which Amazon OpenSearch Service sizes at 100 GiB at most, and infra.storage.size is %q: set infra.storage.size to 100Gi or less, or infra.storage.type to gp3 or gp2" $size) -}}
+      {{- end -}}
+    instance_type_serves_fine_grained_access: >-
+      {{- if has .locals.instance_family (list "t2" "m3" "r3") -}}
+      {{- fail (printf "infra.overrides.InstanceType is %q, and the t2, m3 and r3 instance families support neither fine-grained access control nor encryption at rest, both of which this Recipe turns on: set infra.overrides.InstanceType to another type, such as m7g.medium.search" .locals.instance_type) -}}
+      {{- end -}}
+    instance_type_takes_ebs: >-
+      {{- if has .locals.instance_family (list "i4i" "i7i" "i8g" "i8ge" "im4gn" "r8gd" "i4g" "r6gd") -}}
+      {{- fail (printf "infra.overrides.InstanceType is %q, a type of a family Amazon OpenSearch Service gives no EBS volume, and this Recipe gives the data node one, sized by infra.storage.size: set infra.overrides.InstanceType to a type that takes one, such as m7g.medium.search" .locals.instance_type) -}}
+      {{- end -}}
+    master_password: >-
+      {{- $f := default dict .features -}}
+      {{- if not (hasKey $f "password") -}}
+      {{- fail "the password slot is empty, and its development default, the same for every reader of the catalog, is shorter than the eight characters Amazon OpenSearch Service requires of a master password: attach core/random-password to the password slot, bound to cloudformation/random-password in the Manifest" -}}
+      {{- end -}}
+      {{- $p := $f.password -}}
+      {{- if ne (toString (optional $p "type" "")) "core/random-password" -}}
+      {{- fail (printf "the password slot is filled by %s, and this Recipe hands the domain's master password to the service as a Secrets Manager dynamic reference to a secret the stack generates, which core/random-password creates through cloudformation/random-password; another credential either carries its value as text, which would be written into the rendered template, or carries none the service could take: attach core/random-password to the password slot instead" (toString (optional $p "type" "an attachment of no type"))) -}}
+      {{- end -}}
+      {{- $pv := optional $p "values" dict -}}
+      {{- if contains ":" (toString (optional $pv "key" "")) -}}
+      {{- fail (printf "the password attached to the password slot sets values.key to %q, and the JSON key of a Secrets Manager dynamic reference may not contain a colon: set values.key to a name without one" (toString (optional $pv "key" ""))) -}}
+      {{- end -}}
+
+  # The MasterUserPassword is a Secrets Manager dynamic reference, which
+  # CloudFormation resolves when it creates the domain: the attachment's
+  # published name is its secret's Ref, which resolves to the secret's ARN, and
+  # Fn::Sub writes that ARN into the reference with the JSON key the attachment
+  # publishes. The reference's own braces are written through the template as
+  # literal text.
+  #
+  # The access policy is the one AWS documents for a master user in the
+  # internal user database: it allows the stack's own account, by its root
+  # principal, the OpenSearch HTTP actions on the domain's own indexes and APIs.
+  # A request signed with that account's credentials passes it, and a request
+  # carrying the master user's name and password is decided by fine-grained
+  # access control alone; inside the VPC the security groups decide which
+  # clients reach the domain at all. The account, partition and Region are the
+  # stack's own pseudo parameters, and the domain is named by the DomainName
+  # this fragment sets, so the policy reads no attribute of the domain it
+  # belongs to.
+  #
+  # The domain's name follows the service's own rule, which the component's
+  # name is checked against here, where the name is known.
+  artifacts:
+    template.yaml: |
+      {{- if not (regexMatch `^[a-z][a-z0-9-]{2,27}$` .context.instance_id) }}
+      {{- fail (printf "the component %q names its OpenSearch Service domain, and a domain name starts with a lowercase letter and holds 3 to 28 lowercase letters, digits and hyphens: rename the component in the Aggregate to such a name" .context.instance_id) }}
+      {{- end }}
+      {{- $pwp := optional (optional (default dict .features) "password" dict) "provides" dict }}
+      {{- if not (and (kindIs "map" $pwp) (optional $pwp "name" "") (optional $pwp "key" "")) }}
+      {{- fail (printf "the password slot of %q is filled by an attachment that publishes no secret reference and key, and the master password is a dynamic reference to one: bind core/random-password to cloudformation/random-password in the Manifest" .context.instance_id) }}
+      {{- end }}
+      Resources:
+        {{ .locals.logical_id }}:
+          Type: AWS::OpenSearchService::Domain
+          Properties:
+            DomainName: "{{ .context.instance_id }}"
+            EngineVersion: "OpenSearch_{{ .locals.engine_version }}"
+            ClusterConfig:
+              InstanceType: "{{ .locals.instance_type }}"
+              InstanceCount: 1
+              DedicatedMasterEnabled: false
+              ZoneAwarenessEnabled: false
+            EBSOptions:
+              EBSEnabled: true
+              VolumeSize: {{ trimSuffix "Gi" (toString .infra.storage.size) }}
+              VolumeType: "{{ .locals.volume_type }}"
+              {{- if eq .locals.volume_type "gp3" }}
+              Iops: 3000
+              Throughput: 125
+              {{- end }}
+            EncryptionAtRestOptions:
+              Enabled: true
+            NodeToNodeEncryptionOptions:
+              Enabled: true
+            DomainEndpointOptions:
+              EnforceHTTPS: true
+              TLSSecurityPolicy: "Policy-Min-TLS-1-2-2019-07"
+            AdvancedSecurityOptions:
+              Enabled: true
+              AnonymousAuthEnabled: false
+              InternalUserDatabaseEnabled: true
+              MasterUserOptions:
+                MasterUserName: "admin"
+                MasterUserPassword:
+                  Fn::Sub:
+                    - "{{ "{{" }}resolve:secretsmanager:${Secret}:SecretString:{{ $pwp.key }}{{ "}}" }}"
+                    - Secret: {{ $pwp.name }}
+            VPCOptions:
+              SubnetIds: {{ toJson .infra.overrides.SubnetIds }}
+              {{- with optional .infra.overrides "SecurityGroupIds" "" }}
+              SecurityGroupIds: {{ toJson . }}
+              {{- end }}
+            AccessPolicies:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Principal:
+                    AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+                  Action: "es:ESHttp*"
+                  Resource: !Sub "arn:${AWS::Partition}:es:${AWS::Region}:${AWS::AccountId}:domain/{{ .context.instance_id }}/*"
+
+      # Fragment provides: the provider projects each entry into the assembled
+      # stack Outputs and expands the short-form intrinsics to long form. Each
+      # output is named for this instance and the entry together, so two search
+      # engines in one stack keep their connection identities apart. A
+      # cross-stack consumer imports the host and endpoint entries; an
+      # intra-stack consumer receives them through the value-pipe above.
+      provides:
+        host: {{ if .locals.operator_host }}"{{ .locals.operator_host }}"{{ else }}!GetAtt {{ .locals.logical_id }}.DomainEndpoint{{ end }}
+        port: "443"
+        user: "admin"
+        protocol: https
+        endpoint: {{ if .locals.operator_host }}"https://{{ .locals.operator_host }}"{{ else }}!Sub "https://${ {{- .locals.logical_id }}.DomainEndpoint}"{{ end }}

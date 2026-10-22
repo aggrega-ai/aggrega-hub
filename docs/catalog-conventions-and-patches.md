@@ -2029,8 +2029,9 @@ is not left on a managed endpoint, and the service may refuse it outright. An
 Amazon OpenSearch Service domain's master user is the case:
 [`recipe/terraform/opensearch-service`](../aggrega-catalog/recipe/terraform/opensearch-service/1.0.0/recipe.yaml)
 hands the service the same module output reference as its master password, and
-halts with nothing attached, the Component's `apppass` being shorter than the
-eight characters the service takes.
+[`recipe/cloudformation/opensearch-service`](../aggrega-catalog/recipe/cloudformation/opensearch-service/1.0.0/recipe.yaml)
+the dynamic reference below; both halt with nothing attached, the Component's
+`apppass` being shorter than the eight characters the service takes.
 
 A CloudFormation Recipe takes the same credential as a Secrets Manager dynamic
 reference to the secret `cloudformation/random-password` declares in the same
@@ -3654,7 +3655,7 @@ copying whichever sibling happens to be nearest.
   Recipes size the instance by. A managed cache that provisions no volume — the
   ElastiCache realizations — reads no `storage.*` either, for the same reason, and
   its descriptions say so too, and a managed service that serves one port of its
-  own — the Amazon OpenSearch Service realization — reads no `port` while it holds
+  own — the Amazon OpenSearch Service realizations — reads no `port` while it holds
   the Component's default, refusing any other value by name. A key that alone
   carries a setting the managed service needs — its engine version, the volume
   size of the OpenSearch domain — is read even where its Component default is a
@@ -3676,7 +3677,12 @@ copying whichever sibling happens to be nearest.
   its own; a Recipe handing the key to a chart or a custom resource guards the line
   with `{{- with … }}` rather than rendering it empty. On a managed realization the
   same key is the provider's volume type, and each managed Recipe supplies its own
-  fallback where it renders the key.
+  fallback where it renders the key. It refuses by name a volume type the service
+  will not attach to the instance type it provisions, and one that needs a figure
+  no key carries: the OpenSearch Service Recipes refuse anything but gp3 on an
+  instance family that takes gp3 alone, magnetic storage on a Graviton family or
+  above 100 GiB, and the Provisioned IOPS io1, whose IOPS figure the Component
+  declares no key for.
 - **`provides`** — `host` and `port` are required; `user`, `database` and
   `protocol` are declared **only where the engine has the concept**. Redis, Valkey
   and Memcached have no user or database — do not invent them to make the family
@@ -3810,11 +3816,14 @@ operator's string and resolves nothing about it.
   text exactly as the host's does. A service that serves one port of its own
   publishes that port instead, and refuses an `infra.port` other than the
   Component's default by name: an Amazon OpenSearch Service domain serves HTTPS
-  on 443 alone, so `recipe/terraform/opensearch-service` publishes `port` `443`,
-  `protocol` `https` and `endpoint` `https://` joined to the same `host`, the
-  name or the pointer alike. A client checking that domain's certificate needs a
-  name the certificate carries, which a name of the operator's own gets only from
-  a custom endpoint the Recipe does not configure.
+  on 443 alone, so `recipe/terraform/opensearch-service` and
+  `recipe/cloudformation/opensearch-service` publish `port` `443`, `protocol`
+  `https` and `endpoint` `https://` joined to the same `host`, the name or the
+  pointer alike — on CloudFormation an `Fn::Sub` over the domain's
+  `DomainEndpoint`, which a consumer in the stack receives as that intrinsic and
+  one in another stack imports through its export. A client checking that
+  domain's certificate needs a name the certificate carries, which a name of the
+  operator's own gets only from a custom endpoint neither Recipe configures.
 - **The Recipe emits nothing for the name** — no DNS record, no alias. The operator
   points the name at the instance outside the Release, and the build cannot check
   that it does: resolving the name is the runtime's, and a record the Release never
@@ -3847,7 +3856,9 @@ host of the cluster's configuration endpoint) and the CloudFormation ones
 <LogicalId>.PrimaryEndPoint.Address`, and `memcached-elasticache`, publishing
 `!GetAtt <LogicalId>.ConfigurationEndpoint.Address` — the two resource types spell
 the attribute differently), and `recipe/terraform/opensearch-service`, whose
-pointer names the module's `domain_endpoint` output. A managed datastore Recipe
+pointer names the module's `domain_endpoint` output, and
+`recipe/cloudformation/opensearch-service`, publishing `!GetAtt
+<LogicalId>.DomainEndpoint`. A managed datastore Recipe
 added later follows this section rather than a sibling Recipe.
 
 ### The pipeline family template
