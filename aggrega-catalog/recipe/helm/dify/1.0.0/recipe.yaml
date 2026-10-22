@@ -18,7 +18,10 @@ metadata:
     Redis-compatible cache and the vector datastore are the systems of record,
     so it renders stateless. The identities its uses-edges resolve compose its
     connection settings and the in-cluster URLs of its siblings, and its
-    outbound requests to a user-supplied address leave through the proxy.
+    outbound requests to a user-supplied address leave through the proxy. A
+    cache publishing valkey-tls is reached over TLS, its certificate checked
+    against the cache connection's server_ca, mounted, or the image's default
+    trust store; another TLS protocol on the cache halts the build.
 
     Each of its five credentials comes from a credential when one is attached
     and otherwise from a pinned development literal, so the stack runs
@@ -330,6 +333,37 @@ spec:
     {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
     {{- end }}{{ end -}}
     {{- if $gaps }}{{ fail (printf "core/ai-agent/dify %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    {{- /*
+      The cache connection over TLS. A cache publishing valkey-tls accepts TLS
+      connections alone, so the server reaches it over TLS; any other value
+      ending in -tls names a cache served over TLS that this server is not
+      taught to reach, and halts rather than connecting in plaintext. A
+      server_ca on the connection is the authority the server checks the
+      cache's certificate against; it is mounted, so its attachment must name a
+      Secret, and it is refused on a cache served without TLS, where no
+      handshake takes place to check a certificate in. DELIBERATE
+      NEAR-DUPLICATE: the worker's and the scheduler's Recipes repeat this block
+      inside templates of their own, and no catalog kind holds a template
+      fragment for several Recipes to share; change all three together.
+    */ -}}
+    {{- $cacheTLS := false }}{{ $cacheCA := "" -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "cache" -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- $edgeTLS := eq $proto "valkey-tls" -}}
+    {{- if $edgeTLS }}{{ $cacheTLS = true }}{{ else if hasSuffix "-tls" $proto -}}
+    {{- fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a cache served over TLS that the Dify server does not reach: it speaks the Redis protocol, over TLS to a cache publishing valkey-tls; wire a Redis-protocol cache to the cache socket" $alias $.context.instance_id $edge.target $proto) -}}
+    {{- end -}}
+    {{- if hasKey (default dict $edge.features) "server_ca" -}}
+    {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) -}}
+    {{- fail (printf "the server_ca on the cache connection %s of %q publishes no Secret name, so no Secret could be mounted into the server's container: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if not $edgeTLS -}}
+    {{- fail (printf "the cache connection %s of %q holds a server_ca, but the cache it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that cache, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $proto)) -}}
+    {{- end -}}
+    {{- $cacheCA = $caProvides.name -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # The server holds no durable state — the backend, the cache and the vector
@@ -381,7 +415,21 @@ spec:
     {{- range $alias, $edge := .context.uses }}
     {{- if eq $edge.socket "cache" }}
           REDIS_DB: "{{ $edge.values.db_index }}"
-          CELERY_BROKER_URL: "redis://{{ $env.REDIS_HOST }}:{{ $env.REDIS_PORT }}/{{ $edge.values.broker_db_index }}"
+          CELERY_BROKER_URL: "{{ if $cacheTLS }}rediss{{ else }}redis{{ end }}://{{ $env.REDIS_HOST }}:{{ $env.REDIS_PORT }}/{{ $edge.values.broker_db_index }}"
+    {{- end }}
+    {{- end }}
+          # Over TLS the cache client and the Celery broker, whose rediss:// URL
+          # turns TLS on for it, both verify the cache's certificate and the
+          # name dialed: REDIS_SSL_CERT_REQS defaults to CERT_NONE, which checks
+          # nothing, so it is set. They check it against the authority in the
+          # connection's server_ca where one is attached, and otherwise against
+          # the image's default trust store, which a publicly trusted
+          # certificate chains to.
+    {{- if $cacheTLS }}
+          REDIS_USE_SSL: "true"
+          REDIS_SSL_CERT_REQS: CERT_REQUIRED
+    {{- if $cacheCA }}
+          REDIS_SSL_CA_CERTS: /etc/dify/cache-server-ca/ca.crt
     {{- end }}
     {{- end }}
           # The vector-store edge is translated: the driver named on the edge
@@ -519,6 +567,22 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+    {{- if $cacheCA }}
+        # The cache connection's server_ca Secret mounts whole, read-only, one
+        # file per data key, so the server reads ca.crt from this directory. It
+        # is a secret volume this Recipe names rather than a file attachment,
+        # because a pod volume is named after a file attachment's slot, and the
+        # underscore in server_ca is not a character a Kubernetes volume name
+        # may hold.
+        volumeMounts:
+          - name: cache-server-ca
+            path: /etc/dify/cache-server-ca
+            readonly: true
+    volumes:
+      cache-server-ca:
+        secret:
+          source: "{{ $cacheCA }}"
+    {{- end }}
     services:
       default:
         type: ClusterIP

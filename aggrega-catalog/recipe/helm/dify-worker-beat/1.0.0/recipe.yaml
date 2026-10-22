@@ -27,6 +27,9 @@ metadata:
 
     The backend and cache identities resolved from the component's uses-edges
     arrive on .context.inject.env under the names the scheduler itself reads.
+    A cache publishing valkey-tls is reached over TLS, its certificate checked
+    against the cache connection's server_ca, mounted, or the image's default
+    trust store; another TLS protocol on the cache halts the build.
     The backend password comes from a credential when the backend connection
     carries one and from an inline development default otherwise, matching the
     standard-library PostgreSQL Recipe's own default.
@@ -73,6 +76,33 @@ spec:
     {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
     {{- end }}{{ end -}}
     {{- if $gaps }}{{ fail (printf "core/ai-agent/dify-worker-beat %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    {{- /*
+      The cache connection over TLS, read exactly as the API server's Recipe
+      reads it (DELIBERATE NEAR-DUPLICATE: each Dify Recipe repeats this block
+      inside a template of its own, and no catalog kind holds a template
+      fragment for several Recipes to share; change all three together). A
+      cache publishing valkey-tls is reached over TLS; any other value ending
+      in -tls halts rather than connecting in plaintext. A server_ca must name
+      a Secret, and is refused on a cache served without TLS.
+    */ -}}
+    {{- $cacheTLS := false }}{{ $cacheCA := "" -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "cache" -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- $edgeTLS := eq $proto "valkey-tls" -}}
+    {{- if $edgeTLS }}{{ $cacheTLS = true }}{{ else if hasSuffix "-tls" $proto -}}
+    {{- fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a cache served over TLS that the Dify scheduler does not reach: it speaks the Redis protocol, over TLS to a cache publishing valkey-tls; wire a Redis-protocol cache to the cache socket" $alias $.context.instance_id $edge.target $proto) -}}
+    {{- end -}}
+    {{- if hasKey (default dict $edge.features) "server_ca" -}}
+    {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) -}}
+    {{- fail (printf "the server_ca on the cache connection %s of %q publishes no Secret name, so no Secret could be mounted into the scheduler's container: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if not $edgeTLS -}}
+    {{- fail (printf "the cache connection %s of %q holds a server_ca, but the cache it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that cache, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $proto)) -}}
+    {{- end -}}
+    {{- $cacheCA = $caProvides.name -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # The scheduler holds no durable state — the schedule lives in the backend —
@@ -108,7 +138,19 @@ spec:
     {{- range $alias, $edge := .context.uses }}
     {{- if eq $edge.socket "cache" }}
           REDIS_DB: "{{ $edge.values.db_index }}"
-          CELERY_BROKER_URL: "redis://{{ $env.REDIS_HOST }}:{{ $env.REDIS_PORT }}/{{ $edge.values.broker_db_index }}"
+          CELERY_BROKER_URL: "{{ if $cacheTLS }}rediss{{ else }}redis{{ end }}://{{ $env.REDIS_HOST }}:{{ $env.REDIS_PORT }}/{{ $edge.values.broker_db_index }}"
+    {{- end }}
+    {{- end }}
+          # Over TLS the cache client and the Celery broker verify the cache's
+          # certificate and the name dialed, against the connection's server_ca
+          # where one is attached and the image's default trust store where
+          # not; REDIS_SSL_CERT_REQS defaults to CERT_NONE, which checks nothing,
+          # so it is set.
+    {{- if $cacheTLS }}
+          REDIS_USE_SSL: "true"
+          REDIS_SSL_CERT_REQS: CERT_REQUIRED
+    {{- if $cacheCA }}
+          REDIS_SSL_CA_CERTS: /etc/dify/cache-server-ca/ca.crt
     {{- end }}
     {{- end }}
     {{- if not $backendCredential }}
@@ -130,3 +172,18 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+    {{- if $cacheCA }}
+        # The cache connection's server_ca Secret mounts whole, read-only, so
+        # the scheduler reads ca.crt from this directory: a secret volume this
+        # Recipe names, because a pod volume is named after a file attachment's
+        # slot, and the underscore in server_ca is not a character a Kubernetes
+        # volume name may hold.
+        volumeMounts:
+          - name: cache-server-ca
+            path: /etc/dify/cache-server-ca
+            readonly: true
+    volumes:
+      cache-server-ca:
+        secret:
+          source: "{{ $cacheCA }}"
+    {{- end }}

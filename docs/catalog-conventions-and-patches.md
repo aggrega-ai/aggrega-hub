@@ -3694,6 +3694,17 @@ template, not something the compiler checks: the compiler pipes the published
   from files, and no credential Feature realized on Compose names a secret a
   service can mount, so they refuse the setting, and a certificate attached
   without it, and name the helm realizations.
+- **A consumer taught the TLS value reaches the cache over TLS while the cache
+  publishes it**, with the product's own switch, and checks the cache's
+  certificate against the authority in a `server_ca` slot on its cache socket —
+  optional, `selector: "feature.aggrega.ai/kind=secret"`, `sensitive: true`,
+  `inject: [file]`, a Secret holding `ca.crt`, mounted into its container — or,
+  with none attached, against its image's default trust store, which a publicly
+  trusted certificate chains to. It halts, naming the connection, on a
+  `server_ca` publishing no Secret name, on a `server_ca` on a connection whose
+  cache serves no TLS, and on a value served over TLS it is not taught to reach.
+  The Dify API server, task worker, scheduler and plugin runtime consume a cache
+  this way.
 
 ### The name a managed datastore is reached at from another target
 

@@ -23,7 +23,9 @@ metadata:
     otherwise from a pinned development literal, for evaluation and local
     development; the two it presents, to the backend and to the API server, are
     held on those connections, and the two keys are attached on all three or on
-    none.
+    none. A cache publishing valkey-tls is reached over TLS, its certificate
+    checked against the cache connection's server_ca, mounted, or the system
+    roots; another TLS protocol on the cache halts the build.
 
     The runtime's own metrics, in the Prometheus format at /metrics/ on the
     dispatch port, asking no key, are published as provides.metrics_endpoint.
@@ -114,6 +116,31 @@ spec:
     {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
     {{- end }}{{ end -}}
     {{- if $gaps }}{{ fail (printf "core/ai-agent/dify-plugin-daemon %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    {{- /*
+      The cache connection over TLS. A cache publishing valkey-tls is reached
+      over TLS; any other value ending in -tls names a cache served over TLS
+      that the runtime is not taught to reach, and halts rather than connecting
+      in plaintext. A server_ca on the connection must name a Secret, since it
+      is mounted, and is refused on a cache served without TLS.
+    */ -}}
+    {{- $cacheTLS := false }}{{ $cacheCA := "" -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "cache" -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- $edgeTLS := eq $proto "valkey-tls" -}}
+    {{- if $edgeTLS }}{{ $cacheTLS = true }}{{ else if hasSuffix "-tls" $proto -}}
+    {{- fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a cache served over TLS that the Dify plugin runtime does not reach: it speaks the Redis protocol, over TLS to a cache publishing valkey-tls; wire a Redis-protocol cache to the cache socket" $alias $.context.instance_id $edge.target $proto) -}}
+    {{- end -}}
+    {{- if hasKey (default dict $edge.features) "server_ca" -}}
+    {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) -}}
+    {{- fail (printf "the server_ca on the cache connection %s of %q publishes no Secret name, so no Secret could be mounted into the runtime's container: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if not $edgeTLS -}}
+    {{- fail (printf "the cache connection %s of %q holds a server_ca, but the cache it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that cache, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $proto)) -}}
+    {{- end -}}
+    {{- $cacheCA = $caProvides.name -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # form: stateful selects a StatefulSet on the helm provider; the
@@ -142,6 +169,18 @@ spec:
     {{- range $alias, $edge := .context.uses }}
     {{- if eq $edge.socket "cache" }}
           REDIS_DB: "{{ $edge.values.db_index }}"
+    {{- end }}
+    {{- end }}
+          # Over TLS the runtime verifies the cache's certificate and the name
+          # dialed. Attached, the connection's server_ca is the authority it
+          # checks against, which CERT_REQUIRED needs named; unattached, the
+          # certificate requirement is left unset, which the runtime reads as
+          # verification against the image's system roots.
+    {{- if $cacheTLS }}
+          REDIS_USE_SSL: "true"
+    {{- if $cacheCA }}
+          REDIS_SSL_CERT_REQS: CERT_REQUIRED
+          REDIS_SSL_CA_CERTS: /etc/dify-plugin-daemon/cache-server-ca/ca.crt
     {{- end }}
     {{- end }}
           # The API-server edge is translated into the internal endpoint the
@@ -230,11 +269,25 @@ spec:
         volumeMounts:
           - name: storage
             path: /app/storage
+    {{- if $cacheCA }}
+          # The cache connection's server_ca Secret, whole and read-only: a
+          # secret volume this Recipe names, because a pod volume is named after
+          # a file attachment's slot, and the underscore in server_ca is not a
+          # character a Kubernetes volume name may hold.
+          - name: cache-server-ca
+            path: /etc/dify-plugin-daemon/cache-server-ca
+            readonly: true
+    {{- end }}
     volumes:
       storage:
         persistentTemplate:
           size: "{{ .infra.storage.size }}"
           class: "{{ .infra.storage.type }}"
+    {{- if $cacheCA }}
+      cache-server-ca:
+        secret:
+          source: "{{ $cacheCA }}"
+    {{- end }}
     services:
       default:
         type: ClusterIP
