@@ -2022,6 +2022,16 @@ permits, a length it does not take.
 [`recipe/terraform/valkey-elasticache`](../aggrega-catalog/recipe/terraform/valkey-elasticache/1.0.0/recipe.yaml)
 is the shape.
 
+A service that requires the credential halts with the slot empty, too, naming it,
+where the Component's slot is optional and an unattached slot means a development
+default on the self-hosted targets: a password every reader of the catalog holds
+is not left on a managed endpoint, and the service may refuse it outright. An
+Amazon OpenSearch Service domain's master user is the case:
+[`recipe/terraform/opensearch-service`](../aggrega-catalog/recipe/terraform/opensearch-service/1.0.0/recipe.yaml)
+hands the service the same module output reference as its master password, and
+halts with nothing attached, the Component's `apppass` being shorter than the
+eight characters the service takes.
+
 A CloudFormation Recipe takes the same credential as a Secrets Manager dynamic
 reference to the secret `cloudformation/random-password` declares in the same
 stack, composed with `Fn::Sub` from the reference that realization publishes —
@@ -2074,8 +2084,10 @@ the block as text and reads nothing in it.
 
 A published module a Recipe sources is not a body the catalog authors, and it
 keeps its publisher's own constraint: the terraform-aws-modules RDS module the
-`-rds-terraform-aws-modules` Recipes vendor declares `hashicorp/aws >= 6.28`, and
-the ElastiCache module the `-elasticache` Recipes vendor `hashicorp/aws >= 5.93`.
+`-rds-terraform-aws-modules` Recipes vendor declares `hashicorp/aws >= 6.28`, the
+ElastiCache module the `-elasticache` Recipes vendor `hashicorp/aws >= 5.93`, and
+the OpenSearch module `recipe/terraform/opensearch-service` vendors
+`hashicorp/aws >= 6.51`.
 The highest of those floors is why the constraint above may not drop below it — in
 a boundary holding both, Terraform installs one provider satisfying the catalog's
 range and every module's floor together.
@@ -3641,7 +3653,15 @@ copying whichever sibling happens to be nearest.
   descriptions on the Component says so, and names the `overrides` key the managed
   Recipes size the instance by. A managed cache that provisions no volume — the
   ElastiCache realizations — reads no `storage.*` either, for the same reason, and
-  its descriptions say so too. A value a managed service cannot honour and that a
+  its descriptions say so too, and a managed service that serves one port of its
+  own — the Amazon OpenSearch Service realization — reads no `port` while it holds
+  the Component's default, refusing any other value by name. A key that alone
+  carries a setting the managed service needs — its engine version, the volume
+  size of the OpenSearch domain — is read even where its Component default is a
+  value the service refuses, such as an image tag naming a release the service
+  does not run or a volume below its minimum: the Recipe halts on it naming the
+  key and what to set, and the key's description says the default halts there.
+  A value a managed service cannot honour and that a
   Recipe can tell apart from a default — an application user the service does not
   create, an initialisation script, a raw configuration file, a replica count a
   Recipe does not provision — is refused by name instead. The key stays
@@ -3787,7 +3807,14 @@ operator's string and resolves nothing about it.
 - **`port` publishes the configured `infra.port`, set or unset.** The Recipe sets
   the instance's port from it, so the value is known ahead of time and a consumer
   on any target can use it, where a port pointer would reach another target as
-  text exactly as the host's does.
+  text exactly as the host's does. A service that serves one port of its own
+  publishes that port instead, and refuses an `infra.port` other than the
+  Component's default by name: an Amazon OpenSearch Service domain serves HTTPS
+  on 443 alone, so `recipe/terraform/opensearch-service` publishes `port` `443`,
+  `protocol` `https` and `endpoint` `https://` joined to the same `host`, the
+  name or the pointer alike. A client checking that domain's certificate needs a
+  name the certificate carries, which a name of the operator's own gets only from
+  a custom endpoint the Recipe does not configure.
 - **The Recipe emits nothing for the name** — no DNS record, no alias. The operator
   points the name at the instance outside the Release, and the build cannot check
   that it does: resolving the name is the runtime's, and a record the Release never
@@ -3819,8 +3846,9 @@ host of the cluster's configuration endpoint) and the CloudFormation ones
 (`recipe/cloudformation/valkey-elasticache`, publishing `!GetAtt
 <LogicalId>.PrimaryEndPoint.Address`, and `memcached-elasticache`, publishing
 `!GetAtt <LogicalId>.ConfigurationEndpoint.Address` — the two resource types spell
-the attribute differently). A managed datastore Recipe added later follows this
-section rather than a sibling Recipe.
+the attribute differently), and `recipe/terraform/opensearch-service`, whose
+pointer names the module's `domain_endpoint` output. A managed datastore Recipe
+added later follows this section rather than a sibling Recipe.
 
 ### The pipeline family template
 

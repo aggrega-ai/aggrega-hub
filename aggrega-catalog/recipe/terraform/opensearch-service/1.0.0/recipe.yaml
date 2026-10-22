@@ -1,0 +1,317 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: opensearch-service
+  version: 1.0.0
+  # The licence of the vendored module, the terraform-aws-modules project's
+  # OpenSearch module: the third-party code this Recipe pins and writes into
+  # the output. The OpenSearch Service domain it provisions is a service the
+  # reader contracts for directly with AWS, under AWS's terms.
+  license: Apache-2.0
+  description: >
+    OpenSearch on Amazon OpenSearch Service, as one domain of one data node in
+    the operator's VPC, realized by the published OpenSearch module of the
+    terraform-aws-modules project, terraform-aws-modules/opensearch/aws at
+    v2.11.1, Apache-2.0. The module is fetched from its git repository at that
+    tag and vendored into the component's own directory; the pin is the commit
+    the tag names and the digest of its archive, recorded in the entity.lock
+    beside this Recipe.
+
+    Reach for this realization where the search engine is an OpenSearch Service
+    domain in the operator's AWS account; reach for helm/opensearch-chart or
+    compose/opensearch where it runs as a container.
+
+    The domain serves HTTPS alone on 443, with fine-grained access control on
+    and one account, admin, whose password is the core/random-password
+    attachment drawn at apply time and handed to the service as a Terraform
+    reference, so the rendered files carry no password; with no password
+    attached, or another credential, the build halts naming the slot. host
+    publishes a reference to the domain's endpoint, port 443, protocol https,
+    endpoint https://<host> and user admin. Set infra.overrides.host to publish
+    the DNS name the operator points at the domain instead; a client checking
+    the certificate needs a name it carries, which a name of the operator's own
+    gets only from a custom endpoint this Recipe does not configure.
+    infra.overrides.subnet_ids is required. infra.engine_version must name a
+    version the service offers and infra.storage.size 10Gi or more, so both
+    Component defaults halt here; an infra.port other than 9200 halts, the
+    domain serving 443 alone, and so does a T2 instance type, which lacks
+    fine-grained access control.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/opensearch:1.0.0
+
+  # The published module, at the tag the registry publishes as version 2.11.1.
+  # A registry version of a module is a tag of its git repository, and the
+  # registry's own download for this version answers with a git source at the
+  # commit that tag names; Terraform's dependency lock file records providers
+  # and no module. So the pin is taken here: `aggrega pin` resolves the tag to
+  # its commit and records that commit and the archive's digest in entity.lock,
+  # and every build vendors exactly those bytes.
+  #
+  # The source names the repository root, which declares no module call of its
+  # own: the configuration Terraform loads from it calls no registry module, so
+  # initialising it fetches providers and nothing else. The repository's
+  # modules/, examples/ and wrappers/ directories are vendored with it and never
+  # loaded.
+  #
+  # The module declares hashicorp/aws >= 6.51 in its own required_providers and
+  # is vendored byte for byte, so this Recipe adds no provider constraint of its
+  # own; the catalog conventions' "One AWS provider constraint for every AWS
+  # body" section says how it composes with the catalog's authored AWS bodies.
+  #
+  # The tag is written out rather than read from infra.source_version: a source
+  # whose coordinates come from a template is pinned per Release instead of in
+  # this Recipe's own entity.lock, and this Recipe's pin is the one stated
+  # above. So infra.source_version is not read here.
+  source:
+    kind: git-repository
+    url: https://github.com/terraform-aws-modules/terraform-aws-opensearch.git
+    ref: v2.11.1
+
+  locals:
+    # The engine version, the major and minor version infra.engine_version
+    # begins with: 3.5 from an image tag 3.5.0. OpenSearch Service runs the
+    # newest patch of that version, and takes it spelled OpenSearch_3.5.
+    engine_version: '{{ regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) }}'
+    # The data node's instance type, infra.overrides.instance_type or the
+    # Graviton3 m7g.medium.search, a current-generation type that serves every
+    # OpenSearch version the service offers.
+    instance_type: '{{ optional (optional .infra "overrides" dict) "instance_type" "m7g.medium.search" }}'
+    # The name the Release gives the domain under infra.overrides.host, or empty
+    # while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The address host publishes, and endpoint joins with the scheme: the
+    # operator's name while it is set, otherwise the module's domain_endpoint
+    # output, the domain's bare hostname.
+    host: '{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.domain_endpoint}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   subnet_ids          - []string (vpc_options.subnet_ids), required, one subnet
+  #   vpc_security_groups - []string (vpc_options.security_group_ids)
+  #   instance_type       - string (cluster_config.instance_type; default "m7g.medium.search")
+  #   host                - string (published as provides.host; not passed to the module)
+  #
+  # subnet_ids is named by the module input it sets; vpc_security_groups and
+  # host are the keys, under the same names, that the RDS Recipes read for the
+  # same concepts. subnet_ids is required: it places the domain in the
+  # operator's VPC, and this Recipe never chooses a network for the operator.
+  # It names exactly one subnet, because the domain runs one data node in one
+  # Availability Zone. With no security group named, the service attaches the
+  # VPC's default security group; the module's own security group creation is
+  # left off, because the security groups are the operator's, who opens 443 to
+  # the domain's clients.
+  #
+  # The module's own defaults stand for every input this mapping leaves out.
+  # Three are worth knowing: it publishes the index and search slow logs to
+  # CloudWatch log groups it creates under /aws/opensearch/, with a CloudWatch
+  # Logs resource policy letting the service write them, one per domain of the
+  # ten resource policies CloudWatch Logs allows an account in each Region; it
+  # turns on Auto-Tune, except on the T3 instance types, which do not support
+  # it and for which this mapping turns it off; and it turns on automatic
+  # service software updates in an off-peak window.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation:
+  #   honoured — infra.engine_version (major and minor, among the versions the
+  #     service offers); infra.storage.size, as the data node's EBS volume in
+  #     GiB, 10 or more; infra.storage.type, as its EBS volume type, gp3 when
+  #     unset; and the overrides above.
+  #   refused — infra.port other than 9200, the Component's default: the
+  #     service serves a domain on 443 alone, which is what this Recipe
+  #     publishes; an instance type of the T2 family, which supports neither
+  #     fine-grained access control nor encryption at rest; and a password as
+  #     set out below.
+  #   not read — infra.port while it is 9200; infra.compute.cpu and
+  #     infra.compute.memory, whose Component defaults size a container: the
+  #     service sizes the node by infra.overrides.instance_type, and a Recipe
+  #     cannot tell those defaults from a value the Release wrote, so the
+  #     Component's descriptions say so instead. infra.source_version, as above.
+  #
+  # The domain is served as the service's fine-grained access control requires
+  # it: HTTPS for all traffic, at the module's default minimum of TLS 1.2,
+  # encryption at rest with the service's own key, and node-to-node
+  # encryption. Fine-grained access control keeps its users in the domain's
+  # internal user database, which holds one master user, admin, the
+  # Component's one account; a client signs in with HTTP basic
+  # authentication. The service's master user cannot be handed to AWS Secrets
+  # Manager as an RDS master password can, so the password comes from the
+  # attachment.
+  #
+  # The password reaches the service as a Terraform reference to the password
+  # core/random-password's terraform/random-password realization draws at apply
+  # time, so no password is written into the rendered configuration; the apply
+  # keeps it in the Terraform state. Another credential either carries its value
+  # as text, which would be written into the configuration, or carries none the
+  # service could take, so it halts. With nothing attached the build halts too:
+  # the Component's development default, apppass, is shorter than the eight
+  # characters the service requires, and a password every reader of the catalog
+  # knows is not left on a managed endpoint.
+  assertions:
+    subnet_ids_supplied: >-
+      {{- $s := optional (optional .infra "overrides" dict) "subnet_ids" "" -}}
+      {{- if not (and (kindIs "slice" $s) (eq (len $s) 1) (typeIs "string" (index $s 0)) (index $s 0)) -}}
+      {{- fail (printf "this Release places its OpenSearch Service domain in a subnet of the operator's VPC, one subnet for the one data node it runs, but infra.overrides.subnet_ids is %v: set infra.overrides.subnet_ids in the Release to a list holding the ID of one existing subnet" (toJson $s)) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this search engine reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the domain serves port 443` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The OpenSearch versions the service offers, read off its supported-versions
+    # list. A version it adds later is refused here until this list names it.
+    engine_version_offered: >-
+      {{- $v := regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) -}}
+      {{- if not (has $v (list "3.5" "3.3" "3.1" "2.19" "2.17" "2.15" "2.13" "2.11" "2.9" "2.7" "2.5" "2.3" "1.3" "1.2" "1.1" "1.0")) -}}
+      {{- fail (printf "infra.engine_version is %q, and Amazon OpenSearch Service runs OpenSearch 3.5, 3.3, 3.1, 2.19, 2.17, 2.15, 2.13, 2.11, 2.9, 2.7, 2.5, 2.3, 1.3, 1.2, 1.1 and 1.0, which this Recipe reads off the major and minor version the value begins with; the Component's default is an image tag naming a release the service does not run: set infra.engine_version in the Release to one of them, such as 3.5" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    port_is_the_service_port: >-
+      {{- if ne (int .infra.port) 9200 -}}
+      {{- fail (printf "infra.port is %v, and Amazon OpenSearch Service serves a domain on port 443 alone, which this Recipe publishes as port: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+    ebs_volume: >-
+      {{- $size := toString .infra.storage.size -}}
+      {{- if not (regexMatch `^[0-9]+Gi$` $size) -}}
+      {{- fail (printf "infra.storage.size is %q, and this Recipe gives the data node an EBS volume sized in whole gibibytes: set infra.storage.size in the Release to a size such as 20Gi" $size) -}}
+      {{- end -}}
+      {{- if lt (int (trimSuffix "Gi" $size)) 10 -}}
+      {{- fail (printf "infra.storage.size is %q, and Amazon OpenSearch Service gives a data node an EBS volume of at least 10 GiB; the Component's default, 8Gi, sizes a container's volume: set infra.storage.size in the Release to 10Gi or more" $size) -}}
+      {{- end -}}
+      {{- $t := toString (default "gp3" (optional .infra.storage "type" "")) -}}
+      {{- if not (has $t (list "gp3" "gp2" "io1" "standard")) -}}
+      {{- fail (printf "infra.storage.type is %q, and on Amazon OpenSearch Service it is the data node's EBS volume type, one of gp3, gp2, io1 and standard: set infra.storage.type in the Release to one of them, or leave it unset for gp3" $t) -}}
+      {{- end -}}
+    instance_type_serves_fine_grained_access: >-
+      {{- if hasPrefix "t2." .locals.instance_type -}}
+      {{- fail (printf "infra.overrides.instance_type is %q, and the T2 instance types support neither fine-grained access control nor encryption at rest, both of which this Recipe turns on: set infra.overrides.instance_type to another type, such as m7g.medium.search" .locals.instance_type) -}}
+      {{- end -}}
+    master_password: >-
+      {{- $f := default dict .features -}}
+      {{- if not (hasKey $f "password") -}}
+      {{- fail "the password slot is empty, and its development default, the same for every reader of the catalog, is shorter than the eight characters Amazon OpenSearch Service requires of a master password: attach core/random-password to the password slot, bound to terraform/random-password in the Manifest" -}}
+      {{- end -}}
+      {{- $p := $f.password -}}
+      {{- if ne (toString (optional $p "type" "")) "core/random-password" -}}
+      {{- fail (printf "the password slot is filled by %s, and this Recipe hands the domain's master password to the service as a Terraform reference to a password drawn at apply time, which core/random-password publishes through terraform/random-password; another credential either carries its value as text, which would be written into the rendered configuration, or carries none the service could take: attach core/random-password to the password slot instead" (toString (optional $p "type" "an attachment of no type"))) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the module's domain_endpoint output — the domain's bare hostname — through
+  # this component's module call, which the boundary's root configuration
+  # declares under .context.instance_id for a component declared in the
+  # Aggregate the Release deploys. Terraform resolves it at apply time, so it
+  # resolves only for a consumer authored as a source: Recipe in the same root
+  # configuration; a consumer on another target receives it as text. endpoint
+  # joins the same address with the scheme into one interpolation, which
+  # Terraform resolves the same way.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record or alias for it, so the operator points the name at the domain
+  # outside the Release. A consumer in the same root configuration receives the
+  # name as well, and a name carries no reference for Terraform to order its
+  # module after this one by; a later syncWave on the consumer's boundary,
+  # sharing this boundary's directory, orders the two. The domain serves HTTPS
+  # alone, and a client that checks the certificate against the name it dials
+  # needs a certificate carrying that name, which the service presents for an
+  # operator's name only through a custom endpoint; this Recipe configures none.
+  #
+  # port is 443, where the service serves the domain, and protocol https, the
+  # only scheme the domain accepts. user is admin, the master user.
+  provides:
+    host: "{{ .locals.host }}"
+    port: "443"
+    user: "admin"
+    protocol: "https"
+    endpoint: "https://{{ .locals.host }}"
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # domain is named after the component, as the RDS Recipes name their
+  # instances. One data node with no dedicated master node and no zone
+  # awareness, the shape the Component's one node takes.
+  #
+  # The master password is the attachment's module output joined with a dot and
+  # wrapped in an interpolation, as terraform/random-password publishes it.
+  #
+  # The access policy is the one AWS documents for a master user in the
+  # internal user database: it allows the domain's own account, by its root
+  # principal, the OpenSearch HTTP actions on the domain's own indexes and APIs.
+  # A request signed with that account's credentials passes it, and a request
+  # carrying the master user's name and password is decided by fine-grained
+  # access control alone; inside the VPC the security groups decide which
+  # clients reach the domain at all. The account and its partition are read off
+  # the module's own domain_arn output, which Terraform knows once the domain
+  # exists and before the module writes the policy, so the policy names the
+  # account the apply runs in without the Release naming it. An ARN's fields
+  # are separated by colons and its fourth character is the first of them, so
+  # splitting the ARN on that character yields the partition second and the
+  # account fifth. The expression holds no quoted string of its own: the build
+  # writes it inside the argument's quoted value and escapes any quotation mark
+  # there, and Terraform reads no escaped quotation mark inside an
+  # interpolation.
+  #
+  # The domain's name follows the service's own rule, which the component's
+  # name is checked against here, where the name is known.
+  valuesMapping: |
+    {{- if not (regexMatch `^[a-z][a-z0-9-]{2,27}$` .context.instance_id) }}
+    {{- fail (printf "the component %q names its OpenSearch Service domain, and a domain name starts with a lowercase letter and holds 3 to 28 lowercase letters, digits and hyphens: rename the component in the Aggregate to such a name" .context.instance_id) }}
+    {{- end }}
+    domain_name: "{{ .context.instance_id }}"
+    engine_version: "OpenSearch_{{ .locals.engine_version }}"
+    cluster_config:
+      instance_type: "{{ .locals.instance_type }}"
+      instance_count: 1
+      dedicated_master_enabled: false
+      zone_awareness_enabled: false
+    {{- if hasPrefix "t3." .locals.instance_type }}
+    auto_tune_options:
+      desired_state: "DISABLED"
+      rollback_on_disable: "NO_ROLLBACK"
+    {{- end }}
+    ebs_options:
+      ebs_enabled: true
+      volume_size: {{ trimSuffix "Gi" (toString .infra.storage.size) }}
+      volume_type: "{{ default "gp3" (optional .infra.storage "type" "") }}"
+    encrypt_at_rest:
+      enabled: true
+    node_to_node_encryption:
+      enabled: true
+    domain_endpoint_options:
+      enforce_https: true
+      tls_security_policy: "Policy-Min-TLS-1-2-2019-07"
+    {{- $prov := optional (default dict .features).password "provides" dict }}
+    {{- if not (and (kindIs "map" $prov) (optional $prov "name" "") (optional $prov "key" "")) }}
+    {{- fail (printf "the password slot of %q is filled by an attachment that publishes no module output, and the master password is handed to the service as a reference to one: bind core/random-password to terraform/random-password in the Manifest" .context.instance_id) }}
+    {{- end }}
+    advanced_security_options:
+      enabled: true
+      anonymous_auth_enabled: false
+      internal_user_database_enabled: true
+      master_user_options:
+        master_user_name: "admin"
+        master_user_password: "{{ printf "${%s.%s}" $prov.name $prov.key }}"
+    vpc_options:
+      subnet_ids: {{ toJson .infra.overrides.subnet_ids }}
+      {{- with optional .infra.overrides "vpc_security_groups" "" }}
+      security_group_ids: {{ toJson . }}
+      {{- end }}
+    create_security_group: false
+    access_policy_statements:
+      - effect: "Allow"
+        actions: ["es:ESHttp*"]
+        principals:
+          - type: "AWS"
+            identifiers:
+              - "arn:${split(substr(module.{{ .context.instance_id }}.domain_arn, 3, 1), module.{{ .context.instance_id }}.domain_arn)[1]}:iam::${split(substr(module.{{ .context.instance_id }}.domain_arn, 3, 1), module.{{ .context.instance_id }}.domain_arn)[4]}:root"
