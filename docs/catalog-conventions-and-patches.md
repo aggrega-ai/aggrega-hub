@@ -2022,6 +2022,17 @@ permits, a length it does not take.
 [`recipe/terraform/valkey-elasticache`](../aggrega-catalog/recipe/terraform/valkey-elasticache/1.0.0/recipe.yaml)
 is the shape.
 
+A CloudFormation Recipe takes the same credential as a Secrets Manager dynamic
+reference to the secret `cloudformation/random-password` declares in the same
+stack, composed with `Fn::Sub` from the reference that realization publishes —
+`{{resolve:secretsmanager:${Secret}:SecretString:<key>}}` with `Secret` bound to
+the secret's `Ref`, the form AWS's own templates compose a database password in.
+CloudFormation resolves it when it creates the resource, so the template names the
+secret and never carries the value, and the attachment needs no fixed secret
+name.
+[`recipe/cloudformation/valkey-elasticache`](../aggrega-catalog/recipe/cloudformation/valkey-elasticache/1.0.0/recipe.yaml)
+is the shape.
+
 The same binding serves a self-managed datastore whose controller-driven Recipe
 leaves the credential to its controller.
 [`recipe/helm/mariadb-cluster`](../aggrega-catalog/recipe/helm/mariadb-cluster/1.0.0/recipe.yaml)
@@ -3804,8 +3815,12 @@ The terraform RDS Recipes (`recipe/terraform/postgres-rds`, `mysql-rds`,
 and so do the terraform ElastiCache Recipes (`recipe/terraform/valkey-elasticache`,
 whose pointer names the module's `replication_group_primary_endpoint_address`
 output, and `memcached-elasticache`, whose pointer names `cluster_address`, the
-host of the cluster's configuration endpoint). A managed datastore Recipe added
-later follows this section rather than a sibling Recipe.
+host of the cluster's configuration endpoint) and the CloudFormation ones
+(`recipe/cloudformation/valkey-elasticache`, publishing `!GetAtt
+<LogicalId>.PrimaryEndPoint.Address`, and `memcached-elasticache`, publishing
+`!GetAtt <LogicalId>.ConfigurationEndpoint.Address` — the two resource types spell
+the attribute differently). A managed datastore Recipe added later follows this
+section rather than a sibling Recipe.
 
 ### The pipeline family template
 

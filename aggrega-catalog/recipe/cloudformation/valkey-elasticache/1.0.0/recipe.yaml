@@ -1,0 +1,270 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: valkey-elasticache
+  version: 1.0.0
+  description: >
+    Valkey on Amazon ElastiCache, rendered as a CloudFormation fragment: one
+    AWS::ElastiCache::ReplicationGroup with cluster mode disabled and one node,
+    encrypted at rest, and a parameter group beside it where maxmemory_policy
+    or databases is set. The cloudformation provider stamps the stack envelope
+    and projects this Recipe's provides into the stack Outputs.
+
+    Reach for this realization where the cache is an ElastiCache service in a
+    CloudFormation stack; reach for terraform/valkey-elasticache on terraform,
+    and valkey or valkey-chart on helm, or valkey on compose, where it runs as a
+    container.
+
+    host publishes a CloudFormation reference to the primary endpoint's
+    address, which resolves inside the stack and through its export, and port
+    the configured infra.port. Set infra.overrides.host to publish the DNS name
+    the operator points at the cache instead. infra.overrides.CacheSubnetGroupName
+    is required. A value ElastiCache cannot apply — maxmemory, appendonly,
+    persistence — halts the build naming the key; compute and storage are not
+    read. With infra.client_tls true the service encrypts in transit and
+    protocol is valkey-tls; an attached password becomes the AUTH token through
+    a Secrets Manager dynamic reference, and needs client_tls.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: cloudformation
+  implements: core/datastore/valkey:1.0.0
+
+  # The resource's logical id, derived from this instance's own name so that two
+  # caches of the same type deployed into one stack describe two resources
+  # rather than one. A logical id is unique within a CloudFormation template and
+  # admits only letters and digits, so the instance name's separators are read as
+  # word boundaries and each word is capitalised: instance session-cache names
+  # the resource SessionCache, and its parameter group SessionCacheParameterGroup.
+  locals:
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+    # The engine version ElastiCache takes for Valkey, the major and minor
+    # version alone, read off the start of infra.engine_version: 8.1 from the
+    # Component's default image tag 8.1-alpine. ElastiCache runs the newest
+    # patch of that version.
+    engine_version: '{{ regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) }}'
+    # The parameter group family of that version, as ElastiCache's parameter
+    # reference names them: valkey7 for 7.2, valkey8 for 8.0 to 8.2, valkey9 for
+    # 9.0 and 9.1.
+    family: '{{ $p := splitList "." .locals.engine_version }}valkey{{ index $p 0 }}'
+    # The name the Release gives the cache under infra.overrides.host, or empty
+    # while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # The String Pipe: the compiler pipes each of these strings verbatim into a
+  # consumer's injection context when it uses this cache, and resolves none of
+  # them. host is a CloudFormation intrinsic function reference to the
+  # replication group's PrimaryEndPoint.Address, which CloudFormation resolves
+  # at stack creation time. The provider projects the matching provides block
+  # inside the fragment below into the assembled stack Outputs; this
+  # recipe-level provides is the value-pipe contract, the fragment provides is
+  # the Outputs source, and they carry the same values.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name in
+  # both provides blocks instead of the reference. It is the operator's
+  # deterministic pointer: the compiler pipes it as text and looks nothing up,
+  # and this Recipe emits no DNS record or alias for it, so the operator points
+  # the name at the cache outside the Release. A consumer in the same stack
+  # receives the name as well, and a name carries no reference for
+  # CloudFormation to create that consumer after this cache by; a later
+  # syncWave on the consumer's boundary, sharing this boundary's directory,
+  # orders the two. A consumer in another stack imports the name through the
+  # same export it imports the reference through.
+  #
+  # port is the value the fragment sets on the replication group's Port, so it
+  # is known ahead of time and published as that value in both blocks. protocol
+  # is valkey, or valkey-tls while infra.client_tls is on, when the port accepts
+  # TLS alone.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}!GetAtt {{ .locals.logical_id }}.PrimaryEndPoint.Address{{ end }}"
+    port: "{{ .infra.port }}"
+    protocol: "{{ if .infra.client_tls }}valkey-tls{{ else }}valkey{{ end }}"
+
+  # This Recipe reads from infra.overrides:
+  #   CacheSubnetGroupName - string (Properties.CacheSubnetGroupName), required
+  #   SecurityGroupIds     - []string (Properties.SecurityGroupIds)
+  #   CacheNodeType        - string (Properties.CacheNodeType; default "cache.t3.small")
+  #   host                 - string (published as provides.host; renders nothing)
+  #
+  # The key names are the CloudFormation property names rather than a separate
+  # Aggrega spelling, because each is passed through to the resource unchanged and
+  # the property name is what a reader matches against the resource
+  # documentation, as the CloudFormation RDS Recipes name theirs.
+  # CacheSubnetGroupName is required: the subnet group places the cache in the
+  # operator's network, in-transit encryption needs one, and this Recipe never
+  # chooses a network for the operator. host is the exception to the naming: it
+  # is no property of the resource but the address a consumer reaches the cache
+  # at, under the name every managed datastore Recipe reads for it.
+  #
+  # The fragment sets no ReplicationGroupId, so CloudFormation names the
+  # replication group, as the CloudFormation RDS Recipes leave the instance's
+  # name to it; and no DeletionPolicy, so the stack deletes the cache with it.
+  # It turns encryption at rest on, which the resource leaves off by default,
+  # with the service's own key.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against ElastiCache's own documentation:
+  #   honoured — values.maxmemory_policy and values.databases, as the
+  #     maxmemory-policy and databases parameters ("Modifiable: Yes") of a
+  #     parameter group the fragment declares for the version's family;
+  #     infra.port; infra.engine_version (major and minor, among the versions
+  #     ElastiCache offers); infra.client_tls; and the overrides above.
+  #   refused — values.maxmemory ("The maxmemory parameter cannot be
+  #     modified": the node type fixes it), values.appendonly true ("The
+  #     configuration variables appendonly and appendfsync are not supported
+  #     on Valkey"), values.persistence.enabled true (ElastiCache provisions no
+  #     volume; its durability, a Multi-AZ transaction log, is offered for
+  #     cluster mode enabled alone, which this fragment does not provision), an
+  #     attachment to server_certificate, and a password as set out below.
+  #   not read — infra.compute.cpu and infra.compute.memory, and
+  #     infra.storage.size and infra.storage.type, whose Component defaults
+  #     size a container and its volume: ElastiCache sizes the node by
+  #     infra.overrides.CacheNodeType and provisions no volume, and a Recipe
+  #     cannot tell those defaults from a value the Release wrote, so the
+  #     Component's descriptions say so instead. infra.source_version, which
+  #     selects the chart another realization pulls.
+  #
+  # With infra.client_tls true the fragment sets TransitEncryptionEnabled, and
+  # the port accepts TLS alone. ElastiCache presents a certificate AWS
+  # Certificate Manager issues, which is publicly trusted, so a consumer checks
+  # it against its system trust store and needs no server_ca. That certificate
+  # carries the replication group's name, which AWS records in public
+  # Certificate Transparency logs.
+  #
+  # An attached password becomes the replication group's AuthToken, which
+  # ElastiCache accepts only with in-transit encryption on, so it halts while
+  # infra.client_tls is false. The token reaches the service as a Secrets
+  # Manager dynamic reference to the secret core/random-password's
+  # cloudformation/random-password realization creates in the same stack,
+  # composed with Fn::Sub from that secret's published reference, as AWS's own
+  # examples compose a database password: CloudFormation resolves it when it
+  # creates the cache, so no password is written into the rendered template.
+  # Another credential either carries its value as text, which would be
+  # written into the template, or carries none the service could take, so it
+  # halts, and so do a password with punctuation or one shorter than 16
+  # characters, which an AUTH token may not be.
+  assertions:
+    cache_subnet_group_supplied: >-
+      {{- if not (and (hasKey .infra "overrides") (optional .infra.overrides "CacheSubnetGroupName" "")) -}}
+      {{- fail "this Release places its cache in a cache subnet group that already exists in the target account, and a Valkey replication group with in-transit encryption needs one, but infra.overrides.CacheSubnetGroupName carries none: set infra.overrides.CacheSubnetGroupName in the Release to the name of an existing ElastiCache subnet group" -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this cache reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the port is infra.port` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The Valkey versions ElastiCache offers, read off its engine-versions page.
+    # A version it adds later is refused here until this list names it.
+    engine_version_offered: >-
+      {{- $v := regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) -}}
+      {{- if not (has $v (list "7.2" "8.0" "8.1" "8.2" "9.0" "9.1")) -}}
+      {{- fail (printf "infra.engine_version is %q, and ElastiCache runs Valkey 7.2, 8.0, 8.1, 8.2, 9.0 and 9.1, which this Recipe reads off the major and minor version the value begins with: set infra.engine_version to one of them, such as 8.1" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    values_elasticache_cannot_apply: >-
+      {{- with optional .values "maxmemory" "" -}}
+      {{- fail (printf "values.maxmemory is %q, and ElastiCache fixes the memory a Valkey node may use by its node type; its maxmemory parameter cannot be modified: remove values.maxmemory from the Aggregate and size the cache with infra.overrides.CacheNodeType in the Release" (toString .)) -}}
+      {{- end -}}
+      {{- if .values.appendonly -}}
+      {{- fail "values.appendonly is true, and ElastiCache does not support the appendonly configuration on Valkey, so no append-only file is written: remove values.appendonly from the Aggregate, or map this component to a realization that runs the server itself" -}}
+      {{- end -}}
+      {{- if .values.persistence.enabled -}}
+      {{- fail "values.persistence.enabled is true, and ElastiCache provisions no volume for a Valkey cache: its durability, a Multi-AZ transaction log, is offered only with cluster mode enabled, which this Recipe does not provision: remove values.persistence.enabled from the Aggregate, or map this component to valkey or valkey-chart on helm, which keep the data on a persistent volume" -}}
+      {{- end -}}
+    tls_and_credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "server_certificate" -}}
+      {{- fail "a certificate is attached to the server_certificate slot, and ElastiCache presents a certificate AWS issues for the cache, which consumers trust without one: remove the attachment; infra.client_tls alone turns TLS on here" -}}
+      {{- end -}}
+      {{- if hasKey $f "password" -}}
+      {{- if not .infra.client_tls -}}
+      {{- fail "a password is attached to the password slot, and ElastiCache accepts an AUTH token only with in-transit encryption on, but infra.client_tls is false: set infra.client_tls to true, which serves the cache over TLS alone and publishes protocol valkey-tls, or remove the attachment" -}}
+      {{- end -}}
+      {{- $p := $f.password -}}
+      {{- if ne (toString (optional $p "type" "")) "core/random-password" -}}
+      {{- fail (printf "the password slot is filled by %s, and this Recipe hands ElastiCache its AUTH token as a Secrets Manager dynamic reference to a secret the stack generates, which core/random-password creates through cloudformation/random-password; another credential either carries its value as text, which would be written into the rendered template, or carries none the service could take: attach core/random-password to the password slot instead" (toString (optional $p "type" "an attachment of no type"))) -}}
+      {{- end -}}
+      {{- $pv := optional $p "values" dict -}}
+      {{- if optional $pv "symbols" false -}}
+      {{- fail "the password attached to the password slot sets values.symbols to true, and the punctuation Secrets Manager draws includes characters an ElastiCache AUTH token may not hold, which permits only !, &, #, $, ^, <, > and -: set values.symbols to false" -}}
+      {{- end -}}
+      {{- if lt (int (optional $pv "length" 32)) 16 -}}
+      {{- fail (printf "the password attached to the password slot sets values.length to %v, and an ElastiCache AUTH token is 16 to 128 characters: set values.length to at least 16" (optional $pv "length" 32)) -}}
+      {{- end -}}
+      {{- if contains ":" (toString (optional $pv "key" "")) -}}
+      {{- fail (printf "the password attached to the password slot sets values.key to %q, and the JSON key of a Secrets Manager dynamic reference may not contain a colon: set values.key to a name without one" (toString (optional $pv "key" ""))) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The AuthToken is a Secrets Manager dynamic reference, which CloudFormation
+  # resolves when it creates the replication group: the attachment's published
+  # name is its secret's Ref, which resolves to the secret's ARN, and Fn::Sub
+  # writes that ARN into the reference with the JSON key the attachment
+  # publishes. The reference's own braces are written through the template as
+  # literal text.
+  artifacts:
+    template.yaml: |
+      {{- $pw := optional (default dict .features) "password" dict }}
+      {{- $pwp := optional $pw "provides" dict }}
+      {{- if and (hasKey (default dict .features) "password") (not (and (kindIs "map" $pwp) (optional $pwp "name" "") (optional $pwp "key" ""))) }}
+      {{- fail (printf "the password slot of %q is filled by an attachment that publishes no secret reference and key, and the AUTH token is a dynamic reference to one: bind core/random-password to cloudformation/random-password in the Manifest" .context.instance_id) }}
+      {{- end }}
+      {{- $params := or (optional .values "maxmemory_policy" "") (optional .values "databases" "") }}
+      Resources:
+        {{ .locals.logical_id }}:
+          Type: AWS::ElastiCache::ReplicationGroup
+          Properties:
+            ReplicationGroupDescription: "Valkey cache {{ .context.instance_id }}"
+            Engine: valkey
+            EngineVersion: "{{ .locals.engine_version }}"
+            CacheNodeType: "{{ optional .infra.overrides "CacheNodeType" "cache.t3.small" }}"
+            Port: {{ .infra.port }}
+            NumCacheClusters: 1
+            AtRestEncryptionEnabled: true
+            TransitEncryptionEnabled: {{ .infra.client_tls }}
+            {{- if hasKey (default dict .features) "password" }}
+            AuthToken:
+              Fn::Sub:
+                - "{{ "{{" }}resolve:secretsmanager:${Secret}:SecretString:{{ $pwp.key }}{{ "}}" }}"
+                - Secret: {{ $pwp.name }}
+            {{- end }}
+            CacheSubnetGroupName: "{{ .infra.overrides.CacheSubnetGroupName }}"
+            {{- with optional .infra.overrides "SecurityGroupIds" "" }}
+            SecurityGroupIds: {{ toJson . }}
+            {{- end }}
+            {{- if $params }}
+            CacheParameterGroupName: !Ref {{ .locals.logical_id }}ParameterGroup
+            {{- end }}
+        {{- if $params }}
+        {{ .locals.logical_id }}ParameterGroup:
+          Type: AWS::ElastiCache::ParameterGroup
+          Properties:
+            Description: "Valkey parameters for {{ .context.instance_id }}"
+            CacheParameterGroupFamily: "{{ .locals.family }}"
+            Properties:
+              {{- with optional .values "maxmemory_policy" "" }}
+              maxmemory-policy: "{{ . }}"
+              {{- end }}
+              {{- with optional .values "databases" "" }}
+              databases: "{{ . }}"
+              {{- end }}
+        {{- end }}
+
+      # Fragment provides: the provider projects each entry into the assembled
+      # stack Outputs and expands the short-form intrinsics to long form. Each
+      # output is named for this instance and the entry together, so two caches
+      # of the same type in one stack keep their connection identities apart. A
+      # cross-stack consumer imports the host entry; an intra-stack consumer
+      # receives it through the value-pipe above.
+      provides:
+        host: {{ if .locals.operator_host }}"{{ .locals.operator_host }}"{{ else }}!GetAtt {{ .locals.logical_id }}.PrimaryEndPoint.Address{{ end }}
+        port: "{{ .infra.port }}"
+        protocol: {{ if .infra.client_tls }}valkey-tls{{ else }}valkey{{ end }}

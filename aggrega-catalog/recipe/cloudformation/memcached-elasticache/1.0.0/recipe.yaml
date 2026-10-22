@@ -1,0 +1,240 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: memcached-elasticache
+  version: 1.0.0
+  description: >
+    Memcached on Amazon ElastiCache, rendered as a CloudFormation fragment: one
+    AWS::ElastiCache::CacheCluster of infra.replicas nodes, and a parameter
+    group beside it where max_item_size is set. The cloudformation provider
+    stamps the stack envelope and projects this Recipe's provides into the
+    stack Outputs.
+
+    Reach for this realization where the cache is an ElastiCache service in a
+    CloudFormation stack; reach for terraform/memcached-elasticache on
+    terraform, and memcached on helm or on compose, where it runs as a
+    container.
+
+    host publishes a CloudFormation reference to the cluster's configuration
+    endpoint address, which resolves inside the stack and through its export,
+    and port the configured infra.port. Set infra.overrides.host to publish the
+    DNS name the operator points at the cache instead.
+    infra.overrides.CacheSubnetGroupName is required, and infra.engine_version
+    must name a full version ElastiCache offers, such as 1.6.22. A value
+    ElastiCache cannot apply — memory_limit, max_connections, threads, a
+    password — halts the build naming the key; compute is not read. With
+    infra.client_tls true the service encrypts in transit and protocol is
+    memcached-tls.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: cloudformation
+  implements: core/datastore/memcached:1.0.0
+
+  # The resource's logical id, derived from this instance's own name so that two
+  # caches of the same type deployed into one stack describe two resources
+  # rather than one. A logical id is unique within a CloudFormation template and
+  # admits only letters and digits, so the instance name's separators are read as
+  # word boundaries and each word is capitalised: instance session-cache names
+  # the resource SessionCache, and its parameter group SessionCacheParameterGroup.
+  locals:
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+    # The version number infra.engine_version begins with: 1.6 from the
+    # Component's default image tag 1.6-alpine, 1.6.22 from 1.6.22. ElastiCache
+    # takes a Memcached version in full, major, minor and patch, so the
+    # assertion below refuses one it does not offer.
+    engine_version: '{{ regexFind `^[0-9]+(\.[0-9]+)*` (toString .infra.engine_version) }}'
+    # The parameter group family of that version: memcached1.6, memcached1.5
+    # or memcached1.4.
+    family: '{{ $p := splitList "." .locals.engine_version }}{{ if ge (len $p) 2 }}memcached{{ index $p 0 }}.{{ index $p 1 }}{{ end }}'
+    # values.max_item_size in bytes, read as the memcached -I flag reads it: a
+    # number of bytes, or a number followed by k or m, in either case. Empty
+    # while the value is unset; a value of another form is refused below.
+    item_size: '{{ with optional .values "max_item_size" "" }}{{ $s := toString . }}{{ $n := regexFind `^[0-9]+` $s }}{{ $u := lower (trimPrefix $n $s) }}{{ if eq $u "k" }}{{ mul (int $n) 1024 }}{{ else if eq $u "m" }}{{ mul (int $n) 1048576 }}{{ else }}{{ $n }}{{ end }}{{ end }}'
+    # The name the Release gives the cache under infra.overrides.host, or empty
+    # while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # The String Pipe: the compiler pipes each of these strings verbatim into a
+  # consumer's injection context when it uses this cache, and resolves none of
+  # them. host is a CloudFormation intrinsic function reference to the
+  # cluster's ConfigurationEndpoint.Address — the configuration endpoint,
+  # through which an ElastiCache Auto Discovery client finds every node — which
+  # CloudFormation resolves at stack creation time. The provider projects the
+  # matching provides block inside the fragment below into the assembled stack
+  # Outputs; this recipe-level provides is the value-pipe contract, the
+  # fragment provides is the Outputs source, and they carry the same values.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name in
+  # both provides blocks instead of the reference. It is the operator's
+  # deterministic pointer: the compiler pipes it as text and looks nothing up,
+  # and this Recipe emits no DNS record or alias for it, so the operator points
+  # the name at the cache outside the Release. A consumer in the same stack
+  # receives the name as well, and a name carries no reference for
+  # CloudFormation to create that consumer after this cache by; a later
+  # syncWave on the consumer's boundary, sharing this boundary's directory,
+  # orders the two. A consumer in another stack imports the name through the
+  # same export it imports the reference through.
+  #
+  # port is the value the fragment sets on the cluster's Port, so it is known
+  # ahead of time and published as that value in both blocks. protocol is
+  # memcached, or memcached-tls while infra.client_tls is on, when the port
+  # accepts TLS alone.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}!GetAtt {{ .locals.logical_id }}.ConfigurationEndpoint.Address{{ end }}"
+    port: "{{ .infra.port }}"
+    protocol: "{{ if .infra.client_tls }}memcached-tls{{ else }}memcached{{ end }}"
+
+  # This Recipe reads from infra.overrides:
+  #   CacheSubnetGroupName - string (Properties.CacheSubnetGroupName), required
+  #   VpcSecurityGroupIds  - []string (Properties.VpcSecurityGroupIds)
+  #   CacheNodeType        - string (Properties.CacheNodeType; default "cache.t3.small")
+  #   host                 - string (published as provides.host; renders nothing)
+  #
+  # The key names are the CloudFormation property names rather than a separate
+  # Aggrega spelling, because each is passed through to the resource unchanged and
+  # the property name is what a reader matches against the resource
+  # documentation, as the CloudFormation RDS Recipes name theirs; a cache
+  # cluster names its security groups VpcSecurityGroupIds, where a replication
+  # group names them SecurityGroupIds. CacheSubnetGroupName is required: the
+  # subnet group places the cache in the operator's network, and this Recipe
+  # never chooses a network for the operator. host is the exception to the
+  # naming: it is no property of the resource but the address a consumer
+  # reaches the cache at, under the name every managed datastore Recipe reads
+  # for it.
+  #
+  # The fragment sets no ClusterName, so CloudFormation names the cluster, as the
+  # CloudFormation RDS Recipes leave the instance's name to it; and no
+  # DeletionPolicy, so the stack deletes the cache with it. ElastiCache offers
+  # no encryption at rest for Memcached, so none is set.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against ElastiCache's own documentation:
+  #   honoured — values.max_item_size, as the max_item_size parameter
+  #     ("Modifiable: Yes", in bytes) of a parameter group the fragment
+  #     declares for the version's family; infra.replicas, as NumCacheNodes;
+  #     infra.port; infra.engine_version, among the versions ElastiCache
+  #     offers; infra.client_tls; and the overrides above.
+  #   refused — values.memory_limit (the node's max_cache_memory "cannot be
+  #     modified"), values.max_connections (max_simultaneous_connections
+  #     "Modifiable: No"), values.threads (num_threads "cannot be modified"),
+  #     a max_item_size that is not a multiple of slab_chunk_max's 524288-byte
+  #     default (ElastiCache refuses the cluster "If max_item_size modulo
+  #     slab_chunk_max != 0"), an attachment to server_certificate, and an
+  #     attached password: ElastiCache documents authentication for Valkey and
+  #     Redis OSS alone, and its cache cluster takes no AuthToken for
+  #     Memcached.
+  #   not read — infra.compute.cpu and infra.compute.memory, whose Component
+  #     defaults size a container: ElastiCache sizes the node by
+  #     infra.overrides.CacheNodeType, and a Recipe cannot tell those defaults
+  #     from a value the Release wrote, so the Component's descriptions say so
+  #     instead. values.user, which names the user of a password this Recipe
+  #     refuses.
+  #
+  # With infra.client_tls true the fragment sets TransitEncryptionEnabled, which
+  # ElastiCache offers from Memcached 1.6.12 and sets only when the cluster is
+  # created, so turning it on or off later replaces the cluster. The port then
+  # accepts TLS alone. ElastiCache presents a certificate AWS Certificate
+  # Manager issues, which is publicly trusted, so a consumer checks it against
+  # its system trust store and needs no server_ca. That certificate carries the
+  # cluster's name, which AWS records in public Certificate Transparency logs.
+  assertions:
+    cache_subnet_group_supplied: >-
+      {{- if not (and (hasKey .infra "overrides") (optional .infra.overrides "CacheSubnetGroupName" "")) -}}
+      {{- fail "this Release places its cache in a cache subnet group that already exists in the target account, and this Recipe never chooses a network for the operator, but infra.overrides.CacheSubnetGroupName carries none: set infra.overrides.CacheSubnetGroupName in the Release to the name of an existing ElastiCache subnet group" -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this cache reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the port is infra.port` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The Memcached versions ElastiCache offers, read off its engine-versions
+    # page. A version it adds later is refused here until this list names it.
+    engine_version_offered: >-
+      {{- $v := regexFind `^[0-9]+(\.[0-9]+)*` (toString .infra.engine_version) -}}
+      {{- if not (has $v (list "1.6.22" "1.6.17" "1.6.12" "1.6.6" "1.5.16" "1.5.10" "1.4.34" "1.4.33" "1.4.24" "1.4.14" "1.4.5")) -}}
+      {{- fail (printf "infra.engine_version is %q, and ElastiCache takes a Memcached version in full, one of 1.6.22, 1.6.17, 1.6.12, 1.6.6, 1.5.16, 1.5.10, 1.4.34, 1.4.33, 1.4.24, 1.4.14 and 1.4.5; the Component's default, 1.6-alpine, is an image tag naming a minor version alone: set infra.engine_version in the Release to one of them, such as 1.6.22" (toString .infra.engine_version)) -}}
+      {{- end -}}
+      {{- if and .infra.client_tls (not (has $v (list "1.6.22" "1.6.17" "1.6.12"))) -}}
+      {{- fail (printf "infra.client_tls is true and infra.engine_version is %q, and ElastiCache encrypts Memcached in transit from version 1.6.12: set infra.engine_version to 1.6.12 or later, such as 1.6.22, or set infra.client_tls to false" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    values_elasticache_cannot_apply: >-
+      {{- with optional .values "memory_limit" "" -}}
+      {{- fail (printf "values.memory_limit is %v, and ElastiCache fixes the memory a Memcached node stores items in by its node type; its max_cache_memory parameter cannot be modified: remove values.memory_limit from the Aggregate and size the cache with infra.overrides.CacheNodeType in the Release" .) -}}
+      {{- end -}}
+      {{- with optional .values "max_connections" "" -}}
+      {{- fail (printf "values.max_connections is %v, and ElastiCache fixes a Memcached node's connection limit at 65000; its max_simultaneous_connections parameter cannot be modified: remove values.max_connections from the Aggregate" .) -}}
+      {{- end -}}
+      {{- with optional .values "threads" "" -}}
+      {{- fail (printf "values.threads is %v, and ElastiCache sets a Memcached node's worker threads by its node type; its num_threads parameter cannot be modified: remove values.threads from the Aggregate and choose the node type with infra.overrides.CacheNodeType in the Release" .) -}}
+      {{- end -}}
+      {{- with optional .values "max_item_size" "" -}}
+      {{- $s := toString . -}}
+      {{- if not (regexMatch `^[0-9]+[kKmM]?$` $s) -}}
+      {{- fail (printf "values.max_item_size is %q, which reads as neither a number of bytes nor a number followed by k or m, the forms the memcached -I flag takes: set values.max_item_size to one of them, such as 2m" $s) -}}
+      {{- end -}}
+      {{- $n := regexFind `^[0-9]+` $s -}}
+      {{- $u := lower (trimPrefix $n $s) -}}
+      {{- $b := int $n -}}
+      {{- if eq $u "k" }}{{ $b = mul $b 1024 }}{{ else if eq $u "m" }}{{ $b = mul $b 1048576 }}{{ end -}}
+      {{- if or (lt $b 524288) (ne (mod $b 524288) 0) -}}
+      {{- fail (printf "values.max_item_size is %q, %v bytes, and ElastiCache creates a Memcached cluster only where max_item_size is a whole multiple of slab_chunk_max, 524288 bytes by default: set values.max_item_size to a multiple of 512k, such as 1m or 2m" $s $b) -}}
+      {{- end -}}
+      {{- end -}}
+    tls_and_credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "server_certificate" -}}
+      {{- fail "a certificate is attached to the server_certificate slot, and ElastiCache presents a certificate AWS issues for the cache, which consumers trust without one: remove the attachment; infra.client_tls alone turns TLS on here" -}}
+      {{- end -}}
+      {{- if hasKey $f "password" -}}
+      {{- fail "a password is attached to the password slot, and ElastiCache offers no authentication for Memcached, so nothing would check it: remove the attachment and restrict who reaches the cache with infra.overrides.VpcSecurityGroupIds" -}}
+      {{- end -}}
+
+  artifacts:
+    template.yaml: |
+      Resources:
+        {{ .locals.logical_id }}:
+          Type: AWS::ElastiCache::CacheCluster
+          Properties:
+            Engine: memcached
+            EngineVersion: "{{ .locals.engine_version }}"
+            CacheNodeType: "{{ optional .infra.overrides "CacheNodeType" "cache.t3.small" }}"
+            NumCacheNodes: {{ .infra.replicas }}
+            Port: {{ .infra.port }}
+            TransitEncryptionEnabled: {{ .infra.client_tls }}
+            CacheSubnetGroupName: "{{ .infra.overrides.CacheSubnetGroupName }}"
+            {{- with optional .infra.overrides "VpcSecurityGroupIds" "" }}
+            VpcSecurityGroupIds: {{ toJson . }}
+            {{- end }}
+            {{- if .locals.item_size }}
+            CacheParameterGroupName: !Ref {{ .locals.logical_id }}ParameterGroup
+            {{- end }}
+        {{- with .locals.item_size }}
+        {{ $.locals.logical_id }}ParameterGroup:
+          Type: AWS::ElastiCache::ParameterGroup
+          Properties:
+            Description: "Memcached parameters for {{ $.context.instance_id }}"
+            CacheParameterGroupFamily: "{{ $.locals.family }}"
+            Properties:
+              max_item_size: "{{ . }}"
+        {{- end }}
+
+      # Fragment provides: the provider projects each entry into the assembled
+      # stack Outputs and expands the short-form intrinsics to long form. Each
+      # output is named for this instance and the entry together, so two caches
+      # of the same type in one stack keep their connection identities apart. A
+      # cross-stack consumer imports the host entry; an intra-stack consumer
+      # receives it through the value-pipe above.
+      provides:
+        host: {{ if .locals.operator_host }}"{{ .locals.operator_host }}"{{ else }}!GetAtt {{ .locals.logical_id }}.ConfigurationEndpoint.Address{{ end }}
+        port: "{{ .infra.port }}"
+        protocol: {{ if .infra.client_tls }}memcached-tls{{ else }}memcached{{ end }}
