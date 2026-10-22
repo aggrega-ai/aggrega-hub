@@ -11,11 +11,14 @@ metadata:
     Workload — the compose provider translates the Workload kind into a service
     entry (image, port, exposed service). Used as an in-memory cache with no
     persistence, so no data volume is declared. Authentication is off by
-    default; when a password credential is attached its value arrives on the
-    env pipe and is rendered as the VALKEY_PASSWORD environment variable.
-    Images that read that variable (Bitnami-packaged Valkey) enable
-    authentication from it; the plain upstream image expects the password
-    through its configuration and ignores the variable.
+    default. An attached password is enforced: the server is started with
+    --requirepass through the image's VALKEY_EXTRA_FLAGS variable, which keeps
+    the value off the container's command line. The value is read under the
+    variable the attachment's values.key names, or else VALKEY_PASSWORD, and an
+    attachment delivering it under neither halts the build naming the slot. The
+    image expands that variable unquoted, so a password holding a space stops
+    the server at start, and one holding *, ? or [ is matched against file
+    names in the data directory, so write the password without either.
     provides.host is the bare service name, resolved on the compose network.
     Encrypted client connections are not served here: infra.client_tls set to
     true, or a certificate attached to server_certificate, halts the build by
@@ -42,12 +45,27 @@ spec:
   # does — so this realization has no way to hand the server its certificate.
   # Both directions halt: client_tls true, and a certificate attached while it is
   # false, since nothing here would present it.
+  #
+  # An attached password is enforced, or the build halts: the image reads no
+  # password variable of its own, so a value this Recipe could not find would
+  # leave the cache open while the Aggregate asks for it to be protected. The
+  # value is read under the variable the attachment names in values.key, as
+  # core/secret-value delivers it, and otherwise under VALKEY_PASSWORD.
   workload: |
     {{- if .infra.client_tls }}
     {{- fail (printf "infra.client_tls is true on %q, but this Compose realization of core/datastore/valkey cannot serve TLS: the server reads its certificate and key from files, and no credential Feature the catalog realizes on Compose names a secret a service can mount as files; set infra.client_tls to false, or map the component to helm/valkey or helm/valkey-chart in the Manifest, which serve TLS from the server_certificate slot" .context.instance_id) }}
     {{- end }}
     {{- if hasKey (default dict .features) "server_certificate" }}
     {{- fail (printf "a certificate is attached to the server_certificate slot of %q, but infra.client_tls is false and this Compose realization of core/datastore/valkey serves plaintext alone, since no credential Feature the catalog realizes on Compose delivers a certificate as files, so nothing would present it; remove the attachment, or map the component to helm/valkey or helm/valkey-chart in the Manifest and set infra.client_tls to true there" .context.instance_id) }}
+    {{- end }}
+    {{- $password := "" }}
+    {{- if hasKey (default dict .features) "password" }}
+    {{- $passwordKey := default "VALKEY_PASSWORD" (optional (optional (index .features "password") "values" dict) "key" "") }}
+    {{- $delivered := optional (default dict .context.inject) "env" dict }}
+    {{- if not (optional $delivered $passwordKey "") }}
+    {{- fail (printf "the password slot of %q is attached, but no value reaches this Recipe under %s, the variable it reads the password from, so the server cannot be started with it; attach core/secret-value and name the variable in its values.key, or deliver the value under VALKEY_PASSWORD" .context.instance_id $passwordKey) }}
+    {{- end }}
+    {{- $password = index $delivered $passwordKey }}
     {{- end }}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
@@ -91,16 +109,18 @@ spec:
           - "{{ .infra.port }}"
     {{- end }}
     {{- end }}
-        # Authentication is wired through the optional `password` credential
-        # slot. When a credential is attached its value arrives on the inject
-        # pipe as .context.inject.env.VALKEY_PASSWORD. With no credential
-        # attached, no auth env is emitted and the cache runs without
-        # authentication.
-    {{- if .context.inject.env }}
-    {{- if .context.inject.env.VALKEY_PASSWORD }}
+        # An attached password reaches the server as --requirepass through
+        # VALKEY_EXTRA_FLAGS, which the image's entrypoint appends to the server's
+        # arguments. Passed as an argument instead, the value would show in the
+        # container's command and in its first process's command line; as this
+        # variable it shows in neither. The entrypoint expands the variable
+        # unquoted, so a password holding whitespace stops the server at start,
+        # and one holding *, ? or [ is matched against file names in the data
+        # directory. With no password attached, nothing is emitted and the cache
+        # runs without authentication.
+    {{- if $password }}
         variables:
-          VALKEY_PASSWORD: "{{ .context.inject.env.VALKEY_PASSWORD }}"
-    {{- end }}
+          VALKEY_EXTRA_FLAGS: {{ printf "--requirepass %s" $password | toJson }}
     {{- end }}
         ports:
           valkey: {{ .infra.port }}

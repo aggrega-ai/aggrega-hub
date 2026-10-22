@@ -2244,7 +2244,7 @@ For a runnable end-to-end walkthrough of this model, see
 [`language-reference/examples/mariadb-bitnami-credential-set/`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/examples/mariadb-bitnami-credential-set/).
 
 **Model B — granular transparent inject-value.** For charts that accept a single
-password **value** (`postgres`, `valkey`, `redis`, `memcached`), the Component
+password **value** (`postgres`, `valkey`, `redis`), the Component
 declares one optional transparent `password` slot
 (`selector: feature.aggrega.ai/kind=secret`, `inject: [env]`), filled by an
 inject-value credential, with a deterministic inline development default when the

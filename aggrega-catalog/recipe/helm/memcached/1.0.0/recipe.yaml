@@ -11,13 +11,13 @@ metadata:
     Memcached on Kubernetes via the helm provider's Workload synthesis, running
     the official upstream memcached image directly (no external Helm chart).
     Used as an in-memory cache with no persistence, so it renders a stateless
-    Deployment plus a ClusterIP Service and declares no storage. Authentication
-    is off by default; when the optional password credential slot is attached
-    the value is delivered as an env secretKeyRef (MEMCACHED_PASSWORD) alongside
-    the MEMCACHED_USERNAME value, so the plaintext password never appears in the
-    rendered Deployment manifest. SASL authentication requires a Memcached image
-    built with SASL support; the plain official image ignores these variables
-    and runs without authentication. provides.host is the bare, self-contained
+    Deployment plus a ClusterIP Service and declares no storage. The cache runs
+    without authentication, and a password attached to the password slot halts
+    the build naming the slot: the memcached image enforces no password, and
+    its two authentication modes, SASL over the binary protocol and an ASCII
+    authentication file, are not spoken by the catalog's Memcached clients, so
+    the cache would accept every client whatever the attachment. Access to it is
+    the network's to restrict. provides.host is the bare, self-contained
     in-cluster service name of the synthesized Service — it carries no
     namespace, so the recipe is independent of where it is deployed. A consumer
     in another namespace qualifies the host with the target namespace on its own
@@ -51,7 +51,14 @@ spec:
     host: "{{ .context.rendered_name }}-default"
     port: "{{ .infra.port }}"
     protocol: "{{ if .infra.client_tls }}memcached-tls{{ else }}memcached{{ end }}"
+  # An attached password is refused rather than rendered: the image enforces
+  # none, its SASL and ASCII authentication modes need client support the
+  # catalog's Memcached consumers lack, and a password that protects nothing
+  # would let the Aggregate believe the cache is closed.
   workload: |
+    {{- if hasKey (default dict .features) "password" }}
+    {{- fail (printf "a password is attached to the password slot of %q, but the memcached image this Recipe runs cannot enforce a password: it authenticates only through SASL over the binary protocol or an ASCII authentication file, which the catalog's Memcached clients do not use, so the cache would accept every client anyway; remove the attachment, and restrict who can reach the cache through its network" .context.instance_id) }}
+    {{- end }}
     {{- $tls := .infra.client_tls }}
     {{- $cert := hasKey (default dict .features) "server_certificate" }}
     {{- if and $tls (not $cert) }}
@@ -73,16 +80,6 @@ spec:
     containers:
       main:
         image: "memcached:{{ .infra.engine_version }}"
-        # Authentication is wired through the optional `password` credential
-        # slot. When a credential is attached, the password is delivered as an
-        # env secretKeyRef (MEMCACHED_PASSWORD) and the SASL username is emitted
-        # as MEMCACHED_USERNAME from the developer value — the plaintext
-        # password never lands in the manifest. SASL authentication requires a
-        # Memcached image built with SASL support; the plain official image
-        # ignores these variables. With no credential attached, no auth env and
-        # no secret are emitted and the cache runs without authentication,
-        # byte-identically to a Recipe with no slot at all.
-        #
         # Tuning knobs pass as memcached server flags — the official image's
         # entrypoint prepends `memcached` to a flag-leading argument list. The
         # block is emitted only when a knob is set, so a bare cache renders no
@@ -130,10 +127,6 @@ spec:
           - "ssl_chain_cert=/etc/memcached/tls/tls.crt,ssl_key=/etc/memcached/tls/tls.key"
     {{- end }}
     {{- end }}
-    {{- if hasKey (default dict .features) "password" }}
-        variables:
-          MEMCACHED_USERNAME: "{{ .values.user }}"
-    {{- end }}
         ports:
           memcached: {{ .infra.port }}
         # Memcached documents no health endpoint, so both probes open a TCP
@@ -154,15 +147,8 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
-    {{- if or $tls (hasKey (default dict .features) "password") }}
-        attachments:
-    {{- end }}
-    {{- if hasKey (default dict .features) "password" }}
-          MEMCACHED_PASSWORD:
-            from: password
-            as: env
-    {{- end }}
     {{- if $tls }}
+        attachments:
           # The certificate Secret mounts whole, read-only, one file per data
           # key, so the server reads tls.crt and tls.key from this directory.
           server-certificate:
