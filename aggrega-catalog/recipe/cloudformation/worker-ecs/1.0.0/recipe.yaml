@@ -1,0 +1,300 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: worker-ecs
+  version: 1.0.0
+  description: >
+    The generic background-worker primitive as one Amazon ECS service on
+    Fargate, running infra.replicas tasks of the Release's image, rendered as a
+    CloudFormation fragment the provider assembles into the boundary's stack.
+    Reach for it where the target is an AWS account with an ECS cluster and a
+    VPC; reach for helm/worker on a Kubernetes cluster.
+
+    The cluster, subnets, security groups and execution role come from the
+    operator, under infra.overrides, and each is required; a task role, a
+    public IP and a log group are optional, and nothing is emitted for one
+    left unset. Only a task definition and a service are emitted — no
+    cluster, role, security group, log group or load balancer, each of which
+    the operator already runs — and the container maps no port, so nothing
+    connects to the worker. No container health check is declared, because
+    ECS runs one inside an image this Recipe does not name.
+
+    Every variable the component's uses edges inject on the env pipe becomes
+    an entry of the container's environment, its value written whole, so a
+    neighbour's address arrives as an Fn::GetAtt in the same stack and as an
+    Fn::ImportValue from another; concurrency and queue_depth_hint are
+    delivered as WORKER_CONCURRENCY and WORKER_QUEUE_DEPTH_HINT, as
+    helm/worker delivers them. The task runs at the smallest Fargate size
+    meeting both infra.compute.cpu and infra.compute.memory, so the
+    Component's defaults run at 0.25 vCPU and 512 MiB.
+
+    It is written as a fragment, as the catalog writes its CloudFormation
+    Recipes, rather than sourced from a published template. AWS App Runner is
+    not used: it is no longer open to new customers.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: cloudformation
+  implements: core/compute/worker:1.0.0
+
+  # The resources' logical ids, derived from this instance's own name so that
+  # two workers deployed into one stack describe two services rather than one.
+  # A logical id is unique within a CloudFormation template and admits only
+  # letters and digits, so the instance name's separators are read as word
+  # boundaries and each word is capitalised: instance invoice-jobs names the
+  # service InvoiceJobs, and its task definition InvoiceJobsTaskDefinition.
+  #
+  # The Fargate task size, read off the task-size table of the Amazon ECS
+  # developer guide ("Task CPU and memory" under Fargate): a CPU size in CPU
+  # units, 1024 to a vCPU, and the memory sizes in MiB that each CPU size takes.
+  # The task runs at the first pair in that table, by CPU and then by memory,
+  # that meets both the CPU and the memory infra.compute asks for. Each
+  # requested quantity is a floor: the task may be given more than was written,
+  # and is billed for what it is given. The Component's defaults, 100m and
+  # 128Mi, are below the smallest pair, so they run at 256 CPU units and 512 MiB.
+  # A size the table adds later is not chosen until it is listed here. These
+  # locals are the ones terraform/server-ecs, terraform/worker-ecs and
+  # cloudformation/server-ecs declare, word for word, and a change to the
+  # table is made to all four.
+  locals:
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+    # The requested CPU in millicores, or empty when it is not a quantity this
+    # Recipe reads: whole millicores, or vCPUs with at most three decimals.
+    cpu_millicores: >-
+      {{- $c := toString (optional (optional .infra "compute" dict) "cpu" "") -}}
+      {{- if regexMatch `^[0-9]+m$` $c -}}{{ atoi (trimSuffix "m" $c) }}
+      {{- else if regexMatch `^[0-9]+(\.[0-9]{1,3})?$` $c -}}
+      {{- $p := splitList "." $c -}}{{- $f := 0 -}}
+      {{- if eq (len $p) 2 }}{{ $f = atoi (substr 0 3 (printf "%s000" (index $p 1))) }}{{ end -}}
+      {{- add (mul (atoi (index $p 0)) 1000) $f -}}
+      {{- end -}}
+    # The requested memory in MiB, or empty when it is not a quantity this
+    # Recipe reads: whole Mi or Gi.
+    memory_mib: >-
+      {{- $m := toString (optional (optional .infra "compute" dict) "memory" "") -}}
+      {{- if regexMatch `^[0-9]+Mi$` $m -}}{{ atoi (trimSuffix "Mi" $m) }}
+      {{- else if regexMatch `^[0-9]+Gi$` $m -}}{{ mul (atoi (trimSuffix "Gi" $m)) 1024 }}
+      {{- end -}}
+    # The first pair meeting both, as cpu/memory, or empty when none does.
+    task_size: >-
+      {{- $found := "" -}}
+      {{- if and .locals.cpu_millicores .locals.memory_mib -}}
+      {{- $mc := atoi .locals.cpu_millicores -}}{{- $mib := atoi .locals.memory_mib -}}
+      {{- range list (list 256 (list 512 1024 2048)) (list 512 (untilStep 1024 4097 1024)) (list 1024 (untilStep 2048 8193 1024)) (list 2048 (untilStep 4096 16385 1024)) (list 4096 (untilStep 8192 30721 1024)) (list 8192 (untilStep 16384 61441 4096)) (list 16384 (untilStep 32768 122881 8192)) (list 32768 (list 61440 122880 249856)) -}}
+      {{- $cpu := index . 0 -}}
+      {{- if and (not $found) (ge (mul $cpu 1000) (mul $mc 1024)) -}}
+      {{- range index . 1 }}{{ if and (not $found) (ge . $mib) }}{{ $found = printf "%d/%d" $cpu . }}{{ end }}{{ end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $found -}}
+    task_cpu: '{{ if .locals.task_size }}{{ index (splitList "/" .locals.task_size) 0 }}{{ end }}'
+    task_memory: '{{ if .locals.task_size }}{{ index (splitList "/" .locals.task_size) 1 }}{{ end }}'
+
+  # The component publishes nothing across an edge, so nothing is emitted for
+  # one, and the fragment carries no provides of its own.
+  provides: {}
+
+  # This Recipe reads from infra.overrides:
+  #   Cluster          - string (the service's Cluster), required
+  #   Subnets          - []string (the service's AwsvpcConfiguration.Subnets), required
+  #   SecurityGroups   - []string (the service's AwsvpcConfiguration.SecurityGroups), required
+  #   ExecutionRoleArn - string (the task definition's ExecutionRoleArn), required
+  #   TaskRoleArn      - string (the task definition's TaskRoleArn)
+  #   AssignPublicIp   - string (AwsvpcConfiguration.AssignPublicIp, ENABLED or DISABLED; default DISABLED)
+  #   awslogs-group    - string (the container's LogConfiguration option awslogs-group)
+  #
+  # The key names are the CloudFormation property names rather than a separate
+  # Aggrega spelling, because each is passed through to the resource unchanged
+  # and the property name is what a reader matches against the resource
+  # documentation, as the CloudFormation RDS and ElastiCache Recipes name
+  # theirs; awslogs-group is the log driver option's own name. AssignPublicIp
+  # takes the property's own two values. These are the keys
+  # cloudformation/server-ecs reads, under the same names, less TargetGroupArn.
+  #
+  # The first four are required and none has a default: the cluster, the
+  # network and the role ECS pulls the image and writes logs with are provisioned
+  # outside this Release, no account-independent value exists for any of them,
+  # and this Recipe never chooses a network or a role for the operator. The
+  # execution role is what Amazon ECS pulls a private image and writes the
+  # container's logs with; it is required whichever the image is, so a Release
+  # that later names a private image or a log group changes no role.
+  # AssignPublicIp ENABLED gives each task a public IP address, which a task in
+  # a public subnet needs to pull its image and reach the internet with no NAT
+  # gateway; it is DISABLED unless the Release enables it. awslogs-group names
+  # a log group that already exists, in the Region the stack deploys to, to
+  # which the container's output is written under the stream prefix of the
+  # component's name; the execution role must be allowed to write to it.
+  #
+  # The fragment sets no ServiceName, so CloudFormation names the service, as
+  # the CloudFormation RDS Recipes leave the instance's name to it. The task
+  # definition's Family is the component's name, which ECS checks against the
+  # alphabet below.
+  #
+  # Target-expected names: the image is the Release's, so no upstream
+  # documentation names a spelling for the two developer values. They are
+  # delivered under the names helm/worker delivers them under, and only when
+  # the developer set them, so an unset value renders no variable rather than
+  # an empty one.
+  #
+  # Every Component value and infra key is honoured or refused below by name:
+  #   honoured — values.concurrency and values.queue_depth_hint as above,
+  #     infra.image (required), infra.replicas as the service's DesiredCount,
+  #     infra.compute.cpu and infra.compute.memory as the Fargate size above,
+  #     and the overrides above.
+  #   refused — infra.overrides.TargetGroupArn, since nothing connects to a
+  #     worker; a compute quantity this Recipe cannot read, and a pair larger
+  #     than the largest Fargate task; and an edge injecting a variable under
+  #     one of the two names the developer values are delivered under.
+  assertions:
+    # This component packages no upstream product, so it holds no default image
+    # to fall back to: the Release names the one it runs.
+    image_supplied: >-
+      {{- if not (optional .infra "image" "") -}}
+      {{- fail "this realization runs an image the Release supplies, because the generic compute primitive packages no software and therefore holds no default: set infra.image to the container image running the worker loop in the Release" -}}
+      {{- end -}}
+    # The compute block's two sub-keys carry defaults, which fill either one a
+    # Release leaves out; one the Release sets empty leaves the task nothing to
+    # be sized by, so each must carry a quantity.
+    compute_group_complete: >-
+      {{- $compute := optional .infra "compute" dict -}}
+      {{- if not (optional $compute "cpu" "") -}}
+      {{- fail "infra.compute.cpu is empty, so the task would have no CPU to be sized by: set infra.compute.cpu in the Release to a quantity, or remove it to take the component's default" -}}
+      {{- end -}}
+      {{- if not (optional $compute "memory" "") -}}
+      {{- fail "infra.compute.memory is empty, so the task would have no memory to be sized by: set infra.compute.memory in the Release to a quantity, or remove it to take the component's default" -}}
+      {{- end -}}
+    compute_fits_fargate: >-
+      {{- if not .locals.cpu_millicores -}}
+      {{- fail (printf "infra.compute.cpu is %q, and this Recipe reads it as a Kubernetes CPU quantity, whole millicores such as 100m or vCPUs with at most three decimals such as 0.5: set infra.compute.cpu in the Release to one of those forms" (toString .infra.compute.cpu)) -}}
+      {{- end -}}
+      {{- if not .locals.memory_mib -}}
+      {{- fail (printf "infra.compute.memory is %q, and this Recipe reads it as a Kubernetes memory quantity in whole mebibytes or gibibytes, such as 128Mi or 1Gi: set infra.compute.memory in the Release to one of those forms" (toString .infra.compute.memory)) -}}
+      {{- end -}}
+      {{- if not .locals.task_size -}}
+      {{- fail (printf "infra.compute asks for cpu %q and memory %q, and no Fargate task size meets both: the largest is 32 vCPU with 244 GB, and each CPU size takes a bounded range of memory, up to 120 GB at 16 vCPU and 30 GB at 4 vCPU; set infra.compute in the Release to a pair one Fargate size meets" (toString .infra.compute.cpu) (toString .infra.compute.memory)) -}}
+      {{- end -}}
+    cluster_supplied: >-
+      {{- $v := optional (optional .infra "overrides" dict) "Cluster" "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release runs its worker as an Amazon ECS service in a cluster that already exists in the target account, but infra.overrides.Cluster is %s: set infra.overrides.Cluster in the Release to the name or ARN of an existing ECS cluster" (toJson $v)) -}}
+      {{- end -}}
+    subnets_supplied: >-
+      {{- $s := optional (optional .infra "overrides" dict) "Subnets" "" -}}
+      {{- $ok := and (kindIs "slice" $s) (gt (len $s) 0) (le (len $s) 16) -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) .) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "this Release places its worker's tasks in subnets of the operator's VPC, one to sixteen of them, but infra.overrides.Subnets is %s: set infra.overrides.Subnets in the Release to a list of the IDs of existing subnets" (toJson $s)) -}}
+      {{- end -}}
+    security_groups_supplied: >-
+      {{- $s := optional (optional .infra "overrides" dict) "SecurityGroups" "" -}}
+      {{- $ok := and (kindIs "slice" $s) (gt (len $s) 0) (le (len $s) 5) -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) .) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "this Release attaches its worker's tasks to security groups of the operator's VPC, one to five of them, which decide what the worker may reach, but infra.overrides.SecurityGroups is %s: set infra.overrides.SecurityGroups in the Release to a list of the IDs of existing security groups" (toJson $s)) -}}
+      {{- end -}}
+    execution_role_arn_supplied: >-
+      {{- $v := optional (optional .infra "overrides" dict) "ExecutionRoleArn" "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release runs its worker's tasks under a task execution role that already exists, with which Amazon ECS pulls the image and writes the container's logs, but infra.overrides.ExecutionRoleArn is %s: set infra.overrides.ExecutionRoleArn in the Release to the ARN of an existing role" (toJson $v)) -}}
+      {{- end -}}
+    optional_overrides_typed: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "TargetGroupArn" -}}
+      {{- fail "infra.overrides.TargetGroupArn names a load balancer target group for the worker's tasks, and a worker maps no container port, so nothing could be registered with it: remove infra.overrides.TargetGroupArn from the Release, or map this component as core/compute/server, which serves inbound traffic" -}}
+      {{- end -}}
+      {{- range $k := list "TaskRoleArn" "awslogs-group" -}}
+      {{- if hasKey $o $k -}}
+      {{- $v := index $o $k -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "infra.overrides.%s is %s, and this Recipe reads it as the name or ARN of something that already exists in the target account: set it in the Release to that string, or remove it" $k (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if and (hasKey $o "AssignPublicIp") (not (has (index $o "AssignPublicIp") (list "ENABLED" "DISABLED"))) -}}
+      {{- fail (printf "infra.overrides.AssignPublicIp is %s, and the property takes ENABLED or DISABLED: set it in the Release to ENABLED to give each task a public IP address, or remove it" (toJson (index $o "AssignPublicIp"))) -}}
+      {{- end -}}
+
+  # The environment is read off the inject pipe as a map, and every variable on
+  # it becomes one entry of the container's environment, under the name the
+  # Aggregate gave it on the edge; this Recipe expects no name of its own, so
+  # none is missing whatever the edges deliver. Each value is written as the
+  # entry's whole Value. A value that is a CloudFormation short-form intrinsic
+  # — the Fn::GetAtt a neighbour in the same stack publishes — is written bare,
+  # so the template reads it as that intrinsic; the provider replaces a value a
+  # neighbour publishes from another stack with an Fn::ImportValue, and it can
+  # replace only a whole value. Any other value is written as a quoted
+  # string, so text such as a port number reaches the String property as text.
+  # The two developer values join that map under their own names, and an edge
+  # delivering either name as well halts rather than one value silently
+  # replacing the other.
+  #
+  # The task definition is referenced by its logical id, which resolves to its
+  # ARN; the log Region is the stack's own, read through the AWS::Region pseudo
+  # parameter when the stack deploys.
+  artifacts:
+    template.yaml: |
+      {{- if not (regexMatch `^[A-Za-z0-9_-]{1,255}$` .context.instance_id) }}
+      {{- fail (printf "the component %q names its Amazon ECS task definition family, and ECS takes up to 255 letters, digits, hyphens and underscores for one: rename the component in the Aggregate to such a name" .context.instance_id) }}
+      {{- end }}
+      {{- $o := optional .infra "overrides" dict }}
+      {{- $env := dict }}
+      {{- range $k, $v := optional (default dict .context.inject) "env" dict }}{{ $_ := set $env $k $v }}{{ end }}
+      {{- $developer := dict }}
+      {{- with optional .values "concurrency" "" }}{{ $_ := set $developer "WORKER_CONCURRENCY" (toString .) }}{{ end }}
+      {{- with optional .values "queue_depth_hint" "" }}{{ $_ := set $developer "WORKER_QUEUE_DEPTH_HINT" (toString .) }}{{ end }}
+      {{- range $k, $v := $developer }}
+      {{- if hasKey $env $k }}
+      {{- fail (printf "the component %q delivers its developer value to the container as %s, and an edge in the Aggregate injects a variable under that name as well, so one would silently replace the other: rename the variable the edge injects in its inject block" $.context.instance_id $k) }}
+      {{- end }}
+      {{- $_ := set $env $k $v }}
+      {{- end }}
+      Resources:
+        {{ .locals.logical_id }}:
+          Type: AWS::ECS::Service
+          Properties:
+            Cluster: {{ toJson $o.Cluster }}
+            LaunchType: FARGATE
+            DesiredCount: {{ .infra.replicas }}
+            TaskDefinition: !Ref {{ .locals.logical_id }}TaskDefinition
+            NetworkConfiguration:
+              AwsvpcConfiguration:
+                Subnets: {{ toJson $o.Subnets }}
+                SecurityGroups: {{ toJson $o.SecurityGroups }}
+                AssignPublicIp: {{ optional $o "AssignPublicIp" "DISABLED" }}
+        {{ .locals.logical_id }}TaskDefinition:
+          Type: AWS::ECS::TaskDefinition
+          Properties:
+            Family: "{{ .context.instance_id }}"
+            RequiresCompatibilities:
+              - FARGATE
+            NetworkMode: awsvpc
+            Cpu: "{{ .locals.task_cpu }}"
+            Memory: "{{ .locals.task_memory }}"
+            ExecutionRoleArn: {{ toJson $o.ExecutionRoleArn }}
+            {{- with optional $o "TaskRoleArn" "" }}
+            TaskRoleArn: {{ toJson . }}
+            {{- end }}
+            ContainerDefinitions:
+              - Name: main
+                Image: {{ toJson .infra.image }}
+                Essential: true
+                {{- if $env }}
+                Environment:
+                  {{- range $k, $v := $env }}
+                  - Name: {{ toJson $k }}
+                    Value: {{ if regexMatch `^!(Ref|GetAtt|Sub|ImportValue|GetStackOutput|Join|Select|Split|FindInMap|Base64|Cidr|GetAZs|If) ` (toString $v) }}{{ $v }}{{ else }}{{ toJson (toString $v) }}{{ end }}
+                  {{- end }}
+                {{- end }}
+                {{- with optional $o "awslogs-group" "" }}
+                LogConfiguration:
+                  LogDriver: awslogs
+                  Options:
+                    awslogs-group: {{ toJson . }}
+                    awslogs-region: !Ref AWS::Region
+                    awslogs-stream-prefix: "{{ $.context.instance_id }}"
+                {{- end }}

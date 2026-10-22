@@ -1638,9 +1638,10 @@ The compact form (about 15 keywords) covers the common case in a fraction of the
 Components with provider-specific knobs should include an open-map field under `infra:` — a stateful
 component for its managed services' settings, and a stateless one whose realizations on a cloud provider's
 container service run in a cluster, a network and a role the operator already holds, as `core/compute/server`
-and `core/compute/worker` do for Amazon ECS. Each Recipe documents the keys it reads, each named for the module
-input or CloudFormation property it sets, unless another Recipe already reads the same concept under a spelling
-of its own, which it then reuses — `vpc_security_groups` for security groups on the terraform AWS Recipes. A
+and `core/compute/worker` do for Amazon ECS. Each Recipe documents the keys it reads. A terraform Recipe names
+each for the module input it sets, unless another terraform Recipe already reads the same concept under a
+spelling of its own, which it then reuses — `subnet_ids` for subnets and `vpc_security_groups` for security
+groups on the AWS Recipes; a CloudFormation Recipe names each for the property it sets, such as `Subnets`. A
 realization that reads none of the keys, such as a synthesized Kubernetes workload, says so in a comment:
 
 ```yaml

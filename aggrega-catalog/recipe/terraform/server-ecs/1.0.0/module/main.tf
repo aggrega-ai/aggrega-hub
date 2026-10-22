@@ -91,7 +91,7 @@ resource "aws_ecs_service" "this" {
   desired_count   = var.desired_count
 
   network_configuration {
-    subnets          = var.subnets
+    subnets          = var.subnet_ids
     security_groups  = var.security_groups
     assign_public_ip = var.assign_public_ip
   }

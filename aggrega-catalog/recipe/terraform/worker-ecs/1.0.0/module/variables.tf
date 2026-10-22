@@ -1,6 +1,7 @@
-# Every variable is named for the resource argument it sets. Those with no
-# default are supplied by the caller on every call; those defaulting to null
-# leave their argument unset, so nothing is emitted for them.
+# Every variable is named for the resource argument it sets, except subnet_ids,
+# which sets the service's subnets under the name the caller's key carries. Those
+# with no default are supplied by the caller on every call; those defaulting to
+# null leave their argument unset, so nothing is emitted for them.
 
 variable "name" {
   type        = string
@@ -37,7 +38,7 @@ variable "cluster" {
   description = "Name or ARN of the existing ECS cluster the service runs in."
 }
 
-variable "subnets" {
+variable "subnet_ids" {
   type        = list(string)
   description = "IDs of the existing subnets the tasks are placed in."
 }
