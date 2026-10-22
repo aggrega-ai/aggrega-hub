@@ -1,0 +1,262 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: valkey-elasticache
+  version: 1.0.0
+  # The licence of the vendored module, the terraform-aws-modules project's
+  # ElastiCache module: the third-party code this Recipe pins and writes into
+  # the output. The ElastiCache replication group it provisions is a service
+  # the reader contracts for directly with AWS, under AWS's terms.
+  license: Apache-2.0
+  description: >
+    Valkey on Amazon ElastiCache, as one replication group with cluster mode
+    disabled, realized by the published ElastiCache module of the
+    terraform-aws-modules project, terraform-aws-modules/elasticache/aws at
+    v1.11.2, Apache-2.0. The module is fetched from its git repository at that
+    tag and vendored into the component's own directory; the pin is the commit
+    the tag names and the digest of its archive, recorded in the entity.lock
+    beside this Recipe.
+
+    Reach for this realization where the cache is an ElastiCache service in
+    the operator's AWS account; reach for valkey or valkey-chart on helm, or
+    valkey on compose, where it runs as a container.
+
+    host publishes a Terraform reference to the module's primary endpoint
+    output, which resolves for a consumer authored as a source: Recipe in the
+    same root configuration, and port the configured infra.port. Set
+    infra.overrides.host to publish the DNS name the operator points at the
+    cache instead. infra.overrides.subnet_group is required. maxmemory_policy
+    and databases are set through a parameter group. A value ElastiCache cannot
+    apply — maxmemory, appendonly, persistence — halts the build naming the key;
+    compute and storage are not read. With infra.client_tls true the service
+    encrypts in transit and protocol is valkey-tls; an attached password becomes
+    the AUTH token, and needs client_tls.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/valkey:1.0.0
+
+  # The published module, at the tag the registry publishes as version 1.11.2.
+  # A registry version of a module is a tag of its git repository, and the
+  # registry's own download for this version answers with a git source at the
+  # commit that tag names; Terraform's dependency lock file records providers
+  # and no module. So the pin is taken here: `aggrega pin` resolves the tag to
+  # its commit and records that commit and the archive's digest in entity.lock,
+  # and every build vendors exactly those bytes.
+  #
+  # The source names the repository root, which declares no module call of its
+  # own: the configuration Terraform loads from it calls no registry module, so
+  # initialising it fetches providers and nothing else. The repository's
+  # modules/, examples/ and wrappers/ directories are vendored with it and never
+  # loaded.
+  #
+  # The module declares hashicorp/aws >= 5.93 and hashicorp/random >= 3.0 in its
+  # own required_providers and is vendored byte for byte, so this Recipe adds no
+  # provider constraint of its own; the catalog conventions' "One AWS provider
+  # constraint for every AWS body" section says how it composes with the
+  # catalog's authored AWS bodies.
+  #
+  # The tag is written out rather than read from infra.source_version: a source
+  # whose coordinates come from a template is pinned per Release instead of in
+  # this Recipe's own entity.lock, and this Recipe's pin is the one stated
+  # above. So infra.source_version is not read here.
+  source:
+    kind: git-repository
+    url: https://github.com/terraform-aws-modules/terraform-aws-elasticache.git
+    ref: v1.11.2
+
+  locals:
+    # The engine version ElastiCache takes for Valkey, the major and minor
+    # version alone (the AWS provider refuses any other form), read off the
+    # start of infra.engine_version: 8.1 from the Component's default image
+    # tag 8.1-alpine. ElastiCache runs the newest patch of that version.
+    engine_version: '{{ regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) }}'
+    # The parameter group family of that version: valkey7 for 7.2, valkey8 for
+    # 8.0 to 8.2, valkey9 for 9.0 and 9.1.
+    family: '{{ $p := splitList "." .locals.engine_version }}valkey{{ index $p 0 }}'
+    # The name the Release gives the cache under infra.overrides.host, or empty
+    # while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   subnet_group        - string (subnet_group_name), required
+  #   vpc_security_groups - []string (security_group_ids)
+  #   node_type           - string (node_type; default "cache.t3.small")
+  #   host                - string (published as provides.host; not passed to the module)
+  #
+  # subnet_group, vpc_security_groups and host are the keys, under the same
+  # names, that the RDS Recipes read for the same concepts. subnet_group is
+  # required: a cache subnet group places the replication group in the
+  # operator's network, and this Recipe never chooses a network for the
+  # operator. The module's own subnet group and security group creation is left
+  # off, because both are the operator's.
+  #
+  # The module's own defaults stand for every input this mapping leaves out.
+  # Three are worth knowing: it encrypts the cache's data at rest, with the
+  # service's own key; it sends the Valkey slow log to a CloudWatch log group it
+  # creates under /aws/elasticache/; and it creates one node, with no replica
+  # and no automatic failover.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against ElastiCache's own documentation:
+  #   honoured — values.maxmemory_policy and values.databases, as the
+  #     maxmemory-policy and databases parameters ("Modifiable: Yes") of a
+  #     parameter group the module creates for the version's family;
+  #     infra.port; infra.engine_version (major and minor, among the versions
+  #     ElastiCache offers); infra.client_tls; and the overrides above.
+  #   refused — values.maxmemory ("The maxmemory parameter cannot be
+  #     modified": the node type fixes it), values.appendonly true ("The
+  #     configuration variables appendonly and appendfsync are not supported
+  #     on Valkey"), values.persistence.enabled true (ElastiCache provisions no
+  #     volume; its durability, a Multi-AZ transaction log, is offered for
+  #     cluster mode enabled alone, and the module takes no such input), an
+  #     attachment to server_certificate, and a password as set out below.
+  #   not read — infra.compute.cpu and infra.compute.memory, and
+  #     infra.storage.size and infra.storage.type, whose Component defaults
+  #     size a container and its volume: ElastiCache sizes the node by
+  #     infra.overrides.node_type and provisions no volume, and a Recipe cannot
+  #     tell those defaults from a value the Release wrote, so the Component's
+  #     descriptions say so instead. infra.source_version, as above.
+  #
+  # With infra.client_tls true the module turns on in-transit encryption, and
+  # the port accepts TLS alone. ElastiCache presents a certificate AWS
+  # Certificate Manager issues, which is publicly trusted, so a consumer checks
+  # it against its system trust store and needs no server_ca. That certificate
+  # carries the replication group's name, which AWS records in public
+  # Certificate Transparency logs.
+  #
+  # An attached password becomes the replication group's AUTH token, which
+  # ElastiCache accepts only with in-transit encryption on, so it halts while
+  # infra.client_tls is false. The token reaches the service as a Terraform
+  # reference to the password core/random-password's terraform/random-password
+  # realization draws at apply time, so no password is written into the
+  # rendered configuration; the apply keeps it in the Terraform state. Another
+  # credential either carries its value as text, which would be written into
+  # the configuration, or carries none the service could take, so it halts, and
+  # so do a password with punctuation or one shorter than 16 characters, which
+  # an AUTH token may not be.
+  assertions:
+    subnet_group_supplied: >-
+      {{- if not (and (hasKey .infra "overrides") (optional .infra.overrides "subnet_group" "")) -}}
+      {{- fail "this Release places its cache in a cache subnet group that already exists in the target account, and the published ElastiCache module this Recipe sources would otherwise create one from subnets the Release does not name, but infra.overrides.subnet_group carries none: set infra.overrides.subnet_group in the Release to the name of an existing ElastiCache subnet group" -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this cache reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the port is infra.port` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The Valkey versions ElastiCache offers, read off its engine-versions page.
+    # A version it adds later is refused here until this list names it.
+    engine_version_offered: >-
+      {{- $v := regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) -}}
+      {{- if not (has $v (list "7.2" "8.0" "8.1" "8.2" "9.0" "9.1")) -}}
+      {{- fail (printf "infra.engine_version is %q, and ElastiCache runs Valkey 7.2, 8.0, 8.1, 8.2, 9.0 and 9.1, which this Recipe reads off the major and minor version the value begins with: set infra.engine_version to one of them, such as 8.1" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    values_elasticache_cannot_apply: >-
+      {{- with optional .values "maxmemory" "" -}}
+      {{- fail (printf "values.maxmemory is %q, and ElastiCache fixes the memory a Valkey node may use by its node type; its maxmemory parameter cannot be modified: remove values.maxmemory from the Aggregate and size the cache with infra.overrides.node_type in the Release" (toString .)) -}}
+      {{- end -}}
+      {{- if .values.appendonly -}}
+      {{- fail "values.appendonly is true, and ElastiCache does not support the appendonly configuration on Valkey, so no append-only file is written: remove values.appendonly from the Aggregate, or map this component to a realization that runs the server itself" -}}
+      {{- end -}}
+      {{- if .values.persistence.enabled -}}
+      {{- fail "values.persistence.enabled is true, and ElastiCache provisions no volume for a Valkey cache: its durability, a Multi-AZ transaction log, is offered only with cluster mode enabled, which this Recipe does not provision: remove values.persistence.enabled from the Aggregate, or map this component to valkey or valkey-chart on helm, which keep the data on a persistent volume" -}}
+      {{- end -}}
+    tls_and_credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "server_certificate" -}}
+      {{- fail "a certificate is attached to the server_certificate slot, and ElastiCache presents a certificate AWS issues for the cache, which consumers trust without one: remove the attachment; infra.client_tls alone turns TLS on here" -}}
+      {{- end -}}
+      {{- if hasKey $f "password" -}}
+      {{- if not .infra.client_tls -}}
+      {{- fail "a password is attached to the password slot, and ElastiCache accepts an AUTH token only with in-transit encryption on, but infra.client_tls is false: set infra.client_tls to true, which serves the cache over TLS alone and publishes protocol valkey-tls, or remove the attachment" -}}
+      {{- end -}}
+      {{- $p := $f.password -}}
+      {{- if ne (toString (optional $p "type" "")) "core/random-password" -}}
+      {{- fail (printf "the password slot is filled by %s, and this Recipe hands ElastiCache its AUTH token as a Terraform reference to a password drawn at apply time, which core/random-password publishes through terraform/random-password; another credential either carries its value as text, which would be written into the rendered configuration, or carries none the service could take: attach core/random-password to the password slot instead" (toString (optional $p "type" "an attachment of no type"))) -}}
+      {{- end -}}
+      {{- $pv := optional $p "values" dict -}}
+      {{- if optional $pv "symbols" false -}}
+      {{- fail "the password attached to the password slot sets values.symbols to true, and the punctuation the random provider draws includes characters an ElastiCache AUTH token may not hold, which permits only !, &, #, $, ^, <, > and -: set values.symbols to false" -}}
+      {{- end -}}
+      {{- if lt (int (optional $pv "length" 32)) 16 -}}
+      {{- fail (printf "the password attached to the password slot sets values.length to %v, and an ElastiCache AUTH token is 16 to 128 characters: set values.length to at least 16" (optional $pv "length" 32)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the module's replication_group_primary_endpoint_address output — the
+  # address of the endpoint for the primary node — through this component's
+  # module call, which the boundary's root configuration declares under
+  # .context.instance_id for a component declared in the Aggregate the Release
+  # deploys. Terraform resolves it at apply time, so it resolves only for a
+  # consumer authored as a source: Recipe in the same root configuration; a
+  # consumer on another target receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record or alias for it, so the operator points the name at the cache
+  # outside the Release. A consumer in the same root configuration receives the
+  # name as well, and a name carries no reference for Terraform to order its
+  # module after this one by; a later syncWave on the consumer's boundary,
+  # sharing this boundary's directory, orders the two.
+  #
+  # port is the value the mapping below passes to the module, so it is known
+  # ahead of time and published as that value. protocol is valkey, or
+  # valkey-tls while infra.client_tls is on, when the port accepts TLS alone.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.replication_group_primary_endpoint_address}{{ end }}"
+    port: "{{ .infra.port }}"
+    protocol: "{{ if .infra.client_tls }}valkey-tls{{ else }}valkey{{ end }}"
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # replication group's identifier is the component's name, as the RDS Recipes
+  # name their instances. The module turns in-transit encryption on unless told
+  # otherwise, so the mapping always passes infra.client_tls. The AUTH token is
+  # the attachment's module output joined with a dot and wrapped in an
+  # interpolation, as terraform/random-password publishes it.
+  valuesMapping: |
+    replication_group_id: "{{ .context.instance_id }}"
+    engine: "valkey"
+    engine_version: "{{ .locals.engine_version }}"
+    node_type: "{{ optional .infra.overrides "node_type" "cache.t3.small" }}"
+    port: {{ .infra.port }}
+    transit_encryption_enabled: {{ .infra.client_tls }}
+    {{- with (default dict .features).password }}
+    {{- $prov := optional . "provides" dict }}
+    {{- if not (and (kindIs "map" $prov) (optional $prov "name" "") (optional $prov "key" "")) }}
+    {{- fail (printf "the password slot of %q is filled by an attachment that publishes no module output, and the AUTH token is handed to ElastiCache as a reference to one: bind core/random-password to terraform/random-password in the Manifest" $.context.instance_id) }}
+    {{- end }}
+    auth_token: "{{ printf "${%s.%s}" $prov.name $prov.key }}"
+    {{- end }}
+    create_subnet_group: false
+    subnet_group_name: "{{ .infra.overrides.subnet_group }}"
+    create_security_group: false
+    {{- with optional .infra.overrides "vpc_security_groups" "" }}
+    security_group_ids: {{ toJson . }}
+    {{- end }}
+    {{- if or .values.maxmemory_policy .values.databases }}
+    create_parameter_group: true
+    parameter_group_family: "{{ .locals.family }}"
+    parameters:
+    {{- with .values.maxmemory_policy }}
+      - name: "maxmemory-policy"
+        value: "{{ . }}"
+    {{- end }}
+    {{- with .values.databases }}
+      - name: "databases"
+        value: "{{ . }}"
+    {{- end }}
+    {{- end }}

@@ -1889,6 +1889,8 @@ recorded as "The `component.aggrega.ai/upstream-licensing` label" sets out for a
 vendored module. `recipe/terraform/postgres-rds-terraform-aws-modules` and its MySQL
 and MariaDB siblings are the shape: they source the terraform-aws-modules project's
 RDS module, whose root calls only its own `./modules/` directories.
+`recipe/terraform/valkey-elasticache` and `memcached-elasticache` source the same
+project's ElastiCache module, whose root declares no module call at all.
 
 #### A CloudFormation template
 
@@ -2007,6 +2009,19 @@ The canonical examples are
 and
 [`recipe/cloudformation/mariadb-rds/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/cloudformation/mariadb-rds/1.0.0/recipe.yaml).
 
+Where the managed service keeps no credential of its own and takes one as an
+argument — an ElastiCache Valkey replication group's AUTH token, say — a Terraform
+Recipe takes it from `core/random-password`, as the module output reference
+`terraform/random-password` publishes. The apply draws the value, the rendered
+configuration names it without carrying it, and the value is kept in the
+Terraform state. Another credential Feature either carries its value as text,
+which would be written into the configuration, or carries none the service could
+take, so such a Recipe halts on it, naming the slot, as it halts
+on a generator setting the service refuses — punctuation outside the characters it
+permits, a length it does not take.
+[`recipe/terraform/valkey-elasticache`](../aggrega-catalog/recipe/terraform/valkey-elasticache/1.0.0/recipe.yaml)
+is the shape.
+
 The same binding serves a self-managed datastore whose controller-driven Recipe
 leaves the credential to its controller.
 [`recipe/helm/mariadb-cluster`](../aggrega-catalog/recipe/helm/mariadb-cluster/1.0.0/recipe.yaml)
@@ -2048,10 +2063,11 @@ the block as text and reads nothing in it.
 
 A published module a Recipe sources is not a body the catalog authors, and it
 keeps its publisher's own constraint: the terraform-aws-modules RDS module the
-`-rds-terraform-aws-modules` Recipes vendor declares `hashicorp/aws >= 6.28`.
-That floor is why the constraint above may not drop below it — in a boundary
-holding both, Terraform installs one provider satisfying the catalog's range and
-the module's floor together.
+`-rds-terraform-aws-modules` Recipes vendor declares `hashicorp/aws >= 6.28`, and
+the ElastiCache module the `-elasticache` Recipes vendor `hashicorp/aws >= 5.93`.
+The highest of those floors is why the constraint above may not drop below it — in
+a boundary holding both, Terraform installs one provider satisfying the catalog's
+range and every module's floor together.
 
 ### Optional credential slots for self-managed datastores
 
@@ -3612,7 +3628,9 @@ copying whichever sibling happens to be nearest.
   reach every Recipe, a managed Recipe cannot tell them from a value a Release
   wrote, so it does not read them rather than refusing them. Each of those keys'
   descriptions on the Component says so, and names the `overrides` key the managed
-  Recipes size the instance by. A value a managed service cannot honour and that a
+  Recipes size the instance by. A managed cache that provisions no volume — the
+  ElastiCache realizations — reads no `storage.*` either, for the same reason, and
+  its descriptions say so too. A value a managed service cannot honour and that a
   Recipe can tell apart from a default — an application user the service does not
   create, an initialisation script, a raw configuration file, a replica count a
   Recipe does not provision — is refused by name instead. The key stays
@@ -3688,6 +3706,13 @@ template, not something the compiler checks: the compiler pipes the published
   to `server_certificate`, since the server would have no certificate to present;
   and a certificate attached while `client_tls` is false, since nothing would
   present it. An attachment that publishes no Secret name halts naming the slot.
+- **A managed realization turns on the service's own in-transit encryption.** The
+  ElastiCache realizations do: the service presents a certificate AWS issues, which
+  is publicly trusted, so a consumer needs no `server_ca` for it, and an attachment
+  to `server_certificate` halts naming the slot. An attached Valkey password becomes
+  the AUTH token, which ElastiCache accepts only with in-transit encryption on, so
+  it halts while `client_tls` is false; an attached Memcached password halts, since
+  ElastiCache offers no Memcached authentication.
 - **A realization that cannot serve TLS refuses `client_tls` by name and names one
   that can.** The Compose realizations do: both servers read their certificate
   from files, and no credential Feature realized on Compose names a secret a
@@ -3775,9 +3800,12 @@ The terraform RDS Recipes (`recipe/terraform/postgres-rds`, `mysql-rds`,
 `mariadb-rds`, the two `-module` Recipes and the three
 `-rds-terraform-aws-modules` Recipes, whose pointer names the module's
 `db_instance_address` output) and the CloudFormation ones
-(`recipe/cloudformation/postgres-rds`, `mysql-rds` and `mariadb-rds`) follow it.
-A managed datastore Recipe added later follows this section rather than a sibling
-Recipe.
+(`recipe/cloudformation/postgres-rds`, `mysql-rds` and `mariadb-rds`) follow it,
+and so do the terraform ElastiCache Recipes (`recipe/terraform/valkey-elasticache`,
+whose pointer names the module's `replication_group_primary_endpoint_address`
+output, and `memcached-elasticache`, whose pointer names `cluster_address`, the
+host of the cluster's configuration endpoint). A managed datastore Recipe added
+later follows this section rather than a sibling Recipe.
 
 ### The pipeline family template
 
