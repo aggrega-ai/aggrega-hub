@@ -30,7 +30,10 @@ metadata:
     runs an agent turn or scores an evaluation calls. The relational connections
     are rendered password-free: the password arrives beside them as an env
     secret reference and is named inside each URL in the platform's own
-    runtime-substitution form.
+    runtime-substitution form. A cache or queue publishing valkey-tls is
+    reached over TLS, its certificate checked against that connection's
+    server_ca, mounted, or the image's trust store; another TLS protocol halts
+    the build.
 
     The queue selector is emitted from the component's own value, empty by
     default, which is what makes one container run every family. This Recipe
@@ -50,6 +53,11 @@ spec:
   # AGENTA_WORKER_QUEUES for which families this container runs — an empty value
   # meaning all of them, which is why the variable is emitted even when the
   # component's value is unset.
+  #
+  # The three Redis URLs are composed as the control-plane API's Recipe
+  # composes them, over TLS included: the rediss scheme for a store publishing
+  # valkey-tls, and an ssl_ca_certs query argument naming the mounted
+  # server_ca, both read by the Redis client the worker builds from each URL.
   #
   # The names the edges deliver on are read here as BACKEND_HOST, BACKEND_PORT,
   # BACKEND_USER, CACHE_HOST, CACHE_PORT, QUEUE_HOST, QUEUE_PORT and
@@ -98,6 +106,40 @@ spec:
     {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
     {{- end }}{{ end -}}
     {{- if $gaps }}{{ fail (printf "core/ai-agent/agenta-worker-queues %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    {{- /*
+      The cache and queue connections over TLS, each on its own. A store
+      publishing valkey-tls accepts TLS connections alone, so its URL takes the
+      rediss scheme, which the platform's Redis client reads as TLS; any other
+      value ending in -tls names a store served over TLS the queue worker is not
+      taught to reach, and halts rather than connecting in plaintext. A
+      server_ca on a connection is the authority the client checks that
+      store's certificate against: it is mounted, and the URL names its ca.crt
+      in the client's ssl_ca_certs setting, so its attachment must name a
+      Secret, and it is refused on a store served without TLS, where no
+      handshake takes place to check a certificate in. DELIBERATE
+      NEAR-DUPLICATE of the block in the control-plane API's Recipe, which the
+      services, cron and two worker Recipes repeat inside templates of their
+      own: no catalog kind holds a template fragment for several Recipes to
+      share; change all five together.
+    */ -}}
+    {{- $redisTLS := dict }}{{ $redisCA := dict -}}
+    {{- range $alias, $edge := .context.uses }}{{ if has $edge.socket (list "cache" "queue") -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- $edgeTLS := eq $proto "valkey-tls" -}}
+    {{- if $edgeTLS }}{{ $_ := set $redisTLS $edge.socket true }}{{ else if hasSuffix "-tls" $proto -}}
+    {{- fail (printf "the %s connection %s of %q reaches %q, which publishes protocol %s, a store served over TLS that the agent workspace's queue worker does not reach: it speaks the Redis protocol, over TLS to a store publishing valkey-tls; wire a Redis-protocol store to the %s socket" $edge.socket $alias $.context.instance_id $edge.target $proto $edge.socket) -}}
+    {{- end -}}
+    {{- if hasKey (default dict $edge.features) "server_ca" -}}
+    {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) -}}
+    {{- fail (printf "the server_ca on the %s connection %s of %q publishes no Secret name, so no Secret could be mounted into the worker's container: attach a server_ca publishing one, such as core/referenced-secret" $edge.socket $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if not $edgeTLS -}}
+    {{- fail (printf "the %s connection %s of %q holds a server_ca, but the store it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that store, or remove the server_ca" $edge.socket $alias $.context.instance_id $edge.target (default "none" $proto)) -}}
+    {{- end -}}
+    {{- $_ := set $redisCA $edge.socket $caProvides.name -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # The worker holds no durable state — the relational backend is the system
@@ -129,11 +171,11 @@ spec:
           POSTGRES_URI_TRACING: "postgresql+asyncpg://{{ $env.BACKEND_USER }}:$(POSTGRES_PASSWORD)@{{ $env.BACKEND_HOST }}:{{ $env.BACKEND_PORT }}/{{ $edge.values.tracing_database }}"
     {{- end }}
     {{- if eq $edge.socket "cache" }}
-          REDIS_URI: "redis://{{ $env.CACHE_HOST }}:{{ $env.CACHE_PORT }}/{{ $edge.values.db_index }}"
-          REDIS_URI_VOLATILE: "redis://{{ $env.CACHE_HOST }}:{{ $env.CACHE_PORT }}/{{ $edge.values.db_index }}"
+          REDIS_URI: "{{ if hasKey $redisTLS "cache" }}rediss{{ else }}redis{{ end }}://{{ $env.CACHE_HOST }}:{{ $env.CACHE_PORT }}/{{ $edge.values.db_index }}{{ if hasKey $redisCA "cache" }}?ssl_ca_certs=/etc/agenta/cache-server-ca/ca.crt{{ end }}"
+          REDIS_URI_VOLATILE: "{{ if hasKey $redisTLS "cache" }}rediss{{ else }}redis{{ end }}://{{ $env.CACHE_HOST }}:{{ $env.CACHE_PORT }}/{{ $edge.values.db_index }}{{ if hasKey $redisCA "cache" }}?ssl_ca_certs=/etc/agenta/cache-server-ca/ca.crt{{ end }}"
     {{- end }}
     {{- if eq $edge.socket "queue" }}
-          REDIS_URI_DURABLE: "redis://{{ $env.QUEUE_HOST }}:{{ $env.QUEUE_PORT }}/{{ $edge.values.db_index }}"
+          REDIS_URI_DURABLE: "{{ if hasKey $redisTLS "queue" }}rediss{{ else }}redis{{ end }}://{{ $env.QUEUE_HOST }}:{{ $env.QUEUE_PORT }}/{{ $edge.values.db_index }}{{ if hasKey $redisCA "queue" }}?ssl_ca_certs=/etc/agenta/queue-server-ca/ca.crt{{ end }}"
     {{- end }}
     {{- end }}
     {{- if not $backendCredential }}
@@ -186,3 +228,23 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+    {{- if $redisCA }}
+        # Each store connection's server_ca Secret mounts whole, read-only, one
+        # file per data key, so the client reads ca.crt from its directory. It
+        # is a secret volume this Recipe names rather than a file attachment,
+        # because a pod volume is named after a file attachment's slot, and the
+        # underscore in server_ca is not a character a Kubernetes volume name
+        # may hold.
+        volumeMounts:
+    {{- range $socket := list "cache" "queue" }}{{ if hasKey $redisCA $socket }}
+          - name: {{ $socket }}-server-ca
+            path: /etc/agenta/{{ $socket }}-server-ca
+            readonly: true
+    {{- end }}{{ end }}
+    volumes:
+    {{- range $socket := list "cache" "queue" }}{{ with get $redisCA $socket }}
+      {{ $socket }}-server-ca:
+        secret:
+          source: "{{ . }}"
+    {{- end }}{{ end }}
+    {{- end }}

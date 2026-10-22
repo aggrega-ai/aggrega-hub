@@ -22,7 +22,9 @@ metadata:
     bounds selects a contiguous UDP port range instead, which is emitted as no
     container or service port and carries client traffic only where the pod
     uses the node's own network. Binding the state_store edge lets several
-    replicas coordinate through the shared store. The token-signing secret
+    replicas coordinate through the shared store, over TLS to one publishing
+    valkey-tls, checked against the connection's server_ca, mounted, or the
+    image's trust store. The token-signing secret
     arrives from the api_secret credential slot by reference, so the plaintext
     never appears in the rendered manifest.
 
@@ -87,7 +89,13 @@ spec:
   # When the state_store uses-edge is bound, the resolved host and port compose
   # the server's store address so several replicas coordinate through it, and a
   # bound edge leaving either missing from the inject pipe halts the build;
-  # unbound, no store address is emitted.
+  # unbound, no store address is emitted. A store publishing valkey-tls is
+  # reached over TLS through the body's redis.tls, the server checking the
+  # store's certificate and the name dialed against the authority in the
+  # connection's server_ca, its ca_cert_file, where one is attached, and
+  # against the image's default trust store where not. Read from the Redis
+  # settings of the LiveKit protocol library both LiveKit binaries build
+  # against, at the commit their releases pin.
   #
   # The token-signing secret arrives from the api_secret credential slot as an
   # env secretKeyRef and is composed with the public api_key identifier at
@@ -134,6 +142,36 @@ spec:
     {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
     {{- end }}{{ end -}}
     {{- if $gaps }}{{ fail (printf "core/messaging/livekit-server %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    {{- /*
+      The state store over TLS. A store publishing valkey-tls accepts TLS
+      connections alone, so the server reaches it over TLS; any other value
+      ending in -tls names a store served over TLS the server is not taught to
+      reach, and halts rather than connecting in plaintext. A server_ca on the
+      connection is the authority the server checks the store's certificate
+      against; it is mounted, so its attachment must name a Secret, and it is
+      refused on a store served without TLS, where no handshake takes place to
+      check a certificate in. DELIBERATE NEAR-DUPLICATE of the same block in the
+      SIP bridge's Recipe: no catalog kind holds a template fragment for
+      several Recipes to share; change both together.
+    */ -}}
+    {{- $storeTLS := false }}{{ $storeCA := "" -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "state_store" -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- $edgeTLS := eq $proto "valkey-tls" -}}
+    {{- if $edgeTLS }}{{ $storeTLS = true }}{{ else if hasSuffix "-tls" $proto -}}
+    {{- fail (printf "the state_store connection %s of %q reaches %q, which publishes protocol %s, a store served over TLS that the LiveKit server does not reach: it speaks the Redis protocol, over TLS to a store publishing valkey-tls; wire a Redis-protocol store to the state_store socket" $alias $.context.instance_id $edge.target $proto) -}}
+    {{- end -}}
+    {{- if hasKey (default dict $edge.features) "server_ca" -}}
+    {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) -}}
+    {{- fail (printf "the server_ca on the state_store connection %s of %q publishes no Secret name, so no Secret could be mounted into the server's container: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if not $edgeTLS -}}
+    {{- fail (printf "the state_store connection %s of %q holds a server_ca, but the store it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that store, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $proto)) -}}
+    {{- end -}}
+    {{- $storeCA = $caProvides.name -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     {{- /* The media path: a contiguous UDP range when both bounds carry a
@@ -187,6 +225,13 @@ spec:
     {{- if has "state_store" $wired }}
             redis:
               address: "{{ $env.LIVEKIT_STATE_STORE_HOST }}:{{ $env.LIVEKIT_STATE_STORE_PORT }}"
+    {{- if $storeTLS }}
+              tls:
+                enabled: true
+    {{- if $storeCA }}
+                ca_cert_file: /etc/livekit/state-store-server-ca/ca.crt
+    {{- end }}
+    {{- end }}
     {{- end }}
     {{- if .values.metrics_enabled }}
             prometheus:
@@ -233,6 +278,22 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+    {{- if $storeCA }}
+        # The state_store connection's server_ca Secret mounts whole, read-only,
+        # one file per data key, so the server reads ca.crt from this directory.
+        # It is a secret volume this Recipe names rather than a file attachment,
+        # because a pod volume is named after a file attachment's slot, and the
+        # underscore in server_ca is not a character a Kubernetes volume name
+        # may hold.
+        volumeMounts:
+          - name: state-store-server-ca
+            path: /etc/livekit/state-store-server-ca
+            readonly: true
+    volumes:
+      state-store-server-ca:
+        secret:
+          source: "{{ $storeCA }}"
+    {{- end }}
     services:
       default:
         type: ClusterIP

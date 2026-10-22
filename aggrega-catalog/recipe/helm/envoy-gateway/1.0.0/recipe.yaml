@@ -31,13 +31,11 @@ metadata:
     base URL, qualified with envoy-gateway-system.
 
     The route's one traffic policy holds core/period-budget as a rate limit
-    on the route's token cost, counted in the cache socket's store,
-    core/retry-policy as a retry count, and core/concurrency-limit as a
-    per-model cap on requests in flight. core/audit-logging is the gateway's
-    access log, adding the model and token counts.
-
-    provides also publishes the pod label, port name and path a scraper
-    discovers the proxies' metrics by.
+    on the route's token cost, counted in the cache socket's store, over TLS
+    to one publishing valkey-tls, core/retry-policy as a retry count, and
+    core/concurrency-limit as a per-model cap on requests in flight.
+    core/audit-logging is the gateway's access log, adding the model and token
+    counts.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -213,7 +211,10 @@ spec:
     ## socket, which that realization requires while the budget is attached;
     ## with no attachment nothing here is written, whatever the cache socket
     ## holds. The store must speak the Redis protocol, which a store publishes
-    ## as redis or valkey, and the build halts on any other. Its published
+    ## as redis or valkey, or valkey-tls when it is served over TLS alone, and
+    ## the build halts on any other, another value served over TLS included.
+    ## A server_ca on the connection publishing no Secret name halts, as does
+    ## one on a store served without TLS. Its published
     ## host carries no namespace, so a host with no dot and no colon is
     ## qualified with the namespace the Release places the store in, or
     ## `default` where it declares none. The connection's credential, where it
@@ -236,9 +237,15 @@ spec:
     {{- end }}
     {{- $storeAddress := "" }}
     {{- $storeSecret := dict }}
+    {{- $storeTLS := false }}
+    {{- $storeCA := "" }}
     {{- with $store }}
       {{- $protocol := toString (optional (default dict .provides) "protocol" "") }}
-      {{- if not (has $protocol (list "redis" "valkey")) }}
+      {{- if eq $protocol "valkey-tls" }}
+      {{- $storeTLS = true }}
+      {{- else if hasSuffix "-tls" $protocol }}
+      {{- fail (printf "the cache socket of %q is wired to %q, whose published protocol is %q, a store served over TLS that Envoy Gateway's rate-limit service is not taught to reach: it speaks the Redis protocol, over TLS to a store publishing valkey-tls; wire a Redis-protocol store to the cache socket" $.context.instance_id .target $protocol) }}
+      {{- else if not (has $protocol (list "redis" "valkey")) }}
       {{- fail (printf "the cache socket of %q is wired to %q, whose published protocol is %q, but Envoy Gateway's rate-limit service keeps a period budget's count in a store speaking the Redis protocol, which a store publishes as redis or valkey; wire a core/datastore/redis to the cache socket instead" $.context.instance_id .target $protocol) }}
       {{- end }}
       {{- $host := lower (toString .provides.host) }}
@@ -252,6 +259,16 @@ spec:
         {{- fail (printf "the credential on the cache connection of %q publishes no Secret name and data key, so Envoy Gateway's rate-limit service could not be given a reference to read the store's password from; attach a credential publishing both, such as core/referenced-secret" $.context.instance_id) }}
         {{- end }}
         {{- $storeSecret = $locator }}
+      {{- end }}
+      {{- if hasKey (default dict .features) "server_ca" }}
+        {{- $caLocator := optional (optional (default dict .features) "server_ca" dict) "provides" dict }}
+        {{- if not (and (kindIs "map" $caLocator) (optional $caLocator "name" "")) }}
+        {{- fail (printf "the server_ca on the cache connection of %q publishes no Secret name, so no Secret could be mounted into Envoy Gateway's rate-limit service: attach a server_ca publishing one, such as core/referenced-secret" $.context.instance_id) }}
+        {{- end }}
+        {{- if not $storeTLS }}
+        {{- fail (printf "the cache connection of %q holds a server_ca, but the store it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that store, or remove the server_ca" $.context.instance_id .target (default "none" $protocol)) }}
+        {{- end }}
+        {{- $storeCA = $caLocator.name }}
       {{- end }}
     {{- end }}
     {{- $calendarMonth := false }}
@@ -348,7 +365,19 @@ spec:
         ## counted, because its tokens are charged after the reply. The
         ## password reaches the service as REDIS_AUTH, read from the Secret
         ## the cache connection's credential publishes, which the service
-        ## resolves in its own namespace, the gateway's. For a budget of one
+        ## resolves in its own namespace, the gateway's. A store publishing
+        ## valkey-tls is reached over TLS: redis.tls turns REDIS_TLS on in the
+        ## service, which then checks the store's certificate and the host name
+        ## it dials, against the authority in REDIS_TLS_CACERT where the
+        ## connection holds a server_ca and otherwise against the image's
+        ## default trust store. The control plane mounts a volume named
+        ## redis-certs at /redis-certs into the service whenever redis.tls is
+        ## set, but adds that volume itself only for a client certificate,
+        ## which a store here does not ask for, so the volume is supplied here:
+        ## the server_ca's Secret, in the gateway's namespace, whose ca.crt the
+        ## service reads, or an empty directory where none is held. Read from
+        ## the controller's source at v1.9.1 and the rate-limit service's at
+        ## the commit its chart pins. For a budget of one
         ## calendar month the service is told, through
         ## USE_CALENDAR_MONTH_RATE_LIMIT, to count a Month from the first day
         ## of a calendar month to its last; the setting is the service's, so it
@@ -359,11 +388,15 @@ spec:
             type: Redis
             redis:
               url: {{ . | toJson }}
+              {{- if $storeTLS }}
+              tls: {}
+              {{- end }}
           failClosed: true
-        {{- if or $storeSecret $calendarMonth }}
+        {{- if or $storeSecret $calendarMonth $storeTLS }}
         provider:
           kubernetes:
             rateLimitDeployment:
+              {{- if or $storeSecret $calendarMonth $storeCA }}
               container:
                 env:
                   {{- with $storeSecret }}
@@ -377,6 +410,22 @@ spec:
                   - name: USE_CALENDAR_MONTH_RATE_LIMIT
                     value: "true"
                   {{- end }}
+                  {{- if $storeCA }}
+                  - name: REDIS_TLS_CACERT
+                    value: /redis-certs/ca.crt
+                  {{- end }}
+              {{- end }}
+              {{- if $storeTLS }}
+              pod:
+                volumes:
+                  - name: redis-certs
+                    {{- if $storeCA }}
+                    secret:
+                      secretName: {{ $storeCA | toJson }}
+                    {{- else }}
+                    emptyDir: {}
+                    {{- end }}
+              {{- end }}
         {{- end }}
         {{- end }}
 

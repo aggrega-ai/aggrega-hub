@@ -28,7 +28,10 @@ metadata:
     console and the worker run one version, and the chart version in
     source.version. infra.external_base_url reaches the console as the chart's
     `langfuse.nextauth.url`. The configuration contract is authored against the
-    chart's own application version.
+    chart's own application version. A cache publishing valkey-tls is reached
+    through the chart's own Redis TLS setting, checked against the cache
+    connection's server_ca, mounted, or the runtime's trust store; another TLS
+    protocol on the cache halts the build.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -164,6 +167,35 @@ spec:
       {{- if eq $edge.socket "event_store" }}
         {{- $store = $edge }}
         {{- $storeAlias = $alias }}
+      {{- end }}
+    {{- end }}
+
+    ## The cache connection over TLS. A cache publishing valkey-tls accepts TLS
+    ## connections alone, so the chart's own TLS switch is turned on for it; any
+    ## other value ending in -tls names a cache served over TLS the platform is
+    ## not taught to reach, and halts rather than connecting in plaintext. A
+    ## server_ca on the connection is mounted into both Deployments, so its
+    ## attachment must name a Secret, and it is refused on a cache served
+    ## without TLS, where no handshake takes place to check a certificate in.
+    {{- $cacheTLS := false }}
+    {{- $cacheCA := "" }}
+    {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "cache" }}
+        {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") }}
+        {{- $edgeTLS := eq $proto "valkey-tls" }}
+        {{- if $edgeTLS }}{{ $cacheTLS = true }}{{ else if hasSuffix "-tls" $proto }}
+        {{- fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a cache served over TLS that the Langfuse console and worker do not reach: they speak the Redis protocol, over TLS to a cache publishing valkey-tls; wire a Redis-protocol cache to the cache socket" $alias $.context.instance_id $edge.target $proto) }}
+        {{- end }}
+        {{- if hasKey (default dict $edge.features) "server_ca" }}
+          {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict }}
+          {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) }}
+          {{- fail (printf "the server_ca on the cache connection %s of %q publishes no Secret name, so no Secret could be mounted into the console and the worker: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) }}
+          {{- end }}
+          {{- if not $edgeTLS }}
+          {{- fail (printf "the cache connection %s of %q holds a server_ca, but the cache it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that cache, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $proto)) }}
+          {{- end }}
+          {{- $cacheCA = $caProvides.name }}
+        {{- end }}
       {{- end }}
     {{- end }}
 
@@ -314,6 +346,21 @@ spec:
       {{- end }}
       {{- end }}
 
+      ## ── The cache connection's authority, mounted in both Deployments ──
+      ## The Secret the cache connection's server_ca names, mounted whole and
+      ## read-only into the console and the worker, the chart's own extension
+      ## point for a volume both carry; redis.tls.caPath below names its ca.crt.
+      {{- with $cacheCA }}
+      extraVolumes:
+        - name: cache-server-ca
+          secret:
+            secretName: "{{ . }}"
+      extraVolumeMounts:
+        - name: cache-server-ca
+          mountPath: /etc/langfuse/cache-server-ca
+          readOnly: true
+      {{- end }}
+
       ## ── Settings the chart carries no value of its own for ───
       ## The chart maps every backing system it knows about onto its own value
       ## surface, and these are the ones it does not: the analytics store, which
@@ -396,6 +443,18 @@ spec:
         existingSecret: "{{ $cache.features.credential.provides.name }}"
         existingSecretPasswordKey: "{{ $cache.features.credential.provides.key }}"
         {{- end }}
+      ## Over TLS the chart composes a rediss:// connection string and the
+      ## platform's cache client verifies the cache's certificate and the name
+      ## dialed, Node's default: against the authority mounted above where the
+      ## connection holds a server_ca, and otherwise against the runtime's own
+      ## trust store, which a publicly trusted certificate chains to.
+      {{- if $cacheTLS }}
+      tls:
+        enabled: true
+        {{- if $cacheCA }}
+        caPath: /etc/langfuse/cache-server-ca/ca.crt
+        {{- end }}
+      {{- end }}
 
     ## ── The columnar analytics store ───────────────────────────
     ## Switched off as a thing this chart provisions. Its addresses are

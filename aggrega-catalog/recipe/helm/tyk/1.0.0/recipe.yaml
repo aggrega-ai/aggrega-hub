@@ -27,12 +27,11 @@ metadata:
     chart, which spells the component's name in the alphabet a Kubernetes name
     allows, and provides.host names the Service the chart emits.
     It writes each core/upstream-key-pinning attachment into the gateway's
-    environment. Default chart version in source.version; override via
+    environment. A cache publishing valkey-tls is reached through the chart's
+    own Redis TLS setting, checked against the cache connection's server_ca,
+    mounted, or the image's trust store; another TLS protocol on the cache
+    halts the build. Default chart version in source.version; override via
     infra.source_version.
-
-    The chart writes no namespace; the helm provider places its resources in
-    the one the Release declares, and with none declared they land where the
-    applying tool puts them.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -113,6 +112,33 @@ spec:
     {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
     {{- end }}{{ end -}}
     {{- if $gaps }}{{ fail (printf "core/gateway/tyk %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    {{- /*
+      The cache connection over TLS. A cache publishing valkey-tls accepts TLS
+      connections alone, so the gateway reaches it over TLS; any other value
+      ending in -tls names a cache served over TLS the gateway is not taught to
+      reach, and halts rather than connecting in plaintext. A server_ca on the
+      connection is mounted into the gateway, so its attachment must name a
+      Secret, and it is refused on a cache served without TLS, where no
+      handshake takes place to check a certificate in.
+    */ -}}
+    {{- $cacheTLS := false }}{{ $cacheCA := "" -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "cache" -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- $edgeTLS := eq $proto "valkey-tls" -}}
+    {{- if $edgeTLS }}{{ $cacheTLS = true }}{{ else if hasSuffix "-tls" $proto -}}
+    {{- fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a cache served over TLS that the Tyk gateway does not reach: it speaks the Redis protocol, over TLS to a cache publishing valkey-tls; wire a Redis-protocol cache to the cache socket" $alias $.context.instance_id $edge.target $proto) -}}
+    {{- end -}}
+    {{- if hasKey (default dict $edge.features) "server_ca" -}}
+    {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) -}}
+    {{- fail (printf "the server_ca on the cache connection %s of %q publishes no Secret name, so no Secret could be mounted into the gateway: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if not $edgeTLS -}}
+    {{- fail (printf "the cache connection %s of %q holds a server_ca, but the cache it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that cache, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $proto)) -}}
+    {{- end -}}
+    {{- $cacheCA = $caProvides.name -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
     ## ── The chart's shared block: what is deployed, and what it talks to ──
     global:
       ## The chart carries the analytics purger and the vendor's Kubernetes
@@ -160,6 +186,25 @@ spec:
           keyName: "{{ $cacheCredential.provides.key }}"
         {{- else }}
         pass: ""
+        {{- end }}
+        ## Over TLS the gateway reaches the cache with the chart's own switch,
+        ## and checks the cache's certificate, ssl_insecure_skip_verify being
+        ## left at its default, false: against the authority in the
+        ## connection's server_ca where one is attached — the chart mounts the
+        ## Secret it names and points the gateway at its ca.crt — and otherwise
+        ## against the image's default trust store. The chart writes the two
+        ## TLS version bounds whenever TLS is on, empty unless set, so both are
+        ## set to the gateway's documented defaults.
+        {{- if $cacheTLS }}
+        useSSL: true
+        tlsMinVersion: "1.2"
+        tlsMaxVersion: "1.3"
+        {{- with $cacheCA }}
+        secretName: "{{ . }}"
+        volumeName: cache-server-ca
+        certificatesMountPath: /etc/tyk-gateway/cache-server-ca
+        caFile: /etc/tyk-gateway/cache-server-ca/ca.crt
+        {{- end }}
         {{- end }}
 
     ## The chart emits a configuration secret for the controller regardless of

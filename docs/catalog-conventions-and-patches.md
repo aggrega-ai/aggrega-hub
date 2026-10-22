@@ -3672,10 +3672,9 @@ template, not something the compiler checks: the compiler pipes the published
   documentation uses for the feature. The port then accepts TLS alone, and `host`
   and `port` are unchanged, so `protocol` is what tells a consumer that TLS is
   required; a plaintext client reaching the port fails its handshake and exchanges
-  no command. A consumer Recipe that checks `protocol` against the values it
-  supports refuses one it does not list, naming the connection, so such a consumer
-  not yet taught the TLS value is refused at build time rather than reaching a TLS
-  port in plaintext.
+  no command. Every consumer Recipe of the two caches checks `protocol`: one taught
+  the TLS value reaches the cache over TLS, and every other refuses a value served
+  over TLS, naming the connection, so no consumer reaches a TLS port in plaintext.
 - **A self-hosted realization presents the certificate attached to the slot
   `server_certificate`**, declared optional with `selector:
   "feature.aggrega.ai/kind=secret"`, `sensitive: true` and `inject: [file]`. Its
@@ -3703,8 +3702,23 @@ template, not something the compiler checks: the compiler pipes the published
   trusted certificate chains to. It halts, naming the connection, on a
   `server_ca` publishing no Secret name, on a `server_ca` on a connection whose
   cache serves no TLS, and on a value served over TLS it is not taught to reach.
-  The Dify API server, task worker, scheduler and plugin runtime consume a cache
-  this way.
+  A consumer whose product takes the authority from a file it cannot be given on
+  its target refuses `server_ca` by name there: the Compose realization of Tyk
+  does, and connects over TLS against its image's trust store. The Dify API
+  server, task worker, scheduler and plugin runtime, the Agenta API and its two
+  workers, whose services and scheduler Recipes compose the same URLs, Langfuse,
+  Tyk, the LiveKit media server and SIP bridge, and the period-budget stores of
+  Envoy Gateway and Traefik Hub consume a Valkey cache this way; none is taught
+  `memcached-tls`.
+- **A consumer whose product cannot reach a cache over TLS refuses the TLS value
+  by name**, naming the connection and the cache's protocol: Higress's token
+  limit, whose plugin's Redis settings offer no TLS connection, and the four
+  consumers that hand a store's address to the Release's own code —
+  `core/ai-tool/datastore-query`, `core/ai-agent/langgraph`, `dynamiq` and
+  `phidata` — which give that code no authority to check a certificate against,
+  and the last three not even the store's protocol. Loki's chunk
+  cache refuses `memcached-tls` through the protocol check its Recipes share,
+  which accepts one value.
 
 ### The name a managed datastore is reached at from another target
 

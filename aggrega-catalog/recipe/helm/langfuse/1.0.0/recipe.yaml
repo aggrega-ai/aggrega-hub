@@ -24,7 +24,10 @@ metadata:
     in the rendered manifest. The encryption key and the session secret have
     no default and their slots are required; any other unattached credential
     renders a development literal, as its description says, except the cache
-    and analytics-store passwords, which then render nothing.
+    and analytics-store passwords, which then render nothing. A cache publishing
+    valkey-tls is reached over TLS, its certificate checked against the cache
+    connection's server_ca, mounted, or the runtime's trust store; another TLS
+    protocol on the cache halts the build.
 
     Reach for this realization where the build must complete with nothing
     fetched, or where no chart repository is reachable from it; reach for
@@ -202,6 +205,37 @@ spec:
     {{- end -}}
     {{- end -}}
     {{- end -}}
+    {{- /*
+      The cache connection over TLS. A cache publishing valkey-tls accepts TLS
+      connections alone, so both containers reach it over TLS; any other value
+      ending in -tls names a cache served over TLS this platform is not taught
+      to reach, and halts rather than connecting in plaintext. A server_ca on
+      the connection is the authority both containers check the cache's
+      certificate against; it is mounted, so its attachment must name a
+      Secret, and it is refused on a cache served without TLS, where no
+      handshake takes place to check a certificate in. Resolved once here
+      because both containers deliver it. DELIBERATE NEAR-DUPLICATE of the
+      same block in the Dify Recipes: no catalog kind holds a template
+      fragment for several Recipes to share.
+    */ -}}
+    {{- $cacheTLS := false }}{{ $cacheCA := "" -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "cache" -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- $edgeTLS := eq $proto "valkey-tls" -}}
+    {{- if $edgeTLS }}{{ $cacheTLS = true }}{{ else if hasSuffix "-tls" $proto -}}
+    {{- fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a cache served over TLS that the Langfuse console and worker do not reach: they speak the Redis protocol, over TLS to a cache publishing valkey-tls; wire a Redis-protocol cache to the cache socket" $alias $.context.instance_id $edge.target $proto) -}}
+    {{- end -}}
+    {{- if hasKey (default dict $edge.features) "server_ca" -}}
+    {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) -}}
+    {{- fail (printf "the server_ca on the cache connection %s of %q publishes no Secret name, so no Secret could be mounted into the console and the worker: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if not $edgeTLS -}}
+    {{- fail (printf "the cache connection %s of %q holds a server_ca, but the cache it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that cache, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $proto)) -}}
+    {{- end -}}
+    {{- $cacheCA = $caProvides.name -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # Neither container holds durable state — the relational backend, the cache,
@@ -240,6 +274,17 @@ spec:
     {{- range $alias, $edge := .context.uses }}
     {{- if eq $edge.socket "cache" }}
           REDIS_KEY_PREFIX: "{{ $edge.values.key_prefix }}"
+    {{- end }}
+    {{- end }}
+          # Over TLS the cache client verifies the cache's certificate and the
+          # name dialed, Node's default: against the authority in the
+          # connection's server_ca where one is attached, and otherwise against
+          # the runtime's own trust store, which a publicly trusted certificate
+          # chains to.
+    {{- if $cacheTLS }}
+          REDIS_TLS_ENABLED: "true"
+    {{- if $cacheCA }}
+          REDIS_TLS_CA_PATH: /etc/langfuse/cache-server-ca/ca.crt
     {{- end }}
     {{- end }}
           # The object store is addressed by a single endpoint the platform's S3
@@ -359,6 +404,18 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+    {{- if $cacheCA }}
+        # The cache connection's server_ca Secret mounts whole, read-only, one
+        # file per data key, so the cache client reads ca.crt from this
+        # directory. It is a secret volume this Recipe names rather than a file
+        # attachment, because a pod volume is named after a file attachment's
+        # slot, and the underscore in server_ca is not a character a Kubernetes
+        # volume name may hold.
+        volumeMounts:
+          - name: cache-server-ca
+            path: /etc/langfuse/cache-server-ca
+            readonly: true
+    {{- end }}
       worker:
         image: "{{ .locals.worker_image }}"
         # The worker reads the same backing systems as the console — it drains the
@@ -379,6 +436,12 @@ spec:
     {{- range $alias, $edge := .context.uses }}
     {{- if eq $edge.socket "cache" }}
           REDIS_KEY_PREFIX: "{{ $edge.values.key_prefix }}"
+    {{- end }}
+    {{- end }}
+    {{- if $cacheTLS }}
+          REDIS_TLS_ENABLED: "true"
+    {{- if $cacheCA }}
+          REDIS_TLS_CA_PATH: /etc/langfuse/cache-server-ca/ca.crt
     {{- end }}
     {{- end }}
           LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "{{ $storeEndpoint }}"
@@ -476,6 +539,16 @@ spec:
           limits:
             cpu: "{{ .infra.worker_compute.cpu }}"
             memory: "{{ .infra.worker_compute.memory }}"
+    {{- if $cacheCA }}
+        volumeMounts:
+          - name: cache-server-ca
+            path: /etc/langfuse/cache-server-ca
+            readonly: true
+    volumes:
+      cache-server-ca:
+        secret:
+          source: "{{ $cacheCA }}"
+    {{- end }}
     services:
       default:
         type: ClusterIP

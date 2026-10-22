@@ -31,11 +31,9 @@ metadata:
     core/semantic-caching, core/data-masking, core/fallback-chain or
     core/retry-policy attachment, each FeatureRecipe saying how; the first
     four halt the build until infra.ai_gateway_entitled affirms the licence's
-    AI gateway. No build observes that the gateway enforces any of them.
-
-    With `values.metrics_enabled` true the chart adds a ClusterIP Service,
-    `<rendered_name>-metrics`, for metrics port 9100, which checks no caller,
-    and provides.metrics_endpoint publishes it; false, it is empty.
+    AI gateway. No build observes that the gateway enforces any of them. A
+    budget's store publishing valkey-tls is reached over TLS, checked against
+    the cache connection's server_ca or the system's authorities.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -98,7 +96,13 @@ spec:
   # recipe/helm/litellm-gateway: both gateways call the same analyzer, and a
   # Recipe's local is read by its own attachments alone, so neither can read
   # the other's. If the analyzer's list changes, change both in the same edit.
+  #
+  # cache_server_ca_path is the directory the cache connection's server_ca
+  # Secret is mounted at in the gateway's container, written once here
+  # because the value mapping mounts it and the quota middleware's
+  # configuration names the file in it.
   locals:
+    cache_server_ca_path: /etc/traefik/cache-server-ca
     callers: '{{ with optional .infra "callers" "" }}{{ range $i, $caller := . }}{{ if $i }}, {{ end }}{{ $caller }}{{ end }}{{ end }}'
     analyzer_entity_types: '["CREDIT_CARD", "CRYPTO", "DATE_TIME", "EMAIL_ADDRESS", "IBAN_CODE", "IP_ADDRESS", "LOCATION", "MAC_ADDRESS", "MEDICAL_LICENSE", "NRP", "PERSON", "PHONE_NUMBER", "UK_NHS", "URL", "US_BANK_NUMBER", "US_DRIVER_LICENSE", "US_ITIN", "US_PASSPORT", "US_SSN"]'
 
@@ -269,10 +273,43 @@ spec:
       repository: "{{ $repository }}"
       tag: "{{ $tag }}{{ with $digest }}@{{ . }}{{ end }}"
     versionOverride: "{{ $tag }}"
-    {{- with .infra.image_pull_secret }}
+    {{- /* The authority the quota middleware checks a period budget's store
+           against: the Secret the cache connection's server_ca names, mounted
+           whole and read-only into the gateway while a budget is attached, at
+           the path the middleware's store.redis.tls.ca names below. The
+           middleware reads the file from the gateway's own filesystem, and the
+           chart's additional volumes are how a Secret reaches it there. */}}
+    {{- $cacheCA := "" }}
+    {{- $budgetAttached := false }}
+    {{- range $budgetName, $attachment := (default dict .features) }}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}{{ $budgetAttached = true }}{{ end }}
+    {{- end }}
+    {{- if $budgetAttached }}
+      {{- range $alias, $edge := .context.uses }}
+        {{- if eq $edge.socket "cache" }}
+          {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict }}
+          {{- if kindIs "map" $caProvides }}{{ $cacheCA = toString (optional $caProvides "name" "") }}{{ end }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- if or .infra.image_pull_secret $cacheCA }}
     deployment:
+      {{- with .infra.image_pull_secret }}
       imagePullSecrets:
         - name: "{{ . }}"
+      {{- end }}
+      {{- with $cacheCA }}
+      additionalVolumes:
+        - name: cache-server-ca
+          secret:
+            secretName: "{{ . }}"
+      {{- end }}
+    {{- end }}
+    {{- with $cacheCA }}
+    additionalVolumeMounts:
+      - name: cache-server-ca
+        mountPath: "{{ $.locals.cache_server_ca_path }}"
+        readOnly: true
     {{- end }}
 
     ## ── Traefik Hub and its AI gateway ─────────────────────────
@@ -447,7 +484,14 @@ spec:
   # so a reply the cache serves counts nothing. It counts in the store on the
   # cache connection — one connection speaking the Redis protocol, its
   # published host and port, its credential by reference — and reads the
-  # request as a chat completion, so it counts the tokens a reply reports, a
+  # request as a chat completion. A store publishing valkey-tls is reached
+  # over TLS through the middleware's store.redis.tls: its certificate is
+  # checked against the cache connection's server_ca, mounted into the gateway
+  # and named by tls.ca, or, with none, against the system's authorities, the
+  # middleware's default. Another value served over TLS stops the build, as do
+  # a server_ca publishing no Secret name and one on a store served without
+  # TLS. Read from Traefik's published reference for the middleware. It
+  # counts the tokens a reply reports, a
   # streamed reply's included, or prices them in US dollars from the list it
   # ships with, as unit names. It keeps its count per value of a request
   # header named after the attachment, X-Period-Budget- followed by the
@@ -597,13 +641,23 @@ spec:
       {{- end }}
       {{- $counterAddress := "" }}
       {{- $counterPassword := "" }}
+      {{- $counterTLS := false }}
+      {{- $counterCA := false }}
       {{- if $budgets }}
       {{- if gt (len $counterStores) 1 }}{{ fail (printf "the cache socket of %q holds %d connections, but Traefik Hub's quota middleware keeps a period budget's count in one store; keep one connection on the cache socket" .context.instance_id (len $counterStores)) }}{{ end }}
       {{- with $counterStores }}
       {{- $alias := index (first .) 0 }}
       {{- $edge := index (first .) 1 }}
       {{- $protocol := toString (optional (default dict $edge.provides) "protocol" "") }}
-      {{- if not (has $protocol (list "redis" "valkey")) }}{{ fail (printf "the cache socket of %q is wired to %q, whose published protocol is %q, but Traefik Hub's quota middleware keeps a period budget's count in a store speaking the Redis protocol, which a store publishes as redis or valkey; wire a core/datastore/redis to the cache socket instead" $.context.instance_id $edge.target $protocol) }}{{ end }}
+      {{- $counterTLS = eq $protocol "valkey-tls" }}
+      {{- if and (not $counterTLS) (hasSuffix "-tls" $protocol) }}{{ fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a store served over TLS that Traefik Hub's quota middleware is not taught to reach: it speaks the Redis protocol, over TLS to a store publishing valkey-tls; wire a Redis-protocol store to the cache socket" $alias $.context.instance_id $edge.target $protocol) }}{{ end }}
+      {{- if not (or $counterTLS (has $protocol (list "redis" "valkey"))) }}{{ fail (printf "the cache socket of %q is wired to %q, whose published protocol is %q, but Traefik Hub's quota middleware keeps a period budget's count in a store speaking the Redis protocol, which a store publishes as redis or valkey; wire a core/datastore/redis to the cache socket instead" $.context.instance_id $edge.target $protocol) }}{{ end }}
+      {{- if hasKey (default dict $edge.features) "server_ca" }}
+      {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict }}
+      {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) }}{{ fail (printf "the server_ca on the cache connection %s of %q publishes no Secret name, so no Secret could be mounted into the gateway: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) }}{{ end }}
+      {{- if not $counterTLS }}{{ fail (printf "the cache connection %s of %q holds a server_ca, but the store it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that store, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $protocol)) }}{{ end }}
+      {{- $counterCA = true }}
+      {{- end }}
       {{- $host := lower (toString $edge.provides.host) }}
       {{- if not (or (contains "." $host) (contains ":" $host)) }}
       {{- $host = printf "%s.%s.svc.cluster.local" $host (optional (optional (default dict $edge.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default") }}
@@ -1043,6 +1097,12 @@ spec:
                   - {{ $counterAddress | toJson }}
       {{- with $counterPassword }}
                 password: {{ . | toJson }}
+      {{- end }}
+      {{- if $counterCA }}
+                tls:
+                  ca: {{ printf "%s/ca.crt" $.locals.cache_server_ca_path | toJson }}
+      {{- else if $counterTLS }}
+                tls: {}
       {{- end }}
             {{ $quota.limitKey }}:
               limit: {{ $quota.limit }}
