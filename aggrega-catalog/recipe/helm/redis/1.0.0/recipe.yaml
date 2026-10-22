@@ -20,6 +20,10 @@ metadata:
     independent of where it is deployed. A consumer in another namespace
     qualifies the host with the target namespace on its own side (caller-side
     routing). The packaged Redis server is AGPL-3.0.
+
+    With infra.client_tls true the cache serves TLS alone on its port from the
+    Secret attached to server_certificate, mounted as files, the probes ping
+    over TLS, and protocol is published as redis-tls.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -32,6 +36,11 @@ spec:
   #           authored here rather than exposed, so a Release needing a
   #           different image — one built to be reconciled by a Redis
   #           controller, say — names the whole reference through this key.
+  #           The image named there is given the same server flags as the
+  #           stock one — the knobs, the port, the password and the TLS flags
+  #           below — so it must start redis-server from a flag-leading
+  #           argument list, as the stock image's entrypoint does, and serve
+  #           TLS while infra.client_tls is on.
   #
   # provides.host is the bare Service name "<rendered_name>-default" — the helm
   # provider names the synthesized ClusterIP Service "<rendered_name>-<service-key>"
@@ -39,7 +48,8 @@ spec:
   # consumer reaches it under this name directly; a cross-namespace consumer
   # qualifies it with the target namespace caller-side. protocol is "redis" —
   # Redis speaks the Redis wire protocol; the family publishes it under the
-  # engine name so all redis recipes present a single protocol value.
+  # engine name so all redis recipes present a single protocol value — and
+  # "redis-tls" while infra.client_tls is on, when the port accepts TLS alone.
   #
   # vector_search is true while the image this Recipe runs serves the Redis
   # query engine's vector search, and empty otherwise. With no
@@ -54,9 +64,27 @@ spec:
   provides:
     host: "{{ .context.rendered_name }}-default"
     port: "{{ .infra.port }}"
-    protocol: "redis"
+    protocol: "{{ if .infra.client_tls }}redis-tls{{ else }}redis{{ end }}"
     vector_search: '{{ $image := optional (optional .infra "overrides" dict) "image" "" }}{{ if $image }}{{ if .infra.image_serves_vector_search }}true{{ end }}{{ else if regexMatch "^[0-9]+(\\.[0-9]+){0,2}(-[0-9A-Za-z.-]+)?$" .infra.engine_version }}{{ if semverCompare ">=8.0.0-0" .infra.engine_version }}true{{ end }}{{ end }}'
+  # With infra.client_tls true the server presents the tls.crt and tls.key of
+  # the Secret attached to server_certificate, closes its plaintext listener and
+  # requests no client certificate; an attached password is enforced over TLS as
+  # it is without it. The build halts naming server_certificate when client_tls
+  # is true and nothing is attached, or the attachment publishes no Secret name,
+  # and naming client_tls when a certificate is attached while it is false.
   workload: |
+    {{- $tls := .infra.client_tls }}
+    {{- $cert := hasKey (default dict .features) "server_certificate" }}
+    {{- if and $tls (not $cert) }}
+    {{- fail (printf "infra.client_tls is true on %q, so the cache serves TLS alone, but nothing is attached to its server_certificate slot, so the server has no certificate to present; attach to server_certificate a Secret holding tls.crt and tls.key, through core/referenced-secret, or set infra.client_tls to false" .context.instance_id) }}
+    {{- end }}
+    {{- if and $cert (not $tls) }}
+    {{- fail (printf "a certificate is attached to the server_certificate slot of %q, but infra.client_tls is false, so the cache serves plaintext and nothing presents the certificate; set infra.client_tls to true to serve TLS from it, or remove the attachment" .context.instance_id) }}
+    {{- end }}
+    {{- $certProvides := optional (optional (default dict .features) "server_certificate" dict) "provides" dict }}
+    {{- if and $tls (not (and (kindIs "map" $certProvides) (optional $certProvides "name" ""))) }}
+    {{- fail (printf "the server_certificate slot of %q is filled by an attachment that publishes no Secret name, but the server's certificate is mounted from a Secret named here; bind the slot to core/referenced-secret, whose k8s-existing-secret realization names a Secret that already exists" .context.instance_id) }}
+    {{- end }}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # Persistence is a configurable capability, not a separate component: the
@@ -76,11 +104,28 @@ spec:
         # which the runtime expands from the Secret at container start, so the
         # plaintext never lands in the manifest; the upstream image does not read
         # a password from the environment on its own, so --requirepass is what
-        # enables auth. The args block is emitted only when at least one config
-        # knob or the password slot is set, so a bare cache renders no args,
+        # enables auth. The args block is emitted only when a config knob, a
+        # moved port, TLS or the password slot is set, so a bare cache renders no args,
         # byte-identically to a Recipe with no knobs at all; --requirepass stays
         # last so a password-only deployment matches exactly.
-    {{- if or .values.maxmemory .values.maxmemory_policy .values.databases .values.appendonly (hasKey (default dict .features) "password") }}
+        #
+        # With infra.client_tls on, the plaintext listener is closed (--port 0)
+        # and the server serves TLS on infra.port (--tls-port) from the
+        # certificate and key the server_certificate slot's Secret holds,
+        # mounted below as files. It requests no client certificate
+        # (--tls-auth-clients no): left at its default, Redis asks every client
+        # for one, and with no CA file named it does not start its TLS listener
+        # at all. No CA file is named, which Redis needs only where it verifies
+        # client certificates or replicates over TLS, and this realization does
+        # neither.
+        #
+        # With client_tls off, the server is told its port (--port) only when
+        # infra.port differs from 6379, the port the Redis server listens on
+        # when it is given none — a fact about the server, not a copy of the
+        # Component's default. So a cache at the default port renders no flag,
+        # and one an operator moved listens where its Service and probes point.
+    {{- $portFlag := and (not $tls) (ne (toString .infra.port) "6379") }}
+    {{- if or .values.maxmemory .values.maxmemory_policy .values.databases .values.appendonly $tls $portFlag (hasKey (default dict .features) "password") }}
         args:
     {{- with .values.databases }}
           - "--databases"
@@ -98,6 +143,22 @@ spec:
           - "--appendonly"
           - "yes"
     {{- end }}
+    {{- if $portFlag }}
+          - "--port"
+          - "{{ .infra.port }}"
+    {{- end }}
+    {{- if $tls }}
+          - "--port"
+          - "0"
+          - "--tls-port"
+          - "{{ .infra.port }}"
+          - "--tls-cert-file"
+          - "/etc/redis/tls/tls.crt"
+          - "--tls-key-file"
+          - "/etc/redis/tls/tls.key"
+          - "--tls-auth-clients"
+          - "no"
+    {{- end }}
     {{- if hasKey (default dict .features) "password" }}
           - "--requirepass"
           - "$(REDIS_PASSWORD)"
@@ -112,16 +173,28 @@ spec:
         # probes pass once the server answers on that port, with or without a
         # password attached, and fail while nothing answers there. No start-up
         # time is documented; the liveness probe waits 10 s before its first check.
+        # With infra.client_tls on, a plaintext PING to the TLS port is reset and
+        # fails, so each probe adds --tls and --insecure: the probe dials the
+        # loopback address inside the container, which the certificate need not
+        # name, and it checks that the server answers, not who it is.
         health:
           ready:
             exec:
               - redis-cli
+    {{- if $tls }}
+              - "--tls"
+              - "--insecure"
+    {{- end }}
               - "-p"
               - "{{ .infra.port }}"
               - ping
           live:
             exec:
               - redis-cli
+    {{- if $tls }}
+              - "--tls"
+              - "--insecure"
+    {{- end }}
               - "-p"
               - "{{ .infra.port }}"
               - ping
@@ -138,11 +211,21 @@ spec:
           - name: data
             path: /data
     {{- end }}
-    {{- if hasKey (default dict .features) "password" }}
+    {{- if or $tls (hasKey (default dict .features) "password") }}
         attachments:
+    {{- end }}
+    {{- if hasKey (default dict .features) "password" }}
           REDIS_PASSWORD:
             from: password
             as: env
+    {{- end }}
+    {{- if $tls }}
+          # The certificate Secret mounts whole, read-only, one file per data
+          # key, so the server reads tls.crt and tls.key from this directory.
+          server-certificate:
+            from: server_certificate
+            as: file
+            path: /etc/redis/tls
     {{- end }}
     {{- if .values.persistence.enabled }}
     volumes:

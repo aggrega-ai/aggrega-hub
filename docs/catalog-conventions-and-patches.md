@@ -3729,8 +3729,8 @@ copying whichever sibling happens to be nearest.
 
 ### Encrypted client connections to a cache
 
-`core/datastore/valkey` and `core/datastore/memcached` serve their clients over TLS
-when the operator turns it on. It is a setting on the Component rather than a
+`core/datastore/valkey`, `core/datastore/redis` and `core/datastore/memcached` serve
+their clients over TLS when the operator turns it on. It is a setting on the Component rather than a
 Feature, because TLS reconfigures the server's own listener, which only the
 cache's Recipe controls. This is a catalog convention upheld by each Recipe's
 template, not something the compiler checks: the compiler pipes the published
@@ -3740,11 +3740,12 @@ template, not something the compiler checks: the compiler pipes the published
   Component's contract and every render are exactly what they are without the
   setting.
 - **On, the published `protocol` says so** — `valkey-tls` for `valkey`,
-  `memcached-tls` for `memcached`: the product's name and the word its own
-  documentation uses for the feature. The port then accepts TLS alone, and `host`
-  and `port` are unchanged, so `protocol` is what tells a consumer that TLS is
-  required; a plaintext client reaching the port fails its handshake and exchanges
-  no command. Every consumer Recipe of the two caches checks `protocol`: one taught
+  `redis-tls` for `redis`, `memcached-tls` for `memcached`: the product's name and
+  the word its own documentation uses for the feature. The port then accepts TLS
+  alone, and `host` and `port` are unchanged, so `protocol` is what tells a
+  consumer that TLS is required; a plaintext client reaching the port fails its
+  handshake and exchanges no command. Every consumer Recipe of `valkey` and
+  `memcached` checks `protocol`: one taught
   the TLS value reaches the cache over TLS, and every other refuses a value served
   over TLS, naming the connection, so no consumer reaches a TLS port in plaintext.
 - **A self-hosted realization presents the certificate attached to the slot
@@ -3768,7 +3769,7 @@ template, not something the compiler checks: the compiler pipes the published
   it halts while `client_tls` is false; an attached Memcached password halts, since
   ElastiCache offers no Memcached authentication.
 - **A realization that cannot serve TLS refuses `client_tls` by name and names one
-  that can.** The Compose realizations do: both servers read their certificate
+  that can.** The Compose realizations do: each server reads its certificate
   from files, and no credential Feature realized on Compose names a secret a
   service can mount, so they refuse the setting, and a certificate attached
   without it, and name the helm realizations.
