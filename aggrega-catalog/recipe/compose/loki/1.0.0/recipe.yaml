@@ -24,7 +24,9 @@ metadata:
     port, published as provides.metrics_endpoint. A
     memcached wired to the chunk_cache socket becomes the server's chunk-cache
     client, driven by that edge's batch size, parallelism, timeout and entry
-    lifetime; unwired, there is none.
+    lifetime, over TLS to one publishing memcached-tls, checked against the
+    image's trust store; a server_ca on that connection halts the build.
+    Unwired, there is none.
 
     Nothing is published to the host: a consumer on the compose network reaches
     the server at the service name, provides.host. Docker Compose sets no size
@@ -79,19 +81,20 @@ spec:
   #
   # The chunk-cache client the configuration writes speaks the memcached
   # protocol to whatever is wired on chunk_cache, a socket whose selector admits
-  # any datastore. The check that the wired cache publishes memcached lives in
-  # the TargetProtocol library's Check bundle, imported under artifacts by every
-  # Recipe of this Component. The check_ entries are what it reads — the
-  # socket, the protocol, why Loki needs it and a component publishing it — and
-  # it stops the build, naming the connection, on a cache publishing another
+  # any datastore. The check that the wired cache publishes memcached, or
+  # memcached-tls while it serves TLS alone, lives in the TargetProtocol
+  # library's Check bundle, imported under artifacts by every Recipe of this
+  # Component. The check_ entries are what it reads — the socket, the
+  # protocols, why Loki needs them and a component publishing them — and it
+  # stops the build, naming the connection, on a cache publishing another
   # protocol or none.
   locals:
     image: "docker.io/grafana/loki:3.6.7"
     config_name: "{{ .context.instance_id }}-config"
     config_path: /etc/loki/config/config.yaml
     check_socket: chunk_cache
-    check_protocol: memcached
-    check_reason: "Loki's chunk-cache client speaks the memcached protocol, which a cache publishes as the protocol memcached"
+    check_protocol: '["memcached", "memcached-tls"]'
+    check_reason: "Loki's chunk-cache client speaks the memcached protocol, which a cache publishes as the protocol memcached, or memcached-tls while it serves TLS alone"
     check_example: core/datastore/memcached
 
   # The single-binary Loki configuration, as one compose config the workload
@@ -121,14 +124,27 @@ spec:
   # from that edge's own values and the chart's own write-back and connection
   # settings. Unwired, no chunk_store_config is written and every chunk is read
   # from the server's own store.
+  #
+  # A cache publishing memcached-tls is reached over TLS: the client gets
+  # tls_enabled and checks the cache's certificate and the name dialed against
+  # the trust store the image carries, the system bundle of its distroless
+  # base. A server_ca on the connection is refused by name: the client reads an
+  # authority from a file, and no credential Feature the catalog realizes on
+  # Compose delivers a Secret as files, so the Kubernetes realization is the one
+  # that takes it. Read from Loki's chunk-cache client at the release pinned
+  # here and from the image itself.
   artifacts:
     loki-config.compose-fragment.yaml: |
       {{- $cache := dict }}
       {{- range $alias, $edge := .context.uses }}
       {{- if eq $edge.socket "chunk_cache" }}
       {{- $cache = $edge }}
+      {{- if hasKey (default dict $edge.features) "server_ca" }}
+      {{- fail (printf "the chunk_cache connection %s of %q holds a server_ca, but this Compose realization of core/observability/loki cannot give it to the server: the server reads the authority from a file, and no credential Feature the catalog realizes on Compose delivers a Secret as files; remove the server_ca, so the server checks the cache's certificate against its image's default trust store, or map the server to helm/loki" $alias $.context.instance_id) }}
       {{- end }}
       {{- end }}
+      {{- end }}
+      {{- $cacheTLS := eq (toString (optional (default dict (optional $cache "provides" dict)) "protocol" "")) "memcached-tls" }}
       configs:
         {{ .locals.config_name }}:
           content: |
@@ -195,6 +211,9 @@ spec:
                   consistent_hash: true
                   max_idle_conns: 72
                   timeout: "{{ $cache.values.timeout }}"
+      {{- if $cacheTLS }}
+                  tls_enabled: true
+      {{- end }}
       {{- end }}
     # The check that the cache wired to chunk_cache publishes memcached, from
     # the TargetProtocol library, reading the check_ locals above. It writes no
@@ -213,6 +232,12 @@ spec:
     {{- range $alias, $edge := .context.uses -}}
     {{- if eq $edge.socket "chunk_cache" -}}
     {{- $cache = dict "address" (printf "%v:%v" $edge.provides.host $edge.provides.port) "values" $edge.values -}}
+    {{- /* Over TLS the configuration carries tls_enabled, so the digest takes
+           that too; the key is set only then, so a plaintext connection's
+           digest is the one it always was. */ -}}
+    {{- if eq (toString (optional (default dict $edge.provides) "protocol" "")) "memcached-tls" -}}
+    {{- $_ := set $cache "tls" true -}}
+    {{- end -}}
     {{- end -}}
     {{- end -}}
     apiVersion: aggrega.ai/v1alpha1

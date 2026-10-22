@@ -3703,22 +3703,27 @@ template, not something the compiler checks: the compiler pipes the published
   `server_ca` publishing no Secret name, on a `server_ca` on a connection whose
   cache serves no TLS, and on a value served over TLS it is not taught to reach.
   A consumer whose product takes the authority from a file it cannot be given on
-  its target refuses `server_ca` by name there: the Compose realization of Tyk
-  does, and connects over TLS against its image's trust store. The Dify API
-  server, task worker, scheduler and plugin runtime, the Agenta API and its two
-  workers, whose services and scheduler Recipes compose the same URLs, Langfuse,
-  Tyk, the LiveKit media server and SIP bridge, and the period-budget stores of
-  Envoy Gateway and Traefik Hub consume a Valkey cache this way; none is taught
-  `memcached-tls`.
+  its target refuses `server_ca` by name there: the Compose realizations of Tyk
+  and Loki do, and connect over TLS against their images' trust stores. The Dify
+  API server, task worker, scheduler and plugin runtime, the Agenta API and its
+  two workers, whose services and scheduler Recipes compose the same URLs,
+  Langfuse, Tyk, the LiveKit media server and SIP bridge, and the period-budget
+  stores of Envoy Gateway and Traefik Hub consume a Valkey cache this way; Loki's
+  chunk cache consumes a Memcached cache this way, its shared protocol check
+  accepting `memcached` and `memcached-tls`.
 - **A consumer whose product cannot reach a cache over TLS refuses the TLS value
   by name**, naming the connection and the cache's protocol: Higress's token
   limit, whose plugin's Redis settings offer no TLS connection, and the four
   consumers that hand a store's address to the Release's own code —
   `core/ai-tool/datastore-query`, `core/ai-agent/langgraph`, `dynamiq` and
   `phidata` — which give that code no authority to check a certificate against,
-  and the last three not even the store's protocol. Loki's chunk
-  cache refuses `memcached-tls` through the protocol check its Recipes share,
-  which accepts one value.
+  and the last three not even the store's protocol.
+- **A consumer checking `protocol` through the shared TargetProtocol check lists
+  every value its client speaks** in its `check_protocol` local: one protocol as
+  a plain string, or several as a JSON list in the string — a local is a string,
+  and a list local is written this way elsewhere in the catalog — as
+  `'["memcached", "memcached-tls"]'` on the Loki Recipes. The check refuses any
+  other value, naming every one listed.
 
 ### The name a managed datastore is reached at from another target
 

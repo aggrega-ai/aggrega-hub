@@ -19,8 +19,9 @@ metadata:
     A memcached wired to the chunk_cache socket is exactly that case: the chart
     keeps its own bundled cache off and the recipe points the chunk-cache client
     at the wired memcached instead, with the batch size, parallelism, timeout and
-    entry lifetime taken from that edge's own values. Unwired, the client stays
-    off and every chunk is read from the data volume.
+    entry lifetime taken from that edge's own values, over TLS to one
+    publishing memcached-tls. Unwired, the client stays off and every chunk is
+    read from the data volume.
     The Loki server image and the config-reload sidecar image are pinned to
     resolvable tags for reproducible renders. The developer's retention_period
     flows into the in-process compactor, which deletes log streams once they age
@@ -29,9 +30,7 @@ metadata:
     namespace qualifies it on its own side. provides.otlp_http_endpoint is that
     Service's /otlp address, for OpenTelemetry logs, and
     provides.metrics_endpoint its /metrics address, where the server serves its
-    own metrics in the Prometheus format. Default chart version in
-    source.version; override via infra.source_version. The packaged Loki server
-    is AGPL-3.0.
+    own metrics in the Prometheus format. The packaged Loki server is AGPL-3.0.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -77,16 +76,17 @@ spec:
 
   # The chunk-cache client the value mapping turns on speaks the memcached
   # protocol to whatever is wired on chunk_cache, a socket whose selector admits
-  # any datastore. The check that the wired cache publishes memcached lives in
-  # the TargetProtocol library's Check bundle, imported under artifacts by every
-  # Recipe of this Component. These locals are what it reads — the socket, the
-  # protocol, why Loki needs it and a component publishing it — and it stops
-  # the build, naming the connection, on a cache publishing another protocol or
-  # none. It writes no file.
+  # any datastore. The check that the wired cache publishes memcached, or
+  # memcached-tls while it serves TLS alone, lives in the TargetProtocol
+  # library's Check bundle, imported under artifacts by every Recipe of this
+  # Component. These locals are what it reads — the socket, the protocols, why
+  # Loki needs them and a component publishing them — and it stops the build,
+  # naming the connection, on a cache publishing another protocol or none. It
+  # writes no file.
   locals:
     check_socket: chunk_cache
-    check_protocol: memcached
-    check_reason: "Loki's chunk-cache client speaks the memcached protocol, which a cache publishes as the protocol memcached"
+    check_protocol: '["memcached", "memcached-tls"]'
+    check_reason: "Loki's chunk-cache client speaks the memcached protocol, which a cache publishes as the protocol memcached, or memcached-tls while it serves TLS alone"
     check_example: core/datastore/memcached
   artifacts:
     target-protocol:
@@ -100,6 +100,30 @@ spec:
   #   nodeSelector  - map[string]string (singleBinary.nodeSelector)
   #   tolerations   - []object (singleBinary.tolerations)
   valuesMapping: |
+    {{- /*
+      The chunk cache over TLS. A cache publishing memcached-tls accepts TLS
+      connections alone, so the chunk-cache client reaches it over TLS; the
+      TargetProtocol check above refuses any value but the two this client
+      speaks. A server_ca on the connection is the authority the client checks
+      the cache's certificate against; it is mounted, so its attachment must
+      name a Secret, and it is refused on a cache served without TLS, where no
+      handshake takes place to check a certificate in.
+    */ -}}
+    {{- $cacheTLS := false }}{{ $cacheCA := "" -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "chunk_cache" -}}
+    {{- $edgeTLS := eq (toString (optional (default dict $edge.provides) "protocol" "")) "memcached-tls" -}}
+    {{- if $edgeTLS }}{{ $cacheTLS = true }}{{ end -}}
+    {{- if hasKey (default dict $edge.features) "server_ca" -}}
+    {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) -}}
+    {{- fail (printf "the server_ca on the chunk_cache connection %s of %q publishes no Secret name, so no Secret could be mounted into the server: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if not $edgeTLS -}}
+    {{- fail (printf "the chunk_cache connection %s of %q holds a server_ca, but the cache it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that cache, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" (toString (optional (default dict $edge.provides) "protocol" "")))) -}}
+    {{- end -}}
+    {{- $cacheCA = $caProvides.name -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
     ## ── Pin the chart's resource names to the rendered name ────
     ## Names the Service fronting the push and query API exactly
     ## "<rendered_name>", matching provides.host. Without this the chart derives
@@ -137,6 +161,25 @@ spec:
       compactor:
         retention_enabled: true
         delete_request_store: filesystem
+      ## Over TLS the chunk-cache client the chunksCache block below writes
+      ## connects with TLS on, which the chart's chunksCache values have no key
+      ## for, so it is merged into the client through the chart's
+      ## structuredConfig, which the chart lays over the configuration it
+      ## writes. The client checks the cache's certificate and the name dialed:
+      ## against the authority mounted below where the connection holds a
+      ## server_ca, and otherwise against the image's default trust store,
+      ## which a publicly trusted certificate chains to. Read from Loki's
+      ## chunk-cache client and the chart at the versions this Recipe pins.
+      {{- if $cacheTLS }}
+      structuredConfig:
+        chunk_store_config:
+          chunk_cache_config:
+            memcached_client:
+              tls_enabled: true
+              {{- if $cacheCA }}
+              tls_ca_path: /etc/loki/chunk-cache-server-ca/ca.crt
+              {{- end }}
+      {{- end }}
       ## Loki server image pin. The chart ships a resolvable tag; pin explicitly
       ## for a reproducible render. Override the whole block via
       ## infra.overrides.loki_image.
@@ -180,6 +223,19 @@ spec:
       {{- if .infra.overrides.tolerations }}
       tolerations: {{ toJson .infra.overrides.tolerations }}
       {{- end }}
+      {{- end }}
+      ## The chunk_cache connection's server_ca Secret, mounted whole and
+      ## read-only into the single binary as a volume this Recipe names, so the
+      ## chunk-cache client reads its ca.crt.
+      {{- with $cacheCA }}
+      extraVolumes:
+        - name: chunk-cache-server-ca
+          secret:
+            secretName: "{{ . }}"
+      extraVolumeMounts:
+        - name: chunk-cache-server-ca
+          mountPath: /etc/loki/chunk-cache-server-ca
+          readOnly: true
       {{- end }}
 
     ## ── Distributed scaling paths (off) ────────────────────────
