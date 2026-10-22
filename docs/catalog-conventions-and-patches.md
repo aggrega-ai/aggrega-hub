@@ -2038,7 +2038,12 @@ Amazon OpenSearch Service domain's master user is the case:
 hands the service the same module output reference as its master password, and
 [`recipe/cloudformation/opensearch-service`](../aggrega-catalog/recipe/cloudformation/opensearch-service/1.0.0/recipe.yaml)
 the dynamic reference below; both halt with nothing attached, the Component's
-`apppass` being shorter than the eight characters the service takes.
+`apppass` being shorter than the eight characters the service takes. Both also
+require `values.symbols: true` on the attachment, so the password holds an
+upper-case letter, a lower-case letter, a digit and a punctuation character: the
+service documents a length alone, and a password holding every class is accepted
+whether or not it asks for one, while one without punctuation would fail every
+apply if it does.
 
 A CloudFormation Recipe takes the same credential as a Secrets Manager dynamic
 reference to the secret `cloudformation/random-password` declares in the same
@@ -2366,7 +2371,12 @@ The two terraform and cloudformation realizations share the name
   `symbols` are read off the four products: each takes a length, and each can
   leave punctuation out. Finer control over character classes exists on some
   of them and not on all, so it is not offered. `symbols` is off by default,
-  because a password is often placed inside a URL or a connection string.
+  because a password is often placed inside a URL or a connection string. The
+  terraform and cloudformation realizations put at least one character of
+  every class they draw from into the password — Secrets Manager by default,
+  the `random_password` resource through its `min_upper`, `min_lower`,
+  `min_numeric` and `min_special` settings — so with `symbols` on, a service
+  requiring each class accepts it.
 - **A consumer reads it unchanged.** It carries `feature.aggrega.ai/kind:
   secret` and publishes the `name` and `key` locator `core/referenced-secret`
   publishes, so a slot selecting the credential family admits it and a Recipe
