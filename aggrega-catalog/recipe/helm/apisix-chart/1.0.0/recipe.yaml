@@ -215,7 +215,16 @@ spec:
   # stored under the same earlier messages whose message is at least
   # similarity_threshold alike. The store is the cache_store connection: its
   # published host and port, and its credential by $env:// where it carries
-  # one; a store publishing no vector_search stops the build. The vector index
+  # one; a store publishing no vector_search stops the build. A store
+  # publishing valkey-tls or redis-tls is reached over TLS: redis_ssl turns it
+  # on and redis_ssl_verify checks the store's certificate chain against the
+  # authorities APISIX trusts, its system's by default, and not the store's
+  # name, since the gateway's Redis client names no server in the handshake.
+  # APISIX takes those authorities for every connection it makes, so the
+  # socket offers no server_ca, and a privately signed certificate fails the
+  # handshake when the gateway runs. Another value served over TLS stops the
+  # build. Read from APISIX 3.18.0's shared Redis schema and connection code
+  # and its default trusted-certificate setting. The vector index
   # is named for the gateway and the attachment. A completion route is not
   # cached, since only the exact layer would act on it.
   #
@@ -246,9 +255,13 @@ spec:
       {{- end }}
       {{- $callers := optional .infra "callers" list }}
       {{- $store := dict }}
+      {{- $storeTLS := false }}
       {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "cache_store" }}{{ $store = $edge }}{{ end }}{{ end }}
       {{- with $cache }}{{ with $store }}
       {{- if not (toString (optional (default dict .provides) "vector_search" "")) }}{{ fail (printf "the cache_store socket of %q is wired to %q, a %s publishing no vector_search, but the gateway's semantic cache stores and searches its replies with the Redis query engine's vector search; a store without it would cache nothing while every request still succeeds. Wire a store publishing vector_search to cache_store: a core/datastore/redis on an infra.engine_version from 8.0.0 on, or one whose infra.overrides.image names an image serving that search, with infra.image_serves_vector_search: true set on it in the Release" $.context.instance_id .target (first (splitList ":" (toString .component)))) }}{{ end }}
+      {{- $storeProtocol := toString (optional (default dict .provides) "protocol" "") }}
+      {{- $storeTLS = has $storeProtocol (list "valkey-tls" "redis-tls") }}
+      {{- if and (not $storeTLS) (hasSuffix "-tls" $storeProtocol) }}{{ fail (printf "the cache_store socket of %q is wired to %q, whose published protocol is %q, a store served over TLS that the gateway's semantic cache is not taught to reach: it speaks the Redis protocol, over TLS to a store publishing valkey-tls or redis-tls; wire a Redis-protocol store to the cache_store socket" $.context.instance_id .target $storeProtocol) }}{{ end }}
       {{- end }}{{ end }}
       {{- $operations := list "chat" "completions" }}
       {{- if $guard }}{{ $operations = list "chat" }}{{ end }}
@@ -364,6 +377,10 @@ spec:
                   policy: redis
                   redis_host: {{ $store.provides.host | toJson }}
                   redis_port: {{ $store.provides.port }}
+      {{- if $storeTLS }}
+                  redis_ssl: true
+                  redis_ssl_verify: true
+      {{- end }}
       {{- if hasKey (default dict $store.features) "credential" }}
                   redis_password: {{ printf "$env://%s" $.locals.cache_store_password_variable | toJson }}
       {{- end }}

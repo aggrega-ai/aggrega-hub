@@ -32,7 +32,7 @@ metadata:
     core/retry-policy attachment, each FeatureRecipe saying how; the first
     four halt the build until infra.ai_gateway_entitled affirms the licence's
     AI gateway. No build observes that the gateway enforces any of them. A
-    budget's store publishing valkey-tls is reached over TLS, checked against
+    budget's store publishing valkey-tls or redis-tls is reached over TLS, checked against
     the cache connection's server_ca or the system's authorities.
   maintainers:
     - name: Massimiliano Ferrero
@@ -100,9 +100,11 @@ spec:
   # cache_server_ca_path is the directory the cache connection's server_ca
   # Secret is mounted at in the gateway's container, written once here
   # because the value mapping mounts it and the quota middleware's
-  # configuration names the file in it.
+  # configuration names the file in it. cache_store_server_ca_path is the same
+  # for the cache_store connection's server_ca and the semantic cache.
   locals:
     cache_server_ca_path: /etc/traefik/cache-server-ca
+    cache_store_server_ca_path: /etc/traefik/cache-store-server-ca
     callers: '{{ with optional .infra "callers" "" }}{{ range $i, $caller := . }}{{ if $i }}, {{ end }}{{ $caller }}{{ end }}{{ end }}'
     analyzer_entity_types: '["CREDIT_CARD", "CRYPTO", "DATE_TIME", "EMAIL_ADDRESS", "IBAN_CODE", "IP_ADDRESS", "LOCATION", "MAC_ADDRESS", "MEDICAL_LICENSE", "NRP", "PERSON", "PHONE_NUMBER", "UK_NHS", "URL", "US_BANK_NUMBER", "US_DRIVER_LICENSE", "US_ITIN", "US_PASSPORT", "US_SSN"]'
 
@@ -279,36 +281,53 @@ spec:
            the path the middleware's store.redis.tls.ca names below. The
            middleware reads the file from the gateway's own filesystem, and the
            chart's additional volumes are how a Secret reaches it there. */}}
+    {{- /* The same for the semantic cache's store: the cache_store
+           connection's server_ca, mounted while core/semantic-caching is
+           attached, at the path the cache's vectorDB.redis.tls.ca names. */}}
     {{- $cacheCA := "" }}
+    {{- $storeCA := "" }}
     {{- $budgetAttached := false }}
+    {{- $cacheAttached := false }}
     {{- range $budgetName, $attachment := (default dict .features) }}
       {{- if eq (first (splitList ":" (toString $attachment.type))) "core/period-budget" }}{{ $budgetAttached = true }}{{ end }}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/semantic-caching" }}{{ $cacheAttached = true }}{{ end }}
     {{- end }}
-    {{- if $budgetAttached }}
-      {{- range $alias, $edge := .context.uses }}
-        {{- if eq $edge.socket "cache" }}
-          {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict }}
-          {{- if kindIs "map" $caProvides }}{{ $cacheCA = toString (optional $caProvides "name" "") }}{{ end }}
-        {{- end }}
-      {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+      {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict }}
+      {{- if and $budgetAttached (eq $edge.socket "cache") (kindIs "map" $caProvides) }}{{ $cacheCA = toString (optional $caProvides "name" "") }}{{ end }}
+      {{- if and $cacheAttached (eq $edge.socket "cache_store") (kindIs "map" $caProvides) }}{{ $storeCA = toString (optional $caProvides "name" "") }}{{ end }}
     {{- end }}
-    {{- if or .infra.image_pull_secret $cacheCA }}
+    {{- if or .infra.image_pull_secret $cacheCA $storeCA }}
     deployment:
       {{- with .infra.image_pull_secret }}
       imagePullSecrets:
         - name: "{{ . }}"
       {{- end }}
-      {{- with $cacheCA }}
+      {{- if or $cacheCA $storeCA }}
       additionalVolumes:
+      {{- end }}
+      {{- with $cacheCA }}
         - name: cache-server-ca
           secret:
             secretName: "{{ . }}"
       {{- end }}
+      {{- with $storeCA }}
+        - name: cache-store-server-ca
+          secret:
+            secretName: "{{ . }}"
+      {{- end }}
+    {{- end }}
+    {{- if or $cacheCA $storeCA }}
+    additionalVolumeMounts:
     {{- end }}
     {{- with $cacheCA }}
-    additionalVolumeMounts:
       - name: cache-server-ca
         mountPath: "{{ $.locals.cache_server_ca_path }}"
+        readOnly: true
+    {{- end }}
+    {{- with $storeCA }}
+      - name: cache-store-server-ca
+        mountPath: "{{ $.locals.cache_store_server_ca_path }}"
         readOnly: true
     {{- end }}
 
@@ -477,14 +496,23 @@ spec:
   # store publishing vector_search is accepted on cache_store, one connection;
   # its published host and port are the store's address, a host with no dot
   # qualified with the store's namespace, and its credential, where it
-  # carries one, is named by reference.
+  # carries one, is named by reference. A store publishing valkey-tls or
+  # redis-tls is reached over TLS through the cache's vectorDB.redis.tls: its
+  # certificate is checked against the cache_store connection's server_ca,
+  # mounted into the gateway and named by tls.ca, or, with none, against the
+  # system's authorities. Traefik's reference for the cache says its Redis
+  # settings inherit the Redis client configuration, the one whose tls the
+  # quota middleware's reference documents, and which this Recipe already
+  # relies on for the cache's password; no build observes the cache's TLS.
+  # Another value served over TLS stops the build, as do a server_ca publishing
+  # no Secret name and one on a store served without TLS.
   #
   # A core/period-budget attachment, which period-budget-traefik-hub realizes
   # and checks, is written as Traefik Hub's quota middleware, after the cache,
   # so a reply the cache serves counts nothing. It counts in the store on the
   # cache connection — one connection speaking the Redis protocol, its
   # published host and port, its credential by reference — and reads the
-  # request as a chat completion. A store publishing valkey-tls is reached
+  # request as a chat completion. A store publishing valkey-tls or redis-tls is reached
   # over TLS through the middleware's store.redis.tls: its certificate is
   # checked against the cache connection's server_ca, mounted into the gateway
   # and named by tls.ca, or, with none, against the system's authorities, the
@@ -649,8 +677,8 @@ spec:
       {{- $alias := index (first .) 0 }}
       {{- $edge := index (first .) 1 }}
       {{- $protocol := toString (optional (default dict $edge.provides) "protocol" "") }}
-      {{- $counterTLS = eq $protocol "valkey-tls" }}
-      {{- if and (not $counterTLS) (hasSuffix "-tls" $protocol) }}{{ fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a store served over TLS that Traefik Hub's quota middleware is not taught to reach: it speaks the Redis protocol, over TLS to a store publishing valkey-tls; wire a Redis-protocol store to the cache socket" $alias $.context.instance_id $edge.target $protocol) }}{{ end }}
+      {{- $counterTLS = has $protocol (list "valkey-tls" "redis-tls") }}
+      {{- if and (not $counterTLS) (hasSuffix "-tls" $protocol) }}{{ fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a store served over TLS that Traefik Hub's quota middleware is not taught to reach: it speaks the Redis protocol, over TLS to a store publishing valkey-tls or redis-tls; wire a Redis-protocol store to the cache socket" $alias $.context.instance_id $edge.target $protocol) }}{{ end }}
       {{- if not (or $counterTLS (has $protocol (list "redis" "valkey"))) }}{{ fail (printf "the cache socket of %q is wired to %q, whose published protocol is %q, but Traefik Hub's quota middleware keeps a period budget's count in a store speaking the Redis protocol, which a store publishes as redis or valkey; wire a core/datastore/redis to the cache socket instead" $.context.instance_id $edge.target $protocol) }}{{ end }}
       {{- if hasKey (default dict $edge.features) "server_ca" }}
       {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict }}
@@ -672,12 +700,23 @@ spec:
       {{- end }}
       {{- $storeAddress := "" }}
       {{- $storePassword := "" }}
+      {{- $storeTLS := false }}
+      {{- $storeCA := false }}
       {{- if $cacheName }}
       {{- if gt (len $cacheStores) 1 }}{{ fail (printf "the cache_store socket of %q holds %d connections, but Traefik Hub's semantic cache keeps its replies in one store; keep one connection on the cache_store socket" .context.instance_id (len $cacheStores)) }}{{ end }}
       {{- with $cacheStores }}
       {{- $alias := index (first .) 0 }}
       {{- $edge := index (first .) 1 }}
       {{- if not (toString (optional (default dict $edge.provides) "vector_search" "")) }}{{ fail (printf "the cache_store socket of %q is wired to %q, a %s publishing no vector_search, but Traefik Hub's semantic cache stores and searches its replies with the vector search of the Redis query engine; a store without it would cache nothing while every request still succeeds. Wire a store publishing vector_search to cache_store: a core/datastore/redis on an infra.engine_version from 8.0.0 on, or one whose infra.overrides.image names an image serving that search, with infra.image_serves_vector_search: true set on it in the Release" $.context.instance_id $edge.target (first (splitList ":" (toString $edge.component)))) }}{{ end }}
+      {{- $protocol := toString (optional (default dict $edge.provides) "protocol" "") }}
+      {{- $storeTLS = has $protocol (list "valkey-tls" "redis-tls") }}
+      {{- if and (not $storeTLS) (hasSuffix "-tls" $protocol) }}{{ fail (printf "the cache_store connection %s of %q reaches %q, which publishes protocol %s, a store served over TLS that Traefik Hub's semantic cache is not taught to reach: it speaks the Redis protocol, over TLS to a store publishing valkey-tls or redis-tls; wire a Redis-protocol store to the cache_store socket" $alias $.context.instance_id $edge.target $protocol) }}{{ end }}
+      {{- if hasKey (default dict $edge.features) "server_ca" }}
+      {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict }}
+      {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) }}{{ fail (printf "the server_ca on the cache_store connection %s of %q publishes no Secret name, so no Secret could be mounted into the gateway: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) }}{{ end }}
+      {{- if not $storeTLS }}{{ fail (printf "the cache_store connection %s of %q holds a server_ca, but the store it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that store, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $protocol)) }}{{ end }}
+      {{- $storeCA = true }}
+      {{- end }}
       {{- $host := lower (toString $edge.provides.host) }}
       {{- if not (or (contains "." $host) (contains ":" $host)) }}
       {{- $host = printf "%s.%s.svc.cluster.local" $host (optional (optional (default dict $edge.annotations) "release" dict) "aggrega.ai/namespace" "" | default "default") }}
@@ -1064,6 +1103,12 @@ spec:
                   - {{ $storeAddress | toJson }}
       {{- with $storePassword }}
                 password: {{ . | toJson }}
+      {{- end }}
+      {{- if $storeCA }}
+                tls:
+                  ca: {{ printf "%s/ca.crt" $.locals.cache_store_server_ca_path | toJson }}
+      {{- else if $storeTLS }}
+                tls: {}
       {{- end }}
                 collectionName: {{ printf "%s-%s" $name $part | toJson }}
                 maxDistance: {{ round (subf 1.0 (float64 $cache.values.similarity_threshold)) 6 }}

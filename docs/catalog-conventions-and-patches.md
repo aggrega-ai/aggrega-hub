@@ -3744,8 +3744,8 @@ template, not something the compiler checks: the compiler pipes the published
   the word its own documentation uses for the feature. The port then accepts TLS
   alone, and `host` and `port` are unchanged, so `protocol` is what tells a
   consumer that TLS is required; a plaintext client reaching the port fails its
-  handshake and exchanges no command. Every consumer Recipe of `valkey` and
-  `memcached` checks `protocol`: one taught
+  handshake and exchanges no command. Every consumer Recipe of `valkey`, `redis`
+  and `memcached` checks `protocol`: one taught
   the TLS value reaches the cache over TLS, and every other refuses a value served
   over TLS, naming the connection, so no consumer reaches a TLS port in plaintext.
 - **A self-hosted realization presents the certificate attached to the slot
@@ -3788,16 +3788,27 @@ template, not something the compiler checks: the compiler pipes the published
   API server, task worker, scheduler and plugin runtime, the Agenta API and its
   two workers, whose services and scheduler Recipes compose the same URLs,
   Langfuse, Tyk, the LiveKit media server and SIP bridge, and the period-budget
-  stores of Envoy Gateway and Traefik Hub consume a Valkey cache this way; Loki's
+  stores of Envoy Gateway and Traefik Hub consume a Valkey or Redis cache this
+  way, accepting `valkey-tls` and `redis-tls` alike, and so does Traefik Hub's
+  semantic cache, for a Redis store; Loki's
   chunk cache consumes a Memcached cache this way, its shared protocol check
   accepting `memcached` and `memcached-tls`.
+- **A consumer whose product checks a certificate only against the authorities
+  it trusts for every connection offers no `server_ca`.** APISIX's semantic cache
+  reaches a Redis store publishing `redis-tls` over TLS and checks its
+  certificate chain against the authorities the gateway trusts, its system's by
+  default, and not the store's name; a privately signed certificate fails the
+  handshake when the gateway runs.
 - **A consumer whose product cannot reach a cache over TLS refuses the TLS value
   by name**, naming the connection and the cache's protocol: Higress's token
   limit, whose plugin's Redis settings offer no TLS connection, and the four
   consumers that hand a store's address to the Release's own code —
   `core/ai-tool/datastore-query`, `core/ai-agent/langgraph`, `dynamiq` and
   `phidata` — which give that code no authority to check a certificate against,
-  and the last three not even the store's protocol.
+  and the last three not even the store's protocol. LiteLLM's semantic cache
+  refuses it too, though there the limit is its Recipes': they give the cache
+  the store's host and port, from which it connects without TLS, rather than
+  the whole connection URL, password included, that its TLS connection takes.
 - **A consumer checking `protocol` through the shared TargetProtocol check lists
   every value its client speaks** in its `check_protocol` local: one protocol as
   a plain string, or several as a JSON list in the string — a local is a string,
