@@ -720,8 +720,8 @@ licence, the label to match a policy category.
 recover a licence — the standard library carries `osi-approved` over Apache-2.0,
 AGPL-3.0, MPL-2.0, MIT and BSD-3-Clause alike, and a policy that turns on
 copyleft cannot read that distinction out of the class. Nor does every wrapped
-product yield a single identifier: `open-core`, `proprietary` and
-`not-applicable` describe situations no one SPDX identifier expresses, and the
+product yield a single identifier: `open-core`, `proprietary`, `not-applicable`
+and `mixed` describe situations no one SPDX identifier expresses, and the
 convention is to state the field where a single identifier applies and leave it
 absent where none does — so the label classifies entities the field says nothing
 about. The two also sit on different kinds. The label is a Component-identity
@@ -740,13 +740,15 @@ directly. `recipe/terraform/postgres-rds-terraform-aws-modules` is the shape.
 **The catalog file's own licence is a third surface: the per-file
 `# SPDX-License-Identifier:` header.** It states the terms the YAML itself is
 published under, which is a different question again from the licence, or the
-class, of the software that YAML describes. `core/datastore/redis` carries all
+class, of the software that YAML describes. `core/datastore/weaviate` carries all
 three, and each says something the other two cannot: an `Apache-2.0` header over
-the file, `metadata.license: AGPL-3.0` over the datastore the file describes, and
-`upstream-licensing: osi-approved` over the class that licence falls into.
+the file, `metadata.license: BSD-3-Clause` over the database the file describes,
+and `upstream-licensing: osi-approved` over the class that licence falls into.
 
 The value set is a closed, single-valued standard-library convention (the
-compiler is agnostic to it, as it is to every label):
+compiler is agnostic to it, as it is to every label). A Component carries one
+value, and where its Recipes realize it under terms of more than one class that
+value is `mixed`:
 
 - **`osi-approved`** — the wrapped product is published under an OSI-approved
   licence, and that licence covers the artifact a Release runs.
@@ -764,6 +766,18 @@ compiler is agnostic to it, as it is to every label):
 - **`not-applicable`** — the Component wraps no single third-party product, so
   there is nothing to classify. Protocol shims that reach any implementation of
   an interface, abstract bases, and the generic compute primitives are this case.
+- **`mixed`** — the Component's Recipes run or call software under terms of
+  more than one of the classes above, so which class covers a Release follows
+  the Recipe its Manifest selects, as `mixed` states for `hosting`. Such a
+  Component carries no `metadata.license`, since no single identifier applies,
+  and its description and each Recipe's state the terms of what each
+  realization runs. `core/datastore/redis` is this case: its container
+  realizations run the Redis server under its AGPL-3.0 arm and its ElastiCache
+  realizations Redis OSS under BSD-3-Clause, both `osi-approved`, while
+  `recipe/terraform/redis-azure-managed` provisions Azure Managed Redis, which
+  Microsoft offers under its terms of service, a `proprietary` relationship. A
+  reader filtering on one of the other values does not match a `mixed`
+  Component.
 
 Absence of the label means **not yet classified** — never "nothing to state",
 which is `not-applicable`. Every `core/` Component naming a third-party product
@@ -1318,13 +1332,13 @@ Inside `metadata:`, the keys an entity carries are authored in this order:
 
 ```yaml
 metadata:
-  name: core/datastore/redis
+  name: core/datastore/weaviate
   version: 1.0.0
-  license: AGPL-3.0
+  license: BSD-3-Clause
   description: >
-    A Redis in-memory key-value cache, speaking the Redis wire protocol.
+    A Weaviate vector database.
   labels:
-    component.aggrega.ai/type: server
+    component.aggrega.ai/type: stateful-server
     component.aggrega.ai/category: datastore
   maintainers:
     - name: Massimiliano Ferrero
@@ -1911,7 +1925,11 @@ registry, which `terraform init` fetches whatever inputs the call is given. So
 beside the Recipe, as `recipe/terraform/rabbitmq-amazon-mq` does for an Amazon MQ
 broker, and their descriptions say why. `recipe/terraform/postgres-flexible-server`
 sources the Azure Verified Modules programme's flexible server module, whose root
-calls only its own `./modules/database` directory.
+calls only its own `./modules/database` directory. The same programme's Azure
+Managed Redis module fails the completeness test instead: it calls no module, but
+it takes no persistence or access-key setting and leaves out eviction policies the
+service offers, so `recipe/terraform/redis-azure-managed` writes its body rather
+than refusing values the service can honour.
 
 #### A CloudFormation template
 
@@ -2067,7 +2085,10 @@ IAM access tokens, so
 [`recipe/terraform/valkey-memorystore`](../aggrega-catalog/recipe/terraform/valkey-memorystore/1.0.0/recipe.yaml)
 runs the cache without authentication, gated by the private network alone;
 Memorystore for Memcached offers no instance authentication at all, as ElastiCache
-offers none for Memcached.
+offers none for Memcached. Azure Managed Redis authenticates every client, with
+Microsoft Entra ID tokens or with access keys it generates, so
+[`recipe/terraform/redis-azure-managed`](../aggrega-catalog/recipe/terraform/redis-azure-managed/1.0.0/recipe.yaml)
+halts on any attachment and the cache still authenticates with nothing attached.
 
 A service that requires the credential halts with the slot empty, too, naming it,
 where the Component's slot is optional and an unattached slot means a development
@@ -3859,7 +3880,10 @@ template, not something the compiler checks: the compiler pipes the published
   consumer checks it against that authority in its `server_ca` slot, a Secret
   holding the chain under `ca.crt`, which the operator reads with `gcloud
   memorystore instances get-certificate-authority` once the instance exists. An
-  attachment to `server_certificate` halts there as well.
+  attachment to `server_certificate` halts there as well. So does the Azure
+  Managed Redis realization, which serves TLS by default with a certificate of
+  its own; there `client_tls` false serves plaintext, which the service accepts
+  from access-key clients alone, so it halts while access keys are off.
 - **A realization that cannot serve TLS refuses `client_tls` by name and names one
   that can.** The Compose realizations do: each server reads its certificate
   from files, and no credential Feature realized on Compose names a secret a
@@ -3996,6 +4020,10 @@ So does `recipe/terraform/postgres-flexible-server`, whose pointer names the mod
 `fqdn` output, the server's name under `postgres.database.azure.com`, which resolves
 through the operator's private DNS zone; it publishes `port` `5432`, the one port the
 service serves PostgreSQL on, and refuses any other `infra.port` by name.
+So does `recipe/terraform/redis-azure-managed`, whose pointer names its body's
+`hostname` output, the instance's name under `<region>.redis.azure.net`; it
+publishes `port` `10000`, the one port Azure Managed Redis serves, and refuses
+an `infra.port` other than the Component's default by name.
 So does `recipe/terraform/kafka-msk`, a managed Kafka
 cluster rather than a datastore, whose `host` names the first broker of the module's
 `bootstrap_brokers_plaintext` output and whose `bootstrap_servers` names the whole
