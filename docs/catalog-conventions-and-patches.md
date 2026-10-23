@@ -1896,8 +1896,9 @@ recorded as "The `component.aggrega.ai/upstream-licensing` label" sets out for a
 vendored module. `recipe/terraform/postgres-rds-terraform-aws-modules` and its MySQL
 and MariaDB siblings are the shape: they source the terraform-aws-modules project's
 RDS module, whose root calls only its own `./modules/` directories.
-`recipe/terraform/valkey-elasticache` and `memcached-elasticache` source the same
-project's ElastiCache module, whose root declares no module call at all.
+`recipe/terraform/valkey-elasticache`, `redis-elasticache` and `memcached-elasticache`
+source the same project's ElastiCache module, whose root declares no module call at
+all.
 
 #### A CloudFormation template
 
@@ -3764,10 +3765,10 @@ template, not something the compiler checks: the compiler pipes the published
 - **A managed realization turns on the service's own in-transit encryption.** The
   ElastiCache realizations do: the service presents a certificate AWS issues, which
   is publicly trusted, so a consumer needs no `server_ca` for it, and an attachment
-  to `server_certificate` halts naming the slot. An attached Valkey password becomes
-  the AUTH token, which ElastiCache accepts only with in-transit encryption on, so
-  it halts while `client_tls` is false; an attached Memcached password halts, since
-  ElastiCache offers no Memcached authentication.
+  to `server_certificate` halts naming the slot. An attached Valkey or Redis
+  password becomes the AUTH token, which ElastiCache accepts only with in-transit
+  encryption on, so it halts while `client_tls` is false; an attached Memcached
+  password halts, since ElastiCache offers no Memcached authentication.
 - **A realization that cannot serve TLS refuses `client_tls` by name and names one
   that can.** The Compose realizations do: each server reads its certificate
   from files, and no credential Feature realized on Compose names a secret a
@@ -3877,10 +3878,11 @@ The terraform RDS Recipes (`recipe/terraform/postgres-rds`, `mysql-rds`,
 `-rds-terraform-aws-modules` Recipes, whose pointer names the module's
 `db_instance_address` output) and the CloudFormation ones
 (`recipe/cloudformation/postgres-rds`, `mysql-rds` and `mariadb-rds`) follow it,
-and so do the terraform ElastiCache Recipes (`recipe/terraform/valkey-elasticache`,
-whose pointer names the module's `replication_group_primary_endpoint_address`
-output, and `memcached-elasticache`, whose pointer names `cluster_address`, the
-host of the cluster's configuration endpoint) and the CloudFormation ones
+and so do the terraform ElastiCache Recipes (`recipe/terraform/valkey-elasticache`
+and `redis-elasticache`, whose pointer names the module's
+`replication_group_primary_endpoint_address` output, and `memcached-elasticache`,
+whose pointer names `cluster_address`, the host of the cluster's configuration
+endpoint) and the CloudFormation ones
 (`recipe/cloudformation/valkey-elasticache`, publishing `!GetAtt
 <LogicalId>.PrimaryEndPoint.Address`, and `memcached-elasticache`, publishing
 `!GetAtt <LogicalId>.ConfigurationEndpoint.Address` — the two resource types spell
