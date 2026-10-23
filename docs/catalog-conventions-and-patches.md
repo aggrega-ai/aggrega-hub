@@ -3883,8 +3883,8 @@ and `redis-elasticache`, whose pointer names the module's
 `replication_group_primary_endpoint_address` output, and `memcached-elasticache`,
 whose pointer names `cluster_address`, the host of the cluster's configuration
 endpoint) and the CloudFormation ones
-(`recipe/cloudformation/valkey-elasticache`, publishing `!GetAtt
-<LogicalId>.PrimaryEndPoint.Address`, and `memcached-elasticache`, publishing
+(`recipe/cloudformation/valkey-elasticache` and `redis-elasticache`, publishing
+`!GetAtt <LogicalId>.PrimaryEndPoint.Address`, and `memcached-elasticache`, publishing
 `!GetAtt <LogicalId>.ConfigurationEndpoint.Address` — the two resource types spell
 the attribute differently), and `recipe/terraform/opensearch-service`, whose
 pointer names the module's `domain_endpoint` output, and

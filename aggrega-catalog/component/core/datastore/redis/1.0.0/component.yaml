@@ -11,9 +11,9 @@ metadata:
     A Redis in-memory key-value cache, speaking the Redis wire protocol. Used
     as a cache, entries live in memory and are not durably persisted, so the
     component renders as a stateless workload rather than a stateful one and
-    declares no storage. Provider-agnostic: the same component is implemented
-    by a Helm Recipe (Workload synthesis to native Kubernetes resources) and a Compose Recipe (local
-    development). Exports its host and port to consumers via the uses topology.
+    declares no storage. Realized on Kubernetes (Workload synthesis to native
+    Kubernetes resources), on Compose for local development, and on Amazon
+    ElastiCache. Exports its host and port to consumers via the uses topology.
     The packaged Redis server is AGPL-3.0 (tri-licensed AGPLv3 / RSALv2 /
     SSPLv1; deployed here under the AGPL arm); consumers needing a BSD-licensed
     alternative can select the Valkey component instead.
@@ -22,13 +22,27 @@ metadata:
     gateway's semantic cache searches its replies with, and it publishes
     vector_search while it does; the Valkey image the catalog pins does not.
 
+    Reach for terraform/redis-elasticache, or cloudformation/redis-elasticache
+    in a CloudFormation stack, where the cache is an ElastiCache service in the
+    operator's AWS account. ElastiCache runs Redis OSS 7.1 or earlier, a
+    release line the Redis project publishes under BSD-3-Clause, with no
+    vector search, so those realizations publish none; the Release sets
+    infra.engine_version there, and each halts naming each value ElastiCache
+    cannot apply.
+
     `infra.client_tls`, off by default, serves TLS alone and publishes
     `protocol` `redis-tls`: on Kubernetes with the certificate attached to
-    `server_certificate`. The Compose realization refuses it by name.
+    `server_certificate`, on ElastiCache with one AWS issues. The Compose
+    realization refuses it by name.
   labels:
     component.aggrega.ai/type: server
     component.aggrega.ai/category: datastore
     datastore.aggrega.ai/engine: kv
+    # Realized self-hosted (helm, compose) and managed (ElastiCache), so no
+    # single hosting posture is its identity; the posture of a Release
+    # follows the Recipe the Manifest selects. Selector-only: never stamped
+    # onto output.
+    component.aggrega.ai/hosting: mixed
     component.aggrega.ai/upstream-licensing: osi-approved
   maintainers:
     - name: Massimiliano Ferrero
@@ -50,7 +64,7 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [env]
-      description: "Optional cache authentication credential. When attached, enables Redis password authentication and supplies the password; unattached, the cache runs without authentication."
+      description: "Optional cache authentication credential. When attached, enables Redis password authentication and supplies the password; unattached, the cache runs without authentication. On ElastiCache the password is the AUTH token, which the service accepts only while infra.client_tls is true, drawn by core/random-password, when Terraform applies or the stack is created, with no punctuation and at least 16 characters."
     # Optional server certificate, read only while infra.client_tls is true. It
     # reaches the container as files (inject: [file]), so its fill must name a
     # Secret the workload mounts — core/referenced-secret, whose realization names
@@ -60,7 +74,7 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [file]
-      description: "Optional certificate the cache presents to its clients while infra.client_tls is true: a Secret holding tls.crt, the certificate followed by any intermediate certificates, and tls.key, its private key, the two keys a kubernetes.io/tls Secret holds. The certificate names every address a client dials: the published host, and its namespace-qualified forms where clients in other namespaces connect. Mounted as files, so attach a Feature that names an existing Secret, such as core/referenced-secret. Required by the Kubernetes realization while client_tls is true; a build halts on it attached while client_tls is false."
+      description: "Optional certificate the cache presents to its clients while infra.client_tls is true: a Secret holding tls.crt, the certificate followed by any intermediate certificates, and tls.key, its private key, the two keys a kubernetes.io/tls Secret holds. The certificate names every address a client dials: the published host, and its namespace-qualified forms where clients in other namespaces connect. Mounted as files, so attach a Feature that names an existing Secret, such as core/referenced-secret. Required by the Kubernetes realization while client_tls is true; a build halts on it attached while client_tls is false. ElastiCache presents a certificate AWS issues, so its realizations halt on any attachment here."
   schema:
     values:
       # Developer Intent — filled by the Developer in the Aggregate. Every knob
@@ -70,23 +84,23 @@ spec:
       # cache free of redundant flags until the developer expresses an intent.
       maxmemory:
         type: string
-        description: Maximum memory the cache may use before eviction (the redis maxmemory directive, e.g. 256mb). Omit for no cap.
+        description: Maximum memory the cache may use before eviction (the redis maxmemory directive, e.g. 256mb). Omit for no cap. ElastiCache fixes it by the node type, so its realizations halt on it.
       maxmemory_policy:
         type: string
         description: Eviction policy applied when maxmemory is reached (the redis maxmemory-policy directive, e.g. allkeys-lru, volatile-ttl, noeviction). Omit to use the redis default.
       databases:
         type: integer
         min: 1
-        description: Number of logical databases (the redis databases directive). Omit to use the redis default (16).
+        description: Number of logical databases (the redis databases directive). Omit to use the redis default (16). The ElastiCache realizations set it through a parameter group from Redis OSS 6.0 on, and halt on it below, where ElastiCache lets no parameter group change it.
       appendonly:
         type: boolean
         default: false
-        description: Enable append-only file (AOF) persistence. Pair with persistence.enabled for a durable volume; on an ephemeral cache the AOF is not retained across restarts.
+        description: Enable append-only file (AOF) persistence. Pair with persistence.enabled for a durable volume; on an ephemeral cache the AOF is not retained across restarts. ElastiCache writes no AOF for Redis OSS, so its realizations halt on it set true.
       persistence:
         enabled:
           type: boolean
           default: false
-          description: Run the cache as a durable StatefulSet with a persistent volume mounted at /data instead of the default ephemeral Deployment. Off by default — the cache role holds no durable state. Realized on the synthesized-Helm target; the Compose flavor is ephemeral.
+          description: Run the cache as a durable StatefulSet with a persistent volume mounted at /data instead of the default ephemeral Deployment. Off by default — the cache role holds no durable state. Realized on the synthesized-Helm target; the Compose flavor is ephemeral, and the ElastiCache realizations, which provision no volume, halt on it set true.
     infra:
       # Operational Sizing — filled by the Operator in the Release. Developer
       # never sees this.
@@ -106,7 +120,9 @@ spec:
           the certificate attached to `server_certificate` (required while this
           is on), requests no client certificate, and the published `protocol`
           is `redis-tls`. Served by the `redis` Kubernetes realization; the
-          Compose realization refuses it.
+          Compose realization refuses it. On ElastiCache it turns on the
+          service's in-transit encryption, whose certificate AWS issues and
+          clients trust without a `server_ca`.
       # The default names an exact patch of the Redis image published by the
       # Redis project's own maintainers. A tag naming only the minor line moves
       # to the next patch as one is published, so two builds of the same
@@ -126,28 +142,36 @@ spec:
           container targets. It selects a tag and not a repository, so a Release
           needing a different image — the one the OT-CONTAINER-KIT Redis
           operator's own chart and examples name, quay.io/opstree/redis — sets
-          infra.overrides.image to the whole image reference instead.
+          infra.overrides.image to the whole image reference instead. The
+          ElastiCache realizations read the version the value begins with as
+          the Redis OSS engine version, 7.1, 7.0, 6.2, 6.0, 5.0.6 or 4.0.10, and
+          halt on any other, this default included, so a Release mapped to them
+          sets it; they halt on infra.overrides.image, since no image runs
+          there.
       compute:
         cpu:
           type: string
           default: 100m
+          description: CPU the cache server is given. The ElastiCache realizations do not read it; they size the node by infra.overrides.node_type (CacheNodeType on CloudFormation).
         memory:
           type: string
           default: 128Mi
+          description: Memory the cache server is given. The ElastiCache realizations do not read it; they size the node by infra.overrides.node_type (CacheNodeType on CloudFormation).
       storage:
         type: object
         properties:
           size:
             type: string
             default: 1Gi
-            description: Persistent volume size when persistence.enabled is set (synthesized-Helm target).
+            description: Persistent volume size when persistence.enabled is set (synthesized-Helm target). The ElastiCache realizations provision no volume and do not read it.
           type:
             type: string
             description: >
               Persistent volume storage class when persistence.enabled is set
               (synthesized-Helm target). Leave it unset to take the cluster's
               default storage class; set it to name another class the cluster
-              offers.
+              offers. The ElastiCache realizations provision no volume and do
+              not read it.
       overrides:
         type: object
         additionalProperties: true
@@ -163,16 +187,20 @@ spec:
           Set to true when the image infra.overrides.image names serves the
           Redis query engine's vector search, FT.CREATE and FT.SEARCH over a
           vector field, so this instance publishes vector_search. Read only
-          while infra.overrides.image is set.
+          while infra.overrides.image is set. The ElastiCache realizations run
+          no image and do not read it.
     provides:
       # Public API Contract — keys exported to consumers via uses topology edges.
       host:
         type: string
         required: true
         description: >
-          In-cluster DNS name of the Service fronting the cache. A consumer
-          puts this name in its client's connection settings together with
-          `port`.
+          Address a consumer opens its cache connection to, together with
+          `port`: the in-cluster DNS name of the Service fronting the cache on
+          Kubernetes, and on ElastiCache a pointer string Terraform or
+          CloudFormation resolves to the primary endpoint, or the DNS name the
+          Release sets in infra.overrides.host instead, so a consumer on another
+          target receives an address it can resolve.
       port:
         type: integer
         required: true
@@ -192,8 +220,10 @@ spec:
           handshake and exchanges no command.
       # Whether this instance serves the Redis query engine's vector search,
       # which a gateway's semantic cache stores and searches its replies with.
-      # Every Recipe publishes it from this instance's own infra, as true or
-      # empty. With no infra.overrides.image it is true for an engine_version
+      # Every container Recipe publishes it from this instance's own infra, as
+      # true or empty; the ElastiCache Recipes publish it empty, since
+      # ElastiCache offers vector search on Valkey alone and on no Redis OSS
+      # version. With no infra.overrides.image it is true for an engine_version
       # from 8.0.0 on: the official image builds the query engine in from that
       # release, alpine and debian alike, and loads it when the server starts —
       # on amd64 and arm64 nodes, the only architectures it builds it for. An
@@ -208,4 +238,4 @@ spec:
           search, which a semantic cache needs of its store; empty otherwise.
           With no infra.overrides.image it is `true` for an infra.engine_version
           from 8.0.0 on; with one, only while infra.image_serves_vector_search
-          is true.
+          is true. The ElastiCache realizations publish it empty.
