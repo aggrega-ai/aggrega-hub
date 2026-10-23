@@ -3969,7 +3969,15 @@ operator's string and resolves nothing about it.
   `DomainEndpoint`, which a consumer in the stack receives as that intrinsic and
   one in another stack imports through its export. A client checking that
   domain's certificate needs a name the certificate carries, which a name of the
-  operator's own gets only from a custom endpoint neither Recipe configures.
+  operator's own gets only from the domain's custom endpoint, so on those two
+  Recipes `infra.overrides.host` also names the custom endpoint, which presents
+  the AWS Certificate Manager certificate the Release names beside it, in
+  `infra.overrides.custom_endpoint_certificate_arn` on terraform and
+  `infra.overrides.CustomEndpointCertificateArn` on CloudFormation, each named for
+  the field it sets. The two keys go together: either without the other halts,
+  naming the missing one, and so does a name the custom endpoint cannot take — an
+  IP literal, a single label, a label over 63 characters or a name over 255. The
+  certificate's ARN is piped as text; the Recipes create no certificate.
 - **The Recipe emits nothing for the name** — no DNS record, no alias. The operator
   points the name at the instance outside the Release, and the build cannot check
   that it does: resolving the name is the runtime's, and a record the Release never
