@@ -1,0 +1,271 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: kafka-msk
+  version: 1.0.0
+  # The licence of the vendored module, the terraform-aws-modules project's MSK
+  # module: the third-party code this Recipe pins and writes into the output.
+  # The Amazon MSK cluster it provisions is a service the reader contracts for
+  # directly with AWS, under AWS's terms.
+  license: Apache-2.0
+  description: >
+    Apache Kafka on Amazon MSK (Managed Streaming for Apache Kafka), as one
+    provisioned cluster in KRaft mode in the operator's VPC, through the
+    terraform-aws-modules project's published module
+    terraform-aws-modules/msk-kafka-cluster/aws at v3.3.0, Apache-2.0, fetched
+    from its git repository at that tag and vendored; entity.lock pins the
+    tag's commit and archive digest.
+
+    The cluster runs one broker in each client subnet, the smallest cluster
+    MSK runs, so infra.overrides.subnet_ids names two or three subnets in
+    distinct Availability Zones and the cluster has two or three brokers.
+    Clients reach the brokers inside the VPC on the plaintext listener, port
+    9092, with no authentication, under protocol kafka; MSK's TLS listener on
+    9094 stays on beside it.
+
+    bootstrap_servers publishes a reference to the brokers' whole list, host
+    the first broker in it, port 9092; infra.overrides.host publishes the
+    operator's DNS name instead. A client taking a list reads
+    bootstrap_servers, so it can still start while one broker is down.
+
+    Reach for it where Kafka is an MSK cluster in the operator's AWS account;
+    reach for kafka or kafka-strimzi on helm where it runs in Kubernetes.
+
+    infra.engine_version takes 3.8, 3.9, 4.0 or 4.1, the Component's default
+    included. An infra.broker_port other than 9092 halts, and so do
+    values.metrics_enabled, values.cluster_id, infra.controller_port,
+    infra.compute and infra.control_plane_present away from the Component's
+    defaults: MSK decides each of them itself or has no use for it.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/messaging/kafka:1.0.0
+
+  # The published module, at the tag the registry publishes as version 3.3.0.
+  # A registry version of a module is a tag of its git repository, and the
+  # registry's own download for this version answers with a git source at the
+  # commit that tag names; Terraform's dependency lock file records providers
+  # and no module. So the pin is taken here: `aggrega pin` resolves the tag to
+  # its commit and records that commit and the archive's digest in entity.lock,
+  # and every build vendors exactly those bytes.
+  #
+  # The source names the repository root, which declares no module call of its
+  # own: the configuration Terraform loads from it calls no registry module, so
+  # initialising it fetches providers and nothing else. The repository's
+  # modules/ and examples/ directories are vendored with it and never loaded.
+  #
+  # The module declares hashicorp/aws >= 6.40 and hashicorp/random >= 3.6 in its
+  # own required_providers and is vendored byte for byte, so this Recipe adds no
+  # provider constraint of its own; the catalog conventions' "One AWS provider
+  # constraint for every AWS body" section says how it composes with the
+  # catalog's authored AWS bodies.
+  #
+  # The tag is written out rather than read from infra.source_version: a source
+  # whose coordinates come from a template is pinned per Release instead of in
+  # this Recipe's own entity.lock, and this Recipe's pin is the one stated
+  # above. The Component declares no source_version.
+  source:
+    kind: git-repository
+    url: https://github.com/terraform-aws-modules/terraform-aws-msk-kafka-cluster.git
+    ref: v3.3.0
+
+  locals:
+    # The Kafka version, the major and minor version infra.engine_version
+    # begins with: 4.1 from the Component's default image tag 4.1.2. MSK runs
+    # the newest patch of that version.
+    kafka_version: '{{ regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) }}'
+    # The broker instance type, infra.overrides.instance_type or kafka.t3.small,
+    # the smallest Standard broker size MSK offers.
+    instance_type: '{{ optional (optional .infra "overrides" dict) "instance_type" "kafka.t3.small" }}'
+    # The name the Release gives the cluster under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   subnet_ids          - []string (broker_node_client_subnets), required, two or three
+  #   vpc_security_groups - []string (broker_node_security_groups)
+  #   instance_type       - string (broker_node_instance_type; default "kafka.t3.small")
+  #   host                - string (published as provides.host; not passed to the module)
+  #
+  # subnet_ids, vpc_security_groups, instance_type and host are the keys, under
+  # the same names, that the other AWS Recipes read for the same concepts.
+  # subnet_ids is required: it places the brokers in the operator's VPC, and
+  # this Recipe never chooses a network for the operator. MSK takes two or three
+  # client subnets, two alone in US West (N. California), each in a distinct
+  # Availability Zone, and spreads the brokers evenly across them; the broker
+  # count must be a multiple of the subnet count, so one broker per subnet is
+  # the smallest cluster, and the one this Recipe runs. With no security group
+  # named, MSK attaches the VPC's default security group; the security groups
+  # are the operator's, who opens 9092 to the cluster's clients.
+  #
+  # The instance type is a Standard broker size (kafka.t3.small, kafka.m5.*,
+  # kafka.m7g.*). The Express sizes (express.*) take no EBS volume, which this
+  # Recipe sizes from infra.storage.size, so they halt here.
+  #
+  # The module's own defaults stand for every input this mapping leaves out.
+  # Three are worth knowing: it creates an MSK configuration for the Kafka
+  # version, holding no server property of its own, named after the cluster
+  # with a random suffix Terraform draws at apply time; it creates a CloudWatch
+  # log group under /aws/msk/ while sending no broker log to it; and it keeps
+  # the data at rest encrypted with the service's own key, as MSK always does.
+  # Its storage autoscaling, which grows each broker's volume as it fills, is
+  # turned off here, so the volume stays the size infra.storage.size gives it.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against MSK's own documentation:
+  #   honoured — infra.engine_version (major and minor, among the versions MSK
+  #     offers a new Standard-broker cluster); infra.storage.size, as each
+  #     broker's EBS volume in whole GiB, 1 to 16384; infra.broker_port while it
+  #     is 9092, the port MSK serves plaintext on; and the overrides above.
+  #   refused — infra.broker_port other than 9092; values.metrics_enabled true,
+  #     since the metrics keys name Kubernetes pods and this realization runs
+  #     none; values.cluster_id other than the Component's default, since MSK
+  #     names its cluster and generates its KRaft identity itself;
+  #     infra.controller_port other than 9093, since the controllers are the
+  #     service's own and serve no port a client reaches; infra.compute other
+  #     than 500m and 512Mi, since the broker size is
+  #     infra.overrides.instance_type; infra.control_plane_present true, since
+  #     no Kafka control plane is installed for MSK; and Kafka 4.2, which MSK
+  #     runs on Express brokers alone.
+  #   not read — values.cluster_id, infra.controller_port, infra.compute and
+  #     infra.control_plane_present while they hold the Component's defaults.
+  assertions:
+    subnet_ids_supplied: >-
+      {{- $s := optional (optional .infra "overrides" dict) "subnet_ids" "" -}}
+      {{- $ok := and (kindIs "slice" $s) (ge (len $s) 2) (le (len $s) 3) -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) .) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "this Release places its MSK cluster in subnets of the operator's VPC, two or three subnets in distinct Availability Zones with one broker in each, but infra.overrides.subnet_ids is %v: set infra.overrides.subnet_ids in the Release to a list of the IDs of two or three existing subnets" (toJson $s)) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this Kafka cluster reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the port is infra.broker_port, 9092` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The Kafka versions MSK offers a new cluster of Standard brokers, read off
+    # its supported-versions table: those with no end-of-support date passed.
+    # 4.2 runs on Express brokers alone. A version MSK adds later is refused
+    # here until this list names it.
+    engine_version_offered: >-
+      {{- $v := .locals.kafka_version -}}
+      {{- if eq $v "4.2" -}}
+      {{- fail (printf "infra.engine_version is %q, and MSK runs Kafka 4.2 on Express brokers alone, which take no EBS volume, while this Recipe runs Standard brokers sized by infra.storage.size: set infra.engine_version in the Release to 4.1, 4.0, 3.9 or 3.8" (toString .infra.engine_version)) -}}
+      {{- end -}}
+      {{- if not (has $v (list "4.1" "4.0" "3.9" "3.8")) -}}
+      {{- fail (printf "infra.engine_version is %q, and MSK offers a new cluster Kafka 4.1, 4.0, 3.9 and 3.8, which this Recipe reads off the major and minor version the value begins with: set infra.engine_version in the Release to one of them, such as 4.1" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    broker_port_is_the_plaintext_port: >-
+      {{- if ne (toString .infra.broker_port) "9092" -}}
+      {{- fail (printf "infra.broker_port is %v, and MSK serves its plaintext listener on port 9092 alone, which this Recipe publishes as port: remove infra.broker_port from the Release" .infra.broker_port) -}}
+      {{- end -}}
+    metrics_enabled_unsupported: >-
+      {{- if .values.metrics_enabled -}}
+      {{- fail "values.metrics_enabled is true, and the metrics keys it publishes name the Kubernetes pods a scraper discovers the brokers by, while MSK runs its brokers outside any cluster of the Release's: set values.metrics_enabled to false, or select kafka-strimzi on helm in the Manifest, which serves them" -}}
+      {{- end -}}
+    service_owned_keys: >-
+      {{- if ne (toString .values.cluster_id) "4L6g3nShT-eMCtK--X86sw" -}}
+      {{- fail (printf "values.cluster_id is %q, and MSK names its cluster and generates its KRaft identity itself, with no setting for either: remove values.cluster_id from the Aggregate, or select kafka on helm in the Manifest, which honours it" (toString .values.cluster_id)) -}}
+      {{- end -}}
+      {{- if ne (toString .infra.controller_port) "9093" -}}
+      {{- fail (printf "infra.controller_port is %v, and on MSK the KRaft controllers are the service's own and serve no port a client reaches: remove infra.controller_port from the Release" .infra.controller_port) -}}
+      {{- end -}}
+      {{- if or (ne (toString .infra.compute.cpu) "500m") (ne (toString .infra.compute.memory) "512Mi") -}}
+      {{- fail (printf "infra.compute is cpu %v and memory %v, and MSK sizes a broker by its instance type, not by a container's CPU and memory: remove infra.compute from the Release and set infra.overrides.instance_type, such as kafka.m7g.large" .infra.compute.cpu .infra.compute.memory) -}}
+      {{- end -}}
+      {{- if .infra.control_plane_present -}}
+      {{- fail "infra.control_plane_present is true, which affirms a Kafka control plane installed in a Kubernetes cluster, and MSK runs the brokers itself with none: remove infra.control_plane_present from the Release" -}}
+      {{- end -}}
+    standard_broker_volume: >-
+      {{- if not (hasPrefix "kafka." .locals.instance_type) -}}
+      {{- fail (printf "infra.overrides.instance_type is %q, and this Recipe runs Standard brokers, whose sizes begin kafka., each with an EBS volume sized by infra.storage.size; the Express sizes take no volume: set infra.overrides.instance_type to a Standard size, such as kafka.m7g.large" .locals.instance_type) -}}
+      {{- end -}}
+      {{- $size := toString .infra.storage.size -}}
+      {{- if not (regexMatch `^[0-9]+Gi$` $size) -}}
+      {{- fail (printf "infra.storage.size is %q, and this Recipe gives each MSK broker an EBS volume sized in whole gibibytes: set infra.storage.size in the Release to a size such as 100Gi" $size) -}}
+      {{- end -}}
+      {{- $gi := int (trimSuffix "Gi" $size) -}}
+      {{- if or (lt $gi 1) (gt $gi 16384) -}}
+      {{- fail (printf "infra.storage.size is %q, and MSK gives a broker an EBS volume of 1 to 16384 GiB: set infra.storage.size in the Release within that range" $size) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings.
+  # bootstrap_servers names the module's bootstrap_brokers_plaintext output —
+  # the comma-separated host:port list of the brokers' plaintext listener,
+  # which the service returns sorted — through this component's module call,
+  # which the boundary's root configuration declares under .context.instance_id
+  # for a component declared in the Aggregate the Release deploys. host is the
+  # first broker in that list: the text before its first colon, split on the
+  # colon that is the fourth character of the module's arn output, as every
+  # ARN's is; the expression holds no quoted string, because the build writes it
+  # inside an argument's quoted value. Terraform resolves both at apply time, so
+  # they resolve only for a consumer authored as a source: Recipe in the same
+  # root configuration; a consumer on another target receives them as text.
+  # The service may return a different broker first after the cluster changes,
+  # and Terraform resolves host again on every apply.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference, and bootstrap_servers publishes that name with
+  # the port as the whole list, so a consumer reading either receives an
+  # address it can use on any target. It is the operator's deterministic
+  # pointer: the compiler pipes it as text and looks nothing up, and this
+  # Recipe emits no DNS record or alias for it, so the operator points the name
+  # at the brokers outside the Release. A consumer in the same root
+  # configuration receives the name as well, and a name carries no reference
+  # for Terraform to order its module after this one by; a later syncWave on
+  # the consumer's boundary, sharing this boundary's directory, orders the two.
+  #
+  # port is 9092, where MSK serves every broker's plaintext listener, so it is
+  # known ahead of time and published as that value. protocol is kafka: the
+  # listener speaks Kafka's protocol unencrypted, as the self-hosted
+  # realizations do. The metrics keys are empty.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${split(substr(module.{{ .context.instance_id }}.arn, 3, 1), module.{{ .context.instance_id }}.bootstrap_brokers_plaintext)[0]}{{ end }}"
+    port: "{{ .infra.broker_port }}"
+    bootstrap_servers: "{{ if .locals.operator_host }}{{ .locals.operator_host }}:{{ .infra.broker_port }}{{ else }}${module.{{ .context.instance_id }}.bootstrap_brokers_plaintext}{{ end }}"
+    protocol: "kafka"
+    metrics_pod_selector: ""
+    metrics_pod_port: ""
+    metrics_path: ""
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # cluster is named after the component, as the other AWS Recipes name their
+  # instances; MSK takes a cluster name of 1 to 64 characters, and the module
+  # names the cluster's configuration after it, which MSK takes as a letter or
+  # digit followed by letters, digits and hyphens, so the component's name is
+  # checked against both here, where it is known.
+  #
+  # The client-broker setting TLS_PLAINTEXT serves the plaintext listener beside
+  # the TLS one. A plaintext listener authenticates no client, and MSK lists
+  # unauthenticated access as the authentication that goes with it, so it is
+  # turned on explicitly rather than left to the service's default. Traffic
+  # between brokers stays encrypted, the service's default.
+  valuesMapping: |
+    {{- if not (regexMatch `^[0-9A-Za-z][0-9A-Za-z-]{0,63}$` .context.instance_id) }}
+    {{- fail (printf "the component %q names its MSK cluster and the cluster's configuration, and MSK takes such a name as 1 to 64 letters, digits and hyphens, beginning with a letter or digit: rename the component in the Aggregate to such a name" .context.instance_id) }}
+    {{- end }}
+    name: "{{ .context.instance_id }}"
+    kafka_version: "{{ .locals.kafka_version }}.x.kraft"
+    number_of_broker_nodes: {{ len .infra.overrides.subnet_ids }}
+    broker_node_client_subnets: {{ toJson .infra.overrides.subnet_ids }}
+    broker_node_instance_type: "{{ .locals.instance_type }}"
+    {{- with optional .infra.overrides "vpc_security_groups" "" }}
+    broker_node_security_groups: {{ toJson . }}
+    {{- end }}
+    broker_node_storage_info:
+      ebs_storage_info:
+        volume_size: {{ trimSuffix "Gi" (toString .infra.storage.size) }}
+    enable_storage_autoscaling: false
+    encryption_in_transit_client_broker: "TLS_PLAINTEXT"
+    client_authentication:
+      unauthenticated: true
