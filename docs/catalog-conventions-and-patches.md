@@ -3894,7 +3894,14 @@ pointer names the module's `domain_endpoint` output, and
 cluster rather than a datastore, whose `host` names the first broker of the module's
 `bootstrap_brokers_plaintext` output and whose `bootstrap_servers` names the whole
 list, both replaced by the operator's name, `bootstrap_servers` joined with the
-port. A managed datastore Recipe
+port. So do `recipe/terraform/rabbitmq-amazon-mq` and
+`recipe/cloudformation/rabbitmq-amazon-mq`, a managed RabbitMQ broker, whose
+`host` names the module's `amqp_host` output on Terraform and, on
+CloudFormation, the host read out of the first of the broker's `AmqpEndpoints`
+URLs with `Fn::Select` over `Fn::Split`, since no attribute carries the host
+alone; both publish `port` `5671`, the one port the service serves AMQP on, and
+refuse an `infra.port` other than the Component's default by name. A managed
+datastore Recipe
 added later follows this section rather than a sibling Recipe.
 
 ### The pipeline family template

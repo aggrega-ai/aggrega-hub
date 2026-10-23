@@ -6,32 +6,46 @@ kind: Component
 metadata:
   name: core/messaging/rabbitmq
   version: 1.0.0
+  # The synthesis Recipe needs no controller installed and no chart repository.
+  # Each metrics-serving Recipe makes the metrics port reachable at the
+  # published host and publishes the address as metrics_endpoint; the
+  # controller-driven one does so while the cluster runs one node, and for more
+  # publishes the Service a scraper discovers every node behind. While
+  # values.metrics_enabled is false those keys are empty.
   description: >
-    A RabbitMQ message broker speaking the AMQP protocol. RabbitMQ persists
-    queues and messages durably, so the component renders as a stateful
-    workload with a persistent volume and declares storage sizing. Broker
-    access always requires credentials: the password is an optional,
-    transparent credential slot, and each Recipe falls back to a deterministic
-    inline development default when no credential is attached so the render
-    stays reproducible. Provider-agnostic: the same component is implemented by
-    a Helm Recipe (Workload synthesis to native Kubernetes resources), a Compose Recipe (local
-    development), and a controller-driven Helm Recipe that emits a RabbitmqCluster
-    custom resource for the RabbitMQ Cluster Operator to reconcile. Reach for the
-    synthesis Recipe on a cluster that runs no RabbitMQ control plane — it needs no
-    controller installed and no chart repository — and for the controller-driven
-    Recipe where the control plane is already in place and the cluster should own
-    upgrades, rolling restarts and credential rotation. Exports its host and AMQP
-    port to consumers via the uses topology.
+    A RabbitMQ message broker speaking the AMQP protocol, persisting queues and
+    messages durably. Exports its host and AMQP port to consumers via the uses
+    topology.
 
-    The broker serves its own metrics on every realization. With
-    `values.metrics_enabled` true each Recipe makes their port reachable at the
-    published host and publishes the address as `metrics_endpoint` — the
-    controller-driven one while the cluster runs one node, and for more the
-    Service a scraper discovers every node behind; false, those keys are
-    empty.
+    Self-hosted, it renders as a stateful workload with a persistent volume, by
+    a Helm Recipe (Workload synthesis to native Kubernetes resources), a Compose
+    Recipe (local development), and a controller-driven Helm Recipe that emits
+    a RabbitmqCluster custom resource for the RabbitMQ Cluster Operator. Reach
+    for the synthesis Recipe on a cluster that runs no RabbitMQ control plane,
+    and for the controller-driven one where the control plane is in place and
+    the cluster should own upgrades, rolling restarts and credential rotation.
+    Broker access always requires credentials: on these Recipes the password
+    slot is optional, and each falls back to a deterministic inline development
+    default so the render stays reproducible.
+
+    Reach for the rabbitmq-amazon-mq Recipes, on terraform and on
+    CloudFormation, where the broker is an Amazon MQ broker in the operator's
+    AWS account. Amazon MQ serves AMQP over TLS alone, on 5671, published as
+    protocol amqps, and requires a password: a core/random-password attachment,
+    without which the build halts. It runs RabbitMQ 4.3, 4.2 and 3.13, so the
+    engine_version default halts there.
+
+    The self-hosted brokers serve their own metrics, published with
+    `values.metrics_enabled` true; the Amazon MQ Recipes halt on true.
   labels:
     component.aggrega.ai/type: stateful-server
     component.aggrega.ai/category: messaging
+    # Realized self-hosted (helm, compose) and managed (Amazon MQ), so no single
+    # hosting posture is its identity; the posture of a Release follows the
+    # Recipe the Manifest selects. Selector-only: never stamped onto output.
+    component.aggrega.ai/hosting: mixed
+    # The RabbitMQ server, which the self-hosted Recipes run and Amazon MQ runs
+    # as its engine, is MPL-2.0, as those Recipes' metadata.license states.
     component.aggrega.ai/upstream-licensing: osi-approved
   maintainers:
     - name: Massimiliano Ferrero
@@ -41,11 +55,13 @@ spec:
   # the env delivery mechanism.
   inject: [env]
   featuresSchema:
-    # Optional password credential slot. RabbitMQ always authenticates, so when
-    # a credential is attached here the Recipe wires the broker
-    # password through the credential subsystem; when unattached, the Recipe
-    # falls back to a deterministic inline development default. `required`
-    # omitted → optional, so a bare `broker: {}` still loads.
+    # Password credential slot. RabbitMQ always authenticates, so when a
+    # credential is attached here the Recipe wires the broker password through
+    # the credential subsystem. When unattached, a self-hosted Recipe falls back
+    # to a deterministic inline development default; the Amazon MQ Recipes halt
+    # instead, since a password every reader of the catalog knows is not left on
+    # a managed broker. `required` omitted → optional at load, so a bare
+    # `broker: {}` still loads on the self-hosted targets.
     # Transparent (inject: [env]) so the injected value reaches the Recipe on
     # the env pipe; the selector is secret-kind-pinned but family-agnostic so
     # either an inject-value or a referenceable credential may fill it.
@@ -53,14 +69,14 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [env]
-      description: "Optional broker password credential. When attached, supplies the RabbitMQ application-user password via the credential subsystem; unattached, the Recipe uses a deterministic inline development default."
+      description: "Broker password credential. Attached, it supplies the RabbitMQ application-user password via the credential subsystem. Unattached, a self-hosted Recipe uses a deterministic inline development default, and the Amazon MQ Recipes halt the build: they take core/random-password alone, with values.symbols false and values.length 12 or more, as Amazon MQ refuses a password shorter than 12 characters or holding a comma, colon or equals sign."
   schema:
     values:
       # Developer Intent — filled by the Developer in the Aggregate.
       user:
         type: string
         default: "user"
-        description: Application user the broker provisions on startup. The matching password comes from the optional password credential slot.
+        description: Application user the broker provisions on startup. The matching password comes from the password credential slot. On Amazon MQ it is the broker's one administrative user, named with 2 to 100 letters, digits, dashes, periods and underscores; the Amazon MQ Recipes refuse any other name, and guest.
       # The broker's own metrics, in the Prometheus format, from its prometheus
       # plugin, which the image and the RabbitMQ Cluster Operator both switch
       # on: port 15692, at /metrics, a listener serving those metrics and
@@ -72,11 +88,14 @@ spec:
       # runs one node, and leaves it empty for more: one address then reaches a
       # different node at each scrape, and each node serves only its own. For
       # more it publishes that client Service instead, for a scraper to
-      # discover every node behind it.
+      # discover every node behind it. Amazon MQ serves a broker's Prometheus
+      # metrics, from RabbitMQ 4.2, only to a scraper presenting the broker's
+      # own user name and password, which none of these keys can carry, so the
+      # Amazon MQ Recipes publish them empty and halt on true.
       metrics_enabled:
         type: boolean
         default: false
-        description: Publishes where the broker's own metrics are, in the Prometheus format — the address as `metrics_endpoint`, or, on a controller-driven cluster of more than one node, the Service a scraper discovers every node behind — putting their port on the Service where a realization needs it; while false those keys are empty. The metrics port checks no caller, so anything that reaches it can read them.
+        description: Publishes where the broker's own metrics are, in the Prometheus format — the address as `metrics_endpoint`, or, on a controller-driven cluster of more than one node, the Service a scraper discovers every node behind — putting their port on the Service where a realization needs it; while false those keys are empty. The metrics port checks no caller, so anything that reaches it can read them. The Amazon MQ realizations halt the build on true, since the service shows its metrics only to a scraper presenting the broker's own credentials.
     infra:
       # Operational Sizing — filled by the Operator in the Release. Developer
       # never sees this.
@@ -85,37 +104,41 @@ spec:
         min: 1024
         max: 65535
         default: 5672
-        description: AMQP listen port. Most operators should omit this and let the Recipe assign the default (5672).
+        description: AMQP listen port. Most operators should omit this and let the Recipe assign the default (5672). The Amazon MQ realizations do not read it — the service serves AMQP over TLS on 5671 alone, which they publish as port — and halt the build on any value other than this default.
       management_port:
         type: integer
         min: 1024
         max: 65535
         default: 15672
-        description: Management HTTP API and dashboard port. Most operators should omit this and let the Recipe assign the default (15672).
+        description: Management HTTP API and dashboard port. Most operators should omit this and let the Recipe assign the default (15672). The Amazon MQ realizations do not read it — the service serves the management interface at an address of its own — and halt the build on any value other than this default.
       engine_version:
         type: string
         default: "4.1.3-management-alpine"
-        description: RabbitMQ container image tag. Selects the image tag on container targets.
+        description: RabbitMQ container image tag. Selects the image tag on container targets. On Amazon MQ the major and minor version it begins with is the broker's RabbitMQ version, one of 4.3, 4.2 (both on the mq.m7g instance types alone) and 3.13; this default begins 4.1, which the service does not run, so the Amazon MQ realizations halt on it, naming the versions to set.
       compute:
         cpu:
           type: string
           default: 250m
+          description: CPU the broker's container is given. The Amazon MQ realizations do not read it, sizing the broker by its instance type in infra.overrides, and halt the build on any value other than this default.
         memory:
           type: string
           default: 512Mi
+          description: Memory the broker's container is given. The Amazon MQ realizations do not read it, sizing the broker by its instance type in infra.overrides, and halt the build on any value other than this default.
       storage:
         type: object
         properties:
           size:
             type: string
             default: 8Gi
+            description: Size of the broker's persistent volume. The Amazon MQ realizations do not read it — the service sizes the broker's volume itself — and halt the build on any value other than this default.
           type:
             type: string
             description: >
               Storage class the broker's persistent volume is provisioned from
               on Kubernetes. Leave it unset to take the cluster's default storage
               class; set it to name another class the cluster offers. The Compose
-              Recipe names no class.
+              Recipe names no class. The Amazon MQ realizations name no volume
+              type and halt the build while this is set.
       overrides:
         type: object
         additionalProperties: true
@@ -128,7 +151,9 @@ spec:
           installed in the target cluster. A controller-driven realization halts the
           build unless this is set true, so a RabbitmqCluster custom resource is never
           emitted as an orphan into a cluster that cannot reconcile it. The
-          synthesized realizations ignore this flag.
+          synthesized realizations ignore this flag. The Amazon MQ realizations
+          do not read it and halt the build while it is true: no RabbitMQ
+          control plane is installed for Amazon MQ.
       credentials:
         type: string
         enum: [generated, supplied]
@@ -141,7 +166,8 @@ spec:
           artifact. `supplied` — the controller reads the credentials from an
           existing Secret named in `credentials_secret` and generates none. The
           synthesized realizations ignore this key: they always take the password
-          from the `password` credential slot.
+          from the `password` credential slot. The Amazon MQ realizations do
+          not read it either, and halt the build on `supplied`.
       credentials_secret:
         type: string
         default: ""
@@ -152,7 +178,8 @@ spec:
           controller would otherwise generate — `username`, `password`,
           `default_user.conf`, `host`, `port`, `provider` and `type`. Leave it empty
           when `credentials` is `generated`; a controller-driven build halts if
-          `supplied` is selected without it.
+          `supplied` is selected without it. The Amazon MQ realizations do not
+          read it and halt the build while it is set.
     provides:
       # Public API Contract — keys exported to consumers via uses topology edges.
       host:
@@ -161,17 +188,23 @@ spec:
         description: >
           Address a producer or consumer opens its broker connection to. Which
           Service carries it follows the realization the Manifest selected, so
-          a consumer reads this rather than deriving a name.
+          a consumer reads this rather than deriving a name. On Amazon MQ it is
+          a pointer string the target resolves to the host of the broker's AMQP
+          endpoint — a Terraform reference, or a CloudFormation intrinsic that
+          a consumer in another stack imports — or the DNS name the Release sets
+          in infra.overrides.host instead, so a consumer on another target
+          receives an address it can resolve. The broker's certificate names its
+          own endpoint, so a client checking it fails against that DNS name.
       port:
         type: integer
         required: true
         description: >
           TCP port the broker accepts client connections on. It carries the
           messaging port, never the management API port, so a consumer reaches
-          the broker rather than its dashboard.
+          the broker rather than its dashboard; on Amazon MQ it is 5671.
       protocol:
         type: string
-        description: Wire protocol the published address speaks — `amqp`, which is what a consumer selects a client library for.
+        description: Wire protocol the published address speaks, which is what a consumer selects a client library and its connection security for — `amqp`, AMQP without TLS, from the self-hosted realizations, and `amqps`, AMQP over TLS, from the Amazon MQ realizations, since the service requires TLS on every client connection.
       # Where Prometheus finds the broker's own metrics, while
       # values.metrics_enabled is true: /metrics on port 15692. A Recipe
       # publishes exactly one of two shapes and leaves the other empty:
