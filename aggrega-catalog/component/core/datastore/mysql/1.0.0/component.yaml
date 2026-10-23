@@ -9,7 +9,7 @@ metadata:
   description: >
     A MySQL relational database. Provider-agnostic: the same component
     is implemented by Helm Recipes (Workload synthesis to native Kubernetes resources),
-    Terraform Recipes (AWS RDS, Azure Database), CloudFormation Recipes,
+    Terraform Recipes (AWS RDS, Google Cloud SQL), CloudFormation Recipes,
     and Compose Recipes (local development).
 
     On AWS RDS through Terraform, reach for
@@ -19,9 +19,22 @@ metadata:
     authors its own body, or terraform/mysql-rds-module, which vendors a
     module kept beside it, where nothing may be fetched, and for
     terraform/mysql-rds where read replicas are needed.
+
+    On Google Cloud SQL, reach for terraform/mysql-cloud-sql, which vendors the
+    terraform-google-modules project's published Cloud SQL module, where the
+    database runs in a Google Cloud project whose VPC network already has
+    private services access to Cloud SQL; the instance gets a private address
+    in that network and no public one.
   labels:
     component.aggrega.ai/type: stateful-server
     component.aggrega.ai/category: datastore
+    # This component is realized self-hosted (helm, compose) and managed (RDS
+    # on Terraform and CloudFormation, Cloud SQL on Terraform), so no single
+    # hosting posture is its identity. `mixed` is the honest selector-only
+    # value for such a unified, multi-posture component; the actual posture of
+    # a Release follows the Recipe the Manifest selects. Selector-only: never
+    # stamped onto output.
+    component.aggrega.ai/hosting: mixed
     component.aggrega.ai/upstream-licensing: osi-approved
   maintainers:
     - name: Massimiliano Ferrero
@@ -39,11 +52,11 @@ spec:
       required: true
       sensitive: true
       inject: []
-      description: Root database password. Recipe controls delivery (Black-Box).
+      description: Root database password. Recipe controls delivery (Black-Box). terraform/mysql-cloud-sql takes core/random-password alone, since Cloud SQL creates root with no password, and halts on any other credential.
     user_password:
       sensitive: true
       inject: [env, file]
-      description: Application user password, auto-generated if omitted.
+      description: Application user password, auto-generated if omitted. terraform/mysql-cloud-sql takes core/random-password here, has the module it sources draw one with nothing attached, and halts on any other credential, or on an attachment while values.user is unset.
 
   schema:
     values:
@@ -54,18 +67,18 @@ spec:
         description: Logical database name created on startup.
       user:
         type: string
-        description: Application-level database user (non-root). Omit for root-only access. RDS creates only its master user, admin, which the managed Recipes publish as provides.user, so each of them halts the build when this is set.
+        description: Application-level database user (non-root). Omit for root-only access. RDS creates only its master user, admin, which the RDS Recipes publish as provides.user, so each of them halts the build when this is set; terraform/mysql-cloud-sql creates this user beside root and publishes it, or root where it is unset.
       # charset and collation carry defaults, so a managed Recipe that cannot set
       # them cannot tell the default from a value written explicitly; their
       # descriptions name which Recipes do not read them instead.
       charset:
         type: string
         default: utf8mb4
-        description: Default character set. terraform/mysql-rds-terraform-aws-modules sets it in the parameter group it creates; the other managed Recipes do not read it, and the instance takes its parameter group's.
+        description: Default character set. terraform/mysql-rds-terraform-aws-modules sets it in the parameter group it creates, and terraform/mysql-cloud-sql on the database it creates; the other managed Recipes do not read it, and the instance takes its parameter group's.
       collation:
         type: string
         default: utf8mb4_general_ci
-        description: Default collation. terraform/mysql-rds-terraform-aws-modules sets it in the parameter group it creates; the other managed Recipes do not read it, and the instance takes its parameter group's.
+        description: Default collation. terraform/mysql-rds-terraform-aws-modules sets it in the parameter group it creates, and terraform/mysql-cloud-sql on the database it creates; the other managed Recipes do not read it, and the instance takes its parameter group's.
       init_scripts:
         type: object
         valuesType: string
@@ -81,23 +94,24 @@ spec:
         min: 1024
         max: 65535
         default: 3306
-        description: Server listen port. Most operators should omit this and let the Recipe assign the default (3306).
+        description: Server listen port. Most operators should omit this and let the Recipe assign the default (3306). Cloud SQL serves MySQL on 3306 alone, so terraform/mysql-cloud-sql halts the build on any other value.
       engine_version:
         type: string
         default: "8.4"
         description: Server binary version. Selects the container image tag on container targets and the database engine version on managed targets.
-      # The managed RDS Recipes size the instance by its instance class, and a
-      # Recipe cannot tell these defaults from a value a Release wrote, so they
-      # are not read there rather than refused, and each description says so.
+      # The managed Recipes size the instance by its instance class or tier, and
+      # a Recipe cannot tell these defaults from a value a Release wrote, so
+      # they are not read there rather than refused, and each description says
+      # so.
       compute:
         cpu:
           type: string
           default: 250m
-          description: CPU the database server is given. The managed RDS Recipes do not read it; they size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation).
+          description: CPU the database server is given. The managed Recipes do not read it; the RDS Recipes size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation), and terraform/mysql-cloud-sql by infra.overrides.tier.
         memory:
           type: string
           default: 512Mi
-          description: Memory the database server is given. The managed RDS Recipes do not read it; they size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation).
+          description: Memory the database server is given. The managed Recipes do not read it; the RDS Recipes size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation), and terraform/mysql-cloud-sql by infra.overrides.tier.
       storage:
         type: object
         properties:
@@ -112,7 +126,9 @@ spec:
               storage class, or name another class the cluster offers. On a
               managed database, the provider's volume type instead, such as
               `gp3` or `io1` on AWS RDS: left unset, the RDS Recipes provision
-              `gp3`. The Compose Recipe names no class.
+              `gp3`. On Cloud SQL it is the data disk type, `PD_SSD`, `PD_HDD`
+              or `HYPERDISK_BALANCED`, and left unset terraform/mysql-cloud-sql
+              provisions `PD_SSD`. The Compose Recipe names no class.
       ha:
         enabled:
           type: boolean
@@ -121,17 +137,17 @@ spec:
           type: integer
           min: 0
           default: 0
-          description: Number of read replicas to deploy. terraform/mysql-rds provisions them beside the primary; the other managed Recipes provision one instance and halt the build on a count above zero.
+          description: Number of read replicas to deploy. terraform/mysql-rds and terraform/mysql-cloud-sql provision them beside the primary; the other managed Recipes provision one instance and halt the build on a count above zero.
       backup:
         enabled:
           type: boolean
           default: true
-          description: Enable scheduled backups. The managed Recipes map it onto the instance's backup retention, which false sets to zero.
+          description: Enable scheduled backups. The RDS Recipes map it onto the instance's backup retention, which false sets to zero; terraform/mysql-cloud-sql turns the instance's automated backups and binary logging on or off with it.
         retention_days:
           type: integer
           min: 0
           default: 7
-          description: Number of days to retain backups when backups are enabled.
+          description: Number of days to retain backups when backups are enabled. terraform/mysql-cloud-sql keeps that many daily automated backups, from 2 to 365.
       overrides:
         type: object
         additionalProperties: true

@@ -9,7 +9,7 @@ metadata:
   description: >
     A PostgreSQL relational database. Provider-agnostic: the same component is
     implemented by Compose Recipes (local development), Helm Recipes
-    (Kubernetes), Terraform Recipes (AWS RDS, Azure Database), and
+    (Kubernetes), Terraform Recipes (AWS RDS, Google Cloud SQL), and
     CloudFormation Recipes, and by a reference Recipe that provisions nothing
     and only wires a consumer to a server that already exists. Exports its host
     and port to consumers via the uses topology. Three Helm Recipes realize it
@@ -27,21 +27,21 @@ metadata:
     terraform-aws-modules project's published RDS module, where the pull may
     fetch it from its git repository, and for terraform/postgres-rds, which
     authors its own body, where nothing may be fetched or read replicas are
-    needed.
+    needed. On Google Cloud SQL, reach for terraform/postgres-cloud-sql, where
+    the database runs in a Google Cloud project whose VPC network has private
+    services access to Cloud SQL.
 
-    PostgreSQL serves no Prometheus metrics of its own. The CloudNativePG
-    control plane runs an exporter in every instance it manages, so the
-    controller-driven Recipe publishes the pod label selector, the port name and
-    the path a scraper discovers those instances by; every other Recipe runs no
-    exporter and publishes those keys empty.
+    PostgreSQL serves no Prometheus metrics of its own; the controller-driven
+    Recipe publishes where its control plane's exporter serves them, and every
+    other Recipe publishes those keys empty.
   labels:
     component.aggrega.ai/type: stateful-server
     component.aggrega.ai/category: datastore
-    # This component is realized self-hosted (helm, compose), managed
-    # (Terraform/CloudFormation RDS) and referenced (a server that already
-    # exists), so no single hosting posture is its identity. `mixed` is the
-    # honest selector-only value for such a unified,
-    # multi-posture component; the actual posture of a deployment follows the
+    # This component is realized self-hosted (helm, compose), managed (RDS on
+    # Terraform and CloudFormation, Cloud SQL on Terraform) and referenced (a
+    # server that already exists), so no single hosting posture is its
+    # identity. `mixed` is the honest selector-only value for such a unified,
+    # multi-posture component; the actual posture of a Release follows the
     # Recipe the Manifest selects. Selector-only: never stamped onto output.
     component.aggrega.ai/hosting: mixed
     component.aggrega.ai/upstream-licensing: osi-approved
@@ -66,7 +66,7 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [env]
-      description: "Optional database password credential. When attached, supplies POSTGRES_PASSWORD via the credential subsystem; unattached, the Recipe uses its inline default. The controller-driven realization owns the database's credentials through infra.credentials and halts the build when this slot is filled."
+      description: "Optional database password credential. When attached, supplies POSTGRES_PASSWORD via the credential subsystem; unattached, the Recipe uses its inline default. The controller-driven realization owns the database's credentials through infra.credentials and halts the build when this slot is filled. terraform/postgres-cloud-sql takes core/random-password here as the password of the user values.user names, and with nothing attached the module it sources draws one; it halts on any other credential."
     # Optional application-user credential slot. When a credential is attached
     # here, the helm Recipe creates a distinct non-superuser login role
     # (named by values.app_user) with this credential as its password, via a
@@ -104,10 +104,10 @@ spec:
           build halts rather than emitting an unnamed role.
       encoding:
         type: string
-        description: Database encoding passed to initdb (e.g. UTF8). Omit to use the image default.
+        description: Database encoding passed to initdb (e.g. UTF8). Omit to use the image default. terraform/postgres-cloud-sql accepts UTF8 alone, the one encoding Cloud SQL creates a database with, and halts on any other.
       locale:
         type: string
-        description: Database locale passed to initdb (e.g. en_US.utf8). Omit to use the image default.
+        description: Database locale passed to initdb (e.g. en_US.utf8). Omit to use the image default. terraform/postgres-cloud-sql accepts en_US.UTF8 alone, the one collation Cloud SQL creates a database with, and halts on any other.
       init_scripts:
         type: object
         valuesType: string
@@ -137,25 +137,26 @@ spec:
         description: >
           Server listen port. Most operators should omit this and let the Recipe
           assign the default (5432). The controller-driven realization runs the
-          server on 5432 and cannot move it, so it halts the build on any other
-          value rather than handing a consumer a port the server does not answer
-          on.
+          server on 5432 and cannot move it, and Cloud SQL serves PostgreSQL on
+          5432 alone, so those realizations halt the build on any other value
+          rather than handing a consumer a port the server does not answer on.
       engine_version:
         type: string
         default: "16"
         description: PostgreSQL major version (the postgres image tag).
-      # The managed RDS Recipes size the instance by its instance class, and a
-      # Recipe cannot tell these defaults from a value a Release wrote, so they
-      # are not read there rather than refused, and each description says so.
+      # The managed Recipes size the instance by its instance class or tier, and
+      # a Recipe cannot tell these defaults from a value a Release wrote, so
+      # they are not read there rather than refused, and each description says
+      # so.
       compute:
         cpu:
           type: string
           default: 250m
-          description: CPU the database server is given. The managed RDS Recipes do not read it; they size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation).
+          description: CPU the database server is given. The managed Recipes do not read it; the RDS Recipes size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation), and terraform/postgres-cloud-sql by infra.overrides.tier.
         memory:
           type: string
           default: 512Mi
-          description: Memory the database server is given. The managed RDS Recipes do not read it; they size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation).
+          description: Memory the database server is given. The managed Recipes do not read it; the RDS Recipes size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation), and terraform/postgres-cloud-sql by infra.overrides.tier.
       storage:
         type: object
         properties:
@@ -169,9 +170,12 @@ spec:
               provisioned from: leave it unset to take the cluster's default
               storage class, or name another class the cluster offers. On a
               managed database, the provider's volume type instead, such as
-              `gp3` or `io1` on AWS RDS: left unset, the Terraform and
-              CloudFormation Recipes provision `gp3`. The Compose Recipe names no
-              class, and the reference Recipe provisions no volume.
+              `gp3` or `io1` on AWS RDS: left unset, the RDS Recipes provision
+              `gp3`. On Cloud SQL it is the data disk type, `PD_SSD`, `PD_HDD`
+              or `HYPERDISK_BALANCED`, and left unset
+              terraform/postgres-cloud-sql provisions `PD_SSD`. The Compose
+              Recipe names no class, and the reference Recipe provisions no
+              volume.
       ha:
         enabled:
           type: boolean
@@ -181,7 +185,7 @@ spec:
           type: integer
           min: 0
           default: 0
-          description: Number of read replicas to deploy when high availability is enabled. terraform/postgres-rds provisions them beside the primary; the other managed Recipes provision one instance and halt the build on a count above zero.
+          description: Number of read replicas to deploy when high availability is enabled. terraform/postgres-rds and terraform/postgres-cloud-sql provision them beside the primary; the other managed Recipes provision one instance and halt the build on a count above zero.
       backup:
         enabled:
           type: boolean
@@ -219,7 +223,8 @@ spec:
           `credentials_secret` and generates none. Every other realization
           ignores this key: the synthesized ones take the database password
           from the `password` credential slot and the application role's from
-          `app_user_password`, and on the managed ones RDS owns the password.
+          `app_user_password`; on the RDS ones RDS owns the password, and on
+          terraform/postgres-cloud-sql the `password` slot carries it.
       credentials_secret:
         type: string
         default: ""

@@ -1,0 +1,435 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: postgres-cloud-sql
+  version: 1.0.0
+  # The licence of the vendored module, the terraform-google-modules project's
+  # Cloud SQL module: the third-party code this Recipe pins and writes into the
+  # output. The Cloud SQL instance it provisions is a service the reader
+  # contracts for directly with Google Cloud, under Google Cloud's terms.
+  license: Apache-2.0
+  description: >
+    PostgreSQL on Google Cloud SQL, as one instance with a private IP address
+    in the operator's VPC network, realized by the postgresql module of the
+    terraform-google-modules project's published Cloud SQL module,
+    terraform-google-modules/sql-db/google at v28.3.0, Apache-2.0, fetched
+    from its git repository at that tag; entity.lock pins the tag's commit and
+    archive digest.
+
+    Reach for it where the database is a Cloud SQL instance in the operator's
+    Google Cloud project, reached over a VPC network that already has private
+    services access to Cloud SQL; reach for terraform/postgres-rds or
+    terraform/postgres-rds-terraform-aws-modules on AWS, and for the helm or
+    compose Recipes where PostgreSQL runs as a container.
+
+    The project, region and network are the operator's, named in
+    infra.overrides.project_id, region and private_network, and the Recipe
+    emits none of them: private services access is a peering between the VPC
+    network and Google's services that every service using it shares. The
+    instance gets no public address. The user values.user names logs in with
+    the core/random-password attachment on the password slot, handed over as a
+    Terraform reference, or, with none attached, a password the module draws;
+    either way the rendered files carry no password, and another credential
+    halts naming the slot.
+
+    host publishes a reference to the instance's private address, or the DNS
+    name in infra.overrides.host; port is 5432, the one port the service
+    serves. An encoding or locale the service cannot set, init scripts, a raw
+    configuration file and another infra.port halt naming the key;
+    compute.cpu and compute.memory are not read, because
+    infra.overrides.tier sizes the instance.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/postgres:1.0.0
+
+  # The published module, at the tag the registry publishes as version 28.3.0.
+  # A registry version of a module is a tag of its git repository, and the
+  # registry's own download for this version answers with a git source at the
+  # commit that tag names; Terraform's dependency lock file records providers
+  # and no module. So the pin is taken here: `aggrega pin` resolves the tag to
+  # its commit and records that commit and the archive's digest in entity.lock,
+  # and every build vendors exactly those bytes.
+  #
+  # module_subdir names the repository's modules/postgresql directory, the
+  # module for a PostgreSQL instance. The repository root carries no Terraform
+  # configuration of its own: each engine is a module of its own under
+  # modules/. That directory is whole: none of its files reaches outside it,
+  # and it declares no module call, so the configuration Terraform loads from
+  # it calls no registry module and initialising it fetches providers and
+  # nothing else.
+  #
+  # The module declares hashicorp/google and hashicorp/google-beta ">= 7.22,
+  # < 9", hashicorp/random and hashicorp/null "~> 3.1" in its own
+  # required_providers and is vendored byte for byte, so this Recipe adds no
+  # provider constraint of its own. The boundary's root configuration declares
+  # no provider block for Google: the provider reads its credentials from the
+  # environment the plan runs in — GOOGLE_CREDENTIALS, or Application Default
+  # Credentials — and the module names the project and region on what it
+  # creates.
+  #
+  # The tag is written out rather than read from infra.source_version: a source
+  # whose coordinates come from a template is pinned per Release instead of in
+  # this Recipe's own entity.lock, and this Recipe's pin is the one stated
+  # above.
+  source:
+    kind: git-repository
+    url: https://github.com/terraform-google-modules/terraform-google-sql-db.git
+    ref: v28.3.0
+    module_subdir: modules/postgresql
+
+  locals:
+    # The major version infra.engine_version begins with, in Cloud SQL's
+    # spelling: 9_6 for 9.6, and the first number from 10 on (16 for 16 or
+    # 16.4). Cloud SQL runs the newest minor version of that major version.
+    major: '{{ $v := toString .infra.engine_version }}{{ if regexMatch `^9\.6(\.|$)` $v }}9_6{{ else }}{{ regexFind `^[0-9]+` $v }}{{ end }}'
+    # The edition, infra.overrides.edition or ENTERPRISE, which takes the
+    # dedicated-core custom shapes the default tier is. Left unset, the service
+    # would choose Enterprise Plus for PostgreSQL 16 and later, which takes none
+    # of them, so the Recipe always names it.
+    edition: '{{ optional (optional .infra "overrides" dict) "edition" "ENTERPRISE" }}'
+    # The machine type, infra.overrides.tier or db-custom-1-3840: one vCPU and
+    # 3.75 GB, the smallest dedicated-core shape Cloud SQL Enterprise edition
+    # offers. The shared-core types are outside the service's SLA.
+    tier: '{{ optional (optional .infra "overrides" dict) "tier" "db-custom-1-3840" }}'
+    # The data disk type, infra.storage.type or PD_SSD while it is unset.
+    disk_type: '{{ default "PD_SSD" (optional .infra.storage "type" "") }}'
+    # The name the Release gives the instance under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   project_id          - string (project_id), required
+  #   region              - string (region), required
+  #   private_network     - string (ip_configuration.private_network), required
+  #   allocated_ip_range  - string (ip_configuration.allocated_ip_range)
+  #   zone                - string (zone, and each read replica's zone), required with read replicas
+  #   tier                - string (tier; default "db-custom-1-3840")
+  #   edition             - string (edition; default "ENTERPRISE")
+  #   database_flags      - [{name: string, value: string}] (database_flags)
+  #   deletion_protection - bool (deletion_protection)
+  #   user_labels         - map[string]string (user_labels)
+  #   host                - string (published as provides.host; not passed to the module)
+  #
+  # Each is named by the module input it sets, given in brackets, save host,
+  # which the RDS Recipes read under the same name for the same concept.
+  # project_id, region and private_network are required: they place the
+  # instance in the operator's project and network, and this Recipe never
+  # chooses either. private_network is the network's resource link,
+  # projects/<project>/global/networks/<name>, and that network must already
+  # have private services access to Cloud SQL — an allocated IP range and a
+  # private connection to servicenetworking.googleapis.com, with the Service
+  # Networking and Compute Engine APIs enabled in the project. Cloud SQL
+  # requires that connection for every VPC network an instance takes a private
+  # IP address in, and refuses to create the instance without it. This Recipe
+  # emits none of it, because the connection is the network's and every Google
+  # service using private services access shares it. database_flags carries the
+  # server settings a raw configuration file would.
+  #
+  # The module's own defaults stand for every input this mapping leaves out.
+  # Four are worth knowing: deletion_protection is true, so Terraform refuses to
+  # destroy the instance until a Release sets it false; it encrypts the disk
+  # with a Google-managed key; the disk grows on its own as it fills; and every
+  # plan reads the region's zones through the Compute Engine API.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against Cloud SQL's own documentation:
+  #   honoured — values.database; values.user, a built-in user the service
+  #     makes a member of cloudsqlsuperuser; values.encoding while it is UTF8
+  #     and values.locale while it is en_US.UTF8, the one encoding and
+  #     collation the service creates a database with; infra.engine_version
+  #     (the major version, among those the service offers);
+  #     infra.storage.size, as the data disk in GB, 10 or more (20 for
+  #     HYPERDISK_BALANCED); infra.storage.type, as the disk type, PD_SSD,
+  #     PD_HDD or HYPERDISK_BALANCED, PD_SSD when unset; infra.ha.enabled, as
+  #     the REGIONAL availability type; infra.ha.read_replicas, as read
+  #     replicas beside the instance; infra.backup.enabled, with point-in-time
+  #     recovery; infra.backup.retention_days, as the number of daily
+  #     automated backups kept; and the overrides above.
+  #   refused — any other encoding or locale; values.init_scripts;
+  #     values.custom_config; infra.port other than 5432, the Component's
+  #     default; infra.ha.enabled or read replicas with backups off; a
+  #     retention outside 1 to 365; an edition, tier and disk type the
+  #     service does not combine; an attachment to app_user_password; and a
+  #     password as set out below.
+  #   not read — infra.port while it is 5432; infra.compute.cpu and
+  #     infra.compute.memory, whose Component defaults would size a container:
+  #     Cloud SQL sizes the instance by infra.overrides.tier, and a Recipe
+  #     cannot tell those defaults from a value the Release wrote, so the
+  #     Component's descriptions say so instead. values.app_user,
+  #     infra.control_plane_present, infra.credentials and
+  #     infra.credentials_secret configure other realizations, as their
+  #     descriptions say.
+  #
+  # The user values.user names is the one the module creates, and a consumer
+  # authenticates as it. Its password is the module's user_password: the
+  # password core/random-password's terraform/random-password realization draws
+  # at apply time, handed over as a Terraform reference, or, with nothing
+  # attached or core/generated-secret attached, the one the module itself draws
+  # at apply time and publishes as its generated_user_password output. Either
+  # way no password is written into the rendered configuration, and the apply
+  # keeps it in the Terraform state, where a consumer in the same root
+  # configuration can reach it by the same reference and an operator can read
+  # it from the state. Another credential either carries its value as text, which
+  # would be written into the configuration, or carries none the service could
+  # take, so it halts. The postgres user Cloud SQL creates with every instance
+  # is given no password, so it cannot log in until one is set.
+  assertions:
+    project_region_network_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "project_id" "region" "private_network" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release places its Cloud SQL instance in the operator's own Google Cloud project, region and VPC network, and this Recipe never chooses any of them, but infra.overrides.%s carries none: set infra.overrides.project_id, infra.overrides.region and infra.overrides.private_network in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if not (regexMatch `(^|/)projects/[^/]+/global/networks/[^/]+$` $o.private_network) -}}
+      {{- fail (printf "infra.overrides.private_network is %q, and Cloud SQL takes the VPC network an instance gets its private address in as the network's resource link: set it to projects/<project>/global/networks/<name>" $o.private_network) -}}
+      {{- end -}}
+      {{- $dp := optional $o "deletion_protection" "" -}}
+      {{- if not (or (kindIs "bool" $dp) (eq (toString $dp) "")) -}}
+      {{- fail (printf "infra.overrides.deletion_protection is %v, and it is passed to the module as a boolean: set it to true or false, or remove it" $dp) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this database reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the instance serves port 5432` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The PostgreSQL major versions Cloud SQL offers, read off its database
+    # versions page. A version it adds later is refused here until this list
+    # names it.
+    engine_version_offered: >-
+      {{- if not (has .locals.major (list "9_6" "10" "11" "12" "13" "14" "15" "16" "17" "18")) -}}
+      {{- fail (printf "infra.engine_version is %q, and Cloud SQL runs PostgreSQL 9.6 and 10 to 18, which this Recipe reads off the major version the value begins with: set infra.engine_version in the Release to one of them, such as 16" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    port_is_the_service_port: >-
+      {{- if ne (int .infra.port) 5432 -}}
+      {{- fail (printf "infra.port is %v, and Cloud SQL serves PostgreSQL on port 5432 alone, which this Recipe publishes as port: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+    edition_and_tier: >-
+      {{- $e := .locals.edition -}}
+      {{- $t := .locals.tier -}}
+      {{- if not (has $e (list "ENTERPRISE" "ENTERPRISE_PLUS")) -}}
+      {{- fail (printf "infra.overrides.edition is %q, and Cloud SQL offers the ENTERPRISE and ENTERPRISE_PLUS editions: set it to one of them, or leave it unset for ENTERPRISE" $e) -}}
+      {{- end -}}
+      {{- if eq $e "ENTERPRISE_PLUS" -}}
+      {{- if not (hasPrefix "db-perf-optimized-N-" $t) -}}
+      {{- fail (printf "infra.overrides.tier is %q, and Cloud SQL Enterprise Plus edition takes the predefined db-perf-optimized-N-* machine types alone; shared-core and custom types such as this Recipe's default, db-custom-1-3840, need ENTERPRISE: set infra.overrides.tier to a db-perf-optimized-N-* type, or infra.overrides.edition to ENTERPRISE" $t) -}}
+      {{- end -}}
+      {{- if not (has .locals.major (list "12" "13" "14" "15" "16" "17" "18")) -}}
+      {{- fail (printf "infra.overrides.edition is ENTERPRISE_PLUS, and Cloud SQL Enterprise Plus edition runs PostgreSQL 12 and later, while infra.engine_version is %q: set infra.engine_version to 12 or later, or infra.overrides.edition to ENTERPRISE" (toString .infra.engine_version)) -}}
+      {{- end -}}
+      {{- else if hasPrefix "db-perf-optimized-N-" $t -}}
+      {{- fail (printf "infra.overrides.tier is %q, a type Cloud SQL offers in Enterprise Plus edition alone: set infra.overrides.edition to ENTERPRISE_PLUS, or infra.overrides.tier to an Enterprise edition type such as db-custom-1-3840" $t) -}}
+      {{- end -}}
+    disk: >-
+      {{- $size := toString .infra.storage.size -}}
+      {{- if not (regexMatch `^[0-9]+Gi$` $size) -}}
+      {{- fail (printf "infra.storage.size is %q, and this Recipe sizes the instance's data disk in whole GB from a value such as 20Gi: set infra.storage.size in the Release to one" $size) -}}
+      {{- end -}}
+      {{- $gb := int (trimSuffix "Gi" $size) -}}
+      {{- $t := .locals.disk_type -}}
+      {{- if not (has $t (list "PD_SSD" "PD_HDD" "HYPERDISK_BALANCED")) -}}
+      {{- fail (printf "infra.storage.type is %q, and on Cloud SQL it is the instance's data disk type, one of PD_SSD, PD_HDD and HYPERDISK_BALANCED: set infra.storage.type in the Release to one of them, or leave it unset for PD_SSD" $t) -}}
+      {{- end -}}
+      {{- $min := 10 }}{{ if eq $t "HYPERDISK_BALANCED" }}{{ $min = 20 }}{{ end -}}
+      {{- if lt $gb $min -}}
+      {{- fail (printf "infra.storage.size is %q, and Cloud SQL gives a %s data disk at least %d GB: set infra.storage.size to %dGi or more" $size $t $min $min) -}}
+      {{- end -}}
+      {{- if and (eq $t "PD_HDD") (eq .locals.edition "ENTERPRISE_PLUS") -}}
+      {{- fail "infra.storage.type is PD_HDD, and Cloud SQL offers HDD storage in Enterprise edition alone, while infra.overrides.edition is ENTERPRISE_PLUS: set infra.storage.type to PD_SSD, or leave it unset" -}}
+      {{- end -}}
+      {{- $tier := .locals.tier -}}
+      {{- if and (ne $t "PD_SSD") (hasPrefix "db-perf-optimized-N-" $tier) -}}
+      {{- fail (printf "infra.storage.type is %q, and the tier %s belongs to the N2 machine series, which Cloud SQL gives SSD storage alone: set infra.storage.type to PD_SSD, or leave it unset" $t $tier) -}}
+      {{- end -}}
+      {{- if and (eq $t "HYPERDISK_BALANCED") (or (hasPrefix "db-custom-" $tier) (hasPrefix "db-n1-" $tier) (has $tier (list "db-f1-micro" "db-g1-small"))) -}}
+      {{- fail (printf "infra.storage.type is HYPERDISK_BALANCED, and the tier %s belongs to the general-purpose shared or dedicated core series, which Cloud SQL gives SSD or HDD storage: set infra.storage.type to PD_SSD or PD_HDD, or infra.overrides.tier to a C4, C4A or N4 machine type" $tier) -}}
+      {{- end -}}
+    ha_backup_replicas: >-
+      {{- $b := .infra.backup -}}
+      {{- if and .infra.ha.enabled (not $b.enabled) -}}
+      {{- fail "infra.ha.enabled is true, and Cloud SQL makes an instance highly available only with automated backups and point-in-time recovery on, while infra.backup.enabled is false: set infra.backup.enabled to true, or infra.ha.enabled to false" -}}
+      {{- end -}}
+      {{- $n := int .infra.ha.read_replicas -}}
+      {{- if gt $n 0 -}}
+      {{- if not $b.enabled -}}
+      {{- fail (printf "infra.ha.read_replicas is %d, and Cloud SQL creates a read replica only of an instance with automated backups on, while infra.backup.enabled is false: set infra.backup.enabled to true, or infra.ha.read_replicas to 0" $n) -}}
+      {{- end -}}
+      {{- if not (optional (optional .infra "overrides" dict) "zone" "") -}}
+      {{- fail (printf "infra.ha.read_replicas is %d, and the module this Recipe sources places each read replica in a zone it is given and derives the replica's region from it: set infra.overrides.zone in the Release to a zone of infra.overrides.region, such as europe-west1-b" $n) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if $b.enabled -}}
+      {{- $r := int $b.retention_days -}}
+      {{- if or (lt $r 1) (gt $r 365) -}}
+      {{- fail (printf "infra.backup.retention_days is %d, and Cloud SQL keeps 1 to 365 automated backups, one taken each day, which this Recipe sets from it: set infra.backup.retention_days to a number in that range, or infra.backup.enabled to false" $r) -}}
+      {{- end -}}
+      {{- end -}}
+    # Cloud SQL creates the database through its own API, with the one encoding
+    # and collation it offers, and runs no initdb, no initialisation scripts and
+    # no configuration file of the reader's; its server settings are database
+    # flags.
+    values_cloud_sql_cannot_apply: >-
+      {{- with optional .values "encoding" "" -}}
+      {{- if ne (replace "-" "" (upper .)) "UTF8" -}}
+      {{- fail (printf "values.encoding is %q, and Cloud SQL creates a PostgreSQL database with the UTF8 encoding alone: set values.encoding to UTF8, or remove it from the Aggregate" .) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- with optional .values "locale" "" -}}
+      {{- if ne (replace "-" "" (lower .)) "en_us.utf8" -}}
+      {{- fail (printf "values.locale is %q, and Cloud SQL creates a PostgreSQL database with the en_US.UTF8 collation alone: set values.locale to en_US.UTF8, or remove it from the Aggregate" .) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if optional .values "init_scripts" "" -}}
+      {{- fail "values.init_scripts asks for scripts run when the database is first initialised, and a Cloud SQL instance runs none: remove values.init_scripts from the Aggregate and run them against the instance once it exists, or map this component to a realization that initialises the database itself" -}}
+      {{- end -}}
+      {{- if optional .values "custom_config" "" -}}
+      {{- fail "values.custom_config asks for a server configuration file, and a Cloud SQL instance reads none: its server settings are database flags, which the Release names in infra.overrides.database_flags; remove values.custom_config from the Aggregate" -}}
+      {{- end -}}
+    credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "app_user_password" -}}
+      {{- fail "a credential is attached to the app_user_password slot, and this Recipe creates the one user values.user names: remove the attachment, or map this component to the synthesized helm Recipe, which creates the application role" -}}
+      {{- end -}}
+      {{- if hasKey $f "password" -}}
+      {{- $ty := toString (optional $f.password "type" "") -}}
+      {{- if not (has $ty (list "core/random-password" "core/generated-secret")) -}}
+      {{- fail (printf "the password slot is filled by %s, and this Recipe hands Cloud SQL the user's password as a Terraform reference to one drawn at apply time, which core/random-password publishes through terraform/random-password, or has the module draw one when core/generated-secret or nothing is attached; another credential either carries its value as text, which would be written into the rendered configuration, or carries none the service could take: attach core/random-password to the password slot instead, or remove the attachment" (toString (optional $f.password "type" "an attachment of no type"))) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the module's private_ip_address output — the instance's address in the VPC
+  # network — through this component's module call, which the boundary's root
+  # configuration declares under .context.instance_id for a component declared
+  # in the Aggregate the Release deploys. Terraform resolves it at apply time,
+  # so it resolves only for a consumer authored as a source: Recipe in the same
+  # root configuration; a consumer on another target receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record for it, so the operator points the name at the instance outside
+  # the Release. A consumer in the same root configuration receives the name as
+  # well, and a name carries no reference for Terraform to order its module
+  # after this one by; a later syncWave on the consumer's boundary, sharing
+  # this boundary's directory, orders the two.
+  #
+  # port is 5432, where the service serves PostgreSQL. user and database are
+  # the developer values the module creates. The metrics keys are published
+  # empty: Cloud SQL publishes its metrics to Cloud Monitoring rather than to a
+  # Prometheus endpoint.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.private_ip_address}{{ end }}"
+    port: "5432"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "postgres"
+    metrics_pod_selector: ""
+    metrics_pod_port: ""
+    metrics_path: ""
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # instance is named after the component, as the RDS Recipes name theirs. The
+  # database version is passed in the service's spelling, POSTGRES_16, which is
+  # the form the module also hands each read replica unchanged.
+  #
+  # The instance takes a private address in private_network and no public one:
+  # the module's own default turns a public IPv4 address on, so ipv4_enabled is
+  # passed false.
+  #
+  # Backups on turn on point-in-time recovery too, which high availability
+  # needs, as read replicas need the backups, and keep
+  # infra.backup.retention_days automated backups, counted. Each read replica entry names every field the module
+  # reads from it, since an unset field of the entry reaches the module as
+  # null rather than as the instance's own value: the instance's tier, edition,
+  # disk and network, in infra.overrides.zone.
+  #
+  # The user's password is the attachment's module output joined with a dot
+  # and wrapped in an interpolation, as terraform/random-password publishes it;
+  # with no such attachment the input is left out, and the module draws one.
+  valuesMapping: |
+    project_id: "{{ .infra.overrides.project_id }}"
+    region: "{{ .infra.overrides.region }}"
+    name: "{{ .context.instance_id }}"
+    database_version: "POSTGRES_{{ .locals.major }}"
+    edition: "{{ .locals.edition }}"
+    tier: "{{ .locals.tier }}"
+    {{- with optional .infra.overrides "zone" "" }}
+    zone: "{{ . }}"
+    {{- end }}
+    availability_type: "{{ if .infra.ha.enabled }}REGIONAL{{ else }}ZONAL{{ end }}"
+    disk_size: {{ trimSuffix "Gi" (toString .infra.storage.size) }}
+    disk_type: "{{ .locals.disk_type }}"
+    db_name: "{{ .values.database }}"
+    {{- with optional .values "encoding" "" }}
+    db_charset: "UTF8"
+    {{- end }}
+    {{- with optional .values "locale" "" }}
+    db_collation: "en_US.UTF8"
+    {{- end }}
+    user_name: "{{ .values.user }}"
+    {{- with (default dict .features).password }}
+    {{- if eq (toString (optional . "type" "")) "core/random-password" }}
+    {{- $prov := optional . "provides" dict }}
+    {{- if not (and (kindIs "map" $prov) (optional $prov "name" "") (optional $prov "key" "")) }}
+    {{- fail (printf "the password slot of %q is filled by an attachment that publishes no module output, and the password is handed to Cloud SQL as a reference to one: bind core/random-password to terraform/random-password in the Manifest" $.context.instance_id) }}
+    {{- end }}
+    user_password: "{{ printf "${%s.%s}" $prov.name $prov.key }}"
+    {{- end }}
+    {{- end }}
+    ip_configuration:
+      ipv4_enabled: false
+      private_network: "{{ .infra.overrides.private_network }}"
+      {{- with optional .infra.overrides "allocated_ip_range" "" }}
+      allocated_ip_range: "{{ . }}"
+      {{- end }}
+    backup_configuration:
+      enabled: {{ .infra.backup.enabled }}
+      point_in_time_recovery_enabled: {{ .infra.backup.enabled }}
+      {{- if .infra.backup.enabled }}
+      retained_backups: {{ .infra.backup.retention_days }}
+      retention_unit: "COUNT"
+      {{- end }}
+    {{- $n := int .infra.ha.read_replicas }}
+    {{- if gt $n 0 }}
+    read_replicas:
+      {{- range $i := until $n }}
+      - name: "{{ $i }}"
+        tier: "{{ $.locals.tier }}"
+        edition: "{{ $.locals.edition }}"
+        availability_type: "ZONAL"
+        zone: "{{ $.infra.overrides.zone }}"
+        disk_type: "{{ $.locals.disk_type }}"
+        disk_size: "{{ trimSuffix "Gi" (toString $.infra.storage.size) }}"
+        user_labels: {{ toJson (optional $.infra.overrides "user_labels" dict) }}
+        ip_configuration:
+          ipv4_enabled: false
+          private_network: "{{ $.infra.overrides.private_network }}"
+          {{- with optional $.infra.overrides "allocated_ip_range" "" }}
+          allocated_ip_range: "{{ . }}"
+          {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- with optional .infra.overrides "database_flags" "" }}
+    database_flags: {{ toJson . }}
+    {{- end }}
+    {{- $dp := optional .infra.overrides "deletion_protection" "" }}
+    {{- if kindIs "bool" $dp }}
+    deletion_protection: {{ $dp }}
+    {{- end }}
+    {{- with optional .infra.overrides "user_labels" "" }}
+    user_labels: {{ toJson . }}
+    {{- end }}
