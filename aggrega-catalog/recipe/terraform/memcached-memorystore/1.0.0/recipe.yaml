@@ -1,0 +1,246 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: memcached-memorystore
+  version: 1.0.0
+  description: >
+    Memcached on Google Cloud Memorystore for Memcached, as one instance of one
+    node in the operator's VPC network, rendered by vendoring a Terraform
+    module kept beside this Recipe. The published
+    terraform-google-modules/memorystore/google module is not sourced, because
+    its memcache module calls a module from the Terraform registry, which
+    initialising it would fetch outside any pin. Google is deprecating the
+    service: it creates no instance in a new project after February 1, 2027,
+    and shuts down on January 31, 2029.
+
+    Reach for it where the cache is a Memorystore instance in the operator's
+    Google Cloud project; reach for terraform/memcached-elasticache on AWS, and
+    for memcached on helm or on compose where it runs as a container.
+
+    The project, region and network are the operator's, named in
+    infra.overrides.project_id, region and private_network, and the Recipe
+    emits none of them: the network needs a private services access connection
+    before the instance is created, which every service using it shares. The
+    service offers no encryption in transit and no authentication, so the
+    private network alone gates the cache, and infra.client_tls, a
+    server_certificate and a password each halt naming the key or slot.
+
+    host publishes a reference to the node's address, or the DNS name in
+    infra.overrides.host; port is 11211. values.memory_limit and values.threads
+    size the node, and max_item_size is a parameter; max_connections, an
+    infra.replicas above 1 and another infra.port halt naming the key.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/memcached:1.0.0
+
+  # The module this Recipe vendors lives beside it, and is copied verbatim into
+  # the component's own directory; entity.lock pins its files. Its main.tf pins
+  # hashicorp/google by the one range every Google body in this catalog
+  # declares, and says why.
+  #
+  # The terraform-google-modules project publishes a Memorystore module,
+  # terraform-google-modules/memorystore/google, at 16.4.1 its newest version.
+  # Its memcache module calls terraform-google-modules/project-factory/google's
+  # project_services module from the Terraform registry, and has at every
+  # release since it was added, so initialising it fetches that module at
+  # whatever the registry then serves, which neither this Recipe's lock nor
+  # Terraform's own covers. It is therefore not sourced, and the instance is
+  # declared here instead. The module enables no Google API: the operator
+  # enables the Memorystore for Memcached API in the project.
+  #
+  # The body is a module the Recipe sources rather than an artifacts: body
+  # because its output, the node's address, is referenced from the boundary's
+  # root configuration, where a source: Recipe's valuesMapping becomes the
+  # arguments of its module block.
+  #
+  # Google is deprecating Memorystore for Memcached: after February 1, 2027 it
+  # creates no instance in a project that has none, and it shuts the service
+  # down on January 31, 2029, recommending Memorystore for Valkey, which
+  # terraform/valkey-memorystore realizes for core/datastore/valkey.
+  source: ./module
+
+  locals:
+    # The Memcached version, read off the version number infra.engine_version
+    # begins with: Memorystore for Memcached runs one release of each line it
+    # offers, 1.5.16 and 1.6.15, so 1.6 and 1.6.15 alike are MEMCACHE_1_6_15
+    # and 1.5 and 1.5.16 are MEMCACHE_1_5; any other is empty and refused below.
+    memcache_version: '{{ $v := regexFind `^[0-9]+\.[0-9]+(\.[0-9]+)?` (toString .infra.engine_version) }}{{ if has $v (list "1.6" "1.6.15") }}MEMCACHE_1_6_15{{ else if has $v (list "1.5" "1.5.16") }}MEMCACHE_1_5{{ end }}'
+    # The node's memory in MB, values.memory_limit or 1024, the service's
+    # minimum: the service makes it the node's memcached memory limit.
+    memory_mb: '{{ optional .values "memory_limit" 1024 }}'
+    # The node's vCPUs, values.threads or 1: the service makes it the node's
+    # worker thread count.
+    cpu_count: '{{ optional .values "threads" 1 }}'
+    # values.max_item_size in bytes, read as the memcached -I flag reads it: a
+    # number of bytes, or a number followed by k or m, in either case. Empty
+    # while the value is unset; a value of another form is refused below.
+    item_size: '{{ with optional .values "max_item_size" "" }}{{ $s := toString . }}{{ $n := regexFind `^[0-9]+` $s }}{{ $u := lower (trimPrefix $n $s) }}{{ if eq $u "k" }}{{ mul (int $n) 1024 }}{{ else if eq $u "m" }}{{ mul (int $n) 1048576 }}{{ else }}{{ $n }}{{ end }}{{ end }}'
+    # The name the Release gives the instance under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   project_id      - string (project_id), required
+  #   region          - string (region), required
+  #   private_network - string (authorized_network), required
+  #   host            - string (published as provides.host; not passed to the module)
+  #
+  # These are the keys, under the same names, that the other Google Cloud
+  # Recipes read for the same concepts, each passed to the module input named in
+  # brackets. All three are required: they place the instance in the operator's
+  # project, region and network, and this Recipe never chooses any of them.
+  # private_network is the network's resource link,
+  # projects/<project>/global/networks/<name>, and it must already have a
+  # private services access connection, which Memorystore for Memcached needs
+  # before an instance can be created in it; the connection is the network's,
+  # shared by every service using private services access, so this Recipe emits
+  # none.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against Memorystore for Memcached's own
+  # documentation:
+  #   honoured — values.memory_limit, as the node's memory, which the service
+  #     makes its memcached memory limit, 1024 to 262144 MB in whole GB;
+  #     values.threads, as the node's vCPUs, which the service makes its worker
+  #     threads, 1 to 32; values.max_item_size, as the max-item-size parameter,
+  #     a whole multiple of 512k from 512k to 128m (the service also caps it at
+  #     half the node's memory, which every node of 1 GB or more allows);
+  #     infra.engine_version, among the versions the service offers;
+  #     infra.replicas while it is 1; and the overrides above.
+  #   refused — values.max_connections (conn-limit is "65000 per node", which
+  #     the service does not let an instance change); infra.replicas above 1,
+  #     since the instance's nodes each have their own address and the
+  #     Component publishes one; infra.port other than 11211, the port the
+  #     service serves; infra.client_tls true, since the service offers no
+  #     encryption in transit; an attachment to server_certificate; and an
+  #     attached password, since the service offers no instance
+  #     authentication.
+  #   not read — infra.port while it is 11211; infra.compute.cpu and
+  #     infra.compute.memory, whose Component defaults size a container: the
+  #     node's size here is the developer's memory_limit and threads, and a
+  #     Recipe cannot tell the compute defaults from a value the Release wrote,
+  #     so the Component's descriptions say so instead. values.user, which
+  #     names the user of a password this Recipe refuses.
+  #
+  # One node, one address: a client sends its data commands to the nodes
+  # themselves, and the instance's discovery endpoint answers only the Auto
+  # Discovery service's queries, which Google says not to send data commands to.
+  # The Component publishes one host, so this Recipe provisions the one node
+  # that host reaches.
+  assertions:
+    project_region_network_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "project_id" "region" "private_network" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release places its Memorystore instance in the operator's own Google Cloud project, region and VPC network, and this Recipe never chooses any of them, but infra.overrides.%s carries none: set infra.overrides.project_id, infra.overrides.region and infra.overrides.private_network in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if not (regexMatch `^projects/[^/]+/global/networks/[^/]+$` $o.private_network) -}}
+      {{- fail (printf "infra.overrides.private_network is %q, and Memorystore for Memcached takes the VPC network its instance is reached from as the network's resource link: set it to projects/<project>/global/networks/<name>" $o.private_network) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this cache reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the instance serves port 11211` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The Memcached versions Memorystore for Memcached offers, read off its
+    # supported-versions page.
+    engine_version_offered: >-
+      {{- if not .locals.memcache_version -}}
+      {{- fail (printf "infra.engine_version is %q, and Memorystore for Memcached runs Memcached 1.5.16 and 1.6.15, which this Recipe reads off the version number the value begins with, 1.6 or 1.6.15 for the one and 1.5 or 1.5.16 for the other: set infra.engine_version in the Release to one of them" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    port_is_the_service_port: >-
+      {{- if ne (int .infra.port) 11211 -}}
+      {{- fail (printf "infra.port is %v, and Memorystore for Memcached serves its nodes on port 11211, which it does not let an instance change: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+    one_node: >-
+      {{- if gt (int .infra.replicas) 1 -}}
+      {{- fail (printf "infra.replicas is %v, and each Memorystore for Memcached node has an address of its own, with the instance's discovery endpoint answering only Auto Discovery queries, while this Component publishes one host: set infra.replicas to 1, or select memcached on helm in the Manifest" .infra.replicas) -}}
+      {{- end -}}
+    node_size: >-
+      {{- $m := int .locals.memory_mb -}}
+      {{- if or (lt $m 1024) (gt $m 262144) (ne (mod $m 1024) 0) -}}
+      {{- fail (printf "values.memory_limit is %v, and Memorystore for Memcached gives a node 1 GB to 256 GB of memory in whole GB, which it makes the node's memory limit: set values.memory_limit to a multiple of 1024 from 1024 to 262144, or remove it for 1024" .locals.memory_mb) -}}
+      {{- end -}}
+      {{- $c := int .locals.cpu_count -}}
+      {{- if or (lt $c 1) (gt $c 32) -}}
+      {{- fail (printf "values.threads is %v, and Memorystore for Memcached gives a node 1 to 32 vCPUs, which it makes the node's worker thread count: set values.threads to a number from 1 to 32, or remove it for 1" .locals.cpu_count) -}}
+      {{- end -}}
+    values_memorystore_cannot_apply: >-
+      {{- with optional .values "max_connections" "" -}}
+      {{- fail (printf "values.max_connections is %v, and Memorystore for Memcached fixes a node's connection limit at 65000, a parameter it does not let an instance change: remove values.max_connections from the Aggregate" .) -}}
+      {{- end -}}
+      {{- with optional .values "max_item_size" "" -}}
+      {{- $s := toString . -}}
+      {{- if not (regexMatch `^[0-9]+[kKmM]?$` $s) -}}
+      {{- fail (printf "values.max_item_size is %q, which reads as neither a number of bytes nor a number followed by k or m, the forms the memcached -I flag takes: set values.max_item_size to one of them, such as 2m" $s) -}}
+      {{- end -}}
+      {{- $b := int $.locals.item_size -}}
+      {{- if or (lt $b 524288) (gt $b 134217728) (ne (mod $b 524288) 0) -}}
+      {{- fail (printf "values.max_item_size is %q, %v bytes, and Memorystore for Memcached takes a max-item-size that is a whole multiple of 524288 bytes, from 524288 to 134217728: set values.max_item_size to a multiple of 512k, such as 1m or 2m" $s $b) -}}
+      {{- end -}}
+      {{- end -}}
+    tls_and_credentials: >-
+      {{- if .infra.client_tls -}}
+      {{- fail "infra.client_tls is true, and Memorystore for Memcached offers no encryption in transit, so no port would accept TLS: set infra.client_tls to false, or select memcached on helm in the Manifest, which serves TLS" -}}
+      {{- end -}}
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "server_certificate" -}}
+      {{- fail "a certificate is attached to the server_certificate slot, and Memorystore for Memcached serves no TLS, so nothing would present it: remove the attachment" -}}
+      {{- end -}}
+      {{- if hasKey $f "password" -}}
+      {{- fail "a password is attached to the password slot, and Memorystore for Memcached offers no instance authentication, so nothing would check it: remove the attachment, and restrict who reaches the cache with the network's firewall rules" -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the module's node_address output — the address of the instance's node in
+  # the operator's network — through this component's module call, which the
+  # boundary's root configuration declares under .context.instance_id for a
+  # component declared in the Aggregate the Release deploys. Terraform resolves
+  # it at apply time, so it resolves only for a consumer authored as a source:
+  # Recipe in the same root configuration; a consumer on another target receives
+  # it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record for it, so the operator points the name at the node outside the
+  # Release. A consumer in the same root configuration receives the name as
+  # well, and a name carries no reference for Terraform to order its module
+  # after this one by; a later syncWave on the consumer's boundary, sharing
+  # this boundary's directory, orders the two.
+  #
+  # port is 11211, where the service serves its nodes, and protocol memcached,
+  # since infra.client_tls is refused above.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.node_address}{{ end }}"
+    port: "11211"
+    protocol: "memcached"
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # instance is named after the component, as the other managed Recipes name
+  # theirs. params carries only the parameters the Aggregate sets, so an
+  # instance with none keeps the service's defaults.
+  valuesMapping: |
+    project_id: "{{ .infra.overrides.project_id }}"
+    region: "{{ .infra.overrides.region }}"
+    name: "{{ .context.instance_id }}"
+    authorized_network: "{{ .infra.overrides.private_network }}"
+    memcache_version: "{{ .locals.memcache_version }}"
+    node_count: 1
+    cpu_count: {{ .locals.cpu_count }}
+    memory_size_mb: {{ .locals.memory_mb }}
+    params: {{ if .locals.item_size }}{{ toJson (dict "max-item-size" .locals.item_size) }}{{ else }}{}{{ end }}

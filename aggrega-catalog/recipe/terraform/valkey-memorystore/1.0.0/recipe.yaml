@@ -1,0 +1,266 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: valkey-memorystore
+  version: 1.0.0
+  description: >
+    Valkey on Google Cloud Memorystore for Valkey, as one instance in Cluster
+    Mode Disabled reached from the operator's VPC network, rendered by
+    vendoring a Terraform module kept beside this Recipe. The published
+    terraform-google-modules/memorystore/google module is not sourced, because
+    its valkey module calls a module from the Terraform registry, which
+    initialising it would fetch outside any pin.
+
+    Reach for it where the cache is a Memorystore instance in the operator's
+    Google Cloud project; reach for terraform/valkey-elasticache on AWS, and
+    for valkey or valkey-chart on helm, or valkey on compose, where it runs as
+    a container.
+
+    The project, region and network are the operator's, named in
+    infra.overrides.project_id, region and private_network, and the Recipe
+    emits none of them. The service connects only through Private Service
+    Connect, which the network's service connection policy for the
+    gcp-memorystore service class deploys; that policy must exist first. The
+    cache runs without authentication, so the private network alone gates
+    it: the service accepts no password a Release supplies, and an attached
+    password halts naming the slot.
+
+    host publishes a reference to the instance's primary endpoint, or the DNS
+    name in infra.overrides.host; port is 6379. With infra.client_tls true the
+    service serves TLS alone with the instance's own certificate authority,
+    protocol is valkey-tls, and each consumer's server_ca slot takes a Secret
+    holding that authority under ca.crt. infra.engine_version must name a
+    version the service offers, so the Component's default halts here.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/valkey:1.0.0
+
+  # The module this Recipe vendors lives beside it, and is copied verbatim into
+  # the component's own directory; entity.lock pins its files. Its main.tf pins
+  # hashicorp/google by the one range every Google body in this catalog
+  # declares, and says why.
+  #
+  # The terraform-google-modules project publishes a Memorystore module,
+  # terraform-google-modules/memorystore/google, at 16.4.1 its newest version.
+  # Its valkey module calls terraform-google-modules/project-factory/google's
+  # project_services module from the Terraform registry, and has at every
+  # release since it was added, so initialising it fetches that module at
+  # whatever the registry then serves, which neither this Recipe's lock nor
+  # Terraform's own covers. It is therefore not sourced, and the instance is
+  # declared here instead. The module enables no Google API: the operator
+  # enables the Memorystore, Network Connectivity, Service Consumer Management
+  # and Compute Engine APIs in the project, as the service asks.
+  #
+  # The body is a module the Recipe sources rather than an artifacts: body
+  # because its outputs, the primary endpoint's address, are referenced from
+  # the boundary's root configuration, where a source: Recipe's valuesMapping
+  # becomes the arguments of its module block.
+  source: ./module
+
+  locals:
+    # The Valkey version, the major and minor version infra.engine_version
+    # begins with: 8.0 from 8.0 or 8.0-alpine. Memorystore for Valkey takes it
+    # spelled VALKEY_8_0.
+    engine_version: '{{ regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) }}'
+    # The node type, infra.overrides.node_type or CUSTOM_PICO: the smallest
+    # node the service backs with its SLA, 1.25 GB, offered in Cluster Mode
+    # Disabled. SHARED_CORE_NANO is smaller and has no SLA.
+    node_type: '{{ optional (optional .infra "overrides" dict) "node_type" "CUSTOM_PICO" }}'
+    # Replica nodes beside the primary, infra.overrides.replica_count or 0.
+    replica_count: '{{ optional (optional .infra "overrides" dict) "replica_count" 0 }}'
+    # The persistence mode: AOF while values.appendonly is on, RDB while only
+    # values.persistence.enabled is, DISABLED otherwise. The service keeps one
+    # of the two, never both.
+    persistence_mode: '{{ if .values.appendonly }}AOF{{ else if .values.persistence.enabled }}RDB{{ else }}DISABLED{{ end }}'
+    # The name the Release gives the instance under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   project_id      - string (project_id), required
+  #   region          - string (location), required
+  #   private_network - string (network), required
+  #   node_type       - string (node_type; default "CUSTOM_PICO")
+  #   replica_count   - integer (replica_count; default 0)
+  #   host            - string (published as provides.host; not passed to the module)
+  #
+  # project_id, region and private_network are the keys, under the same names,
+  # that the Cloud SQL Recipes read for the same concepts; each is passed to the
+  # module input named in brackets, and node_type and replica_count are named
+  # for the inputs they set. project_id, region and private_network are
+  # required: they place the instance in the operator's project, region and
+  # network, and this Recipe never chooses any of them. private_network is the
+  # network's resource link, projects/<project>/global/networks/<name>. The
+  # service connects to it only through Private Service Connect, deployed by a
+  # service connection policy that must already exist for the project, the
+  # network, the region and the gcp-memorystore service class; the policy is
+  # the network's, shared by every Memorystore instance in it, so this Recipe
+  # emits none. Clients reach the instance on 6379 and on its nodes' ports
+  # 11000 to 13047, which the operator's firewall allows.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against Memorystore for Valkey's own documentation:
+  #   honoured — values.maxmemory, values.maxmemory_policy and
+  #     values.databases, as the instance's engine configurations of those
+  #     names, with the units, policies and range of 1 to 100 the service
+  #     takes; values.appendonly, as AOF persistence with an fsync every
+  #     second; values.persistence.enabled, as RDB persistence with an hourly
+  #     snapshot while appendonly is off; infra.engine_version (major and
+  #     minor, among the versions the service offers); infra.client_tls; and
+  #     the overrides above.
+  #   refused — infra.port other than 6379, the Component's default, the port
+  #     the service serves; a maxmemory, a maxmemory policy or a database count
+  #     the service does not take; maxmemory on SHARED_CORE_NANO, whose limit
+  #     the service fixes; a node type the service does not offer; an
+  #     attachment to server_certificate; and a password as set out below.
+  #   not read — infra.port while it is 6379; infra.compute.cpu and
+  #     infra.compute.memory, and infra.storage.size and infra.storage.type,
+  #     whose Component defaults size a container and its volume: the service
+  #     sizes the node by infra.overrides.node_type and provisions no volume,
+  #     and a Recipe cannot tell those defaults from a value the Release wrote,
+  #     so the Component's descriptions say so instead. infra.source_version,
+  #     which pins a chart this Recipe does not pull.
+  #
+  # Authentication is off. Memorystore for Valkey's token authentication runs on
+  # a token the service generates for itself, and its IAM authentication on
+  # IAM access tokens that expire after an hour; neither takes a password a
+  # Release supplies, so an attached password halts naming the slot rather than
+  # render a credential that protects nothing. The private network and the
+  # operator's firewall are what gate the cache.
+  #
+  # With infra.client_tls true the instance encrypts in transit, the port
+  # accepts TLS alone, and the service presents a certificate from the
+  # instance's own certificate authority, its default, which it rotates every
+  # week. A consumer checks it against that authority, which its server_ca slot
+  # takes as a Secret holding the chain under ca.crt: the operator reads the
+  # chain with gcloud memorystore instances get-certificate-authority, or from
+  # the module's server_ca output in the Terraform state, once the instance
+  # exists.
+  assertions:
+    project_region_network_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "project_id" "region" "private_network" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release places its Memorystore instance in the operator's own Google Cloud project, region and VPC network, and this Recipe never chooses any of them, but infra.overrides.%s carries none: set infra.overrides.project_id, infra.overrides.region and infra.overrides.private_network in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if not (regexMatch `^projects/[^/]+/global/networks/[^/]+$` $o.private_network) -}}
+      {{- fail (printf "infra.overrides.private_network is %q, and Memorystore for Valkey takes the VPC network its instance is reached from as the network's resource link: set it to projects/<project>/global/networks/<name>" $o.private_network) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this cache reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the instance serves port 6379` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The Valkey versions Memorystore for Valkey offers, read off its
+    # supported-versions page. A version it adds later is refused here until
+    # this list names it.
+    engine_version_offered: >-
+      {{- if not (has .locals.engine_version (list "7.2" "8.0" "9.0" "9.1")) -}}
+      {{- fail (printf "infra.engine_version is %q, and Memorystore for Valkey runs Valkey 7.2, 8.0, 9.0 and 9.1, which this Recipe reads off the major and minor version the value begins with; the Component's default is an image tag naming a release the service does not run: set infra.engine_version in the Release to one of them, such as 9.1" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    port_is_the_service_port: >-
+      {{- if ne (int .infra.port) 6379 -}}
+      {{- fail (printf "infra.port is %v, and Memorystore for Valkey serves an instance on port 6379, which this Recipe publishes as port: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+    node_type_and_replicas: >-
+      {{- $n := .locals.node_type -}}
+      {{- if not (has $n (list "SHARED_CORE_NANO" "CUSTOM_PICO" "CUSTOM_MICRO" "CUSTOM_MINI" "STANDARD_SMALL" "HIGHMEM_MEDIUM" "HIGHCPU_MEDIUM" "STANDARD_LARGE" "HIGHMEM_XLARGE" "HIGHMEM_2XLARGE")) -}}
+      {{- fail (printf "infra.overrides.node_type is %q, and Memorystore for Valkey offers the node types SHARED_CORE_NANO, CUSTOM_PICO, CUSTOM_MICRO, CUSTOM_MINI, STANDARD_SMALL, HIGHMEM_MEDIUM, HIGHCPU_MEDIUM, STANDARD_LARGE, HIGHMEM_XLARGE and HIGHMEM_2XLARGE: set it to one of them, or leave it unset for CUSTOM_PICO" $n) -}}
+      {{- end -}}
+      {{- $r := optional (optional .infra "overrides" dict) "replica_count" 0 -}}
+      {{- if not (regexMatch `^[0-9]+$` (toString $r)) -}}
+      {{- fail (printf "infra.overrides.replica_count is %v, and it is the number of replica nodes beside the primary: set it to a whole number, 0 or more, or leave it unset for 0" $r) -}}
+      {{- end -}}
+    engine_configs_accepted: >-
+      {{- with optional .values "maxmemory" "" -}}
+      {{- if not (regexMatch `^[0-9]+(b|k|kb|m|mb|g|gb)?$` (toString .)) -}}
+      {{- fail (printf "values.maxmemory is %q, and Memorystore for Valkey takes maxmemory as a number of bytes or a number followed by k, kb, m, mb, g or gb: set values.maxmemory to such a value, such as 512mb" (toString .)) -}}
+      {{- end -}}
+      {{- if eq $.locals.node_type "SHARED_CORE_NANO" -}}
+      {{- fail "values.maxmemory is set, and the SHARED_CORE_NANO node type has a limit the service fixes and maxmemory cannot change: remove values.maxmemory from the Aggregate, or set infra.overrides.node_type to another node type" -}}
+      {{- end -}}
+      {{- end -}}
+      {{- with optional .values "maxmemory_policy" "" -}}
+      {{- if not (has (toString .) (list "noeviction" "allkeys-lru" "volatile-lru" "allkeys-random" "volatile-random" "volatile-ttl" "volatile-lfu" "allkeys-lfu")) -}}
+      {{- fail (printf "values.maxmemory_policy is %q, and Memorystore for Valkey takes noeviction, allkeys-lru, volatile-lru, allkeys-random, volatile-random, volatile-ttl, volatile-lfu and allkeys-lfu: set values.maxmemory_policy to one of them" (toString .)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- with optional .values "databases" "" -}}
+      {{- if gt (int .) 100 -}}
+      {{- fail (printf "values.databases is %v, and Memorystore for Valkey takes up to 100 databases: set values.databases to 100 or fewer" .) -}}
+      {{- end -}}
+      {{- end -}}
+    tls_and_credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "server_certificate" -}}
+      {{- fail "a certificate is attached to the server_certificate slot, and Memorystore for Valkey presents a certificate from the instance's own certificate authority, which takes none: remove the attachment; infra.client_tls alone turns TLS on here" -}}
+      {{- end -}}
+      {{- if hasKey $f "password" -}}
+      {{- fail "a password is attached to the password slot, and Memorystore for Valkey accepts no password a Release supplies: its token authentication runs on a token the service generates, and its IAM authentication on IAM access tokens, so this Recipe runs the cache without authentication, gated by the private network alone: remove the attachment, and restrict who reaches the cache with the network's firewall rules" -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the module's primary_address output — the address of the instance's primary
+  # endpoint in the operator's network, which takes reads and writes — through
+  # this component's module call, which the boundary's root configuration
+  # declares under .context.instance_id for a component declared in the
+  # Aggregate the Release deploys. Terraform resolves it at apply time, so it
+  # resolves only for a consumer authored as a source: Recipe in the same root
+  # configuration; a consumer on another target receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record for it, so the operator points the name at the instance outside
+  # the Release. A consumer in the same root configuration receives the name as
+  # well, and a name carries no reference for Terraform to order its module
+  # after this one by; a later syncWave on the consumer's boundary, sharing
+  # this boundary's directory, orders the two. A consumer checking the
+  # instance's certificate needs a name the certificate carries, which the
+  # operator's own name may not be.
+  #
+  # port is 6379, where the service serves the instance. protocol is valkey, or
+  # valkey-tls while infra.client_tls is on, when the port accepts TLS alone.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.primary_address}{{ end }}"
+    port: "6379"
+    protocol: "{{ if .infra.client_tls }}valkey-tls{{ else }}valkey{{ end }}"
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # instance is named after the component, as the other managed Recipes name
+  # theirs, so the name is checked here, where it is known, against the
+  # service's rule for an instance ID. engine_configs carries only the values
+  # the Aggregate sets, so an instance with none keeps the service's own
+  # configuration.
+  valuesMapping: |
+    {{- if not (regexMatch `^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$` .context.instance_id) }}
+    {{- fail (printf "the component %q names its Memorystore instance, and an instance ID is 1 to 63 lowercase letters, digits and hyphens, starting with a letter and ending with a letter or digit: rename the component in the Aggregate to such a name" .context.instance_id) }}
+    {{- end }}
+    {{- $cfg := dict }}
+    {{- with optional .values "maxmemory" "" }}{{ $_ := set $cfg "maxmemory" (toString .) }}{{ end }}
+    {{- with optional .values "maxmemory_policy" "" }}{{ $_ := set $cfg "maxmemory-policy" (toString .) }}{{ end }}
+    {{- with optional .values "databases" "" }}{{ $_ := set $cfg "databases" (toString .) }}{{ end }}
+    project_id: "{{ .infra.overrides.project_id }}"
+    location: "{{ .infra.overrides.region }}"
+    instance_id: "{{ .context.instance_id }}"
+    network: "{{ .infra.overrides.private_network }}"
+    replica_count: {{ .locals.replica_count }}
+    node_type: "{{ .locals.node_type }}"
+    engine_version: "VALKEY_{{ replace "." "_" .locals.engine_version }}"
+    engine_configs: {{ toJson $cfg }}
+    transit_encryption_mode: "{{ if .infra.client_tls }}SERVER_AUTHENTICATION{{ else }}TRANSIT_ENCRYPTION_DISABLED{{ end }}"
+    persistence_mode: "{{ .locals.persistence_mode }}"

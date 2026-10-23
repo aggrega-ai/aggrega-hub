@@ -1898,7 +1898,18 @@ and MariaDB siblings are the shape: they source the terraform-aws-modules projec
 RDS module, whose root calls only its own `./modules/` directories.
 `recipe/terraform/valkey-elasticache`, `redis-elasticache` and `memcached-elasticache`
 source the same project's ElastiCache module, whose root declares no module call at
-all.
+all. `recipe/terraform/postgres-cloud-sql` and `mysql-cloud-sql` source the
+terraform-google-modules project's Cloud SQL module, whose repository root holds no
+module of its own: each engine is a directory under `modules/`, which the Recipe names
+as its `module_subdir`. Such a directory is vendored alone, so it qualifies only where
+it is whole — it declares no module call and no file in it reaches a sibling with a
+`../` path — and the configuration Terraform loads is that directory. The same
+project's Memorystore module fails the registry test: its `valkey` and `memcache`
+directories each call `terraform-google-modules/project-factory/google` from the
+registry, which `terraform init` fetches whatever inputs the call is given. So
+`recipe/terraform/valkey-memorystore` and `memcached-memorystore` write their module
+beside the Recipe, as `recipe/terraform/rabbitmq-amazon-mq` does for an Amazon MQ
+broker, and their descriptions say why.
 
 #### A CloudFormation template
 
@@ -1974,8 +1985,8 @@ the edge delivers and knows nothing of which names a Recipe expects.
 
 ### Managed-service credentials
 
-For Recipes targeting cloud-managed services (AWS RDS, Azure Database, GCP
-Cloud SQL, etc.), prefer the provider's native managed-secret flag over a
+For Recipes targeting a cloud-managed service that keeps a credential of its own
+(AWS RDS, say), prefer the provider's native managed-secret flag over a
 credential FeatureRecipe that *renders* a secret. Terraform Recipes for RDS set
 `manage_master_user_password = true` so RDS auto-manages the password via AWS
 Secrets Manager; CloudFormation Recipes set `ManageMasterUserPassword: true`
@@ -2029,6 +2040,27 @@ on a generator setting the service refuses — punctuation outside the character
 permits, a length it does not take.
 [`recipe/terraform/valkey-elasticache`](../aggrega-catalog/recipe/terraform/valkey-elasticache/1.0.0/recipe.yaml)
 is the shape.
+
+Cloud SQL keeps no database password of its own either, and the module the
+Cloud SQL Recipes source draws one itself when none is given.
+[`recipe/terraform/postgres-cloud-sql`](../aggrega-catalog/recipe/terraform/postgres-cloud-sql/1.0.0/recipe.yaml)
+hands the user `values.user` names the `core/random-password` reference when one is
+attached to its `password` slot, and with nothing attached, or
+`core/generated-secret`, leaves the module to draw the password at apply time; either
+way the password is kept in the Terraform state and no rendered file carries it.
+Cloud SQL for MySQL creates `root'@'%` with no password, so
+[`recipe/terraform/mysql-cloud-sql`](../aggrega-catalog/recipe/terraform/mysql-cloud-sql/1.0.0/recipe.yaml)
+takes its required `root_password` slot from `core/random-password` alone and halts on
+`core/generated-secret`, which would leave root open.
+
+A service that takes no password a Release supplies leaves the slot nothing to
+carry, and its Recipe halts on any attachment, naming the slot and why.
+Memorystore for Valkey authenticates with a token it generates for itself or with
+IAM access tokens, so
+[`recipe/terraform/valkey-memorystore`](../aggrega-catalog/recipe/terraform/valkey-memorystore/1.0.0/recipe.yaml)
+runs the cache without authentication, gated by the private network alone;
+Memorystore for Memcached offers no instance authentication at all, as ElastiCache
+offers none for Memcached.
 
 A service that requires the credential halts with the slot empty, too, naming it,
 where the Component's slot is optional and an unattached slot means a development
@@ -2106,6 +2138,27 @@ OpenSearch module `recipe/terraform/opensearch-service` vendors
 The highest of those floors is why the constraint above may not drop below it — in
 a boundary holding both, Terraform installs one provider satisfying the catalog's
 range and every module's floor together.
+
+### One Google provider constraint for every Google body
+
+The same rule holds for Google Cloud, with its own string. Every Terraform body the
+catalog authors for Google Cloud declares `hashicorp/google` in its
+`required_providers` block as **`~> 8.8`**, one string in every such body, carried
+by each body with a comment naming this section, for the reasons the AWS section
+gives. The major and minor are those of the provider's current release when the
+constraint is set, and never lower than the highest `hashicorp/google` floor a
+published Google module a catalog Recipe sources declares. The bodies that follow it
+are the modules `recipe/terraform/valkey-memorystore` and `memcached-memorystore`
+keep beside them, which declare only GA resources and so need no `hashicorp/google-beta`.
+
+The Cloud SQL module the `-cloud-sql` Recipes vendor keeps its publisher's own
+constraint, `hashicorp/google` and `hashicorp/google-beta` `>= 7.22, < 9`. In a
+boundary holding a Cloud SQL instance and a Memorystore cache, Terraform installs one
+`hashicorp/google` satisfying both `~> 8.8` and `>= 7.22, < 9`, a release from 8.8
+below 9, and one `hashicorp/google-beta` for the Cloud SQL module alone. Moving the
+range is one change made to every Google body at once, and when the major moves to 9
+the vendored module's `< 9` ceiling has to move with it. This is a catalog
+convention: the compiler pipes the block as text and reads nothing in it.
 
 ### Optional credential slots for self-managed datastores
 
@@ -3672,7 +3725,7 @@ copying whichever sibling happens to be nearest.
   wrote, so it does not read them rather than refusing them. Each of those keys'
   descriptions on the Component says so, and names the `overrides` key the managed
   Recipes size the instance by. A managed cache that provisions no volume — the
-  ElastiCache realizations — reads no `storage.*` either, for the same reason, and
+  ElastiCache and Memorystore realizations — reads no `storage.*` either, for the same reason, and
   its descriptions say so too, and a managed service that serves one port of its
   own — the Amazon OpenSearch Service realizations — reads no `port` while it holds
   the Component's default, refusing any other value by name. A key that alone
@@ -3718,8 +3771,9 @@ copying whichever sibling happens to be nearest.
   the application-role split applies.
 - **Realizations** — helm synthesis (the workload `form`, a PersistentVolumeClaim
   and a headless Service for stateful engines), compose for local development, and
-  the managed cloud equivalents where one exists, with HA and backup honored there
-  through the provider's native flags rather than re-implemented. A managed
+  the managed cloud equivalents where one exists — on AWS, RDS, ElastiCache and
+  Amazon OpenSearch Service; on Google Cloud, Cloud SQL and Memorystore — with HA and backup honored
+  there through the provider's native flags rather than re-implemented. A managed
   realization of a Component promising an extension enabled in its database is
   authored only where the service enables it through its own configuration of the
   database; where only a SQL statement enables it, the Component's description
@@ -3779,12 +3833,19 @@ template, not something the compiler checks: the compiler pipes the published
   to `server_certificate` halts naming the slot. An attached Valkey or Redis
   password becomes the AUTH token, which ElastiCache accepts only with in-transit
   encryption on, so it halts while `client_tls` is false; an attached Memcached
-  password halts, since ElastiCache offers no Memcached authentication.
+  password halts, since ElastiCache offers no Memcached authentication. The
+  Memorystore for Valkey realization does too, with a certificate from the
+  instance's own certificate authority, which no system trust store holds: each
+  consumer checks it against that authority in its `server_ca` slot, a Secret
+  holding the chain under `ca.crt`, which the operator reads with `gcloud
+  memorystore instances get-certificate-authority` once the instance exists. An
+  attachment to `server_certificate` halts there as well.
 - **A realization that cannot serve TLS refuses `client_tls` by name and names one
   that can.** The Compose realizations do: each server reads its certificate
   from files, and no credential Feature realized on Compose names a secret a
   service can mount, so they refuse the setting, and a certificate attached
-  without it, and name the helm realizations.
+  without it, and name the helm realizations. The Memorystore for Memcached
+  realization does too, since the service offers no encryption in transit.
 - **A consumer taught the TLS value reaches the cache over TLS while the cache
   publishes it**, with the product's own switch, and checks the cache's
   certificate against the authority in a `server_ca` slot on its cache socket —
@@ -3900,7 +3961,18 @@ endpoint) and the CloudFormation ones
 the attribute differently), and `recipe/terraform/opensearch-service`, whose
 pointer names the module's `domain_endpoint` output, and
 `recipe/cloudformation/opensearch-service`, publishing `!GetAtt
-<LogicalId>.DomainEndpoint`. So does `recipe/terraform/kafka-msk`, a managed Kafka
+<LogicalId>.DomainEndpoint`. So do the Cloud SQL Recipes
+(`recipe/terraform/postgres-cloud-sql` and `mysql-cloud-sql`), whose pointer names the
+module's `private_ip_address` output, the instance's address in the operator's
+network; Cloud SQL serves one port per engine, so they publish `port` `5432` and
+`3306` and refuse an `infra.port` other than the Component's default by name.
+So do the Memorystore Recipes: `recipe/terraform/valkey-memorystore`, whose pointer
+names its module's `primary_address` output, the instance's primary endpoint, and
+`memcached-memorystore`, whose pointer names `node_address`, the address of its one
+node, since the instance's discovery endpoint answers Auto Discovery queries alone;
+they publish `port` `6379` and `11211`, the ports the service serves, and refuse an
+`infra.port` other than the Component's default by name.
+So does `recipe/terraform/kafka-msk`, a managed Kafka
 cluster rather than a datastore, whose `host` names the first broker of the module's
 `bootstrap_brokers_plaintext` output and whose `bootstrap_servers` names the whole
 list, both replaced by the operator's name, `bootstrap_servers` joined with the

@@ -11,37 +11,41 @@ metadata:
     as a cache, entries live in memory and are not durably persisted, so the
     component renders as a stateless workload rather than a stateful one and
     declares no storage. Realized on Kubernetes, on Compose for local
-    development, and on Amazon ElastiCache. Exports its host and port to
-    consumers via the uses topology.
+    development, on Amazon ElastiCache and on Google Cloud Memorystore for
+    Valkey. Exports its host and port to consumers via the uses topology.
 
     On Kubernetes there are two realizations and the Manifest chooses between
     them. `valkey` synthesizes the cache as a workload and fetches nothing, so it
     is the one to reach for where the build must complete with no chart
     repository reachable. `valkey-chart` renders the community-maintained Valkey
-    Helm chart, which additionally runs the cache unprivileged on a read-only
-    root filesystem with every capability dropped, and expresses an attached
-    password as an access-control entry hashed on the pod from a mounted secret,
-    so reach for it where a chart repository is reachable at build time. Both
-    realizations probe the cache over its own protocol, so a rollout reports it
-    ready only once it answers.
+    Helm chart, which hardens the container further, so reach for it where a
+    chart repository is reachable at build time.
 
     Reach for terraform/valkey-elasticache, or cloudformation/valkey-elasticache
     in a CloudFormation stack, where the cache is an ElastiCache service in the
     operator's AWS account; each halts naming each value ElastiCache cannot
-    apply.
+    apply. Reach for terraform/valkey-memorystore where it is a Memorystore
+    instance in the operator's Google Cloud project, whose VPC network has a
+    service connection policy for Memorystore; it runs without authentication.
 
     `infra.client_tls`, off by default, serves TLS alone and publishes
     `protocol` `valkey-tls`: on Kubernetes with the certificate attached to
-    `server_certificate`, on ElastiCache with one AWS issues. The Compose
-    realization refuses it by name.
+    `server_certificate`, on ElastiCache with one AWS issues, on Memorystore
+    with one from the instance's own authority, which consumers trust through
+    `server_ca`. The Compose realization refuses it by name.
+  # The Kubernetes realizations in detail: valkey-chart runs the cache
+  # unprivileged on a read-only root filesystem with every capability dropped,
+  # and expresses an attached password as an access-control entry hashed on the
+  # pod from a mounted secret. Both probe the cache over its own protocol, so a
+  # rollout reports it ready only once it answers.
   labels:
     component.aggrega.ai/type: server
     component.aggrega.ai/category: datastore
     datastore.aggrega.ai/engine: kv
-    # Realized self-hosted (helm, compose) and managed (ElastiCache), so no
-    # single hosting posture is its identity; the posture of a Release
-    # follows the Recipe the Manifest selects. Selector-only: never stamped
-    # onto output.
+    # Realized self-hosted (helm, compose) and managed (ElastiCache,
+    # Memorystore), so no single hosting posture is its identity; the posture
+    # of a Release follows the Recipe the Manifest selects. Selector-only:
+    # never stamped onto output.
     component.aggrega.ai/hosting: mixed
     component.aggrega.ai/upstream-licensing: osi-approved
   maintainers:
@@ -64,7 +68,7 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [env]
-      description: "Optional cache authentication credential. When attached, enables Valkey password authentication and supplies the password; unattached, the cache runs without authentication. On ElastiCache the password is the AUTH token, which the service accepts only while infra.client_tls is true, drawn by core/random-password, when Terraform applies or the stack is created, with no punctuation and at least 16 characters."
+      description: "Optional cache authentication credential. When attached, enables Valkey password authentication and supplies the password; unattached, the cache runs without authentication. On ElastiCache the password is the AUTH token, which the service accepts only while infra.client_tls is true, drawn by core/random-password, when Terraform applies or the stack is created, with no punctuation and at least 16 characters. Memorystore for Valkey takes no password a Release supplies, so terraform/valkey-memorystore halts on any attachment here."
     # Optional server certificate, read only while infra.client_tls is true. It
     # reaches the container as files (inject: [file]), so its fill must name a
     # Secret the workload mounts — core/referenced-secret, whose realization names
@@ -74,7 +78,7 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [file]
-      description: "Optional certificate the cache presents to its clients while infra.client_tls is true: a Secret holding tls.crt, the certificate followed by any intermediate certificates, and tls.key, its private key, the two keys a kubernetes.io/tls Secret holds. The certificate names every address a client dials: the published host, and its namespace-qualified forms where clients in other namespaces connect. Mounted as files, so attach a Feature that names an existing Secret, such as core/referenced-secret. Required by the Kubernetes realizations while client_tls is true; a build halts on it attached while client_tls is false. ElastiCache presents a certificate AWS issues, so its realizations halt on any attachment here."
+      description: "Optional certificate the cache presents to its clients while infra.client_tls is true: a Secret holding tls.crt, the certificate followed by any intermediate certificates, and tls.key, its private key, the two keys a kubernetes.io/tls Secret holds. The certificate names every address a client dials: the published host, and its namespace-qualified forms where clients in other namespaces connect. Mounted as files, so attach a Feature that names an existing Secret, such as core/referenced-secret. Required by the Kubernetes realizations while client_tls is true; a build halts on it attached while client_tls is false. ElastiCache presents a certificate AWS issues, and Memorystore one from the instance's own authority, so their realizations halt on any attachment here."
   schema:
     values:
       # Developer Intent — filled by the Developer in the Aggregate. Every knob
@@ -84,7 +88,7 @@ spec:
       # free of redundant flags until the developer expresses an intent.
       maxmemory:
         type: string
-        description: Maximum memory the cache may use before eviction (the maxmemory directive, e.g. 256mb). Omit for no cap. ElastiCache fixes it by the node type, so its realizations halt on it.
+        description: Maximum memory the cache may use before eviction (the maxmemory directive, e.g. 256mb). Omit for no cap. ElastiCache fixes it by the node type, so its realizations halt on it; Memorystore takes it as a configuration, except on the SHARED_CORE_NANO node type.
       maxmemory_policy:
         type: string
         description: Eviction policy applied when maxmemory is reached (the maxmemory-policy directive, e.g. allkeys-lru, volatile-ttl, noeviction). Omit to use the default.
@@ -95,12 +99,12 @@ spec:
       appendonly:
         type: boolean
         default: false
-        description: Enable append-only file (AOF) persistence. Pair with persistence.enabled for a durable volume; on an ephemeral cache the AOF is not retained across restarts. ElastiCache writes no AOF for Valkey, so its realizations halt on it set true.
+        description: Enable append-only file (AOF) persistence. Pair with persistence.enabled for a durable volume; on an ephemeral cache the AOF is not retained across restarts. ElastiCache writes no AOF for Valkey, so its realizations halt on it set true; Memorystore keeps the data with AOF persistence.
       persistence:
         enabled:
           type: boolean
           default: false
-          description: Run the cache as a durable StatefulSet with a persistent volume mounted at /data instead of the default ephemeral Deployment. Off by default — the cache role holds no durable state. Realized on the synthesized-Helm target; the Compose flavor is ephemeral, and the ElastiCache realizations, which provision no volume, halt on it set true.
+          description: Run the cache as a durable StatefulSet with a persistent volume mounted at /data instead of the default ephemeral Deployment. Off by default — the cache role holds no durable state. Realized on the synthesized-Helm target; the Compose flavor is ephemeral, and the ElastiCache realizations, which provision no volume, halt on it set true. Memorystore, which provisions none either, keeps the data with hourly RDB snapshots while appendonly is off.
     infra:
       # Operational Sizing — filled by the Operator in the Release. Developer
       # never sees this.
@@ -109,7 +113,7 @@ spec:
         min: 1024
         max: 65535
         default: 6379
-        description: Server listen port. Most operators should omit this and let the Recipe assign the default (6379).
+        description: Server listen port. Most operators should omit this and let the Recipe assign the default (6379). Memorystore serves 6379 alone, so terraform/valkey-memorystore halts on any other value.
       client_tls:
         type: boolean
         default: false
@@ -122,38 +126,41 @@ spec:
           is `valkey-tls`. Served by the `valkey` and `valkey-chart` Kubernetes
           realizations; the Compose realization refuses it. On ElastiCache it
           turns on the service's in-transit encryption, whose certificate AWS
-          issues and clients trust without a `server_ca`.
+          issues and clients trust without a `server_ca`. On Memorystore it
+          turns on the service's in-transit encryption with the instance's own
+          certificate authority, which each consumer takes in its `server_ca`
+          slot.
       engine_version:
         type: string
         default: "8.1-alpine"
-        description: Valkey container image tag. Selects the image tag on container targets; the chart-backed realization pins its own image tag. The ElastiCache realizations read the major and minor version the value begins with (8.1 from 8.1-alpine) as the engine version, and halt on one ElastiCache does not offer, naming those it does.
+        description: Valkey container image tag. Selects the image tag on container targets; the chart-backed realization pins its own image tag. The ElastiCache realizations read the major and minor version the value begins with (8.1 from 8.1-alpine) as the engine version, and halt on one ElastiCache does not offer, naming those it does. terraform/valkey-memorystore reads it the same way and takes 7.2, 8.0, 9.0 and 9.1, so the default halts there and the Release sets one of them.
       source_version:
         type: string
-        description: Version of the Helm chart the chart-backed realization pulls. Read only by that realization; the workload-synthesis and Compose realizations pull no source artifact and ignore it, and the ElastiCache realizations ignore it too, the terraform one pinning the module it vendors at a version it writes out and the CloudFormation one pulling nothing. Changing it away from the Recipe's default does not guarantee value-mapping compatibility with the new chart.
+        description: Version of the Helm chart the chart-backed realization pulls. Read only by that realization; the workload-synthesis and Compose realizations pull no source artifact and ignore it, and the ElastiCache and Memorystore realizations ignore it too, the terraform ElastiCache one pinning the module it vendors at a version it writes out, the Memorystore one vendoring a module kept beside it and the CloudFormation one pulling nothing. Changing it away from the Recipe's default does not guarantee value-mapping compatibility with the new chart.
       compute:
         cpu:
           type: string
           default: 100m
-          description: CPU the cache server is given. The ElastiCache realizations do not read it; they size the node by infra.overrides.node_type (CacheNodeType on CloudFormation).
+          description: CPU the cache server is given. The ElastiCache and Memorystore realizations do not read it; they size the node by infra.overrides.node_type (CacheNodeType on CloudFormation).
         memory:
           type: string
           default: 128Mi
-          description: Memory the cache server is given. The ElastiCache realizations do not read it; they size the node by infra.overrides.node_type (CacheNodeType on CloudFormation).
+          description: Memory the cache server is given. The ElastiCache and Memorystore realizations do not read it; they size the node by infra.overrides.node_type (CacheNodeType on CloudFormation).
       storage:
         type: object
         properties:
           size:
             type: string
             default: 1Gi
-            description: Persistent volume size when persistence.enabled is set (both Kubernetes Recipes). The ElastiCache realizations provision no volume and do not read it.
+            description: Persistent volume size when persistence.enabled is set (both Kubernetes Recipes). The ElastiCache and Memorystore realizations provision no volume and do not read it.
           type:
             type: string
             description: >
               Persistent volume storage class when persistence.enabled is set
               (both Kubernetes Recipes). Leave it unset to take the cluster's
               default storage class; set it to name another class the cluster
-              offers. The ElastiCache realizations provision no volume and do
-              not read it.
+              offers. The ElastiCache and Memorystore realizations provision no
+              volume and do not read it.
       overrides:
         type: object
         additionalProperties: true
@@ -166,7 +173,7 @@ spec:
         description: >
           Address a consumer opens its cache connection to, together with
           `port`: the in-cluster DNS name of the Service fronting the cache on
-          Kubernetes, and on ElastiCache a pointer string Terraform or
+          Kubernetes, and on ElastiCache or Memorystore a pointer string Terraform or
           CloudFormation resolves to the primary endpoint, or the DNS name the Release sets in
           infra.overrides.host instead, so a consumer on another target receives
           an address it can resolve.
@@ -175,8 +182,8 @@ spec:
         required: true
         description: >
           TCP port the cache accepts connections on. It follows the port an
-          operator set in the Release, so a consumer reads it rather than
-          assuming 6379.
+          operator set in the Release, or the one port the service serves on
+          Memorystore, so a consumer reads it rather than assuming 6379.
       protocol:
         type: string
         description: >
