@@ -2099,9 +2099,10 @@ the block as text and reads nothing in it.
 A published module a Recipe sources is not a body the catalog authors, and it
 keeps its publisher's own constraint: the terraform-aws-modules RDS module the
 `-rds-terraform-aws-modules` Recipes vendor declares `hashicorp/aws >= 6.28`, the
-ElastiCache module the `-elasticache` Recipes vendor `hashicorp/aws >= 5.93`, and
-the OpenSearch module `recipe/terraform/opensearch-service` vendors
-`hashicorp/aws >= 6.51`.
+ElastiCache module the `-elasticache` Recipes vendor `hashicorp/aws >= 5.93`, the
+OpenSearch module `recipe/terraform/opensearch-service` vendors
+`hashicorp/aws >= 6.51`, and the MSK module `recipe/terraform/kafka-msk` vendors
+`hashicorp/aws >= 6.40`.
 The highest of those floors is why the constraint above may not drop below it — in
 a boundary holding both, Terraform installs one provider satisfying the catalog's
 range and every module's floor together.
@@ -3889,7 +3890,11 @@ endpoint) and the CloudFormation ones
 the attribute differently), and `recipe/terraform/opensearch-service`, whose
 pointer names the module's `domain_endpoint` output, and
 `recipe/cloudformation/opensearch-service`, publishing `!GetAtt
-<LogicalId>.DomainEndpoint`. A managed datastore Recipe
+<LogicalId>.DomainEndpoint`. So does `recipe/terraform/kafka-msk`, a managed Kafka
+cluster rather than a datastore, whose `host` names the first broker of the module's
+`bootstrap_brokers_plaintext` output and whose `bootstrap_servers` names the whole
+list, both replaced by the operator's name, `bootstrap_servers` joined with the
+port. A managed datastore Recipe
 added later follows this section rather than a sibling Recipe.
 
 ### The pipeline family template
