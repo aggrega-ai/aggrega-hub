@@ -66,7 +66,7 @@ the label section below). The 15 categories:
 | `mesh` | Service meshes | server | created when the first entity lands |
 | `network` | Network primitives | server, resource | created when the first entity lands |
 | `messaging` | Event buses, queues, streams, the realtime media services that carry voice and video between participants, and the external carriers a message leaves the Release through | stateful-server, server, resource | populated |
-| `storage` | Object/file storage, managed cloud resources | resource, server | populated |
+| `storage` | Object/file storage: a self-hosted object-storage server (`core/storage/minio`), and managed buckets reached over the S3 API (`core/storage/s3-object-store`) or through Google Cloud Storage's own API (`core/storage/gcs`) | resource, server | populated |
 | `compute` | Generic compute primitives, plus the control planes an event-driven realization depends on | server, worker, task, function | populated |
 | `observability` | Telemetry, tracing, monitoring | varies | populated |
 | `security` | Security and compliance components | varies | populated |
@@ -2152,13 +2152,17 @@ are the modules `recipe/terraform/valkey-memorystore` and `memcached-memorystore
 keep beside them, which declare only GA resources and so need no `hashicorp/google-beta`.
 
 The Cloud SQL module the `-cloud-sql` Recipes vendor keeps its publisher's own
-constraint, `hashicorp/google` and `hashicorp/google-beta` `>= 7.22, < 9`. In a
-boundary holding a Cloud SQL instance and a Memorystore cache, Terraform installs one
-`hashicorp/google` satisfying both `~> 8.8` and `>= 7.22, < 9`, a release from 8.8
-below 9, and one `hashicorp/google-beta` for the Cloud SQL module alone. Moving the
-range is one change made to every Google body at once, and when the major moves to 9
-the vendored module's `< 9` ceiling has to move with it. This is a catalog
-convention: the compiler pipes the block as text and reads nothing in it.
+constraint, `hashicorp/google` and `hashicorp/google-beta` `>= 7.22, < 9` and
+`hashicorp/random` `~> 3.1`, and so does the cloud-storage module that
+`recipe/terraform/s3-object-store-gcs` and `recipe/terraform/gcs` vendor, with
+`hashicorp/google` `>= 6.37.0, < 9` and `hashicorp/random` `>= 2.1`. In a boundary
+holding a Cloud SQL instance, a Memorystore cache and a Cloud Storage bucket,
+Terraform installs one `hashicorp/google` satisfying `~> 8.8`, `>= 7.22, < 9` and
+`>= 6.37.0, < 9` together, a release from 8.8 below 9, one `hashicorp/google-beta`
+for the Cloud SQL module alone, and one `hashicorp/random` satisfying both modules'
+ranges. Moving the range is one change made to every Google body at once, and when
+the major moves to 9 each vendored module's `< 9` ceiling has to move with it. This
+is a catalog convention: the compiler pipes the block as text and reads nothing in it.
 
 ### Optional credential slots for self-managed datastores
 
