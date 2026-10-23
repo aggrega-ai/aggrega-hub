@@ -66,7 +66,7 @@ the label section below). The 15 categories:
 | `mesh` | Service meshes | server | created when the first entity lands |
 | `network` | Network primitives | server, resource | created when the first entity lands |
 | `messaging` | Event buses, queues, streams, the realtime media services that carry voice and video between participants, and the external carriers a message leaves the Release through | stateful-server, server, resource | populated |
-| `storage` | Object/file storage: a self-hosted object-storage server (`core/storage/minio`), and managed buckets reached over the S3 API (`core/storage/s3-object-store`) or through Google Cloud Storage's own API (`core/storage/gcs`) | resource, server | populated |
+| `storage` | Object/file storage: a self-hosted object-storage server with its own settings (`core/storage/minio`); a bucket reached over the S3 API (`core/storage/s3-object-store`), on Amazon S3 or Google Cloud Storage or on a SeaweedFS server the Release runs; and a managed bucket reached through Google Cloud Storage's own API (`core/storage/gcs`) | resource, server | populated |
 | `compute` | Generic compute primitives, plus the control planes an event-driven realization depends on | server, worker, task, function | populated |
 | `observability` | Telemetry, tracing, monitoring | varies | populated |
 | `security` | Security and compliance components | varies | populated |

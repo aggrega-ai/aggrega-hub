@@ -1,0 +1,235 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: s3-object-store
+  version: 1.0.0
+  # The licence of SeaweedFS, the server this Recipe runs from its project's
+  # published chrislusf/seaweedfs image.
+  license: Apache-2.0
+  description: >
+    An S3-compatible object store on Kubernetes: SeaweedFS 4.48, Apache-2.0,
+    from its project's published chrislusf/seaweedfs image, run by the helm
+    provider's Workload synthesis as one weed server process — master, volume
+    server, filer and S3 gateway — in a StatefulSet with a persistent volume
+    and a ClusterIP Service. An init container creates the bucket
+    values.bucket names before the server serves, and leaves an existing one
+    as it is.
+
+    Reach for it where the store runs in the cluster with nothing else in
+    place; for compose/s3-object-store on a Compose host; for
+    terraform/s3-object-store-amazon-s3 or
+    cloudformation/s3-object-store-amazon-s3 in an AWS account; and for
+    terraform/s3-object-store-gcs in a Google Cloud project.
+
+    The access_key_id and secret_access_key slots are the server's S3 account,
+    and both are required here: each is read by reference as an env
+    secretKeyRef, so no key reaches the rendered manifest, and an empty slot
+    halts naming it. The server serves plain HTTP inside the cluster; only the
+    S3 gateway listens beyond the pod, on its S3 port and the gRPC port beside
+    it, and each refuses a caller without the key.
+
+    It publishes the bucket, the endpoint http://<service>:8333, its host,
+    port 8333, protocol s3 and region us-east-1, the one S3 clients read from
+    a server reporting none. infra.region, any infra.overrides key and a
+    bucket name SeaweedFS does not take halt naming the key.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/storage/s3-object-store:1.0.0
+  # This Recipe reads no infra.overrides keys; any key under it halts the build
+  # naming it.
+  #
+  # Every Component value and infra key is honoured or refused by name:
+  #   honoured — values.bucket, as the bucket the init container creates;
+  #     access_key_id and secret_access_key, as the server's S3 account.
+  #   refused — a bucket name SeaweedFS does not take; infra.region, which
+  #     SeaweedFS reads nowhere; any infra.overrides key; and either key slot
+  #     left empty.
+  #
+  # The Component declares no version, port or sizing key, so the image tag,
+  # the S3 port and the volume's size are fixed here: 4.48, 8333 — the S3
+  # gateway's own default — and 8Gi. No resources are requested or limited.
+  #
+  # The region. SeaweedFS verifies a request signed for any region, taking the
+  # region from the request's own credential scope, and answers
+  # GetBucketLocation with an empty location constraint, which an S3 client
+  # reads as us-east-1. So region is published as us-east-1, a client signing
+  # for it is answered, and infra.region, which would place nothing, halts the
+  # build naming it.
+  #
+  # host is the bare Service name "<rendered_name>-default" — the helm provider
+  # names the synthesized Service "<rendered_name>-<service-key>" — with no
+  # namespace segment; a consumer in another namespace qualifies it with the
+  # target namespace on its own side. endpoint composes it with the port under
+  # http, the scheme the S3 gateway is served over: the workload mounts no
+  # certificate, so the server terminates no TLS. host and endpoint spell the
+  # Service name out twice on purpose: a provides entry cannot read another.
+  provides:
+    bucket: "{{ .values.bucket }}"
+    region: "us-east-1"
+    endpoint: "http://{{ .context.rendered_name }}-default:8333"
+    host: "{{ .context.rendered_name }}-default"
+    port: "8333"
+    protocol: "s3"
+  assertions:
+    # The two slots are the account the S3 gateway authenticates every request
+    # by, and a key every reader of the catalog holds would guard nothing, so
+    # there is no default for either.
+    key_slots_filled: >-
+      {{- $f := default dict .features -}}
+      {{- range $slot := list "access_key_id" "secret_access_key" -}}
+      {{- if not (hasKey $f $slot) -}}
+      {{- fail (printf "the %s slot is empty, and SeaweedFS takes the access_key_id and secret_access_key pair as the account its S3 API authenticates every request by, so there is no default for either: attach a referenceable credential, such as core/referenced-secret, to %s" $slot $slot) -}}
+      {{- end -}}
+      {{- end -}}
+    region_unset: >-
+      {{- with optional .infra "region" "" -}}
+      {{- fail (printf "infra.region is %q, and SeaweedFS reads no region: it answers a request signed for any region and reports none for its buckets, which S3 clients read as us-east-1, the region this Recipe publishes; remove infra.region from the Release" (toString .)) -}}
+      {{- end -}}
+    # The bucket name rules SeaweedFS's S3 API applies, so the init container
+    # never meets a name the server refuses.
+    bucket_name_seaweedfs_takes: >-
+      {{- $b := toString .values.bucket -}}
+      {{- $rule := "" -}}
+      {{- if not (regexMatch `^[\p{Ll}\p{N}.-]*$` $b) -}}
+      {{- $rule = "SeaweedFS takes lowercase letters, numbers, periods and hyphens alone in a bucket name" -}}
+      {{- else if or (lt (len $b) 3) (gt (len $b) 63) -}}
+      {{- $rule = "SeaweedFS takes a bucket name of 3 to 63 bytes" -}}
+      {{- else if or (hasPrefix "." $b) (hasPrefix "-" $b) (hasSuffix "." $b) (hasSuffix "-" $b) -}}
+      {{- $rule = "SeaweedFS takes a bucket name only where it begins and ends with a letter or a number" -}}
+      {{- else if contains ".." $b -}}
+      {{- $rule = "SeaweedFS takes no bucket name holding two adjacent periods" -}}
+      {{- else if regexMatch `^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$` $b -}}
+      {{- $rule = "SeaweedFS takes no bucket name in the form of an IP address" -}}
+      {{- else if hasPrefix "xn--" $b -}}
+      {{- $rule = "SeaweedFS reserves the prefix xn--" -}}
+      {{- else if hasSuffix "-s3alias" $b -}}
+      {{- $rule = "SeaweedFS reserves the suffix -s3alias" -}}
+      {{- else if eq $b "filemeta" -}}
+      {{- $rule = "SeaweedFS reserves the name filemeta for its own metadata store" -}}
+      {{- end -}}
+      {{- if $rule -}}
+      {{- fail (printf "values.bucket is %q, and %s: set values.bucket in the Aggregate to another name" $b $rule) -}}
+      {{- end -}}
+    overrides_unread: >-
+      {{- range $k, $v := (optional .infra "overrides" dict) -}}
+      {{- fail (printf "infra.overrides.%s is not a setting this Recipe reads: it reads no infra.overrides key; remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+  workload: |
+    {{- /* The script the init container runs, with the bucket name in it. The
+      name holds lowercase letters, numbers, periods and hyphens alone, which the
+      assertion above has checked, so the shell reads it as one word. The line is
+      written as a JSON string, so YAML reads it as written. */ -}}
+    {{- $create := printf "/entrypoint.sh server -ip=127.0.0.1 -ip.bind=127.0.0.1 -filer -master.telemetry=false & pid=$!; n=0; while :; do out=`echo 's3.bucket.create -name %s' | timeout 30 weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888 2>&1`; status=$?; case \"$out\" in *'bucket %s already exists'*) status=0;; esac; [ $status -eq 0 ] && break; n=`expr $n + 1`; [ $n -ge 60 ] && break; kill -0 $pid 2>/dev/null || break; sleep 2; done; echo \"$out\"; kill $pid; wait $pid; exit $status" (toString .values.bucket) (toString .values.bucket) -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # One server holds the store's data on its own volume, so the stateful form
+    # (a StatefulSet on the helm provider) runs exactly one copy of it at a time,
+    # including while a pod is replaced.
+    form: stateful
+    replicas: 1
+    initContainers:
+      # Creates the bucket before the server serves. The admin shell creates a
+      # bucket over the filer's gRPC, so the init container starts a server of
+      # its own against the data volume, on the loopback address alone and with
+      # no S3 gateway, runs s3.bucket.create until its filer answers, and stops
+      # it. A bucket that already exists — every start after the first — is
+      # left as it is: the shell answers "bucket <name> already exists", which
+      # counts as done. The shell is retried every 2 s while the server starts,
+      # 60 times at most; an answer still failing then, or a server that exits,
+      # fails the init container, so the server never serves a store without
+      # its bucket. The image's entrypoint makes the volume the seaweed user's
+      # and drops to that user, for this server as for the main one. No
+      # credential is read: the shell reaches the filer on loopback.
+      - name: bucket
+        image: "chrislusf/seaweedfs:4.48"
+        command: ["/bin/sh"]
+        args:
+          - "-c"
+          - {{ $create | toJson | replace "\u0085" "\\u0085" }}
+        volumeMounts:
+          - name: data
+            path: /data
+    containers:
+      main:
+        image: "chrislusf/seaweedfs:4.48"
+        # The image's entrypoint runs `weed server` with its data directory at
+        # /data and the volume count sized to the disk. The master, the volume
+        # server and the filer listen on the loopback address alone, -ip and
+        # -ip.bind, because their HTTP and gRPC ports take no key; only the S3
+        # gateway listens on every address, -s3.ip.bind, on the S3 port and the
+        # gRPC port beside it. The
+        # gateway's Iceberg and Lance catalog ports are off, and so is the
+        # master's report of anonymous usage statistics to SeaweedFS's own
+        # server, which is on unless switched off.
+        args:
+          - server
+          - -ip=127.0.0.1
+          - -ip.bind=127.0.0.1
+          - -filer
+          - -s3
+          - -s3.port=8333
+          - -s3.ip.bind=0.0.0.0
+          - -s3.port.iceberg=0
+          - -s3.port.lance=0
+          - -master.telemetry=false
+        # The server's S3 account. SeaweedFS reads AWS_ACCESS_KEY_ID and
+        # AWS_SECRET_ACCESS_KEY as an admin identity, and with an identity
+        # present it authenticates every S3 request. The gateway's own gRPC port
+        # listens beside the S3 port and takes identity changes, unauthenticated
+        # unless a filer signing key is set, so WEED_JWT_FILER_SIGNING_KEY, the
+        # environment spelling of that key, is the secret key as well. Each is
+        # an env secretKeyRef to the Secret the slot's credential publishes, so
+        # no key lands in the manifest; the assertion above has halted a build
+        # leaving either slot empty, and the guard lets a single-entity
+        # validate, which attaches nothing, still render the rest.
+    {{- if and (hasKey (default dict .features) "access_key_id") (hasKey (default dict .features) "secret_access_key") }}
+        attachments:
+          AWS_ACCESS_KEY_ID:
+            from: access_key_id
+            as: env
+          AWS_SECRET_ACCESS_KEY:
+            from: secret_access_key
+            as: env
+          WEED_JWT_FILER_SIGNING_KEY:
+            from: secret_access_key
+            as: env
+    {{- end }}
+        ports:
+          s3: 8333
+        # The S3 gateway answers /healthz with 200, unauthenticated, once it
+        # serves; SeaweedFS documents no start-up time, and the liveness probe
+        # waits 10 s before its first check.
+        health:
+          ready:
+            http: /healthz
+            periodSeconds: 10
+            timeoutSeconds: 5
+          live:
+            http: /healthz
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+        volumeMounts:
+          - name: data
+            path: /data
+    volumes:
+      data:
+        persistentTemplate:
+          size: "8Gi"
+    # default is the Service consumers reach; headless is the governing Service a
+    # StatefulSet names, carrying the same port.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          s3: 8333
+      headless:
+        type: Headless
+        ports:
+          s3: 8333
