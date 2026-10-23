@@ -1,0 +1,240 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: s3-object-store-amazon-s3
+  version: 1.0.0
+  # The licence of the vendored module, the terraform-aws-modules project's
+  # s3-bucket module: the third-party code this Recipe pins and writes into the
+  # output. The Amazon S3 bucket it provisions is a service the reader
+  # contracts for directly with AWS, under AWS's terms.
+  license: Apache-2.0
+  description: >
+    An S3-compatible object store on Amazon S3: one general purpose bucket in
+    the operator's AWS account and the Region infra.region names, realized by
+    the terraform-aws-modules project's published s3-bucket module,
+    terraform-aws-modules/s3-bucket/aws at v5.17.0, Apache-2.0, fetched from
+    its git repository at that tag; entity.lock pins the tag's commit and
+    archive digest.
+
+    Reach for it where a consumer speaks the S3 API to a bucket in an AWS
+    account through Terraform; for cloudformation/s3-object-store-amazon-s3 in
+    a CloudFormation stack; for terraform/s3-object-store-gcs on Google Cloud;
+    and for core/storage/minio where the store is a MinIO server the Release
+    runs.
+
+    Every public access is blocked: all four S3 Block Public Access settings
+    are on and ACLs are disabled, and no key a Release sets changes either, so
+    S3 rejects a public ACL or a public bucket policy. S3 takes no key from a
+    bucket: each consumer brings the access key of an IAM principal, created
+    outside the build, on its own connection, and an attachment on
+    access_key_id or secret_access_key halts naming the slot. No IAM user,
+    role, key or policy is created; a bucket policy is written only where
+    infra.overrides.policy supplies one.
+
+    infra.region is required. It publishes the bucket as written, infra.region
+    as region, the Regional endpoint https://s3.<region> under the partition's
+    domain suffix, its host, port 443 and protocol s3. A Region outside the
+    partitions S3 serves, or a bucket name S3 does not take, halts naming the
+    key.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/storage/s3-object-store:1.0.0
+
+  # The published module, at the tag the registry publishes as version 5.17.0.
+  # A registry version of a module is a tag of its git repository, and the
+  # registry's own download for this version answers with a git source at the
+  # commit that tag names; Terraform's dependency lock file records providers
+  # and no module. So the pin is taken here: `aggrega pin` resolves the tag to
+  # its commit and records that commit and the archive's digest in entity.lock,
+  # and every build vendors exactly those bytes.
+  #
+  # The repository root is the module, and no module_subdir is written. The
+  # root's configuration files — main.tf, variables.tf, outputs.tf and
+  # versions.tf — declare one module call, s3_file_system, whose source is the
+  # repository's own ./modules/file-system directory, and that directory
+  # declares none. So the configuration Terraform loads calls no registry
+  # module, and initialising it fetches providers and nothing else. The
+  # repository's other modules/ directories, examples/ and wrappers/ are
+  # vendored with it and never loaded. The file-system call is made once per
+  # entry of the module's file_systems input, which this Recipe leaves empty,
+  # so it creates nothing.
+  #
+  # The module declares hashicorp/aws ">= 6.44" in its own required_providers
+  # and is vendored byte for byte, so this Recipe adds no provider constraint
+  # of its own; the catalog conventions' "One AWS provider constraint for every
+  # AWS body" section says how it composes with the catalog's authored AWS
+  # bodies. The boundary's root configuration declares no provider block for
+  # AWS: the provider reads its Region and credentials from the environment
+  # the plan runs in, and the module places the bucket in the Region it is
+  # given, as set out below.
+  #
+  # The tag is written out rather than read from a template: a source whose
+  # coordinates come from a template is pinned per Release instead of in this
+  # Recipe's own entity.lock, and this Recipe's pin is the one stated above.
+  source:
+    kind: git-repository
+    url: https://github.com/terraform-aws-modules/terraform-aws-s3-bucket.git
+    ref: v5.17.0
+
+  locals:
+    # The Region the bucket is placed in, infra.region as written.
+    region: '{{ toString (optional .infra "region" "") }}'
+    # The DNS suffix of the partition that Region belongs to, read off the
+    # Region code by the patterns the AWS SDKs publish for each partition:
+    # amazonaws.com.cn for China (cn-), amazonaws.eu for the European
+    # Sovereign Cloud (eusc-de-), and amazonaws.com for the standard Regions
+    # and AWS GovCloud (US). A Region of none of the four is refused below,
+    # leaving this empty.
+    dns_suffix: >-
+      {{- $r := .locals.region -}}
+      {{- if regexMatch `^cn-[a-z]+-[0-9]+$` $r -}}amazonaws.com.cn
+      {{- else if regexMatch `^eusc-de-[a-z]+-[0-9]+$` $r -}}amazonaws.eu
+      {{- else if regexMatch `^us-gov-[a-z]+-[0-9]+$` $r -}}amazonaws.com
+      {{- else if regexMatch `^(us|eu|ap|sa|ca|me|af|il|mx)-[a-z]+-[0-9]+$` $r -}}amazonaws.com
+      {{- end -}}
+
+  # This Recipe reads from infra.overrides:
+  #   policy - object (policy, with attach_policy true), the bucket policy document
+  #
+  # It is named by the module input it sets, and is the key
+  # cloudformation/s3-object-store-amazon-s3 reads for the same document. It is
+  # the operator's own policy, written as a mapping — the JSON policy document
+  # in YAML or JSON form — and passed to the module as JSON text; this Recipe
+  # writes no statement of its own into it, so the bucket's ARN is written out
+  # in it, arn:aws:s3:::<bucket>. Block Public Access is on before the policy
+  # is put — the module orders the policy after the public access block — so
+  # S3 rejects a policy that grants public access, and RestrictPublicBuckets
+  # blocks the cross-account access a public policy would grant. The text
+  # reaches S3 exactly as written: Terraform would read ${ and %{ inside a
+  # string as the start of an interpolation or a directive, so the mapping
+  # writes them $${ and %%{, which Terraform turns back into the characters
+  # written, and an IAM policy variable such as ${aws:username} is written in
+  # the Release as it is in any policy. Any other key under infra.overrides
+  # halts the build naming it.
+  #
+  # Every Component value and infra key is honoured or refused by name:
+  #   honoured — values.bucket, as the bucket's name, exactly as written;
+  #     infra.region, as the Region the bucket is placed in; and
+  #     infra.overrides.policy.
+  #   refused — a bucket name S3 does not take; infra.region unset, or not a
+  #     Region code of the aws, aws-cn, aws-us-gov or aws-eusc partition;
+  #     infra.overrides.policy that is not a mapping; any other
+  #     infra.overrides key; and an attachment on either key slot, as set out
+  #     below.
+  #
+  # The module's own defaults stand for every input the mapping leaves out.
+  # Three are worth knowing: force_destroy is false, so Terraform refuses to
+  # delete the bucket while it holds objects; versioning is off, and no
+  # server-side encryption configuration of the module's is written; and the
+  # bucket is named in the shared global namespace of its partition.
+  #
+  # The key slots. S3 authenticates a request by the access key of an IAM
+  # principal — an IAM user, or a role's temporary credentials — and a bucket
+  # takes none. So nothing this Recipe could be given in access_key_id or
+  # secret_access_key would be read, and an attachment on either halts the
+  # build naming the slot, rather than leaving the Release believing the bucket
+  # holds that key. Create the principal and its access key outside the build,
+  # allow it the bucket in an IAM policy or in infra.overrides.policy, and
+  # attach the key to each consumer's own connection; the consumer presents it
+  # there, with the endpoint and Region this Recipe publishes. No credential
+  # reaches a rendered file.
+  assertions:
+    key_slots_unattached: >-
+      {{- $f := default dict .features -}}
+      {{- range $slot := list "access_key_id" "secret_access_key" -}}
+      {{- if hasKey $f $slot -}}
+      {{- fail (printf "a credential is attached to the %s slot, and Amazon S3 takes no key from a bucket: it authenticates each request by the access key of an IAM principal, and each consumer presents that key on its own connection. Remove the attachment, create the IAM principal and its access key outside the build, allow it the bucket, and attach the key to each consumer's connection instead" $slot) -}}
+      {{- end -}}
+      {{- end -}}
+    region_is_a_region: >-
+      {{- if not .locals.region -}}
+      {{- fail "this Recipe places its S3 bucket in the AWS Region infra.region names, and never chooses one, but infra.region carries none: set infra.region in the Release to a Region code, such as eu-west-1" -}}
+      {{- end -}}
+      {{- if not .locals.dns_suffix -}}
+      {{- fail (printf "infra.region is %q, and this Recipe places the bucket in a Region of the aws, aws-cn, aws-us-gov or aws-eusc partition, named by its Region code, such as eu-west-1, cn-north-1, us-gov-west-1 or eusc-de-east-1: set infra.region in the Release to one" .locals.region) -}}
+      {{- end -}}
+    # The general purpose bucket naming rules of the Amazon S3 User Guide. A
+    # name ending -an is taken only in an account's regional namespace, which
+    # this Recipe does not create buckets in.
+    bucket_name_s3_takes: >-
+      {{- $b := toString .values.bucket -}}
+      {{- $rule := "" -}}
+      {{- if not (regexMatch `^[a-z0-9.-]*$` $b) -}}
+      {{- $rule = "S3 takes lowercase letters, numbers, periods and hyphens alone in a bucket name" -}}
+      {{- else if or (lt (len $b) 3) (gt (len $b) 63) -}}
+      {{- $rule = "S3 takes a bucket name of 3 to 63 characters" -}}
+      {{- else if not (regexMatch `^[a-z0-9].*[a-z0-9]$` $b) -}}
+      {{- $rule = "S3 takes a bucket name only where it begins and ends with a letter or a number" -}}
+      {{- else if contains ".." $b -}}
+      {{- $rule = "S3 takes no bucket name holding two adjacent periods" -}}
+      {{- else if regexMatch `^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$` $b -}}
+      {{- $rule = "S3 takes no bucket name in the form of an IP address" -}}
+      {{- else if regexMatch `^(xn--|sthree-|amzn-s3-demo-)` $b -}}
+      {{- $rule = "S3 takes no bucket name beginning with xn--, sthree- or amzn-s3-demo-" -}}
+      {{- else if regexMatch `(-s3alias|--ol-s3|\.mrap|--x-s3|--table-s3)$` $b -}}
+      {{- $rule = "S3 reserves the suffixes -s3alias, --ol-s3, .mrap, --x-s3 and --table-s3 for other kinds of resource" -}}
+      {{- else if hasSuffix "-an" $b -}}
+      {{- $rule = "S3 takes a bucket name ending -an only in an account's regional namespace, which this Recipe does not create buckets in" -}}
+      {{- end -}}
+      {{- if $rule -}}
+      {{- fail (printf "values.bucket is %q, and %s: set values.bucket in the Aggregate to another name" $b $rule) -}}
+      {{- end -}}
+    overrides_this_recipe_reads: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k, $v := $o -}}
+      {{- if ne $k "policy" -}}
+      {{- fail (printf "infra.overrides.%s is not a setting this Recipe reads: it reads policy alone from infra.overrides, keeps every S3 Block Public Access setting on and ACLs disabled, and creates no IAM user, role, key or policy; remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "policy" -}}
+      {{- if not (and (kindIs "map" $o.policy) $o.policy) -}}
+      {{- fail (printf "infra.overrides.policy is %v, and it is the bucket policy document, written as a mapping with its Version and Statement keys: set infra.overrides.policy in the Release to the policy document as a mapping, or remove it" $o.policy) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. Each is
+  # known before anything is applied. bucket is the name the module gives the
+  # bucket, which is values.bucket exactly. region is infra.region, the Region
+  # the module places the bucket in and the one a consumer's S3 client signs
+  # its requests for. endpoint is the bucket's Regional S3 endpoint,
+  # https://s3.<region> followed by the partition's DNS suffix, reached over
+  # TLS on port 443; a client addresses the bucket by path under it, which S3
+  # serves in every Region, or by its virtual-hosted name, <bucket>.s3.<region>
+  # and the suffix, whose TLS certificate covers a bucket name holding no
+  # period.
+  provides:
+    bucket: "{{ .values.bucket }}"
+    region: "{{ .locals.region }}"
+    endpoint: "https://s3.{{ .locals.region }}.{{ .locals.dns_suffix }}"
+    host: "s3.{{ .locals.region }}.{{ .locals.dns_suffix }}"
+    port: "443"
+    protocol: "s3"
+
+  # The arguments of this component's module block in the boundary's root
+  # configuration, named for the module's own inputs. The bucket is named as
+  # written, in the Region infra.region names. The public access block is
+  # created with its four settings on, and the ownership controls with
+  # BucketOwnerEnforced, which disables ACLs; both are written out here rather
+  # than left to the module's defaults, so a change of default upstream cannot
+  # relax them, and no key reaches them. The policy is the operator's,
+  # attached only where infra.overrides.policy supplies it.
+  valuesMapping: |
+    bucket: "{{ .values.bucket }}"
+    region: "{{ .locals.region }}"
+    attach_public_policy: true
+    block_public_acls: true
+    block_public_policy: true
+    ignore_public_acls: true
+    restrict_public_buckets: true
+    control_object_ownership: true
+    object_ownership: "BucketOwnerEnforced"
+    {{- with optional (optional .infra "overrides" dict) "policy" "" }}
+    attach_policy: true
+    policy: {{ toJson (replace "%{" "%%{" (replace "${" "$${" (toJson .))) }}
+    {{- end }}
