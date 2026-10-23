@@ -1,0 +1,293 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: azure-openai
+  version: 1.0.0
+  description: >
+    Creates the Azure OpenAI resource core/ai-model/azure-openai is served
+    from, and its chat model deployment, rendered as Terraform for the azurerm
+    provider: an account of kind OpenAI under the custom subdomain the Release
+    names, and one model deployment named values.deployment_name serving
+    values.model. The published Azure/avm-res-cognitiveservices-account/azurerm
+    module is not sourced, because it calls a module from the Terraform
+    registry, so this Recipe writes the body.
+
+    Reach for it where the Release is to create the resource; reach for the
+    helm or compose reference where the resource already exists outside the
+    Release.
+
+    The resource group exists beforehand; the Release names it, the region
+    and the subdomain in infra.overrides. Which models, versions and
+    deployment types a region offers, and the quota the subscription holds
+    for them, are the subscription's and no build sees them: a model the
+    region does not offer, or one beyond the quota, fails when Terraform
+    applies.
+
+    endpoint is https://<subdomain>.openai.azure.com, the address Azure serves
+    a resource under its custom subdomain, so it is known before the deploy
+    and a consumer on any target can use it; model is the deployment name.
+    The account holds its API keys and the rendered files carry none: a
+    consumer's credential is a key read from the resource once it exists,
+    attached on the consumer's connection. Public network access is the
+    service's default, every network, unless the Release turns it off.
+
+    It needs hashicorp/azurerm 5, as terraform/azure-api-management does, so
+    it goes in a different terraform boundary from
+    terraform/postgres-flexible-server, which needs azurerm 4.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/ai-model/azure-openai:1.0.0
+
+  # Microsoft's Azure Verified Modules programme publishes a module for this
+  # resource, Azure/avm-res-cognitiveservices-account/azurerm, at 0.11.1 its
+  # newest version. Its root calls Azure/avm-utl-interfaces/azure from the
+  # Terraform registry for its private endpoints, so initialising it fetches
+  # that module at whatever the registry then serves, which neither this
+  # Recipe's lock nor Terraform's own covers. It is therefore not sourced, and
+  # the account and the model deployment are declared here. The terraform
+  # realization of core/ai-model/azure-openai-embedding writes the same body
+  # for an embedding model: an authored body cannot import a block from a
+  # library, so the two carry it each.
+  #
+  # Values the assertions, provides and the body all read, worked out once.
+  locals:
+    # The deployment type, infra.overrides.sku_name or Standard: the type whose
+    # prompts and responses are processed within the Azure geography of the
+    # resource's region. Microsoft recommends GlobalStandard for most
+    # workloads, which may process them in any Azure region, so it is the
+    # operator's choice, written in the Release, rather than a default.
+    sku_name: '{{ optional (optional .infra "overrides" dict) "sku_name" "Standard" }}'
+    # The model deployment's capacity, infra.overrides.sku_capacity or 1,
+    # the provider's own default and the least quota a model deployment
+    # holds.
+    sku_capacity: '{{ optional (optional .infra "overrides" dict) "sku_capacity" 1 }}'
+    # The subdomain the resource is created under and its endpoint is composed
+    # from, or empty while the Release names none, which the assertion below
+    # refuses.
+    subdomain: '{{ $s := optional (optional .infra "overrides" dict) "custom_subdomain_name" "" }}{{ if typeIs "string" $s }}{{ $s }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   resource_group_name           - string, required
+  #   location                      - string, required
+  #   custom_subdomain_name         - string, required
+  #   model_version                 - string (the model block's version)
+  #   sku_name                      - string (the sku block's name; default "Standard")
+  #   sku_capacity                  - integer (the sku block's capacity; default 1)
+  #   public_network_access_enabled - bool (the service's default is true)
+  #   version_upgrade_option        - string (the provider's default is OnceNewDefaultVersionAvailable)
+  #
+  # Each is named by the azurerm argument it sets: an argument of the account
+  # or of the model deployment by its own name, one inside a block by the
+  # block's name and its own joined with an underscore.
+  # resource_group_name, location and custom_subdomain_name are required:
+  # they place the resource in the operator's subscription and give it its
+  # address, and this Recipe never chooses any of them. The resource group
+  # already exists; this Recipe creates none.
+  #
+  # custom_subdomain_name is unique to the resource across Azure and cannot be
+  # changed once the resource exists, so changing it replaces the resource.
+  # Microsoft's rule for it is checked below: 2 to 64 letters, digits and
+  # hyphens, not ending with a hyphen. On destroy, the azurerm provider
+  # purges the account rather than leaving it soft-deleted, the default of the
+  # features block the boundary's provider configuration writes, so the
+  # subdomain can be taken again.
+  #
+  # model_version names a version of values.model the region offers. Left
+  # unset, the service assigns the model's default version when the
+  # model deployment is created. version_upgrade_option decides whether the
+  # service moves the model deployment to a new default version:
+  # OnceNewDefaultVersionAvailable, the provider's default,
+  # OnceCurrentVersionExpired, or NoAutoUpgrade.
+  #
+  # sku_name is the deployment type: Standard, DataZoneStandard,
+  # GlobalStandard, DataZoneBatch, GlobalBatch, DataZoneProvisionedManaged,
+  # GlobalProvisionedManaged or ProvisionedManaged, the names the provider
+  # takes. sku_capacity is counted in units of the deployment type: on the
+  # standard and batch types a unit is a share of the subscription's quota in
+  # the region, 1,000 tokens per minute for most chat models and more for
+  # some reasoning models; on the provisioned types it is a provisioned
+  # throughput unit, which is purchased outside Terraform.
+  #
+  # public_network_access_enabled false turns off access from every network;
+  # this Recipe creates no private endpoint, so a resource without public
+  # access is reached only through one the operator creates.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read:
+  #   honoured — values.model, which the model deployment serves in the
+  #     OpenAI format; values.deployment_name, as its deployment name; and
+  #     the overrides above.
+  #   refused — infra.endpoint, since this realization composes the address of
+  #     the resource it creates.
+  #   not read — values.api_version, which a consumer sends on each request
+  #     and the model deployment does not take; values.context_window, a
+  #     sizing hint for inference servers; values.display_name and
+  #     values.description, which describe the component to a reader.
+  #
+  # The account is created with its API keys enabled, the service's default,
+  # and the keys stay in the account and in the Terraform state; no output or
+  # rendered file carries one. Microsoft Entra authentication, content filters
+  # and network rules other than public access keep the service's defaults.
+  assertions:
+    placement_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "resource_group_name" "location" "custom_subdomain_name" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "%q creates its Azure OpenAI resource in the operator's own resource group and region, under a subdomain the operator chooses, and this Recipe never chooses any of them, but infra.overrides.%s is not set to a name: set infra.overrides.resource_group_name, infra.overrides.location and infra.overrides.custom_subdomain_name in the Release" $.metadata.instance_id $k) -}}
+      {{- end -}}
+      {{- end -}}
+    custom_subdomain_name: >-
+      {{- $s := .locals.subdomain -}}
+      {{- if not (and (le (len $s) 64) (regexMatch `^[A-Za-z0-9-]+[A-Za-z0-9]$` $s)) -}}
+      {{- fail (printf "infra.overrides.custom_subdomain_name is %q, and an Azure OpenAI resource's custom subdomain is 2 to 64 letters, digits and hyphens, not ending with a hyphen: set it in the Release to such a name, which becomes the first label of https://<subdomain>.openai.azure.com" $s) -}}
+      {{- end -}}
+    endpoint_not_set: >-
+      {{- if hasKey .infra "endpoint" -}}
+      {{- fail (printf "%q sets infra.endpoint, and the terraform realization of core/ai-model/azure-openai creates the Azure OpenAI resource and composes its address from infra.overrides.custom_subdomain_name: remove infra.endpoint from the Release, or map this component to the helm or compose reference to reach a resource that already exists" .metadata.instance_id) -}}
+      {{- end -}}
+    # The account is named after the component, as the other managed Recipes
+    # name theirs; the rule the provider checks the name against is checked
+    # here, where the name is known.
+    account_name: >-
+      {{- if not (regexMatch `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` .metadata.instance_id) -}}
+      {{- fail (printf "the component %q names its Azure OpenAI account, and an account name begins with a letter or a digit and holds letters, digits, periods, hyphens and underscores, two characters at least: rename the component in the Aggregate to such a name" .metadata.instance_id) -}}
+      {{- end -}}
+    deployment_settings: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if not (has .locals.sku_name (list "Standard" "DataZoneStandard" "GlobalStandard" "DataZoneBatch" "GlobalBatch" "DataZoneProvisionedManaged" "GlobalProvisionedManaged" "ProvisionedManaged")) -}}
+      {{- fail (printf "infra.overrides.sku_name is %q, and the deployment types the azurerm provider creates are Standard, DataZoneStandard, GlobalStandard, DataZoneBatch, GlobalBatch, DataZoneProvisionedManaged, GlobalProvisionedManaged and ProvisionedManaged: set it to one of them, or remove it for Standard" .locals.sku_name) -}}
+      {{- end -}}
+      {{- if not (regexMatch `^[1-9][0-9]*$` (toString .locals.sku_capacity)) -}}
+      {{- fail (printf "infra.overrides.sku_capacity is %v, and a model deployment's capacity is a whole number of units, 1 or more: set it to one, or remove it for 1" .locals.sku_capacity) -}}
+      {{- end -}}
+      {{- $mv := optional $o "model_version" "" -}}
+      {{- if not (typeIs "string" $mv) -}}
+      {{- fail (printf "infra.overrides.model_version is %v, and the model's version is written as a string, such as \"2024-11-20\": quote it in the Release" $mv) -}}
+      {{- end -}}
+      {{- $pna := optional $o "public_network_access_enabled" "" -}}
+      {{- if not (or (kindIs "bool" $pna) (eq (toString $pna) "")) -}}
+      {{- fail (printf "infra.overrides.public_network_access_enabled is %s, and it is passed to the account as a boolean: set it to false, unquoted, to turn off access from every network, true to keep it, or remove it for the service's default, true" (toJson $pna)) -}}
+      {{- end -}}
+      {{- with optional $o "version_upgrade_option" "" -}}
+      {{- if not (has . (list "OnceNewDefaultVersionAvailable" "OnceCurrentVersionExpired" "NoAutoUpgrade")) -}}
+      {{- fail (printf "infra.overrides.version_upgrade_option is %s, and the model deployment takes OnceNewDefaultVersionAvailable, OnceCurrentVersionExpired or NoAutoUpgrade: set it to one of them, or remove it for OnceNewDefaultVersionAvailable" (toJson .)) -}}
+      {{- end -}}
+      {{- end -}}
+    # Terraform reads ${ and %{ inside a quoted string as its own template
+    # syntax, so a value carrying either is refused rather than written.
+    strings_are_text: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $vals := dict "values.model" .values.model "values.deployment_name" .values.deployment_name -}}
+      {{- range $k := list "resource_group_name" "location" "custom_subdomain_name" "model_version" -}}
+      {{- $_ := set $vals (printf "infra.overrides.%s" $k) (toString (optional $o $k "")) -}}
+      {{- end -}}
+      {{- range $k, $v := $vals -}}
+      {{- if or (contains "${" $v) (contains "%{" $v) -}}
+      {{- fail (printf "%s carries ${ or %%{, which Terraform reads inside a string as its own template syntax, so the terraform realization of core/ai-model/azure-openai does not write it: remove the sequence from %s" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. endpoint is
+  # composed from the subdomain the Release names, the host Azure serves the
+  # resource under, so it is a fixed string a consumer on any target can use,
+  # not a Terraform reference; it resolves once Terraform has created the
+  # resource. model is the deployment name, the name a request addresses on
+  # this provider.
+  provides:
+    endpoint: "https://{{ .locals.subdomain }}.openai.azure.com"
+    model: "{{ .values.deployment_name }}"
+
+  # The body renders into this component's own module directory.
+  #
+  # required_providers names the provider by its full source address and
+  # constrains its version to azurerm 5 from 5.9, the release whose resource
+  # schema this body was written against, a range that composes in one root
+  # configuration with terraform/azure-api-management's exact 5.9.0. The body
+  # configures no provider: the azurerm provider refuses to plan without a
+  # features block, and that block is a file of the boundary below, written
+  # beside the root configuration, which this module inherits. The provider
+  # reads its credentials and subscription from the environment Terraform runs
+  # in.
+  #
+  # Each string is written as a JSON string, which is a Terraform string, so a
+  # quote or a backslash in it stays text. The outputs restate what this
+  # component publishes from the resources themselves, once they exist.
+  artifacts:
+    main.tf: |
+      {{- $o := .infra.overrides }}
+      {{- $pna := optional $o "public_network_access_enabled" "" }}
+      terraform {
+        required_providers {
+          azurerm = {
+            source  = "hashicorp/azurerm"
+            version = "~> 5.9"
+          }
+        }
+      }
+
+      resource "azurerm_cognitive_account" "this" {
+        name                  = {{ toJson .context.instance_id }}
+        resource_group_name   = {{ toJson $o.resource_group_name }}
+        location              = {{ toJson $o.location }}
+        kind                  = "OpenAI"
+        sku_name              = "S0"
+        custom_subdomain_name = {{ toJson .locals.subdomain }}
+      {{- if kindIs "bool" $pna }}
+
+        public_network_access_enabled = {{ $pna }}
+      {{- end }}
+      }
+
+      resource "azurerm_cognitive_deployment" "this" {
+        name                 = {{ toJson .values.deployment_name }}
+        cognitive_account_id = azurerm_cognitive_account.this.id
+
+        model {
+          format  = "OpenAI"
+          name    = {{ toJson .values.model }}
+      {{- with optional $o "model_version" "" }}
+          version = {{ toJson . }}
+      {{- end }}
+        }
+
+        sku {
+          name     = "{{ .locals.sku_name }}"
+          capacity = {{ .locals.sku_capacity }}
+        }
+      {{- with optional $o "version_upgrade_option" "" }}
+
+        version_upgrade_option = "{{ . }}"
+      {{- end }}
+      }
+
+      output "endpoint" {
+        value = "https://${azurerm_cognitive_account.this.custom_subdomain_name}.openai.azure.com"
+      }
+
+      output "model" {
+        value = azurerm_cognitive_deployment.this.name
+      }
+
+  # Written once, beside the boundary's root configuration rather than in the
+  # module, and shared by every component of the boundary that declares this
+  # file with these bytes: another component bound to this Recipe, or one whose
+  # Recipe configures azurerm the same way under the same name. The same name
+  # with other bytes halts the build. The module inherits this configuration,
+  # and Terraform destroys the module's resources with it, so the file stays
+  # while any component declaring it does: remove the last of them from a
+  # Release only after destroying what their modules created, because with the
+  # file gone Terraform refuses to plan, asking for a provider block with the
+  # features argument.
+  boundary:
+    artifacts:
+      provider-azurerm.tf: |
+        provider "azurerm" {
+          features {}
+        }
