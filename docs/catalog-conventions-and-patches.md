@@ -3719,7 +3719,17 @@ copying whichever sibling happens to be nearest.
 - **Realizations** — helm synthesis (the workload `form`, a PersistentVolumeClaim
   and a headless Service for stateful engines), compose for local development, and
   the managed cloud equivalents where one exists, with HA and backup honored there
-  through the provider's native flags rather than re-implemented.
+  through the provider's native flags rather than re-implemented. A managed
+  realization of a Component promising an extension enabled in its database is
+  authored only where the service enables it through its own configuration of the
+  database; where only a SQL statement enables it, the Component's description
+  says so and names the managed path. `core/datastore/pgvector` has no RDS
+  realization for that reason: RDS for PostgreSQL offers the pgvector extension,
+  but no setting of the database instance enables it in a database, only a
+  `CREATE EXTENSION` statement, so its description names `core/datastore/postgres`
+  on its RDS Recipes, with the application running `CREATE EXTENSION vector` in
+  its own database. This is a catalog convention, not something the compiler
+  checks.
 - **Identity labels** — the component's `metadata.labels` carries all three label
   axes: `component.aggrega.ai/type`, `component.aggrega.ai/category: datastore`,
   and the family's capability label `datastore.aggrega.ai/engine` where the engine
