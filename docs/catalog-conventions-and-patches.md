@@ -1909,7 +1909,9 @@ directories each call `terraform-google-modules/project-factory/google` from the
 registry, which `terraform init` fetches whatever inputs the call is given. So
 `recipe/terraform/valkey-memorystore` and `memcached-memorystore` write their module
 beside the Recipe, as `recipe/terraform/rabbitmq-amazon-mq` does for an Amazon MQ
-broker, and their descriptions say why.
+broker, and their descriptions say why. `recipe/terraform/postgres-flexible-server`
+sources the Azure Verified Modules programme's flexible server module, whose root
+calls only its own `./modules/database` directory.
 
 #### A CloudFormation template
 
@@ -2051,7 +2053,12 @@ way the password is kept in the Terraform state and no rendered file carries it.
 Cloud SQL for MySQL creates `root'@'%` with no password, so
 [`recipe/terraform/mysql-cloud-sql`](../aggrega-catalog/recipe/terraform/mysql-cloud-sql/1.0.0/recipe.yaml)
 takes its required `root_password` slot from `core/random-password` alone and halts on
-`core/generated-secret`, which would leave root open.
+`core/generated-secret`, which would leave root open. Azure Database for PostgreSQL
+flexible server takes its administrator's password as an argument and neither it nor
+the module the Recipe sources draws one, so
+[`recipe/terraform/postgres-flexible-server`](../aggrega-catalog/recipe/terraform/postgres-flexible-server/1.0.0/recipe.yaml)
+takes the optional `password` slot from `core/random-password` alone and halts with the
+slot empty or on `core/generated-secret`.
 
 A service that takes no password a Release supplies leaves the slot nothing to
 carry, and its Recipe halts on any attachment, naming the slot and why.
@@ -3776,7 +3783,8 @@ copying whichever sibling happens to be nearest.
 - **Realizations** — helm synthesis (the workload `form`, a PersistentVolumeClaim
   and a headless Service for stateful engines), compose for local development, and
   the managed cloud equivalents where one exists — on AWS, RDS, ElastiCache and
-  Amazon OpenSearch Service; on Google Cloud, Cloud SQL and Memorystore — with HA and backup honored
+  Amazon OpenSearch Service; on Google Cloud, Cloud SQL and Memorystore; on Azure,
+  Azure Database for PostgreSQL flexible server — with HA and backup honored
   there through the provider's native flags rather than re-implemented. A managed
   realization of a Component promising an extension enabled in its database is
   authored only where the service enables it through its own configuration of the
@@ -3786,8 +3794,15 @@ copying whichever sibling happens to be nearest.
   but no setting of the database instance enables it in a database, only a
   `CREATE EXTENSION` statement, so its description names `core/datastore/postgres`
   on its RDS Recipes, with the application running `CREATE EXTENSION vector` in
-  its own database. This is a catalog convention, not something the compiler
-  checks.
+  its own database. `core/datastore/timescaledb` has no flexible server
+  realization for the same reason: the service carries TimescaleDB, and its
+  server parameters allow the extension (`azure.extensions`) and preload its
+  library (`shared_preload_libraries`), but neither creates it in a database, so
+  the Component's description names `core/datastore/postgres` on
+  `recipe/terraform/postgres-flexible-server`, with both parameters set through
+  that Recipe's `infra.overrides.server_configuration` and the application running
+  `CREATE EXTENSION timescaledb`. This is a catalog convention, not something the
+  compiler checks.
 - **Identity labels** — the component's `metadata.labels` carries all three label
   axes: `component.aggrega.ai/type`, `component.aggrega.ai/category: datastore`,
   and the family's capability label `datastore.aggrega.ai/engine` where the engine
@@ -3976,6 +3991,10 @@ names its module's `primary_address` output, the instance's primary endpoint, an
 node, since the instance's discovery endpoint answers Auto Discovery queries alone;
 they publish `port` `6379` and `11211`, the ports the service serves, and refuse an
 `infra.port` other than the Component's default by name.
+So does `recipe/terraform/postgres-flexible-server`, whose pointer names the module's
+`fqdn` output, the server's name under `postgres.database.azure.com`, which resolves
+through the operator's private DNS zone; it publishes `port` `5432`, the one port the
+service serves PostgreSQL on, and refuses any other `infra.port` by name.
 So does `recipe/terraform/kafka-msk`, a managed Kafka
 cluster rather than a datastore, whose `host` names the first broker of the module's
 `bootstrap_brokers_plaintext` output and whose `bootstrap_servers` names the whole

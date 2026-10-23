@@ -9,11 +9,9 @@ metadata:
   description: >
     A PostgreSQL relational database. Provider-agnostic: the same component is
     implemented by Compose Recipes (local development), Helm Recipes
-    (Kubernetes), Terraform Recipes (AWS RDS, Google Cloud SQL), and
+    (Kubernetes), Terraform Recipes (AWS RDS, Google Cloud SQL, Azure), and
     CloudFormation Recipes, and by a reference Recipe that provisions nothing
-    and only wires a consumer to a server that already exists. Exports its host
-    and port to consumers via the uses topology. Three Helm Recipes realize it
-    and the Manifest selects between them per deployment. Reach for the
+    and only wires a consumer to a server that already exists. Reach for the
     synthesis Recipe on a cluster that runs no PostgreSQL control plane: it
     needs no controller installed and no chart repository, so it builds with
     nothing fetched. Reach for the controller-driven Recipe, which emits a
@@ -29,16 +27,22 @@ metadata:
     authors its own body, where nothing may be fetched or read replicas are
     needed. On Google Cloud SQL, reach for terraform/postgres-cloud-sql, where
     the database runs in a Google Cloud project whose VPC network has private
-    services access to Cloud SQL.
+    services access to Cloud SQL. On Azure, reach for
+    terraform/postgres-flexible-server, a flexible server in a delegated subnet
+    of the operator's virtual network.
 
     PostgreSQL serves no Prometheus metrics of its own; the controller-driven
     Recipe publishes where its control plane's exporter serves them, and every
     other Recipe publishes those keys empty.
+  # Every realization exports host and port to consumers through the uses
+  # topology. Three Helm Recipes realize the component, and the Manifest selects
+  # between them for each Release.
   labels:
     component.aggrega.ai/type: stateful-server
     component.aggrega.ai/category: datastore
     # This component is realized self-hosted (helm, compose), managed (RDS on
-    # Terraform and CloudFormation, Cloud SQL on Terraform) and referenced (a
+    # Terraform and CloudFormation, Cloud SQL and Azure Database for PostgreSQL
+    # flexible server on Terraform) and referenced (a
     # server that already exists), so no single hosting posture is its
     # identity. `mixed` is the honest selector-only value for such a unified,
     # multi-posture component; the actual posture of a Release follows the
@@ -66,7 +70,7 @@ spec:
       selector: "feature.aggrega.ai/kind=secret"
       sensitive: true
       inject: [env]
-      description: "Optional database password credential. When attached, supplies POSTGRES_PASSWORD via the credential subsystem; unattached, the Recipe uses its inline default. The controller-driven realization owns the database's credentials through infra.credentials and halts the build when this slot is filled. terraform/postgres-cloud-sql takes core/random-password here as the password of the user values.user names, and with nothing attached the module it sources draws one; it halts on any other credential."
+      description: "Optional database password credential. When attached, supplies POSTGRES_PASSWORD via the credential subsystem; unattached, the Recipe uses its inline default. The controller-driven realization owns the database's credentials through infra.credentials and halts the build when this slot is filled. terraform/postgres-cloud-sql takes core/random-password here as the password of the user values.user names, and with nothing attached the module it sources draws one; it halts on any other credential. terraform/postgres-flexible-server requires core/random-password here as the administrator's password, and halts with nothing attached or on any other credential, since neither the service nor its module draws one."
     # Optional application-user credential slot. When a credential is attached
     # here, the helm Recipe creates a distinct non-superuser login role
     # (named by values.app_user) with this credential as its password, via a
@@ -104,10 +108,10 @@ spec:
           build halts rather than emitting an unnamed role.
       encoding:
         type: string
-        description: Database encoding passed to initdb (e.g. UTF8). Omit to use the image default. terraform/postgres-cloud-sql accepts UTF8 alone, the one encoding Cloud SQL creates a database with, and halts on any other.
+        description: Database encoding passed to initdb (e.g. UTF8). Omit to use the image default. terraform/postgres-cloud-sql accepts UTF8 alone, the one encoding Cloud SQL creates a database with, and halts on any other. terraform/postgres-flexible-server creates the database with it as its charset.
       locale:
         type: string
-        description: Database locale passed to initdb (e.g. en_US.utf8). Omit to use the image default. terraform/postgres-cloud-sql accepts en_US.UTF8 alone, the one collation Cloud SQL creates a database with, and halts on any other.
+        description: Database locale passed to initdb (e.g. en_US.utf8). Omit to use the image default. terraform/postgres-cloud-sql accepts en_US.UTF8 alone, the one collation Cloud SQL creates a database with, and halts on any other. terraform/postgres-flexible-server creates the database with it as its collation.
       init_scripts:
         type: object
         valuesType: string
@@ -137,9 +141,10 @@ spec:
         description: >
           Server listen port. Most operators should omit this and let the Recipe
           assign the default (5432). The controller-driven realization runs the
-          server on 5432 and cannot move it, and Cloud SQL serves PostgreSQL on
-          5432 alone, so those realizations halt the build on any other value
-          rather than handing a consumer a port the server does not answer on.
+          server on 5432 and cannot move it, and Cloud SQL and Azure Database
+          for PostgreSQL flexible server serve PostgreSQL on 5432 alone, so
+          those realizations halt the build on any other value rather than
+          handing a consumer a port the server does not answer on.
       engine_version:
         type: string
         default: "16"
@@ -152,17 +157,22 @@ spec:
         cpu:
           type: string
           default: 250m
-          description: CPU the database server is given. The managed Recipes do not read it; the RDS Recipes size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation), and terraform/postgres-cloud-sql by infra.overrides.tier.
+          description: CPU the database server is given. The managed Recipes do not read it; the RDS Recipes size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation), terraform/postgres-cloud-sql by infra.overrides.tier, and terraform/postgres-flexible-server by infra.overrides.sku_name.
         memory:
           type: string
           default: 512Mi
-          description: Memory the database server is given. The managed Recipes do not read it; the RDS Recipes size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation), and terraform/postgres-cloud-sql by infra.overrides.tier.
+          description: Memory the database server is given. The managed Recipes do not read it; the RDS Recipes size the instance by infra.overrides.instance_class (DBInstanceClass on CloudFormation), terraform/postgres-cloud-sql by infra.overrides.tier, and terraform/postgres-flexible-server by infra.overrides.sku_name.
       storage:
         type: object
         properties:
           size:
             type: string
             default: 10Gi
+            description: >
+              Size of the database's storage. terraform/postgres-flexible-server
+              provisions it as Premium SSD in the sizes Azure Database for
+              PostgreSQL flexible server offers, from 32Gi, so this default
+              halts the build there naming the key.
           type:
             type: string
             description: >
@@ -173,14 +183,16 @@ spec:
               `gp3` or `io1` on AWS RDS: left unset, the RDS Recipes provision
               `gp3`. On Cloud SQL it is the data disk type, `PD_SSD`, `PD_HDD`
               or `HYPERDISK_BALANCED`, and left unset
-              terraform/postgres-cloud-sql provisions `PD_SSD`. The Compose
+              terraform/postgres-cloud-sql provisions `PD_SSD`.
+              terraform/postgres-flexible-server provisions Premium SSD, takes
+              no disk type and halts the build when this is set. The Compose
               Recipe names no class, and the reference Recipe provisions no
               volume.
       ha:
         enabled:
           type: boolean
           default: false
-          description: Enable read-replica high availability. The synthesized-Helm and Compose Recipes deploy a single instance and do not implement read-replica high availability.
+          description: Enable read-replica high availability. The synthesized-Helm and Compose Recipes deploy a single instance and do not implement read-replica high availability. terraform/postgres-flexible-server turns on the service's zone-redundant high availability, a standby server in another availability zone, and halts the build on a Burstable SKU, which takes none.
         read_replicas:
           type: integer
           min: 0
@@ -190,12 +202,12 @@ spec:
         enabled:
           type: boolean
           default: true
-          description: Enable scheduled backups. Managed-service Recipes map it onto the managed database's native backup window; the synthesized-Helm and Compose Recipes do not schedule backups.
+          description: Enable scheduled backups. Managed-service Recipes map it onto the managed database's native backup window; the synthesized-Helm and Compose Recipes do not schedule backups. Azure Database for PostgreSQL flexible server backs up every server, so terraform/postgres-flexible-server halts the build when this is false.
         retention_days:
           type: integer
           min: 0
           default: 7
-          description: Number of days to retain backups when backups are enabled. Honored by managed-service Recipes alongside backup.enabled.
+          description: Number of days to retain backups when backups are enabled. Honored by managed-service Recipes alongside backup.enabled; terraform/postgres-flexible-server takes 7 to 35, the days the service keeps backups, and halts the build outside them.
       overrides:
         type: object
         additionalProperties: true
@@ -224,7 +236,8 @@ spec:
           ignores this key: the synthesized ones take the database password
           from the `password` credential slot and the application role's from
           `app_user_password`; on the RDS ones RDS owns the password, and on
-          terraform/postgres-cloud-sql the `password` slot carries it.
+          terraform/postgres-cloud-sql and terraform/postgres-flexible-server
+          the `password` slot carries it.
       credentials_secret:
         type: string
         default: ""
