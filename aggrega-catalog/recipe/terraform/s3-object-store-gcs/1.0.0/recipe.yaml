@@ -1,0 +1,155 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: s3-object-store-gcs
+  version: 1.0.0
+  # The licence of the vendored module, the terraform-google-modules project's
+  # cloud-storage module: the third-party code this Recipe pins and writes into
+  # the output. The Cloud Storage bucket it provisions is a service the reader
+  # contracts for directly with Google Cloud, under Google Cloud's terms.
+  license: Apache-2.0
+  description: >
+    An S3-compatible object store on Google Cloud Storage: one bucket in the
+    operator's project, reached over Cloud Storage's XML API, which S3 clients
+    interoperate with, and realized by the terraform-google-modules project's
+    published cloud-storage module, terraform-google-modules/cloud-storage/google
+    at v12.4.1, Apache-2.0, fetched from its git repository at that tag;
+    entity.lock pins the tag's commit and archive digest.
+
+    Reach for it where a consumer speaks the S3 API with an access key to a
+    bucket on Google Cloud; for core/storage/gcs, realized by terraform/gcs,
+    where it uses Google's client libraries with a Google identity; and for
+    core/storage/minio where the store is a MinIO server the Release runs.
+
+    The bucket is never public: public access prevention is enforced and
+    uniform bucket-level access is on, and no key a Release sets changes
+    either. So an S3 client setting a bucket or object ACL is answered 400 Bad
+    Request, and access is granted by IAM on the bucket. Cloud Storage takes no
+    key from a bucket: each consumer brings a Cloud Storage HMAC key, created
+    for a service account outside the build, on its own connection, and an
+    attachment on access_key_id or secret_access_key halts naming the slot.
+
+    It publishes the bucket as written, the location as region, the endpoint
+    https://storage.googleapis.com, its host, port 443 and protocol s3. The
+    project and location are the operator's, in infra.overrides.project_id and
+    infra.region.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/storage/s3-object-store:1.0.0
+
+  # The published module, at the tag the registry publishes as version 12.4.1.
+  # A registry version of a module is a tag of its git repository, and the
+  # registry's own download for this version answers with a git source at the
+  # commit that tag names; Terraform's dependency lock file records providers
+  # and no module. So the pin is taken here: `aggrega pin` resolves the tag to
+  # its commit and records that commit and the archive's digest in entity.lock,
+  # and every build vendors exactly those bytes.
+  #
+  # The repository root is the module, and no module_subdir is written. The
+  # root's configuration files — main.tf, variables.tf, outputs.tf and
+  # versions.tf — declare no module call, so the configuration Terraform loads
+  # from it calls no registry module and initialising it fetches providers and
+  # nothing else. The repository's modules/simple_bucket directory calls the
+  # registry's terraform-google-modules/kms/google module, and its examples/
+  # and test/ directories call others; the root reaches none of them, so they
+  # are vendored and never loaded.
+  #
+  # The module declares hashicorp/google ">= 6.37.0, < 9" and hashicorp/random
+  # ">= 2.1" in its own required_providers, and a provider_meta block naming
+  # itself to Google, and is vendored byte for byte, so this Recipe adds no
+  # provider constraint of its own. The boundary's root configuration declares
+  # no provider block for Google: the provider reads its credentials from the
+  # environment the plan runs in — GOOGLE_CREDENTIALS, or Application Default
+  # Credentials — and the module names the project on what it creates.
+  #
+  # The tag is written out rather than read from a template: a source whose
+  # coordinates come from a template is pinned per Release instead of in this
+  # Recipe's own entity.lock, and this Recipe's pin is the one stated above.
+  source:
+    kind: git-repository
+    url: https://github.com/terraform-google-modules/terraform-google-cloud-storage.git
+    ref: v12.4.1
+
+  # What the shared mapping reads from this Recipe: the bucket's location,
+  # which is infra.region on this Component, and that key's name for the
+  # sentence stopping a build without one. This Recipe writes no storage class
+  # and no versioning, so the module's own defaults stand: Standard storage,
+  # object versioning off.
+  locals:
+    location: '{{ toString (optional .infra "region" "") }}'
+    location_key: infra.region
+
+  # This Recipe reads from infra.overrides:
+  #   project_id - string (project_id), required
+  #
+  # It is named by the module input it sets, as the Cloud SQL Recipes name the
+  # same key. project_id places the bucket in the operator's own Google Cloud
+  # project, and this Recipe never chooses one. Any other key under
+  # infra.overrides halts the build naming it.
+  #
+  # Every Component value and infra key is honoured or refused by name:
+  #   honoured — values.bucket, as the bucket's name, exactly as written;
+  #     infra.region, as the bucket's location, a region, dual-region or
+  #     multi-region; and infra.overrides.project_id.
+  #   refused — a bucket name Cloud Storage does not take, or one longer than
+  #     63 characters; infra.region unset or not a location code;
+  #     infra.overrides.project_id unset; any other infra.overrides key; and an
+  #     attachment on either key slot, as set out below.
+  #
+  # The module's own defaults stand for every input the mapping leaves out.
+  # Three are worth knowing: force_destroy is false, so Terraform refuses to
+  # delete the bucket while it holds objects; no customer-managed encryption
+  # key is named, so Cloud Storage encrypts the bucket with a Google-managed
+  # one; and the module labels the bucket with its name.
+  #
+  # The key slots. Cloud Storage issues an HMAC key to a service account, or a
+  # user account, and gives out the key's secret once, when the key is
+  # created; a bucket takes none. So nothing this Recipe could be given in
+  # access_key_id or secret_access_key would be read, and an attachment on
+  # either halts the build naming the slot, rather than leaving the Release
+  # believing the bucket holds that key. Create the HMAC key for a service
+  # account allowed to use the bucket, outside the build, and attach it to each
+  # consumer's own connection; the consumer presents it there, with the
+  # endpoint and region this Recipe publishes. No credential reaches a
+  # rendered file.
+  assertions:
+    key_slots_unattached: >-
+      {{- $f := default dict .features -}}
+      {{- range $slot := list "access_key_id" "secret_access_key" -}}
+      {{- if hasKey $f $slot -}}
+      {{- fail (printf "a credential is attached to the %s slot, and Cloud Storage takes no key from a bucket: it issues an HMAC key to a service account, and each consumer presents that key on its own connection. Remove the attachment, create the HMAC key for a service account allowed to use the bucket outside the build, and attach it to each consumer's connection instead" $slot) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. Each is
+  # known before anything is applied. bucket is the name the module gives the
+  # bucket, which is values.bucket exactly, since the mapping fixes the
+  # module's prefix empty and its random suffix off. region is the location as
+  # the Release names it: Cloud Storage accepts any region in a request
+  # signature, recommending the bucket's own location. endpoint is the XML
+  # API's address, the one Cloud Storage tells an S3 tool to point at, reached
+  # over TLS on port 443; a client addresses the bucket by path under it, or by
+  # its virtual-hosted name, bucket.storage.googleapis.com, where the name
+  # holds no dot.
+  provides:
+    bucket: "{{ .values.bucket }}"
+    region: '{{ toString (optional .infra "region" "") }}'
+    endpoint: "https://storage.googleapis.com"
+    host: "storage.googleapis.com"
+    port: "443"
+    protocol: "s3"
+
+  # The arguments of this component's module block in the boundary's root
+  # configuration, written once in the shared mapping for every Recipe
+  # provisioning a Cloud Storage bucket through this module: the bucket named
+  # as written, in the project and location the Release names, with public
+  # access prevention enforced and uniform bucket-level access on, and no IAM
+  # binding, service account or HMAC key.
+  valuesMapping:
+    $import: GCSBucket#/mappings/ModuleArguments
