@@ -2140,8 +2140,9 @@ keeps its publisher's own constraint: the terraform-aws-modules RDS module the
 `-rds-terraform-aws-modules` Recipes vendor declares `hashicorp/aws >= 6.28`, the
 ElastiCache module the `-elasticache` Recipes vendor `hashicorp/aws >= 5.93`, the
 OpenSearch module `recipe/terraform/opensearch-service` vendors
-`hashicorp/aws >= 6.51`, and the MSK module `recipe/terraform/kafka-msk` vendors
-`hashicorp/aws >= 6.40`.
+`hashicorp/aws >= 6.51`, the MSK module `recipe/terraform/kafka-msk` vendors
+`hashicorp/aws >= 6.40`, and the s3-bucket module
+`recipe/terraform/s3-object-store-amazon-s3` vendors `hashicorp/aws >= 6.44`.
 The highest of those floors is why the constraint above may not drop below it — in
 a boundary holding both, Terraform installs one provider satisfying the catalog's
 range and every module's floor together.
