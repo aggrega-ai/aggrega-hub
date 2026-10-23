@@ -1,0 +1,314 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: rabbitmq-amazon-mq
+  version: 1.0.0
+  description: >
+    RabbitMQ on Amazon MQ, as one broker in the operator's VPC, rendered by
+    vendoring a Terraform module kept beside this Recipe. The published
+    cloudposse/mq-broker/aws module is not sourced, because its root calls two
+    more modules from the Terraform registry, which initialising it would fetch
+    outside any pin.
+
+    Reach for it where the broker is an Amazon MQ broker in the operator's AWS
+    account; reach for rabbitmq or rabbitmq-cluster on helm, or rabbitmq on
+    compose, where it runs as a container.
+
+    Amazon MQ serves AMQP over TLS alone, so port is 5671 and protocol amqps,
+    which is what tells a consumer to connect over TLS. host publishes a
+    reference to the broker's endpoint; infra.overrides.host publishes the
+    operator's DNS name instead, which a client checking the certificate cannot
+    use, since the certificate names the broker's own endpoint.
+
+    The password is required: with nothing attached the build halts naming the
+    slot. It is the core/random-password attachment drawn at apply time and
+    handed over as a Terraform reference, so the rendered files carry none, and
+    the attachment must leave values.symbols off and keep values.length at 12
+    or more, as the service's password rules need. Any other credential halts.
+
+    infra.overrides.subnet_ids is required. infra.engine_version must name a
+    version the service offers, so the Component's default halts here; the
+    container-sizing, port and controller keys, and values.metrics_enabled,
+    halt away from the Component's defaults.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/messaging/rabbitmq:1.0.0
+
+  # The module this Recipe vendors lives beside it, and is copied verbatim into
+  # the component's own directory; entity.lock pins its files. Its main.tf pins
+  # hashicorp/aws by the one range every AWS body in this catalog declares, and
+  # says why.
+  #
+  # The cloudposse project publishes an Amazon MQ module,
+  # cloudposse/mq-broker/aws, at 3.6.0 its newest version. Its root calls
+  # cloudposse/label/null 0.25.0 and cloudposse/security-group/aws 2.2.0 from
+  # the Terraform registry, so initialising it fetches both at whatever the
+  # registry then serves, which neither this Recipe's lock nor Terraform's own
+  # covers. It is therefore not sourced, and the broker is declared here
+  # instead.
+  #
+  # The body is a module the Recipe sources rather than an artifacts: body
+  # because the broker's password is a reference to another module call, the
+  # password attachment's, and that reference resolves only in the boundary's
+  # root configuration, where a source: Recipe's valuesMapping becomes the
+  # arguments of its module block.
+  source: ./module
+
+  locals:
+    # The RabbitMQ version, the major and minor version infra.engine_version
+    # begins with: 4.3 from 4.3.0. Amazon MQ takes a new RabbitMQ broker's
+    # version as its major and minor number and keeps the broker on the newest
+    # patch of it.
+    engine_version: '{{ regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) }}'
+    # The broker instance type, infra.overrides.instance_type or mq.m7g.medium,
+    # the size Amazon MQ recommends for evaluation, which runs every RabbitMQ
+    # version the service offers, as a single instance or as a cluster.
+    instance_type: '{{ optional (optional .infra "overrides" dict) "instance_type" "mq.m7g.medium" }}'
+    # Whether the broker runs as a single instance or as a cluster,
+    # infra.overrides.deployment_mode or SINGLE_INSTANCE.
+    deployment_mode: '{{ optional (optional .infra "overrides" dict) "deployment_mode" "SINGLE_INSTANCE" }}'
+    # The name the Release gives the broker under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   subnet_ids          - []string (subnet_ids), required; one, or one or more for a cluster
+  #   vpc_security_groups - []string (security_groups)
+  #   instance_type       - string (host_instance_type; default "mq.m7g.medium")
+  #   deployment_mode     - string (deployment_mode; SINGLE_INSTANCE, the default, or CLUSTER_MULTI_AZ)
+  #   host                - string (published as provides.host; not passed to the module)
+  #
+  # subnet_ids, vpc_security_groups, instance_type and host are the keys, under
+  # the same names, that the other AWS Recipes read for the same concepts;
+  # deployment_mode is named for the broker argument it sets. subnet_ids is
+  # required: it places the broker in the operator's VPC, and this Recipe never
+  # chooses a network for the operator. A single-instance broker takes exactly
+  # one subnet; a cluster, three nodes across Availability Zones, takes at least
+  # one, and several must lie in distinct Availability Zones. The security
+  # groups are the operator's, who opens 5671 to the broker's clients; with none
+  # named, the module passes none to the service.
+  #
+  # deployment_mode CLUSTER_MULTI_AZ runs three nodes behind one endpoint, in
+  # place of one broker; ACTIVE_STANDBY_MULTI_AZ is Amazon MQ's mode for
+  # ActiveMQ alone, and halts here, as does any other value.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against Amazon MQ's own documentation:
+  #   honoured — values.user, as the broker's one administrative user, among
+  #     the names Amazon MQ takes; infra.engine_version (major and minor, among
+  #     the versions Amazon MQ offers, on the instance types that run each);
+  #     and the overrides above.
+  #   refused — values.metrics_enabled true; infra.port other than 5672 and
+  #     infra.management_port other than 15672, the Component's defaults, since
+  #     the broker serves AMQP on 5671 alone and its management interface at an
+  #     address of the service's own; infra.compute other than 250m and 512Mi,
+  #     since the broker's size is infra.overrides.instance_type;
+  #     infra.storage.size other than 8Gi and any infra.storage.type, since
+  #     Amazon MQ gives a single-instance broker a fixed EBS volume and this
+  #     Recipe sets no size; infra.control_plane_present true, infra.credentials
+  #     supplied and any infra.credentials_secret, which configure the
+  #     controller-driven realization; the mq.t3.micro instance type, which
+  #     Amazon MQ no longer creates; and a password as set out below.
+  #   not read — infra.port, infra.management_port, infra.compute,
+  #     infra.storage, infra.control_plane_present, infra.credentials and
+  #     infra.credentials_secret while they hold the Component's defaults.
+  #
+  # values.metrics_enabled true halts: Amazon MQ serves Prometheus metrics for
+  # RabbitMQ 4.2 and later over HTTPS on 16001, but only to a scraper
+  # presenting the broker's own user name and password, while the metrics keys
+  # this Component publishes carry no credential for a scraper to present.
+  #
+  # The password is required, and reaches the broker as a Terraform reference
+  # to the password core/random-password's terraform/random-password
+  # realization draws at apply time, so no password is written into the
+  # rendered configuration; the apply keeps it in the Terraform state. Another
+  # credential either carries its value as text, which would be written into
+  # the configuration, or carries none the service could take, so it halts.
+  # With nothing attached the build halts too: the development default the
+  # self-hosted Recipes fall back to is the same for every reader of the
+  # catalog, and is not left on a managed broker.
+  #
+  # Amazon MQ takes a password of at least 12 characters, holding at least 4
+  # distinct characters and no comma, colon or equals sign. The random
+  # provider's punctuation includes the colon and the equals sign, so the
+  # attachment must leave values.symbols off, and values.length must be 12 or
+  # more; core/random-password takes at most 128, within the service's bound.
+  # With punctuation off, terraform/random-password asks for at least one
+  # upper-case letter, one lower-case letter and one digit, three distinct
+  # characters by construction; a fourth distinct character among twelve or
+  # more drawn from sixty-two is left to chance, and missing it is vanishingly
+  # unlikely rather than impossible.
+  assertions:
+    subnet_ids_supplied: >-
+      {{- $s := optional (optional .infra "overrides" dict) "subnet_ids" "" -}}
+      {{- $single := eq .locals.deployment_mode "SINGLE_INSTANCE" -}}
+      {{- $ok := and (kindIs "slice" $s) (gt (len $s) 0) -}}
+      {{- if and $ok $single }}{{ $ok = eq (len $s) 1 }}{{ end -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) .) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- if $single -}}
+      {{- fail (printf "this Release places its Amazon MQ broker in a subnet of the operator's VPC, one subnet for the single-instance broker it runs, but infra.overrides.subnet_ids is %v: set infra.overrides.subnet_ids in the Release to a list holding the ID of one existing subnet" (toJson $s)) -}}
+      {{- else -}}
+      {{- fail (printf "this Release places its Amazon MQ cluster in subnets of the operator's VPC, one or more in distinct Availability Zones, but infra.overrides.subnet_ids is %v: set infra.overrides.subnet_ids in the Release to a list of the IDs of existing subnets" (toJson $s)) -}}
+      {{- end -}}
+      {{- end -}}
+    vpc_security_groups_typed: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "vpc_security_groups" -}}
+      {{- $s := index $o "vpc_security_groups" -}}
+      {{- $ok := and (kindIs "slice" $s) (gt (len $s) 0) (le (len $s) 125) -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) .) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.vpc_security_groups is %v, and this Recipe attaches the broker to security groups of the operator's VPC, one to 125 of them: set it in the Release to a list of the IDs of existing security groups, or remove it" (toJson $s)) -}}
+      {{- end -}}
+      {{- end -}}
+    deployment_mode_offered: >-
+      {{- $m := .locals.deployment_mode -}}
+      {{- if eq $m "ACTIVE_STANDBY_MULTI_AZ" -}}
+      {{- fail "infra.overrides.deployment_mode is \"ACTIVE_STANDBY_MULTI_AZ\", which Amazon MQ offers for ActiveMQ brokers alone: set it in the Release to CLUSTER_MULTI_AZ for three RabbitMQ nodes across Availability Zones, or remove it for a single-instance broker" -}}
+      {{- end -}}
+      {{- if not (has $m (list "SINGLE_INSTANCE" "CLUSTER_MULTI_AZ")) -}}
+      {{- fail (printf "infra.overrides.deployment_mode is %q, and Amazon MQ runs a RabbitMQ broker as SINGLE_INSTANCE or CLUSTER_MULTI_AZ: set it in the Release to one of them, or remove it for a single-instance broker" $m) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this broker reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the broker serves port 5671` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The RabbitMQ versions Amazon MQ offers, read off its version-management
+    # page: 4.3 and 4.2 on the mq.m7g instance types alone, 3.13 on mq.m5 and
+    # mq.m7g. A version it adds later is refused here until this list names it.
+    engine_version_offered: >-
+      {{- $v := .locals.engine_version -}}
+      {{- if not (has $v (list "4.3" "4.2" "3.13")) -}}
+      {{- fail (printf "infra.engine_version is %q, and Amazon MQ runs RabbitMQ 4.3, 4.2 and 3.13, which this Recipe reads off the major and minor version the value begins with; the Component's default is an image tag naming a release the service does not run: set infra.engine_version in the Release to one of them, such as 4.3" (toString .infra.engine_version)) -}}
+      {{- end -}}
+      {{- if and (hasPrefix "4." $v) (not (hasPrefix "mq.m7g." .locals.instance_type)) -}}
+      {{- fail (printf "infra.engine_version asks for RabbitMQ %s, which Amazon MQ runs on the mq.m7g instance types alone, and the instance type is %s, from infra.overrides.instance_type: set infra.overrides.instance_type to an mq.m7g type, such as mq.m7g.large, or infra.engine_version to 3.13" $v .locals.instance_type) -}}
+      {{- end -}}
+    instance_type_offered: >-
+      {{- if eq .locals.instance_type "mq.t3.micro" -}}
+      {{- fail "infra.overrides.instance_type is \"mq.t3.micro\", which Amazon MQ no longer offers for a new broker: set it in the Release to another type, such as mq.m7g.medium, or remove it" -}}
+      {{- end -}}
+    user_name_accepted: >-
+      {{- $u := toString .values.user -}}
+      {{- if or (not (regexMatch `^[A-Za-z0-9._-]{2,100}$` $u)) (eq $u "guest") -}}
+      {{- fail (printf "values.user is %q, and Amazon MQ names a RabbitMQ broker's user with 2 to 100 letters, digits, dashes, periods and underscores, and refuses guest: set values.user in the Aggregate to such a name" $u) -}}
+      {{- end -}}
+    metrics_enabled_unsupported: >-
+      {{- if .values.metrics_enabled -}}
+      {{- fail "values.metrics_enabled is true, and Amazon MQ serves a RabbitMQ broker's Prometheus metrics only to a scraper presenting the broker's own user name and password, which the metrics keys this realization would publish carry no way to require: set values.metrics_enabled to false, or select rabbitmq on helm in the Manifest, which serves them" -}}
+      {{- end -}}
+    ports_are_the_service_ports: >-
+      {{- if ne (toString .infra.port) "5672" -}}
+      {{- fail (printf "infra.port is %v, and Amazon MQ serves a RabbitMQ broker's AMQP over TLS on port 5671 alone, which this Recipe publishes as port: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+      {{- if ne (toString .infra.management_port) "15672" -}}
+      {{- fail (printf "infra.management_port is %v, and Amazon MQ serves a RabbitMQ broker's management interface at an address of the service's own, which no port setting moves: remove infra.management_port from the Release" .infra.management_port) -}}
+      {{- end -}}
+    service_owned_keys: >-
+      {{- if or (ne (toString .infra.compute.cpu) "250m") (ne (toString .infra.compute.memory) "512Mi") -}}
+      {{- fail (printf "infra.compute is cpu %v and memory %v, and Amazon MQ sizes a broker by its instance type, not by a container's CPU and memory: remove infra.compute from the Release and set infra.overrides.instance_type, such as mq.m7g.large" .infra.compute.cpu .infra.compute.memory) -}}
+      {{- end -}}
+      {{- $st := default dict .infra.storage -}}
+      {{- if ne (toString (optional $st "size" "8Gi")) "8Gi" -}}
+      {{- fail (printf "infra.storage.size is %v, and Amazon MQ gives a RabbitMQ broker an EBS volume whose size the service fixes by the instance type and by whether the broker runs as a single instance or a cluster, which this Recipe does not set: remove infra.storage.size from the Release" (optional $st "size" "")) -}}
+      {{- end -}}
+      {{- with optional $st "type" "" -}}
+      {{- fail (printf "infra.storage.type is %v, and Amazon MQ stores a RabbitMQ broker's data on an EBS volume of its own choosing, with no storage class to name: remove infra.storage.type from the Release" .) -}}
+      {{- end -}}
+      {{- if .infra.control_plane_present -}}
+      {{- fail "infra.control_plane_present is true, which affirms the RabbitMQ Cluster Operator installed in a Kubernetes cluster, and Amazon MQ runs the broker itself with none: remove infra.control_plane_present from the Release" -}}
+      {{- end -}}
+      {{- if ne (toString .infra.credentials) "generated" -}}
+      {{- fail (printf "infra.credentials is %q, which chooses who owns the credentials on the controller-driven realization, and Amazon MQ takes the password from the password slot: remove infra.credentials from the Release" (toString .infra.credentials)) -}}
+      {{- end -}}
+      {{- with .infra.credentials_secret -}}
+      {{- fail (printf "infra.credentials_secret is %q, which names a Kubernetes Secret for the controller-driven realization, and Amazon MQ takes the password from the password slot: remove infra.credentials_secret from the Release" .) -}}
+      {{- end -}}
+    broker_password: >-
+      {{- $f := default dict .features -}}
+      {{- if not (hasKey $f "password") -}}
+      {{- fail "the password slot is empty, and Amazon MQ requires a password for the broker's user — at least 12 characters, 4 of them distinct, with no comma, colon or equals sign — while the development default the self-hosted Recipes fall back to is the same for every reader of the catalog: attach core/random-password to the password slot with values.symbols false, bound to terraform/random-password in the Manifest" -}}
+      {{- end -}}
+      {{- $p := $f.password -}}
+      {{- if ne (toString (optional $p "type" "")) "core/random-password" -}}
+      {{- fail (printf "the password slot is filled by %s, and this Recipe hands the broker's password to Amazon MQ as a Terraform reference to a password drawn at apply time, which core/random-password publishes through terraform/random-password; another credential either carries its value as text, which would be written into the rendered configuration, or carries none the service could take: attach core/random-password to the password slot instead" (toString (optional $p "type" "an attachment of no type"))) -}}
+      {{- end -}}
+      {{- $pv := optional $p "values" dict -}}
+      {{- if optional $pv "symbols" false -}}
+      {{- fail "the password attached to the password slot sets values.symbols to true, and the punctuation the random provider draws includes the colon and the equals sign, which an Amazon MQ password may not hold: set values.symbols to false" -}}
+      {{- end -}}
+      {{- if lt (int (optional $pv "length" 32)) 12 -}}
+      {{- fail (printf "the password attached to the password slot sets values.length to %v, and Amazon MQ takes a password of at least 12 characters: set values.length to 12 or more" (optional $pv "length" 32)) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the module's amqp_host output — the host of the broker's AMQP endpoint —
+  # through this component's module call, which the boundary's root
+  # configuration declares under .context.instance_id for a component declared
+  # in the Aggregate the Release deploys. Terraform resolves it at apply time,
+  # so it resolves only for a consumer authored as a source: Recipe in the same
+  # root configuration; a consumer on another target receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record or alias for it, so the operator points the name at the broker
+  # outside the Release. A consumer in the same root configuration receives the
+  # name as well, and a name carries no reference for Terraform to order its
+  # module after this one by; a later syncWave on the consumer's boundary,
+  # sharing this boundary's directory, orders the two. The broker's certificate
+  # names its own endpoint, and Amazon MQ asks clients to check it against that
+  # endpoint rather than a DNS alias of their own, so a client checking the
+  # certificate fails against the operator's name.
+  #
+  # port is 5671 and protocol amqps: Amazon MQ serves AMQP over TLS alone, on
+  # that port, so amqps is what tells a consumer to open a TLS connection, where
+  # the self-hosted realizations publish amqp. The metrics keys are empty, as
+  # values.metrics_enabled is refused above.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.amqp_host}{{ end }}"
+    port: "5671"
+    protocol: "amqps"
+    metrics_endpoint: ""
+    metrics_service: ""
+    metrics_service_port: ""
+    metrics_path: ""
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # broker is named after the component, as the other AWS Recipes name their
+  # resources, so the name is checked here against what Amazon MQ accepts.
+  #
+  # The password is the attachment's module output joined with a dot and
+  # wrapped in an interpolation, as terraform/random-password publishes it.
+  valuesMapping: |
+    {{- if not (regexMatch `^[A-Za-z0-9_-]{1,50}$` .context.instance_id) }}
+    {{- fail (printf "the component %q names its Amazon MQ broker, and Amazon MQ takes a broker name of 1 to 50 letters, digits, dashes and underscores: rename the component in the Aggregate to such a name" .context.instance_id) }}
+    {{- end }}
+    {{- $prov := optional (default dict .features).password "provides" dict }}
+    {{- if not (and (kindIs "map" $prov) (optional $prov "name" "") (optional $prov "key" "")) }}
+    {{- fail (printf "the password slot of %q is filled by an attachment that publishes no module output, and the broker's password is handed to Amazon MQ as a reference to one: bind core/random-password to terraform/random-password in the Manifest" .context.instance_id) }}
+    {{- end }}
+    broker_name: "{{ .context.instance_id }}"
+    engine_version: "{{ .locals.engine_version }}"
+    host_instance_type: "{{ .locals.instance_type }}"
+    deployment_mode: "{{ .locals.deployment_mode }}"
+    subnet_ids: {{ toJson .infra.overrides.subnet_ids }}
+    {{- with optional .infra.overrides "vpc_security_groups" "" }}
+    security_groups: {{ toJson . }}
+    {{- end }}
+    username: {{ toJson (toString .values.user) }}
+    password: "{{ printf "${%s.%s}" $prov.name $prov.key }}"
