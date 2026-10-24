@@ -14,9 +14,12 @@ metadata:
     call while that revision runs no replicas, and sets the replica count from
     the concurrency it observes, so the tool occupies no compute between
     calls. The replica floor and ceiling carry through as the
-    revision's own scaling bounds. provides is the addressable name the control
-    plane gives the Service, so a consumer wires to the tool's declared
-    contract rather than to anything Knative-specific. The Knative Serving
+    revision's own scaling bounds. An edge from the tool, on a socket the
+    author names, delivers the names its `inject:` block dictates, as
+    variables or as files from a ConfigMap emitted beside the Service.
+    provides is the addressable name the control plane gives the Service, so a
+    consumer wires to the tool's declared contract rather than to anything
+    Knative-specific. The Knative Serving
     control plane is a runtime prerequisite: the build halts unless the
     operator affirms it is installed (infra.control_plane_present), so no
     custom resource is emitted into a cluster that cannot reconcile it.
@@ -79,8 +82,93 @@ spec:
   # and timeout reach the running tool through exactly these names. The two
   # optional values are emitted only when the developer set them, so an
   # unset value renders no variable rather than an empty one.
+  #
+  # The image is the tool's own code, and the component declares no socket, so
+  # this recipe derives no variable from a connection: an edge from the tool,
+  # on whatever socket the author names, delivers exactly what its inject block
+  # dictates — any key the target publishes, under the names that code reads —
+  # and an edge writing none delivers nothing. A dictated env entry becomes an
+  # entry of the container's env under the name it gives, read off the inject
+  # pipe as a map; a dictated file entry a read-only file at the absolute path
+  # it names, held in one ConfigMap and mounted by subPath, so a path that is
+  # not absolute, or one lying beneath another file's path, is refused. An arg
+  # entry is refused, because this recipe renders no command line: Knative
+  # takes a container's arguments in place of the image's default command,
+  # which is the Release's. Any other mechanism is refused too. A dictated
+  # variable named like one of the tool's own values this recipe delivers
+  # halts the build, naming both, since the compiler cannot see the names a
+  # recipe writes.
+  #
+  # http-request-knative-files.configmap.yaml holds the file entries the
+  # connections dictate, keyed file-0, file-1 and so on in path order, the keys
+  # the Service's mounts read, and is emitted only while a connection dictates a
+  # file, so a build with none renders nothing there. It names no namespace, as
+  # the Service names none, so the two are applied into one namespace together.
+  # The block reading the connections' inject directives is the one every
+  # Knative realization of a tool in this catalog declares, differing only in
+  # the names each delivers itself and the refusals its own connections call
+  # for; a change to it is made to all.
   artifacts:
+    http-request-knative-files.configmap.yaml: |
+      {{- $pipeFiles := optional (default dict .context.inject) "file" dict }}
+      {{- $files := dict }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- range $path, $from := (optional (default dict $edge.inject) "file" dict) }}
+      {{- $_ := set $files $path (optional $pipeFiles $path "") }}
+      {{- end }}
+      {{- end }}
+      {{- if $files -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.instance_id }}-files
+      data:
+        {{- $i := 0 }}
+        {{- range $path, $v := $files }}
+        file-{{ $i }}: {{ toJson (toString $v) }}
+        {{- $i = add $i 1 }}
+        {{- end }}
+      {{- end }}
     service.yaml: |
+      {{- $env := optional (default dict .context.inject) "env" dict -}}
+      {{- $taken := dict -}}
+      {{- $_ := set $taken "HTTP_TOOL_METHOD" "the component's own value method" -}}
+      {{- $_ := set $taken "HTTP_TOOL_SIDE_EFFECTS" "the component's own value side_effects" -}}
+      {{- $_ := set $taken "HTTP_TOOL_TIMEOUT_SECONDS" "the component's own value timeout_seconds" -}}
+      {{- if .values.payload_schema_ref -}}
+      {{- $_ := set $taken "HTTP_TOOL_PAYLOAD_SCHEMA_REF" "the component's own value payload_schema_ref" -}}
+      {{- end -}}
+      {{- if .values.llm_description_override -}}
+      {{- $_ := set $taken "HTTP_TOOL_DESCRIPTION" "the component's own value llm_description_override" -}}
+      {{- end -}}
+      {{- $files := dict -}}
+      {{- range $alias, $edge := .context.uses -}}
+      {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+      {{- range $name, $from := $entries -}}
+      {{- if eq $mechanism "env" -}}
+      {{- with optional $taken $name "" -}}
+      {{- fail (printf "the %s connection %s of %q dictates the variable %s, which this realization already delivers from %s: dictate another name in that connection's inject block" $edge.socket $alias $.context.instance_id $name .) -}}
+      {{- end -}}
+      {{- else if eq $mechanism "file" -}}
+      {{- if not (hasPrefix "/" $name) -}}
+      {{- fail (printf "the %s connection %s of %q dictates a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $edge.socket $alias $.context.instance_id $name) -}}
+      {{- end -}}
+      {{- $_ := set $files $name true -}}
+      {{- else if eq $mechanism "arg" -}}
+      {{- fail (printf "the %s connection %s of %q dictates the command-line argument %q, and this realization renders no command line: Knative takes a container's arguments in place of the image's default command, and that command is the Release's. Dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name) -}}
+      {{- else -}}
+      {{- fail (printf "the %s connection %s of %q dictates %q under the delivery mechanism %q, and this realization delivers env and file entries only: dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name $mechanism) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- range $path, $_ := $files -}}
+      {{- range $other, $_ := $files -}}
+      {{- if hasPrefix (printf "%s/" $path) $other -}}
+      {{- fail (printf "the component %q is handed a file at %q and another at %q beneath it, and one path cannot be both a file and a directory: dictate the two files at paths neither of which lies beneath the other" $.context.instance_id $path $other) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
       apiVersion: serving.knative.dev/v1
       kind: Service
       metadata:
@@ -116,6 +204,12 @@ spec:
                   - name: HTTP_TOOL_DESCRIPTION
                     value: "{{ . }}"
                   {{- end }}
+                  {{- range $alias, $edge := .context.uses }}
+                  {{- range $name, $from := (optional (default dict $edge.inject) "env" dict) }}
+                  - name: {{ toJson $name }}
+                    value: {{ toJson (toString (optional $env $name "")) }}
+                  {{- end }}
+                  {{- end }}
                 resources:
                   requests:
                     cpu: "{{ .infra.compute.cpu }}"
@@ -123,3 +217,20 @@ spec:
                   limits:
                     cpu: "{{ .infra.compute.cpu }}"
                     memory: "{{ .infra.compute.memory }}"
+                {{- if $files }}
+                volumeMounts:
+                  {{- $i := 0 }}
+                  {{- range $path, $_ := $files }}
+                  - name: inject-files
+                    mountPath: {{ toJson $path }}
+                    subPath: "file-{{ $i }}"
+                    readOnly: true
+                  {{- $i = add $i 1 }}
+                  {{- end }}
+                {{- end }}
+            {{- if $files }}
+            volumes:
+              - name: inject-files
+                configMap:
+                  name: "{{ .context.instance_id }}-files"
+            {{- end }}

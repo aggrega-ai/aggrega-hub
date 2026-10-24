@@ -21,7 +21,10 @@ metadata:
     starts. One server process runs per client session, at the path /mcp on
     infra.port, on the compose network: nothing is published to the host, and
     provides.host is the compose service name. The healthcheck asks the
-    bridge's /healthz endpoint with the wget the image carries.
+    bridge's /healthz endpoint with the wget the image carries. An edge from
+    the tool, on a socket the author names, delivers the names its `inject:`
+    block dictates into the bridge's environment, which the server inherits,
+    or as files from compose configs.
 
     It delivers no credential to the server: an attachment on the server_env
     slot halts the build, because this target has no secret reference to
@@ -129,6 +132,53 @@ spec:
   # the container under the names helm/mcp delivers them under, and from the
   # bridge's environment the server inherits them. No product reads these
   # names: they are there for a server's own code to read.
+  #
+  # The server is the Release's own code, and the component declares no
+  # socket, so this recipe derives no variable from a connection: an edge from
+  # the tool, on whatever socket the author names, delivers exactly what its
+  # inject block dictates — any key the target publishes, under the names the
+  # server reads — and an edge writing none delivers nothing. A dictated env
+  # entry becomes a variable of the bridge's service under the name it gives,
+  # written as the inject pipe carries it, so Docker Compose substitutes a $
+  # in it as in every variable, and the server inherits it as it inherits the
+  # values above; a dictated file entry becomes a compose config mounted as
+  # one file at the absolute path it names in that service, where the server
+  # runs, its content written with each $ doubled so the file holds the value
+  # itself, and a path that is not absolute, or one lying beneath another
+  # file's path, is refused. An arg entry is refused, because the service's
+  # arguments are the bridge's flags and the server's own command line is
+  # infra.stdio_command, which is the Release's. Any other mechanism is
+  # refused too. A dictated variable named like one this recipe delivers
+  # itself halts the build, naming both, since the compiler cannot see the
+  # names a recipe writes. No server_env variable reaches this service, since
+  # an attachment there halts the build, so no dictated name can repeat one.
+  #
+  # The compose configs holding the file entries the connections dictate are
+  # written by mcp-stdio-bridge-files.compose-fragment.yaml, one per file and
+  # numbered in path order, the names the workload's volumes read. They are
+  # emitted only while a connection dictates a file, so a build with none
+  # renders nothing there. The block reading the connections' inject
+  # directives is the one every compose Workload realization of a tool in this
+  # catalog declares, differing only in the names each delivers itself and the
+  # refusals its own service calls for; a change to it is made to all.
+  artifacts:
+    mcp-stdio-bridge-files.compose-fragment.yaml: |
+      {{- $pipeFiles := optional (default dict .context.inject) "file" dict }}
+      {{- $files := dict }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- range $path, $from := (optional (default dict $edge.inject) "file" dict) }}
+      {{- $_ := set $files $path (optional $pipeFiles $path "") }}
+      {{- end }}
+      {{- end }}
+      {{- if $files }}
+      configs:
+        {{- $i := 0 }}
+        {{- range $path, $v := $files }}
+        {{ $.context.instance_id }}-file-{{ $i }}:
+          content: {{ toJson (replace "$" "$$" (toString $v)) }}
+        {{- $i = add $i 1 }}
+        {{- end }}
+      {{- end }}
   workload: |
     {{- /* infra.image names the image helm/mcp runs. This realization runs
            the bridge image it pins, so a Release setting the key would see it
@@ -147,6 +197,42 @@ spec:
            build halts on any attachment rather than drop it. */ -}}
     {{- if hasKey (default dict .features) "server_env" -}}
     {{- fail (printf "the server_env slot of %q carries an attachment, but the compose realization of the Model Context Protocol bridge delivers no credential to the server: this target has no secret reference to import the variables through; run the server under helm/mcp-stdio-bridge, which imports every key of the attachment's Secret by reference, or remove the attachment" $.context.instance_id) -}}
+    {{- end -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $taken := dict -}}
+    {{- $_ := set $taken "MCP_TOOL_SIDE_EFFECTS" "the component's own value side_effects" -}}
+    {{- $_ := set $taken "MCP_TOOL_TIMEOUT_SECONDS" "the component's own value timeout_seconds" -}}
+    {{- $_ := set $taken "MCP_TOOL_PORT" "the component's own infra.port" -}}
+    {{- if .values.llm_description_override -}}
+    {{- $_ := set $taken "MCP_TOOL_DESCRIPTION" "the component's own value llm_description_override" -}}
+    {{- end -}}
+    {{- $files := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+    {{- range $name, $from := $entries -}}
+    {{- if eq $mechanism "env" -}}
+    {{- with optional $taken $name "" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the variable %s, which this realization already delivers from %s: dictate another name in that connection's inject block" $edge.socket $alias $.context.instance_id $name .) -}}
+    {{- end -}}
+    {{- else if eq $mechanism "file" -}}
+    {{- if not (hasPrefix "/" $name) -}}
+    {{- fail (printf "the %s connection %s of %q dictates a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- end -}}
+    {{- $_ := set $files $name true -}}
+    {{- else if eq $mechanism "arg" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the command-line argument %q, and this realization's service arguments are the bridge's own flags, while the server's command line is infra.stdio_command, which is the Release's. Dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- else -}}
+    {{- fail (printf "the %s connection %s of %q dictates %q under the delivery mechanism %q, and this realization delivers env and file entries only: dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name $mechanism) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- range $path, $_ := $files -}}
+    {{- range $other, $_ := $files -}}
+    {{- if hasPrefix (printf "%s/" $path) $other -}}
+    {{- fail (printf "the component %q is handed a file at %q and another at %q beneath it, and one path cannot be both a file and a directory: dictate the two files at paths neither of which lies beneath the other" $.context.instance_id $path $other) -}}
+    {{- end -}}
+    {{- end -}}
     {{- end -}}
     {{- $words := list -}}
     {{- range .infra.stdio_command -}}
@@ -179,6 +265,11 @@ spec:
           {{- with .values.llm_description_override }}
           MCP_TOOL_DESCRIPTION: {{ . | replace "$" "$$" | toJson }}
           {{- end }}
+          {{- range $alias, $edge := .context.uses }}
+          {{- range $name, $from := (optional (default dict $edge.inject) "env" dict) }}
+          {{ toJson $name }}: {{ toJson (toString (optional $env $name "")) }}
+          {{- end }}
+          {{- end }}
         ports:
           http: {{ .infra.port }}
         # A compose service carries one healthcheck, run inside the image. The
@@ -199,6 +290,25 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+        {{- if $files }}
+        volumeMounts:
+          {{- $i := 0 }}
+          {{- range $path, $_ := $files }}
+          - name: inject-file-{{ $i }}
+            path: {{ toJson $path }}
+          {{- $i = add $i 1 }}
+          {{- end }}
+        {{- end }}
+    {{- if $files }}
+    volumes:
+      {{- $i := 0 }}
+      {{- range $path, $_ := $files }}
+      inject-file-{{ $i }}:
+        configmap:
+          source: "{{ $.context.instance_id }}-file-{{ $i }}"
+      {{- $i = add $i 1 }}
+      {{- end }}
+    {{- end }}
     # A ClusterIP service entry keeps the bridge on the compose network, which
     # is where its consumers sit: a consumer wired to it resolves the service
     # name and the port straight from the edge. Nothing is published to the
