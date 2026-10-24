@@ -15,6 +15,8 @@ metadata:
     reads, so the application talks to the wired model without hardcoding an
     endpoint. The model name published by the same component is delivered as
     MODEL, the variable CrewAI resolves first when no model is set in code.
+    A connection writing an `inject:` block also receives the names it dictates,
+    as variables or as files mounted at the paths it names, beside these.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -22,6 +24,77 @@ spec:
   capability: helm
   implements: core/ai-agent/crewai:1.0.0
   workload: |
+    {{- /*
+      The image is the Release's own code, so the names this recipe derives from
+      a connection's provides are defaults: a connection that writes no inject
+      block receives them, and a connection that writes one receives exactly
+      what it dictates instead, read off the inject pipe as a map. On a model
+      connection nothing is a default: the client SDK reads OPENAI_BASE_URL and
+      CrewAI reads MODEL by themselves, and OPENAI_API_KEY is the credential
+      attached on the connection, so a model connection that dictates receives
+      its names beside them. A dictated env entry becomes a container variable
+      under the name it gives; a dictated file entry a read-only file at the
+      absolute path it names, held in one ConfigMap and mounted by subPath, so a
+      path that is not absolute, or one lying beneath another file's path, is
+      refused. An arg entry is refused, because this recipe renders no command
+      line: Kubernetes takes a container's arguments in place of the image's
+      default command, which is the Release's. Any other mechanism is refused
+      too. A dictated variable named like one this recipe delivers itself halts
+      the build, naming both, since the compiler cannot see the names a recipe
+      writes.
+
+      The block reading the connections' inject directives is the one every helm
+      Recipe of an agent built on a framework in this catalog declares,
+      differing only in the names each delivers itself and the refusals its own
+      connections call for; a change to it is made to all.
+    */ -}}
+    {{- $pipe := default dict .context.inject }}
+    {{- $env := optional $pipe "env" dict }}
+    {{- $pipeFiles := optional $pipe "file" dict }}
+    {{- $dictating := dict }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- range $mechanism, $entries := (default dict $edge.inject) }}
+    {{- if $entries }}{{ $_ := set $dictating $alias true }}{{ end }}
+    {{- end }}
+    {{- end }}
+    {{- $taken := dict }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "model" }}
+    {{- $_ := set $taken "OPENAI_BASE_URL" (printf "the model connection %s, whose endpoint the client SDK reads under that name" $alias) }}
+    {{- $_ := set $taken "MODEL" (printf "the model connection %s, whose model name CrewAI reads under that name" $alias) }}
+    {{- if hasKey (default dict $edge.features) "credential" }}
+    {{- $_ := set $taken "OPENAI_API_KEY" (printf "the credential attached on the model connection %s" $alias) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- $files := dict }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- range $mechanism, $entries := (default dict $edge.inject) }}
+    {{- range $name, $from := $entries }}
+    {{- if eq $mechanism "env" }}
+    {{- with optional $taken $name "" }}
+    {{- fail (printf "the %s connection %s of %q dictates the variable %s, which this realization already delivers from %s: dictate another name in that connection's inject block" $edge.socket $alias $.context.instance_id $name .) }}
+    {{- end }}
+    {{- else if eq $mechanism "file" }}
+    {{- if not (hasPrefix "/" $name) }}
+    {{- fail (printf "the %s connection %s of %q dictates a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $edge.socket $alias $.context.instance_id $name) }}
+    {{- end }}
+    {{- $_ := set $files $name (optional $pipeFiles $name "") }}
+    {{- else if eq $mechanism "arg" }}
+    {{- fail (printf "the %s connection %s of %q dictates the command-line argument %q, and this realization renders no command line: Kubernetes takes a container's arguments in place of the image's default command, and that command is the Release's. Dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name) }}
+    {{- else }}
+    {{- fail (printf "the %s connection %s of %q dictates %q under the delivery mechanism %q, and this realization delivers env and file entries only: dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name $mechanism) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- range $path, $_ := $files }}
+    {{- range $other, $_ := $files }}
+    {{- if hasPrefix (printf "%s/" $path) $other }}
+    {{- fail (printf "the component %q is handed a file at %q and another at %q beneath it, and one path cannot be both a file and a directory: dictate the two files at paths neither of which lies beneath the other" $.context.instance_id $path $other) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     form: stateless
@@ -39,11 +112,28 @@ spec:
         # is the spelling its own configuration guide documents. The recipe
         # therefore delivers the model name under MODEL and the framework picks it
         # up with no application code, so no second model variable is emitted.
+        # Nothing here is a default: a connection writing an inject block
+        # receives the variables it dictates beside these, on its own position
+        # among the edges.
         variables:
     {{- range $alias, $edge := .context.uses }}
     {{- if eq $edge.socket "model" }}
           OPENAI_BASE_URL: "{{ $edge.provides.endpoint }}"
           MODEL: "{{ $edge.provides.model }}"
+    {{- end }}
+    {{- range $name, $from := (optional (default dict $edge.inject) "env" dict) }}
+          {{ toJson $name }}: {{ toJson (optional $env $name "") }}
+    {{- end }}
+    {{- end }}
+    {{- if $files }}
+        volumeMounts:
+    {{- $i := 0 }}
+    {{- range $path, $_ := $files }}
+          - name: inject-files
+            path: {{ toJson $path }}
+            subPath: "file-{{ $i }}"
+            readonly: true
+    {{- $i = add $i 1 }}
     {{- end }}
     {{- end }}
         # The model API key, when a credential is attached on the `model`
@@ -59,3 +149,40 @@ spec:
             as: env
     {{- end }}
     {{- end }}
+    {{- if $files }}
+    volumes:
+      inject-files:
+        configmap:
+          source: "{{ .context.rendered_name }}-files"
+    {{- end }}
+  # The ConfigMap holding the file entries the connections dictate, keyed
+  # file-0, file-1 and so on in path order, the keys the workload's mounts read.
+  # It is emitted only while a connection dictates a file, so a build with none
+  # renders nothing here. The pod mounts it by name, which resolves only in the
+  # pod's own namespace, so it carries the namespace the Release declares for
+  # the component through the aggrega.ai/namespace annotation, and none where it
+  # declares none.
+  artifacts:
+    crewai-files.configmap.yaml: |
+      {{- $pipeFiles := optional (default dict .context.inject) "file" dict }}
+      {{- $files := dict }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- range $path, $from := (optional (default dict $edge.inject) "file" dict) }}
+      {{- $_ := set $files $path (optional $pipeFiles $path "") }}
+      {{- end }}
+      {{- end }}
+      {{- if $files -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-files
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+        namespace: "{{ . }}"
+        {{- end }}
+      data:
+        {{- $i := 0 }}
+        {{- range $path, $v := $files }}
+        file-{{ $i }}: {{ toJson $v }}
+        {{- $i = add $i 1 }}
+        {{- end }}
+      {{- end }}
