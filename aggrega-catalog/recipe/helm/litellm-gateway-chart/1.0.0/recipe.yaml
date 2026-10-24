@@ -22,7 +22,12 @@ metadata:
     bundle, exactly as on the synthesis, the allowlist as a second container
     of the chart's pod. Every credential reaches the gateway as a
     secretKeyRef, so no credential value is rendered; unattached, api_key
-    leaves the gateway with no master key, as on the synthesis.
+    leaves the gateway with no master key, as on the synthesis. A cache store
+    publishing redis-tls is reached over TLS, its certificate checked against
+    the connection's server_ca or the image's trust store and for the store's
+    published host; its password is
+    expanded into the cache's connection URL in the container, so keep it to
+    letters and digits.
 
     With `values.metrics_enabled` true the allowlist forwards a GET of
     /metrics alone from port 9090, on the chart's metrics Service, published
@@ -136,6 +141,7 @@ spec:
     cache_store_host_variable: SEMANTIC_CACHE_STORE_HOST
     cache_store_port_variable: SEMANTIC_CACHE_STORE_PORT
     cache_store_password_variable: REDIS_PASSWORD
+    cache_store_url_variable: SEMANTIC_CACHE_STORE_URL
 
   # provides.host is the chart's Service. The value mapping pins the chart's
   # fullnameOverride to the rendered name, the release name the helm provider
@@ -295,7 +301,9 @@ spec:
   # build, naming both. The cache_store connection's credential is delivered
   # as REDIS_PASSWORD, the variable the semantic cache reads, and with none on
   # that connection the variable is written empty, which connects without a
-  # password. A slot or a connection credential whose realization publishes no
+  # password; on a store publishing redis-tls, where the cache reads the
+  # password only inside the connection URL below, none is written with no
+  # credential. A slot or a connection credential whose realization publishes no
   # Secret name halts the build naming it. The chart gives that list to its
   # migration Job as well, so the Job, which runs only with database_url
   # attached, reads DATABASE_URL from it and carries the other references
@@ -319,9 +327,30 @@ spec:
   # PRESIDIO_ANALYZER_API_BASE and PRESIDIO_ANONYMIZER_API_BASE. With the
   # cache_store socket wired, the store's published host and port reach it
   # under the two variables the locals above name, and the build halts when
-  # the store publishes no vector_search, or a protocol ending in -tls, served
-  # over TLS alone: the cache composes a plaintext address from the host and
-  # port it is given. A second component wired to one of
+  # the store publishes no vector_search. A store publishing redis-tls, served
+  # over TLS alone, is reached over TLS: in place of the host and port the
+  # proxy gets the cache's whole connection URL under
+  # cache_store_url_variable, rediss://:$(REDIS_PASSWORD)@<host>:<port> with
+  # a credential and rediss://<host>:<port> without one, followed by
+  # ?ssl_check_hostname=true, or by
+  # ?ssl_ca_certs=/etc/litellm-cache-store-ca/ca.crt&ssl_check_hostname=true
+  # while the connection holds a server_ca, whose Secret is a volume of the
+  # pod mounted whole and read-only there. The chart writes its map of plain variables ahead of its
+  # list of environment entries, and Kubernetes expands a $(...) reference
+  # only from the entries before it, so the URL is written into that list,
+  # right after the password's secretKeyRef, and never into the map: the
+  # container expands the password when it starts, and it reaches no rendered
+  # file. Kubernetes inserts it unencoded, so a password carrying /, ?, # or
+  # %, or a tab or a line break, breaks the URL when the gateway starts, and
+  # nothing at build can refuse one it never sees: use letters and digits.
+  # Without a server_ca the cache checks the store's certificate against its
+  # image's default trust store, and with one against that authority, and
+  # checks that the certificate names the store's published host; a
+  # certificate that does not fails the connection, and every lookup is then
+  # a miss and nothing is stored. Any other protocol ending
+  # in -tls halts the build, naming the connection, as do a server_ca
+  # publishing no Secret name and one on a connection whose store serves no
+  # TLS. A second component wired to one of
   # those three sockets halts the build naming the socket, because the
   # gateway reads one address from each. With none wired, none of them is
   # written. The chart's own LITELLM_LOG setting is emptied, so the proxy logs
@@ -354,6 +383,7 @@ spec:
   valuesMapping: |
     {{- $features := default dict .features }}
     {{- $configDir := "/etc/litellm-gateway" }}
+    {{- $caDir := "/etc/litellm-cache-store-ca" }}
     {{- range $slot := list "api_key" "provider_key" "database_url" }}
     {{- if and (hasKey $features $slot) (not (index $features $slot).provides.name) }}
     {{- fail (printf "the %s slot of the LiteLLM gateway %q is filled by a realization that publishes no Secret name, so the gateway would read its credential from no Secret: bind that slot's Feature to a realization that names the Secret it holds" $slot $.context.instance_id) }}
@@ -379,8 +409,17 @@ spec:
     {{- fail (printf "the cache_store socket is wired to %q, a %s publishing no vector_search, but the gateway's semantic cache stores and searches its replies with the Redis query engine's vector search; a store without it would cache nothing while every request still succeeds. Wire a store publishing vector_search to cache_store: a core/datastore/redis on an infra.engine_version from 8.0.0 on, or one whose infra.overrides.image names an image serving that search, with infra.image_serves_vector_search: true set on it in the Release" $edge.target (first (splitList ":" (toString $edge.component)))) }}
     {{- end }}
     {{- $storeProtocol := toString (optional (default dict $edge.provides) "protocol" "") }}
-    {{- if hasSuffix "-tls" $storeProtocol }}
-    {{- fail (printf "the cache_store connection %s of %q reaches %q, which publishes protocol %s, a store served over TLS alone, but the gateway's semantic cache is given the store's host and port, from which it connects without TLS; wire a store served without TLS to the cache_store socket" $alias $.context.instance_id $edge.target $storeProtocol) }}
+    {{- if and (hasSuffix "-tls" $storeProtocol) (ne $storeProtocol "redis-tls") }}
+    {{- fail (printf "the cache_store connection %s of %q reaches %q, which publishes protocol %s, a store served over TLS that the gateway's semantic cache is not taught to reach: it speaks the Redis protocol, over TLS to a store publishing redis-tls; wire a Redis store publishing redis-tls, or one served without TLS, to the cache_store socket" $alias $.context.instance_id $edge.target $storeProtocol) }}
+    {{- end }}
+    {{- if hasKey $edgeFeatures "server_ca" }}
+    {{- $caProvides := optional (optional $edgeFeatures "server_ca" dict) "provides" dict }}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) }}
+    {{- fail (printf "the server_ca on the cache_store connection %s of %q publishes no Secret name, so no Secret could be mounted into the gateway: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) }}
+    {{- end }}
+    {{- if ne $storeProtocol "redis-tls" }}
+    {{- fail (printf "the cache_store connection %s of %q holds a server_ca, but the store it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that store, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $storeProtocol)) }}
+    {{- end }}
     {{- end }}
     {{- $store = $edge }}
     {{- end }}
@@ -392,7 +431,15 @@ spec:
     {{- end }}
     {{- end }}
     {{- $storeCredential := "" }}
+    {{- $storeURL := "" }}
+    {{- $storeCA := "" }}
     {{- if $store }}{{ if hasKey (default dict $store.features) "credential" }}{{ $storeCredential = $store.features.credential.provides }}{{ end }}{{ end }}
+    {{- if $store }}{{ if eq (toString (optional (default dict $store.provides) "protocol" "")) "redis-tls" }}
+    {{- if hasKey (default dict $store.features) "server_ca" }}{{ $storeCA = $store.features.server_ca.provides.name }}{{ end }}
+    {{- $userinfo := "" }}{{ if $storeCredential }}{{ $userinfo = printf ":$(%s)@" $.locals.cache_store_password_variable }}{{ end }}
+    {{- $query := "" }}{{ if $storeCA }}{{ $query = printf "ssl_ca_certs=%s/ca.crt&" $caDir }}{{ end }}
+    {{- $storeURL = printf "rediss://%s%s:%s?%sssl_check_hostname=true" $userinfo (toString $store.provides.host) (toString $store.provides.port) $query }}
+    {{- end }}{{ end }}
 
     ## ── Pin the chart's resource names to the rendered name ────
     ## Names the gateway's Service exactly "<rendered_name>", matching
@@ -472,7 +519,7 @@ spec:
       port: {{ .locals.metrics_port }}
 
     ## ── Credentials, each by reference to its own Secret ───────
-    {{- if or (hasKey $features "api_key") (hasKey $features "provider_key") (hasKey $features "database_url") $storeCredential $modelKeys }}
+    {{- if or (hasKey $features "api_key") (hasKey $features "provider_key") (hasKey $features "database_url") $storeCredential $modelKeys $storeURL }}
     extraEnvVars:
       {{- with $features.api_key }}
       - name: LITELLM_MASTER_KEY
@@ -502,6 +549,10 @@ spec:
             name: "{{ .name }}"
             key: "{{ .key }}"
       {{- end }}
+      {{- with $storeURL }}
+      - name: "{{ $.locals.cache_store_url_variable }}"
+        value: "{{ . }}"
+      {{- end }}
       {{- range $variable, $alias := $modelKeys }}
       {{- $credential := (get $.context.uses $alias).features.credential.provides }}
       - name: "{{ $variable }}"
@@ -515,7 +566,7 @@ spec:
     {{- end }}
 
     ## ── The addresses the gateway reads, as plain variables ────
-    {{- if or .infra.external_base_url $analyzer $anonymizer $store }}
+    {{- if or .infra.external_base_url $analyzer $anonymizer (and $store (not $storeURL)) }}
     envVars:
       {{- with .infra.external_base_url }}
       PROXY_BASE_URL: "{{ . }}"
@@ -526,13 +577,13 @@ spec:
       {{- with $anonymizer }}
       PRESIDIO_ANONYMIZER_API_BASE: "{{ .provides.endpoint }}"
       {{- end }}
-      {{- with $store }}
+      {{- if and $store (not $storeURL) }}{{ with $store }}
       {{ $.locals.cache_store_host_variable }}: "{{ .provides.host }}"
       {{ $.locals.cache_store_port_variable }}: "{{ .provides.port }}"
       {{- if not $storeCredential }}
       {{ $.locals.cache_store_password_variable }}: ""
       {{- end }}
-      {{- end }}
+      {{- end }}{{ end }}
     {{- else }}
     envVars: {}
     {{- end }}
@@ -567,6 +618,11 @@ spec:
       - name: request-guard
         configMap:
           name: "{{ .locals.request_guard_config_map_name }}"
+      {{- with $storeCA }}
+      - name: cache-store-server-ca
+        secret:
+          secretName: "{{ . }}"
+      {{- end }}
     volumeMounts:
       - name: gateway-config
         mountPath: "{{ $configDir }}"
@@ -574,6 +630,11 @@ spec:
       - name: request-guard
         mountPath: "{{ .locals.request_guard_dir }}"
         readOnly: true
+      {{- with $storeCA }}
+      - name: cache-store-server-ca
+        mountPath: "{{ $caDir }}"
+        readOnly: true
+      {{- end }}
 
     ## ── Proxy resources ────────────────────────────────────────
     ## Quoted so a whole-core quantity stays a string.

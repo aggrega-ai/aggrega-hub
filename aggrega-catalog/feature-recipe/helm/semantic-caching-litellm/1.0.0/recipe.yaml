@@ -11,7 +11,8 @@ metadata:
     Release binds it in its Manifest. It writes the gateway's own cache
     setting into the configuration the gateway's Recipe renders, and emits no
     file. The gateway keeps its replies in the core/datastore/redis wired to
-    its cache_store socket, turns each prompt into a vector with
+    its cache_store socket, reached over TLS while it publishes redis-tls,
+    turns each prompt into a vector with
     embedding_model, an alias of its model map, and serves a stored reply
     whose prompt is at least similarity_threshold alike; the store removes a
     reply ttl_seconds after it was stored. Chat requests, streamed or not, and
@@ -108,7 +109,10 @@ spec:
   # recipe writes only the names of those variables, which the gateway
   # resolves when it starts. The password is read by the cache from
   # REDIS_PASSWORD, which that Recipe delivers from the credential on the
-  # cache_store connection as a secret reference, or empty with none. The
+  # cache_store connection as a secret reference, or empty with none. For a
+  # store publishing redis-tls that Recipe writes one variable instead, the
+  # cache's whole connection URL with the password in it as a reference the
+  # container expands, and this recipe names that variable. The
   # cache connects to the store when it first serves a request, not when the
   # gateway starts. A store it
   # cannot use — one wanting a password it was not given, one refusing a
@@ -181,18 +185,32 @@ spec:
     # named for the component and the attachment, so two gateways of one
     # Release sharing a store keep separate indexes. The similarity threshold
     # is written as the cosine similarity the attachment gives, which the
-    # gateway converts to the distance the store searches by.
+    # gateway converts to the distance the store searches by. While the store
+    # wired to cache_store publishes redis-tls, the cache is named its whole
+    # connection URL instead of the host and port, through redis_url, the one
+    # setting through which it connects over TLS: the variable the gateway's
+    # Recipe writes that URL under, which its cache_store_url_variable local
+    # names, and the build halts where that Recipe publishes no such local.
+    # The protocol is read here from the connection as the Recipe reads it,
+    # because a pipeline step and a Recipe's template are separate templates
+    # and neither can hand the other what it decided.
     - id: write_semantic_cache
       plugin: pipeline-step/litellm-gateway-config:1.0.0
       function: step
       with: |
+        {{- $urlVariable := "" }}
+        {{- range $alias, $edge := .context.uses }}{{ if and (eq $edge.socket "cache_store") (eq (toString (optional (default dict $edge.provides) "protocol" "")) "redis-tls") }}{{ $urlVariable = optional $.locals "cache_store_url_variable" "" }}{{ if not $urlVariable }}{{ fail (printf "core/semantic-caching attachment %q on %q is wired to a store publishing redis-tls, which the cache reaches only through a whole connection URL, but the Recipe rendering %q names no variable it delivers that URL under in a cache_store_url_variable local; bind the component in the Manifest to a Recipe that does" $.attachment_name $.context.instance_id $.context.instance_id) }}{{ end }}{{ end }}{{ end }}
         section: litellm_settings
         settings:
           cache: true
           cache_params:
             type: redis-semantic
+        {{- if $urlVariable }}
+            redis_url: os.environ/{{ $urlVariable }}
+        {{- else }}
             host: os.environ/{{ .locals.cache_store_host_variable }}
             port: os.environ/{{ .locals.cache_store_port_variable }}
+        {{- end }}
             redis_semantic_cache_index_name: {{ printf "%s-%s" .context.instance_id (.attachment_name | replace "_" "-") | toJson }}
             redis_semantic_cache_embedding_model: {{ .values.embedding_model | toJson }}
             similarity_threshold: {{ .values.similarity_threshold }}

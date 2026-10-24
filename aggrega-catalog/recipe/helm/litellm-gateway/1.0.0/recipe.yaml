@@ -9,31 +9,32 @@ metadata:
   license: MIT
   description: >
     An AI gateway on Kubernetes via the helm provider's Workload synthesis,
-    running the official upstream proxy image directly (no external Helm chart).
-    Renders a Deployment, a ClusterIP Service and a ConfigMap carrying the
-    routing table. Every credential reaches the gateway as an env
-    secretKeyRef, so no credential value appears in its own resources.
-    It is proven at LiteLLM v1.103.1 and halts on any other engine_version.
+    running the official upstream proxy image directly. Renders a Deployment,
+    a ClusterIP Service and a ConfigMap carrying the routing table. Every
+    credential reaches the gateway as an env secretKeyRef, so no credential
+    value appears in its own resources. It is proven at LiteLLM v1.103.1 and
+    halts on any other engine_version.
 
     On every Release a second ConfigMap carries a request guard, which
     forwards only the request fields the proxy declares for the route, plus
     any the Release admits in infra.admitted_request_fields, and refuses the
     rest naming the field. The same ConfigMap configures a path allowlist, a
     container running the official nginx image (BSD-2-Clause) on infra.port,
-    which answers 403 to every path but the routes the gateway serves. Both
-    come from the LiteLLMGuard bundle.
+    which answers 403 to every path but the routes the gateway serves.
 
     A core/context-propagation attachment, a core/data-masking one listing
     what to mask, or values.log_masking listing it, adds the module each
     relies on. A core/prompt-injection-shield attachment sends every map entry
     to the guard on the guard socket.
     PROXY_BASE_URL and the Presidio and cache store addresses appear only when
-    infra.external_base_url and their sockets are set.
+    infra.external_base_url and their sockets are set. A store publishing
+    redis-tls is reached over TLS, its password inside the cache's URL: keep
+    that password to letters and digits.
 
-    With `values.metrics_enabled` true the gateway serves its Prometheus
-    metrics on its loopback address, and the path allowlist forwards a GET of
-    /metrics alone there from port 9090, on the ClusterIP Service, published
-    as provides.metrics_endpoint; false leaves that key empty.
+    With `values.metrics_enabled` true the path allowlist forwards a GET of
+    /metrics alone from port 9090, on the ClusterIP Service, to the gateway's
+    metrics, published as provides.metrics_endpoint; false leaves that key
+    empty.
 
     Reach for this realization where the build must fetch nothing; reach for
     `litellm-gateway-chart`, BerriAI's own chart, where its registry is
@@ -230,10 +231,18 @@ spec:
     # carries: the cache will not start without one, so with no credential on
     # that connection the workload writes it empty, which connects without a
     # password; on its own that variable names no store, and nothing else in
-    # the proxy reads it.
+    # the proxy reads it. While the store publishes redis-tls the workload
+    # writes the cache's whole connection URL under cache_store_url_variable
+    # in place of the host and port, and the semantic-caching realization
+    # names it as the cache's redis_url, the one setting through which the
+    # cache connects over TLS. That URL carries the password as a reference to
+    # the password variable, which the container expands when it starts; it is
+    # a name of this Recipe's own and not the proxy's REDIS_URL for the same
+    # reason the host and port are.
     cache_store_host_variable: SEMANTIC_CACHE_STORE_HOST
     cache_store_port_variable: SEMANTIC_CACHE_STORE_PORT
     cache_store_password_variable: REDIS_PASSWORD
+    cache_store_url_variable: SEMANTIC_CACHE_STORE_URL
   # provides is evaluated before the workload and cannot read it, so the port has
   # one authored home in .infra.port that every reader dereferences — provides.port
   # and provides.endpoint here, the path allowlist's listen port, which the
@@ -437,20 +446,40 @@ spec:
   # wired, the store's published host and port reach the gateway under the
   # two variables the locals above name, and its password as REDIS_PASSWORD:
   # an env secretKeyRef when the cache_store connection carries a credential,
-  # an empty value when it does not. With nothing wired to cache_store, none
-  # of the three is emitted. Each models connection carrying a credential
-  # delivers it as an env secretKeyRef under the variable its routing-table
-  # entry names, derived from its alias by the rule the locals above state;
-  # two aliases the rule maps to one variable halt the build here, naming
-  # both. The pod is ready only once a request through the path allowlist
-  # would be served.
+  # an empty value when it does not. A store publishing redis-tls is reached
+  # over TLS: the gateway gets one variable in place of the host and port, the
+  # URL the cache connects with, rediss://:$(REDIS_PASSWORD)@<host>:<port>
+  # with a credential and rediss://<host>:<port> without one, followed by
+  # ?ssl_check_hostname=true, or by
+  # ?ssl_ca_certs=/etc/litellm-cache-store-ca/ca.crt&ssl_check_hostname=true
+  # while the connection holds a server_ca, whose Secret is mounted whole and
+  # read-only there. The password stays an env secretKeyRef, which the provider writes ahead of
+  # every plain variable, so the container expands the reference when it
+  # starts and the password reaches no rendered file; with no credential, no
+  # password variable is written, since the cache reads none beside a URL.
+  # Kubernetes inserts the password unencoded, so a password carrying /, ?, #
+  # or %, or a tab or a line break, breaks the URL when the gateway starts,
+  # and nothing at build can refuse one it never sees: use letters and
+  # digits. Without a server_ca the cache checks the store's certificate
+  # against its image's default trust store, and with one against that
+  # authority, and checks that the certificate names the store's published
+  # host; a certificate that does not fails the connection, and every lookup
+  # is then a miss and nothing is stored. With nothing
+  # wired to cache_store, none of these is emitted. Each models connection
+  # carrying a credential delivers it as an env secretKeyRef under the
+  # variable its routing-table entry names, derived from its alias by the
+  # rule the locals above state; two aliases the rule maps to one variable
+  # halt the build here, naming both. The pod is ready only once a request
+  # through the path allowlist would be served.
   workload: |
     {{- $configDir := "/etc/litellm" -}}
     {{- $recognizer := false -}}
     {{- $cacheStore := false -}}
     {{- $storeCredential := "" -}}
+    {{- $storeCA := "" -}}
+    {{- $caDir := "/etc/litellm-cache-store-ca" -}}
     {{- $modelKeys := dict -}}
-    {{- range $alias, $edge := .context.uses }}{{ if or (eq $edge.socket "pii_analyzer") (eq $edge.socket "pii_anonymizer") }}{{ $recognizer = true }}{{ end }}{{ if eq $edge.socket "cache_store" }}{{ $cacheStore = true }}{{ if hasKey (default dict $edge.features) "credential" }}{{ $storeCredential = $alias }}{{ end }}{{ end }}{{ end -}}
+    {{- range $alias, $edge := .context.uses }}{{ if or (eq $edge.socket "pii_analyzer") (eq $edge.socket "pii_anonymizer") }}{{ $recognizer = true }}{{ end }}{{ if eq $edge.socket "cache_store" }}{{ $cacheStore = true }}{{ if hasKey (default dict $edge.features) "credential" }}{{ $storeCredential = $alias }}{{ end }}{{ if hasKey (default dict $edge.features) "server_ca" }}{{ $storeCA = $alias }}{{ end }}{{ end }}{{ end -}}
     {{- range $alias, $edge := .context.uses }}
     {{- if and (eq $edge.socket "models") (hasKey (default dict $edge.features) "credential") }}
     {{- $variable := printf "%s%s%s" $.locals.connection_key_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_") $.locals.connection_key_variable_suffix }}
@@ -506,11 +535,22 @@ spec:
         # With the cache_store socket wired, the store's published host and
         # port are written the same way, and the build halts when the store
         # publishes no vector_search, its own statement that it serves the
-        # query engine's vector search, and on a store publishing a protocol
-        # ending in -tls, served over TLS alone: the cache composes a plaintext
-        # address from the host and port it is given. With no credential on the
-        # cache_store connection the password variable is written empty; with
-        # one, it is delivered below instead.
+        # query engine's vector search. With no credential on the cache_store
+        # connection the password variable is written empty; with one, it is
+        # delivered below instead. A store publishing redis-tls is served over
+        # TLS alone, and the cache composes a plaintext address from a host and
+        # port, so the URL variable is written in their place: rediss://, the
+        # password as a $(...) reference to the password variable while the
+        # connection carries a credential, the host and port, the mounted
+        # authority's ca.crt while it holds a server_ca, and always
+        # ssl_check_hostname=true, so the cache checks that the store's
+        # certificate names the host it dials. Every attachment
+        # delivered as env is written ahead of every plain variable, so the
+        # reference follows the entry it names. With no credential no password
+        # variable is written, since the cache reads none beside a URL. Any
+        # other protocol ending in -tls halts the build, naming the connection,
+        # as do a server_ca publishing no Secret name and one on a connection
+        # whose store serves no TLS.
     {{- if or .infra.external_base_url $recognizer $cacheStore }}
         variables:
     {{- end }}
@@ -529,9 +569,23 @@ spec:
     {{- fail (printf "the cache_store socket is wired to %q, a %s publishing no vector_search, but the gateway's semantic cache stores and searches its replies with the Redis query engine's vector search; a store without it would cache nothing while every request still succeeds. Wire a store publishing vector_search to cache_store: a core/datastore/redis on an infra.engine_version from 8.0.0 on, or one whose infra.overrides.image names an image serving that search, with infra.image_serves_vector_search: true set on it in the Release" $edge.target (first (splitList ":" (toString $edge.component)))) }}
     {{- end }}
     {{- $storeProtocol := toString (optional (default dict $edge.provides) "protocol" "") }}
-    {{- if hasSuffix "-tls" $storeProtocol }}
-    {{- fail (printf "the cache_store connection %s of %q reaches %q, which publishes protocol %s, a store served over TLS alone, but the gateway's semantic cache is given the store's host and port, from which it connects without TLS; wire a store served without TLS to the cache_store socket" $alias $.context.instance_id $edge.target $storeProtocol) }}
+    {{- $storeTLS := eq $storeProtocol "redis-tls" }}
+    {{- if and (hasSuffix "-tls" $storeProtocol) (not $storeTLS) }}
+    {{- fail (printf "the cache_store connection %s of %q reaches %q, which publishes protocol %s, a store served over TLS that the gateway's semantic cache is not taught to reach: it speaks the Redis protocol, over TLS to a store publishing redis-tls; wire a Redis store publishing redis-tls, or one served without TLS, to the cache_store socket" $alias $.context.instance_id $edge.target $storeProtocol) }}
     {{- end }}
+    {{- $edgeFeatures := default dict $edge.features }}
+    {{- if hasKey $edgeFeatures "server_ca" }}
+    {{- $caProvides := optional (optional $edgeFeatures "server_ca" dict) "provides" dict }}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) }}
+    {{- fail (printf "the server_ca on the cache_store connection %s of %q publishes no Secret name, so no Secret could be mounted into the gateway: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) }}
+    {{- end }}
+    {{- if not $storeTLS }}
+    {{- fail (printf "the cache_store connection %s of %q holds a server_ca, but the store it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that store, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $storeProtocol)) }}
+    {{- end }}
+    {{- end }}
+    {{- if $storeTLS }}
+          {{ $.locals.cache_store_url_variable }}: "rediss://{{ if hasKey $edgeFeatures "credential" }}:$({{ $.locals.cache_store_password_variable }})@{{ end }}{{ $edge.provides.host }}:{{ $edge.provides.port }}?{{ if hasKey $edgeFeatures "server_ca" }}ssl_ca_certs={{ $caDir }}/ca.crt&{{ end }}ssl_check_hostname=true"
+    {{- else }}
           {{ $.locals.cache_store_host_variable }}: "{{ $edge.provides.host }}"
           {{ $.locals.cache_store_port_variable }}: "{{ $edge.provides.port }}"
     {{- if not (hasKey (default dict $edge.features) "credential") }}
@@ -539,7 +593,8 @@ spec:
     {{- end }}
     {{- end }}
     {{- end }}
-    {{- if or (hasKey (default dict .features) "api_key") (hasKey (default dict .features) "provider_key") (hasKey (default dict .features) "database_url") $storeCredential $modelKeys }}
+    {{- end }}
+    {{- if or (hasKey (default dict .features) "api_key") (hasKey (default dict .features) "provider_key") (hasKey (default dict .features) "database_url") $storeCredential $modelKeys $storeCA }}
         attachments:
     {{- end }}
     {{- if hasKey (default dict .features) "api_key" }}
@@ -585,6 +640,16 @@ spec:
             connection: "{{ $alias }}"
             from: credential
             as: env
+    {{- end }}
+    {{- with $storeCA }}
+          # The cache_store connection's server_ca Secret, mounted whole and
+          # read-only, one file per data key, at the directory the cache's
+          # connection URL names its ca.crt in.
+          cache-store-server-ca:
+            connection: "{{ . }}"
+            from: server_ca
+            as: file
+            path: "{{ $caDir }}"
     {{- end }}
         # The proxy documents /health/readiness and /health/liveliness as its
         # readiness and liveness contract; neither makes a model call. Readiness

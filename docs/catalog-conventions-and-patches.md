@@ -4032,8 +4032,18 @@ template, not something the compiler checks: the compiler pipes the published
   two workers, whose services and scheduler Recipes compose the same URLs,
   Langfuse, Tyk, the LiveKit media server and SIP bridge, and the period-budget
   stores of Envoy Gateway and Traefik Hub consume a Valkey or Redis cache this
-  way, accepting `valkey-tls` and `redis-tls` alike, and so does Traefik Hub's
-  semantic cache, for a Redis store; Loki's
+  way, accepting `valkey-tls` and `redis-tls` alike, and so do the semantic
+  caches of Traefik Hub and LiteLLM, for a Redis store. LiteLLM's semantic cache
+  reaches a store publishing `redis-tls` over TLS through a whole connection URL,
+  so its Recipes compose that URL with the password in it as a reference the
+  gateway's container expands from the password's Secret when it starts, and the
+  password reaches no rendered file; inserted unencoded, a password carrying `/`,
+  `?`, `#` or `%` breaks the URL when the gateway starts and nothing refuses it at
+  build, so the store takes a password of letters and digits. The cache checks
+  the store's certificate chain and that the certificate names the store's
+  published host, refusing an authority certificate carrying no key usage
+  extension; a refused certificate fails the connection, and every lookup is
+  then a miss and nothing is stored. Loki's
   chunk cache consumes a Memcached cache this way, its shared protocol check
   accepting `memcached` and `memcached-tls`.
 - **A consumer whose product checks a certificate only against the authorities
@@ -4049,10 +4059,7 @@ template, not something the compiler checks: the compiler pipes the published
   `core/ai-tool/datastore-query`, and, on a connection writing no `inject:`
   block, `core/ai-agent/langgraph`, `dynamiq` and
   `phidata` — which give that code no authority to check a certificate against,
-  and the last three not even the store's protocol. LiteLLM's semantic cache
-  refuses it too, though there the limit is its Recipes': they give the cache
-  the store's host and port, from which it connects without TLS, rather than
-  the whole connection URL, password included, that its TLS connection takes.
+  and the last three not even the store's protocol.
 - **A consumer checking `protocol` through the shared TargetProtocol check lists
   every value its client speaks** in its `check_protocol` local: one protocol as
   a plain string, or several as a JSON list in the string — a local is a string,
