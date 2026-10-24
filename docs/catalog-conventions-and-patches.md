@@ -4013,15 +4013,15 @@ template, not something the compiler checks: the compiler pipes the published
 - **The setting is `infra.client_tls`**, a boolean that defaults to false. Off, the
   Component's contract and every render are exactly what they are without the
   setting.
-- **On, the published `protocol` says so** — `valkey-tls` for `valkey`,
-  `redis-tls` for `redis`, `memcached-tls` for `memcached`: the product's name and
-  the word its own documentation uses for the feature. The port then accepts TLS
-  alone, and `host` and `port` are unchanged, so `protocol` is what tells a
-  consumer that TLS is required; a plaintext client reaching the port fails its
-  handshake and exchanges no command. Every consumer Recipe of `valkey`, `redis`
-  and `memcached` checks `protocol`: one taught
-  the TLS value reaches the cache over TLS, and every other refuses a value served
-  over TLS, naming the connection, so no consumer reaches a TLS port in plaintext.
+- **On, the published `protocol` says so** — `valkey-tls` for `valkey`, `redis-tls` for
+  `redis`, `memcached-tls` for `memcached`: the product's name and the word its own
+  documentation uses for the feature. The port then accepts TLS alone, and `host` and
+  `port` are unchanged, so `protocol` is what tells a consumer that TLS is required; a
+  plaintext client reaching the port fails its handshake and exchanges no command.
+  Every consumer Recipe checks `protocol` on a connection it delivers under its default
+  variables: one taught the TLS value reaches the cache over TLS; every other refuses
+  it, naming the connection. A connection that dictates gets what it dictates (see "A
+  component running the Release's own code takes `inject:` on its connections").
 - **A self-hosted realization presents the certificate attached to the slot
   `server_certificate`**, declared optional with `selector:
   "feature.aggrega.ai/kind=secret"`, `sensitive: true` and `inject: [file]`. Its
