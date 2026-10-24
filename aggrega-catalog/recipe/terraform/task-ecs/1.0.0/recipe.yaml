@@ -1,0 +1,409 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: task-ecs
+  version: 1.0.0
+  description: >
+    The generic ephemeral compute primitive as an Amazon ECS task on Fargate
+    that an EventBridge Scheduler schedule starts, rendered by vendoring a
+    Terraform module kept beside this Recipe. Reach for it where the target is
+    an AWS account with an ECS cluster and a VPC; reach for helm/task on
+    Kubernetes, which also runs a task with no schedule once.
+
+    A task with no schedule is refused by name: nothing on AWS starts a run
+    that happens once. The schedule's cron fields become the scheduler's own
+    expression where the two mean the same times, evaluated in UTC unless the
+    Release names a time zone, and are refused by name where they do not, as
+    for a schedule restricting both the day of the month and the day of the
+    week.
+
+    The cluster, subnets, security groups, execution role and the role the
+    scheduler starts each run under come from infra.overrides and are
+    required. Only a task definition and a schedule are emitted: no role, log
+    group or network resource, each of which the operator already runs, and
+    no service, as a run ends.
+
+    Each env entry an edge dictates becomes a container variable, its value
+    written whole; timeout arrives as TASK_TIMEOUT, which no edge may dictate
+    while it is set, for the code to honour, as ECS sets no deadline on a run.
+    File, arg and other entries are refused by name. The image is a
+    linux/amd64 image; the task runs at the smallest Fargate size meeting
+    infra.compute.
+
+    The terraform-aws-modules ECS module is not sourced: it offers no
+    scheduled task.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/compute/task:1.0.0
+
+  # The module this Recipe vendors lives beside it, and is copied verbatim into
+  # the component's own directory: no fetch and no lockfile pin. Its main.tf pins
+  # hashicorp/aws by the one range every AWS body in this catalog declares, and
+  # says why.
+  #
+  # The terraform-aws-modules project publishes an ECS module,
+  # terraform-aws-modules/ecs/aws, and at v7.6.1 it is not complete for this
+  # component: its root module and its cluster, container-definition,
+  # express-service and service sub-modules declare no scheduled task, so
+  # nothing in it starts a run on a schedule. A module of the catalog's own
+  # declaring a task definition and a schedule is what fits.
+  source: ./module
+
+  # This Recipe reads from infra.overrides:
+  #   cluster                      - string (cluster), required
+  #   scheduler_role_arn           - string (scheduler_role_arn), required
+  #   subnet_ids                   - []string (subnet_ids), required
+  #   vpc_security_groups          - []string (security_groups), required
+  #   execution_role_arn           - string (execution_role_arn), required
+  #   task_role_arn                - string (task_role_arn)
+  #   assign_public_ip             - bool (assign_public_ip; default false)
+  #   awslogs_group                - string (awslogs_group)
+  #   schedule_expression_timezone - string (schedule_expression_timezone; default UTC)
+  #
+  # Each is passed to the module input named in brackets. Each module input is
+  # named for the resource argument it sets, the awslogs_group one for the
+  # awslogs-group option of the container's log configuration, except three:
+  # subnet_ids carries its key's name to the schedule's subnets, cluster sets
+  # the schedule target's arn, and scheduler_role_arn its role_arn. Four keys
+  # reuse the spelling terraform/server-ecs and terraform/worker-ecs read for the
+  # same concept, so an operator writes each under one name across the
+  # catalog's terraform Amazon ECS Recipes: cluster, subnet_ids,
+  # vpc_security_groups and execution_role_arn.
+  #
+  # The first five are required and none has a default: the cluster, the
+  # network, the role ECS pulls the image and writes logs with and the role the
+  # scheduler calls ECS with are provisioned outside this Release, no
+  # account-independent value exists for any of them, and this Recipe never
+  # chooses a network or a role for the operator. The cluster is named by its
+  # ARN, since a schedule's target is the ARN of the resource it acts on; the
+  # scheduler role must trust the scheduler and be allowed to run the task
+  # definition and pass the task's roles to ECS. assign_public_ip gives each run
+  # a public IP address, which a task in a public subnet needs to reach the
+  # internet with no NAT gateway; it is off unless the Release turns it on.
+  # awslogs_group names a log group that already exists, in the Region the task
+  # runs in, to which the container's output is written under the stream prefix
+  # of the component's name; the execution role must be allowed to write to it.
+  # schedule_expression_timezone names the IANA time zone the schedule is
+  # evaluated in. The task definition names no runtime platform, so Fargate
+  # runs the image as linux/amd64.
+  #
+  # Target-expected names: the image is the Release's, so no upstream
+  # documentation names a spelling for the developer's timeout value. It is
+  # delivered under the name helm/task delivers it under, and only when the
+  # developer set it, so an unset value renders no variable rather than an empty
+  # one. The schedule is not delivered as a variable: it becomes the schedule's
+  # expression.
+  #
+  # Every Component value and infra key is honoured or refused below by name:
+  #   honoured — values.schedule as the schedule's expression, values.timeout
+  #     as above, infra.image (required), infra.compute.cpu and
+  #     infra.compute.memory as the Fargate size below, and the overrides above.
+  #   refused — a task with no schedule, and a schedule with no exact
+  #     equivalent, as the comment above the locals describes;
+  #     infra.overrides.target_group_arn, since nothing connects to a run; a
+  #     compute quantity this Recipe cannot read, and a pair larger than the
+  #     largest Fargate task; an edge injecting a variable under TASK_TIMEOUT
+  #     while the timeout is set; and an edge's file, arg or custom-mechanism
+  #     entry, as the comment above valuesMapping describes.
+  assertions:
+    # This component packages no upstream product, so it holds no default image
+    # to fall back to: the Release names the one it runs.
+    image_supplied: >-
+      {{- if not (optional .infra "image" "") -}}
+      {{- fail "this realization runs an image the Release supplies, because the generic compute primitive packages no software and therefore holds no default: set infra.image to the container image the run executes in the Release" -}}
+      {{- end -}}
+    # A run that happens once has nothing on AWS to start it, and a schedule
+    # the scheduler cannot carry exactly would run at other times than the
+    # developer wrote, so both halt here.
+    schedule_translates: >-
+      {{- $s := trim (toString (optional .values "schedule" "")) -}}
+      {{- if not $s -}}
+      {{- fail (printf "the component %q has no schedule, so it runs once, and nothing on AWS starts a run that happens once: neither Terraform nor CloudFormation runs an Amazon ECS task when it applies, so the run would never happen. Give the component a schedule in the Aggregate, or map core/compute/task to helm/task in the Manifest, which runs it once on Kubernetes" .locals.instance_id) -}}
+      {{- end -}}
+      {{- if hasPrefix "refuse:" .locals.schedule_translation -}}
+      {{- fail (printf "the component %q is scheduled %q, and %s" .locals.instance_id $s (trimPrefix "refuse:" .locals.schedule_translation)) -}}
+      {{- end -}}
+    # The compute block's two sub-keys carry defaults, which fill either one a
+    # Release leaves out; one the Release sets empty leaves the task nothing to
+    # be sized by, so each must carry a quantity.
+    compute_group_complete: >-
+      {{- $compute := optional .infra "compute" dict -}}
+      {{- if not (optional $compute "cpu" "") -}}
+      {{- fail "infra.compute.cpu is empty, so the task would have no CPU to be sized by: set infra.compute.cpu in the Release to a quantity, or remove it to take the component's default" -}}
+      {{- end -}}
+      {{- if not (optional $compute "memory" "") -}}
+      {{- fail "infra.compute.memory is empty, so the task would have no memory to be sized by: set infra.compute.memory in the Release to a quantity, or remove it to take the component's default" -}}
+      {{- end -}}
+    compute_fits_fargate: >-
+      {{- if not .locals.cpu_millicores -}}
+      {{- fail (printf "infra.compute.cpu is %q, and this Recipe reads it as a Kubernetes CPU quantity, whole millicores such as 100m or vCPUs with at most three decimals such as 0.5: set infra.compute.cpu in the Release to one of those forms" (toString .infra.compute.cpu)) -}}
+      {{- end -}}
+      {{- if not .locals.memory_mib -}}
+      {{- fail (printf "infra.compute.memory is %q, and this Recipe reads it as a Kubernetes memory quantity in whole mebibytes or gibibytes, such as 128Mi or 1Gi: set infra.compute.memory in the Release to one of those forms" (toString .infra.compute.memory)) -}}
+      {{- end -}}
+      {{- if not .locals.task_size -}}
+      {{- fail (printf "infra.compute asks for cpu %q and memory %q, and no Fargate task size meets both: the largest is 32 vCPU with 244 GB, and each CPU size takes a bounded range of memory, up to 120 GB at 16 vCPU and 30 GB at 4 vCPU; set infra.compute in the Release to a pair one Fargate size meets" (toString .infra.compute.cpu) (toString .infra.compute.memory)) -}}
+      {{- end -}}
+    cluster_supplied: >-
+      {{- $v := optional (optional .infra "overrides" dict) "cluster" "" -}}
+      {{- if not (and (typeIs "string" $v) (regexMatch `^arn:aws[a-z-]*:ecs:[a-z0-9-]+:[0-9]{12}:cluster/[A-Za-z0-9_-]{1,255}$` $v)) -}}
+      {{- fail (printf "this Release starts its task's runs in an Amazon ECS cluster that already exists in the target account, and a schedule names the cluster by its ARN, but infra.overrides.cluster is %s: set infra.overrides.cluster in the Release to the ARN of an existing ECS cluster, such as arn:aws:ecs:us-east-1:123456789012:cluster/example" (toJson $v)) -}}
+      {{- end -}}
+    scheduler_role_arn_supplied: >-
+      {{- $v := optional (optional .infra "overrides" dict) "scheduler_role_arn" "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release starts its task's runs from an EventBridge Scheduler schedule, which calls Amazon ECS under a role that already exists, trusts the scheduler and may run the task definition, but infra.overrides.scheduler_role_arn is %s: set infra.overrides.scheduler_role_arn in the Release to the ARN of an existing role" (toJson $v)) -}}
+      {{- end -}}
+    subnet_ids_supplied: >-
+      {{- $s := optional (optional .infra "overrides" dict) "subnet_ids" "" -}}
+      {{- $ok := and (kindIs "slice" $s) (gt (len $s) 0) (le (len $s) 16) -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) .) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "this Release places its task's runs in subnets of the operator's VPC, one to sixteen of them, but infra.overrides.subnet_ids is %s: set infra.overrides.subnet_ids in the Release to a list of the IDs of existing subnets" (toJson $s)) -}}
+      {{- end -}}
+    vpc_security_groups_supplied: >-
+      {{- $s := optional (optional .infra "overrides" dict) "vpc_security_groups" "" -}}
+      {{- $ok := and (kindIs "slice" $s) (gt (len $s) 0) (le (len $s) 5) -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) .) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "this Release attaches its task's runs to security groups of the operator's VPC, one to five of them, which decide what a run may reach, but infra.overrides.vpc_security_groups is %s: set infra.overrides.vpc_security_groups in the Release to a list of the IDs of existing security groups" (toJson $s)) -}}
+      {{- end -}}
+    execution_role_arn_supplied: >-
+      {{- $v := optional (optional .infra "overrides" dict) "execution_role_arn" "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release runs its task under a task execution role that already exists, with which Amazon ECS pulls the image and writes the container's logs, but infra.overrides.execution_role_arn is %s: set infra.overrides.execution_role_arn in the Release to the ARN of an existing role" (toJson $v)) -}}
+      {{- end -}}
+    optional_overrides_typed: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "target_group_arn" -}}
+      {{- fail "infra.overrides.target_group_arn names a load balancer target group for the task's runs, and a run maps no container port and ends, so nothing could be registered with it: remove infra.overrides.target_group_arn from the Release, or map this component as core/compute/server, which serves inbound traffic" -}}
+      {{- end -}}
+      {{- range $k := list "task_role_arn" "awslogs_group" "schedule_expression_timezone" -}}
+      {{- if hasKey $o $k -}}
+      {{- $v := index $o $k -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "infra.overrides.%s is %s, and this Recipe reads it as a non-empty string: set it in the Release to that string, or remove it" $k (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if and (hasKey $o "assign_public_ip") (not (kindIs "bool" (index $o "assign_public_ip"))) -}}
+      {{- fail (printf "infra.overrides.assign_public_ip is %s, and this Recipe reads it as true or false: set it in the Release to true to give each run a public IP address, or remove it" (toJson (index $o "assign_public_ip"))) -}}
+      {{- end -}}
+
+  # The schedule's translation, from the five cron fields the Component's
+  # schedule carries into the six fields of an EventBridge Scheduler cron
+  # expression, or a refusal prefixed refuse: naming what the expression cannot
+  # carry. The fields are read as Kubernetes reads a CronJob's schedule, the
+  # helm/task realization's: minute, hour, day of the month, month and day of
+  # the week, each a comma list of numbers, ranges and steps, or *; month and
+  # day names in any case; ? as *; and the descriptors @hourly, @daily,
+  # @midnight, @weekly, @monthly, @yearly and @annually as the fields they stand
+  # for. The scheduler reads minute, hour, day of the month and month in the
+  # same forms, so they pass through, with names written as numbers. It numbers
+  # the days of the week 1 to 7 from Sunday and takes no step there, so that
+  # field becomes the explicit list of the days it names. Both readers run a
+  # field whose list holds * (or a step of 1 over it) as unrestricted; with
+  # both day fields restricted, Kubernetes runs on a day matching either, which
+  # the scheduler cannot express, since it requires one of the two to be ?, so
+  # that schedule is refused, as are @every, which counts its interval from a
+  # moment the scheduler cannot reproduce, a time zone written into the
+  # expression, and any field in another form. The year field is *. These
+  # locals are the ones cloudformation/task-ecs declares, word for word, and a
+  # change to them is made to both.
+  #
+  # The Fargate task size, read off the task-size table of the Amazon ECS
+  # developer guide ("Task CPU and memory" under Fargate): a CPU size in CPU
+  # units, 1024 to a vCPU, and the memory sizes in MiB that each CPU size takes.
+  # The task runs at the first pair in that table, by CPU and then by memory,
+  # that meets both the CPU and the memory infra.compute asks for. Each
+  # requested quantity is a floor: the task may be given more than was written,
+  # and is billed for what it is given. The Component's defaults, 100m and
+  # 128Mi, are below the smallest pair, so they run at 256 CPU units and 512 MiB.
+  # A size the table adds later is not chosen until it is listed here. These
+  # locals are the ones terraform/server-ecs, terraform/worker-ecs,
+  # cloudformation/server-ecs, cloudformation/worker-ecs and
+  # cloudformation/task-ecs declare, word for word, and a change to the table is
+  # made to all six.
+  locals:
+    # The component's name, for the assertions' messages to name it.
+    instance_id: '{{ .context.instance_id }}'
+    schedule_translation: >-
+      {{- $s := trim (toString (optional .values "schedule" "")) -}}
+      {{- $out := "" -}}
+      {{- if $s -}}
+      {{- $f := regexSplit `\s+` $s -1 -}}
+      {{- $descriptors := dict "@yearly" "0 0 1 1 *" "@annually" "0 0 1 1 *" "@monthly" "0 0 1 * *" "@weekly" "0 0 * * 0" "@daily" "0 0 * * *" "@midnight" "0 0 * * *" "@hourly" "0 * * * *" -}}
+      {{- if and (eq (len $f) 1) (hasKey $descriptors (index $f 0)) -}}
+      {{- $f = regexSplit `\s+` (index $descriptors (index $f 0)) -1 -}}
+      {{- end -}}
+      {{- if hasPrefix "@every" $s -}}
+      {{- $out = "refuse:@every repeats at an interval counted from a moment Kubernetes chooses, which an EventBridge Scheduler schedule cannot reproduce: write the schedule as five cron fields" -}}
+      {{- else if regexMatch `^(CRON_)?TZ=` (index $f 0) -}}
+      {{- $out = "refuse:it names a time zone inside the expression, where an EventBridge Scheduler expression takes none: write the five fields alone, and name the time zone under infra.overrides in the Release" -}}
+      {{- else if ne (len $f) 5 -}}
+      {{- $out = printf "refuse:it has %d fields where a cron expression has five, minute, hour, day of the month, month and day of the week: write the schedule as those five fields" (len $f) -}}
+      {{- else -}}
+      {{- $item := `^(\*|\?|[0-9]+(-[0-9]+)?)(/[0-9]+)?$` -}}
+      {{- $min := index $f 0 -}}{{- $hour := index $f 1 -}}{{- $dom := index $f 2 -}}
+      {{- $mon := lower (index $f 3) -}}{{- $dow := lower (index $f 4) -}}
+      {{- range $i, $n := list "jan" "feb" "mar" "apr" "may" "jun" "jul" "aug" "sep" "oct" "nov" "dec" }}{{ $mon = replace $n (toString (add1 $i)) $mon }}{{ end -}}
+      {{- range $i, $n := list "sun" "mon" "tue" "wed" "thu" "fri" "sat" }}{{ $dow = replace $n (toString $i) $dow }}{{ end -}}
+      {{- $badField := "" -}}{{- $badValue := "" -}}
+      {{- range $pair := list (list "minute" $min (index $f 0)) (list "hour" $hour (index $f 1)) (list "day-of-month" $dom (index $f 2)) (list "month" $mon (index $f 3)) (list "day-of-week" $dow (index $f 4)) -}}
+      {{- range splitList "," (index $pair 1) -}}
+      {{- if and (not $badField) (not (regexMatch $item .)) }}{{ $badField = index $pair 0 }}{{ $badValue = index $pair 2 }}{{ end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $domStar := false -}}{{- $dowStar := false -}}
+      {{- range splitList "," $dom }}{{ $p := splitList "/" . }}{{ if and (has (index $p 0) (list "*" "?")) (or (eq (len $p) 1) (le (atoi (index $p 1)) 1)) }}{{ $domStar = true }}{{ end }}{{ end -}}
+      {{- range splitList "," $dow }}{{ $p := splitList "/" . }}{{ if and (has (index $p 0) (list "*" "?")) (or (eq (len $p) 1) (le (atoi (index $p 1)) 1)) }}{{ $dowStar = true }}{{ end }}{{ end -}}
+      {{- $days := list -}}{{- $dowBad := false -}}
+      {{- if not $badField -}}
+      {{- range splitList "," $dow -}}
+      {{- $p := splitList "/" . -}}
+      {{- $step := 1 -}}{{- if eq (len $p) 2 }}{{ $step = atoi (index $p 1) }}{{ end -}}
+      {{- $lo := 0 -}}{{- $hi := 6 -}}
+      {{- if not (has (index $p 0) (list "*" "?")) -}}
+      {{- $lh := splitList "-" (index $p 0) -}}
+      {{- $lo = atoi (index $lh 0) -}}
+      {{- if eq (len $lh) 2 }}{{ $hi = atoi (index $lh 1) }}{{ else if eq (len $p) 1 }}{{ $hi = $lo }}{{ end -}}
+      {{- end -}}
+      {{- if or (gt $hi 6) (gt $lo $hi) (lt $step 1) }}{{ $dowBad = true }}{{ else }}{{ range untilStep $lo (int (add1 $hi)) $step }}{{ $days = append $days (toString (add1 .)) }}{{ end }}{{ end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if $badField -}}
+      {{- $out = printf "refuse:its %s field %q is not a comma list of numbers, names, ranges, steps or *, the forms Kubernetes and EventBridge Scheduler both read alike: write that field in those forms" $badField $badValue -}}
+      {{- else if $dowBad -}}
+      {{- $out = printf "refuse:its day-of-week field %q names a day outside 0 to 6, Sunday to Saturday, or a range running backwards, which Kubernetes refuses as well: write the days from 0 for Sunday to 6 for Saturday" (index $f 4) -}}
+      {{- else if and (not $domStar) (not $dowStar) -}}
+      {{- $out = "refuse:it restricts both the day of the month and the day of the week, so a run happens on a day matching either, and an EventBridge Scheduler cron expression leaves one of the two unrestricted, so it cannot run on a day matching either: restrict one of the two fields only, and declare a second component for the other" -}}
+      {{- else -}}
+      {{- $domOut := $dom -}}{{- $dowOut := "?" -}}
+      {{- if $domStar }}{{ $domOut = "?" }}{{ $dowOut = join "," (sortAlpha (uniq $days)) }}{{ end -}}
+      {{- if and $domStar $dowStar }}{{ $domOut = "*" }}{{ $dowOut = "?" }}{{ end -}}
+      {{- $out = printf "cron(%s %s %s %s %s *)" (replace "?" "*" $min) (replace "?" "*" $hour) $domOut (replace "?" "*" $mon) $dowOut -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $out -}}
+    # The requested CPU in millicores, or empty when it is not a quantity this
+    # Recipe reads: whole millicores, or vCPUs with at most three decimals.
+    cpu_millicores: >-
+      {{- $c := toString (optional (optional .infra "compute" dict) "cpu" "") -}}
+      {{- if regexMatch `^[0-9]+m$` $c -}}{{ atoi (trimSuffix "m" $c) }}
+      {{- else if regexMatch `^[0-9]+(\.[0-9]{1,3})?$` $c -}}
+      {{- $p := splitList "." $c -}}{{- $f := 0 -}}
+      {{- if eq (len $p) 2 }}{{ $f = atoi (substr 0 3 (printf "%s000" (index $p 1))) }}{{ end -}}
+      {{- add (mul (atoi (index $p 0)) 1000) $f -}}
+      {{- end -}}
+    # The requested memory in MiB, or empty when it is not a quantity this
+    # Recipe reads: whole Mi or Gi.
+    memory_mib: >-
+      {{- $m := toString (optional (optional .infra "compute" dict) "memory" "") -}}
+      {{- if regexMatch `^[0-9]+Mi$` $m -}}{{ atoi (trimSuffix "Mi" $m) }}
+      {{- else if regexMatch `^[0-9]+Gi$` $m -}}{{ mul (atoi (trimSuffix "Gi" $m)) 1024 }}
+      {{- end -}}
+    # The first pair meeting both, as cpu/memory, or empty when none does.
+    task_size: >-
+      {{- $found := "" -}}
+      {{- if and .locals.cpu_millicores .locals.memory_mib -}}
+      {{- $mc := atoi .locals.cpu_millicores -}}{{- $mib := atoi .locals.memory_mib -}}
+      {{- range list (list 256 (list 512 1024 2048)) (list 512 (untilStep 1024 4097 1024)) (list 1024 (untilStep 2048 8193 1024)) (list 2048 (untilStep 4096 16385 1024)) (list 4096 (untilStep 8192 30721 1024)) (list 8192 (untilStep 16384 61441 4096)) (list 16384 (untilStep 32768 122881 8192)) (list 32768 (list 61440 122880 249856)) -}}
+      {{- $cpu := index . 0 -}}
+      {{- if and (not $found) (ge (mul $cpu 1000) (mul $mc 1024)) -}}
+      {{- range index . 1 }}{{ if and (not $found) (ge . $mib) }}{{ $found = printf "%d/%d" $cpu . }}{{ end }}{{ end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $found -}}
+    task_cpu: '{{ if .locals.task_size }}{{ index (splitList "/" .locals.task_size) 0 }}{{ end }}'
+    task_memory: '{{ if .locals.task_size }}{{ index (splitList "/" .locals.task_size) 1 }}{{ end }}'
+
+  # The component publishes nothing across an edge, so nothing is emitted for
+  # one.
+  provides: {}
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # schedule and the task definition's family are named after the component, so
+  # the name is checked here against what both accept.
+  #
+  # The environment is read off the inject pipe as a map, and every variable on
+  # it becomes one entry of the container's environment, under the name the
+  # Aggregate gave it on the edge; this Recipe expects no name of its own, so
+  # none is missing whatever the edges deliver. Each value is written whole as
+  # the map's value, so a Terraform reference a neighbour publishes, such as
+  # ${module.db.address}, reaches the root configuration as an interpolation
+  # the engine evaluates there, where the neighbour's module is declared. The
+  # developer's timeout joins that map as TASK_TIMEOUT, and an edge delivering
+  # that name as well halts, naming the connection, rather than one value
+  # silently replacing the other.
+  #
+  # Every other mechanism on the pipe is refused, naming the entry, its
+  # mechanism and the connection that dictated it, so none is dropped: a file
+  # entry, because a Fargate task definition has no volume whose content it
+  # supplies itself; an arg entry, because this Recipe renders no command line,
+  # and a container's command on ECS replaces the image's default one, which is
+  # the Release's; and any custom mechanism. This block is the one
+  # terraform/server-ecs, terraform/worker-ecs, cloudformation/server-ecs,
+  # cloudformation/worker-ecs and cloudformation/task-ecs declare, word for
+  # word; a change to it is made to all six.
+  valuesMapping: |
+    {{- if not (regexMatch `^[A-Za-z0-9_-]{1,64}$` .context.instance_id) }}
+    {{- fail (printf "the component %q names its EventBridge Scheduler schedule and its Amazon ECS task definition family, and the two take up to 64 letters, digits, hyphens and underscores together: rename the component in the Aggregate to such a name" .context.instance_id) }}
+    {{- end }}
+    {{- range $mechanism, $entries := default dict .context.inject }}
+    {{- if not (has $mechanism (list "all" "env")) }}
+    {{- range $name, $_ := $entries }}
+    {{- $by := "an attachment on the component" }}
+    {{- range $alias, $edge := $.context.uses }}
+    {{- if hasKey (optional (default dict $edge.inject) $mechanism dict) $name }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+    {{- end }}
+    {{- if eq $mechanism "file" }}
+    {{- fail (printf "the component %q is handed a file at %q by %s, and an Amazon ECS task definition on Fargate offers no way to write a file's content into the container: dictate the value as an env entry in that inject block instead" $.context.instance_id $name $by) }}
+    {{- end }}
+    {{- if eq $mechanism "arg" }}
+    {{- fail (printf "the component %q is handed the command-line argument %q by %s, and this realization renders no command line: Amazon ECS takes a container's command in place of the image's default one, and that command is the Release's. Dictate the value as an env entry in that inject block instead" $.context.instance_id $name $by) }}
+    {{- end }}
+    {{- fail (printf "the component %q is handed %q under the delivery mechanism %q by %s, and this realization delivers env entries only: dictate the value as an env entry in that inject block instead" $.context.instance_id $name $mechanism $by) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- $o := optional .infra "overrides" dict }}
+    {{- $env := dict }}
+    {{- range $k, $v := optional (default dict .context.inject) "env" dict }}{{ $_ := set $env $k $v }}{{ end }}
+    {{- with optional .values "timeout" "" }}
+    {{- if hasKey $env "TASK_TIMEOUT" }}
+    {{- $by := "an attachment on the component" }}
+    {{- range $alias, $edge := $.context.uses }}
+    {{- if hasKey (optional (default dict $edge.inject) "env" dict) "TASK_TIMEOUT" }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+    {{- end }}
+    {{- fail (printf "the component %q delivers its developer value timeout to the container as TASK_TIMEOUT, and %s dictates a variable under that name as well, so one would silently replace the other: rename the variable in that inject block" $.context.instance_id $by) }}
+    {{- end }}
+    {{- $_ := set $env "TASK_TIMEOUT" (toString .) }}
+    {{- end }}
+    name: "{{ .context.instance_id }}"
+    image: {{ toJson .infra.image }}
+    cpu: "{{ .locals.task_cpu }}"
+    memory: "{{ .locals.task_memory }}"
+    environment: {{ toJson $env }}
+    schedule_expression: {{ toJson .locals.schedule_translation }}
+    schedule_expression_timezone: {{ toJson (optional $o "schedule_expression_timezone" "UTC") }}
+    cluster: {{ toJson $o.cluster }}
+    scheduler_role_arn: {{ toJson $o.scheduler_role_arn }}
+    subnet_ids: {{ toJson $o.subnet_ids }}
+    security_groups: {{ toJson $o.vpc_security_groups }}
+    assign_public_ip: {{ optional $o "assign_public_ip" false }}
+    execution_role_arn: {{ toJson $o.execution_role_arn }}
+    {{- with optional $o "task_role_arn" "" }}
+    task_role_arn: {{ toJson . }}
+    {{- end }}
+    {{- with optional $o "awslogs_group" "" }}
+    awslogs_group: {{ toJson . }}
+    {{- end }}

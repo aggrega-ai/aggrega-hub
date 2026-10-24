@@ -1,0 +1,295 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: function-lambda
+  version: 1.0.0
+  description: >
+    The generic event-driven compute primitive as one AWS Lambda function run
+    from a container image, rendered as a CloudFormation fragment the provider
+    assembles into the boundary's stack. Reach for it where the target is an
+    AWS account; reach for helm/function-knative or helm/function-keda on
+    Kubernetes.
+
+    Only the function is emitted, with a published version holding
+    provisioned concurrency for a floor: no role, log group, trigger, URL or
+    event source mapping: what invokes it, its role and its log group are the
+    operator's, the role required under infra.overrides.
+
+    The image is in Amazon ECR, in the function's Region, and implements
+    Lambda's runtime API — an AWS base image for Lambda, or a linux/amd64
+    image with a runtime interface client; one serving HTTP carries an adapter
+    forwarding Lambda's invocations. An image outside ECR is refused by name.
+    compute.memory is the function's memory, max_replicas its reserved
+    concurrency, and a min_replicas above zero provisioned concurrency on a
+    version published at each change, serving invocations of that version; as
+    a replaced version holds its share until deleted, the floor is half the
+    ceiling at most. port, compute.cpu, control_plane_present and scaler are
+    not read: Lambda reaches the image through its runtime API, not a port,
+    allots CPU from memory, and needs no control plane or scaler.
+
+    Each env entry an edge dictates becomes a variable of the function's
+    environment, its value written whole; runtime arrives as
+    FUNCTION_RUNTIME. A name Lambda reserves or cannot take, or
+    FUNCTION_RUNTIME, is refused by name, and so are file, arg and other
+    entries. It is written as a fragment, as the catalog writes its
+    CloudFormation Recipes.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: cloudformation
+  implements: core/compute/function:1.0.0
+
+  # The resources' logical ids, derived from this instance's own name so that
+  # two functions deployed into one stack describe two functions rather than
+  # one. A logical id is unique within a CloudFormation template and admits
+  # only letters and digits, so the instance name's separators are read as word
+  # boundaries and each word is capitalised: instance resize-image names the
+  # function ResizeImage.
+  #
+  # The version holding provisioned concurrency is named after the function and
+  # a digest of what a version captures — the image, the memory, the
+  # environment and the overrides the function is configured with — because
+  # CloudFormation publishes a version only when it creates the version's
+  # resource: a resource whose logical id never changed would keep serving the
+  # code and configuration it was first published with. A change to any of them
+  # therefore names a new version, which CloudFormation publishes before it
+  # deletes the old one. A value a neighbour publishes as an intrinsic enters
+  # the digest as written, so a change in what the intrinsic resolves to alone
+  # publishes no new version.
+  #
+  # The requested memory in MiB, or empty when it is not a quantity this Recipe
+  # reads: whole Mi or Gi. Lambda's memory setting is in MB, one per MiB
+  # requested. This local is the one terraform/function-lambda declares, word
+  # for word, and a change to it is made to both.
+  locals:
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+    memory_mib: >-
+      {{- $m := toString (optional (optional .infra "compute" dict) "memory" "") -}}
+      {{- if regexMatch `^[0-9]+Mi$` $m -}}{{ atoi (trimSuffix "Mi" $m) }}
+      {{- else if regexMatch `^[0-9]+Gi$` $m -}}{{ mul (atoi (trimSuffix "Gi" $m)) 1024 }}
+      {{- end -}}
+
+  # The component publishes nothing across an edge, so nothing is emitted for
+  # one, and the fragment carries no provides of its own.
+  provides: {}
+
+  # This Recipe reads from infra.overrides:
+  #   Role             - string (the function's Role), required
+  #   LogGroup         - string (the function's LoggingConfig.LogGroup)
+  #   Timeout          - integer (the function's Timeout; seconds, 1 to 900; default 3)
+  #   SubnetIds        - []string (the function's VpcConfig.SubnetIds)
+  #   SecurityGroupIds - []string (the function's VpcConfig.SecurityGroupIds)
+  #
+  # The key names are the CloudFormation property names rather than a separate
+  # Aggrega spelling, because each is passed through to the resource unchanged
+  # and the property name is what a reader matches against the resource
+  # documentation, as the catalog's other CloudFormation Recipes name theirs.
+  #
+  # Role is the function's execution role, which Lambda assumes to run it and
+  # which the function's code calls AWS with; it must be allowed to pull the
+  # image from its ECR repository and to write the function's logs. It has no
+  # default: it is provisioned outside this Release, no account-independent
+  # value exists for it, and this Recipe never creates a role for the operator.
+  # LogGroup names the CloudWatch Logs log group the function writes to; while
+  # it is unset, Lambda writes to /aws/lambda/ and the function's name, creating
+  # that group itself where the role allows it. Timeout is how long Lambda lets
+  # one invocation run before stopping it, and Lambda's own default of three
+  # seconds stands while it is unset. SubnetIds and SecurityGroupIds place the
+  # function in the operator's VPC, so it reaches what lives there, and are set
+  # together or not at all; with neither, the function runs outside any VPC of
+  # the operator's.
+  #
+  # The fragment sets no FunctionName, so CloudFormation names the function, as
+  # cloudformation/server-ecs leaves the service's name to it. Lambda's own
+  # defaults stand for every property the fragment leaves out: among them, the
+  # function runs on x86_64, so the image is built for linux/amd64, and no
+  # tracing, dead-letter target or file system is set.
+  #
+  # Target-expected names: the image is the Release's, so no upstream
+  # documentation names a spelling for the developer's runtime value. It is
+  # delivered under the name the Kubernetes realizations deliver it under, for
+  # the application's own code to read.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read:
+  #   honoured — values.runtime as above; infra.image (required, in ECR);
+  #     infra.compute.memory as MemorySize; infra.max_replicas as
+  #     ReservedConcurrentExecutions; infra.min_replicas above zero as the
+  #     version's ProvisionedConcurrentExecutions; and the overrides above.
+  #   refused — an image outside ECR; a memory this Recipe cannot read or
+  #     Lambda cannot give; a floor above half the ceiling; an edge's env entry
+  #     under a name Lambda reserves or cannot take, or under
+  #     FUNCTION_RUNTIME; and an edge's file, arg or custom-mechanism entry, as
+  #     the comment above the artifact describes.
+  #   not read — infra.port, infra.compute.cpu, infra.control_plane_present and
+  #     infra.scaler, for the reasons the description gives.
+  assertions:
+    # This component packages no upstream product, so it holds no default image
+    # to fall back to: the Release names the one it runs.
+    image_supplied: >-
+      {{- if not (optional .infra "image" "") -}}
+      {{- fail "this realization runs an image the Release supplies, because the generic compute primitive packages no software and therefore holds no default: set infra.image to the container image serving the function in the Release" -}}
+      {{- end -}}
+    # Lambda creates a function only from an image in an Amazon ECR repository
+    # in the function's own Region, and not through ECR's FIPS endpoints. The
+    # Region is the stack's, which a build does not know, so the
+    # repository's Region is the operator's to match.
+    image_in_ecr: >-
+      {{- $i := toString (optional .infra "image" "") -}}
+      {{- if not (regexMatch `^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com(\.cn)?/[a-z0-9._/-]+(:[A-Za-z0-9._-]{1,128}|@sha256:[a-f0-9]{64})?$` $i) -}}
+      {{- fail (printf "infra.image is %q, and AWS Lambda runs a container image only from an Amazon ECR repository in the function's own Region, named as 123456789012.dkr.ecr.us-east-1.amazonaws.com/repository:tag: push the image to such a repository and set infra.image in the Release to its URI" $i) -}}
+      {{- end -}}
+    memory_fits_lambda: >-
+      {{- $m := toString (optional (optional .infra "compute" dict) "memory" "") -}}
+      {{- if not .locals.memory_mib -}}
+      {{- fail (printf "infra.compute.memory is %q, and this Recipe reads it as a Kubernetes memory quantity in whole mebibytes or gibibytes, such as 128Mi or 1Gi: set infra.compute.memory in the Release to one of those forms" $m) -}}
+      {{- end -}}
+      {{- if or (lt (atoi .locals.memory_mib) 128) (gt (atoi .locals.memory_mib) 10240) -}}
+      {{- fail (printf "infra.compute.memory is %q, and a Lambda function takes from 128 to 10240 MB of memory: set infra.compute.memory in the Release to a quantity between 128Mi and 10Gi" $m) -}}
+      {{- end -}}
+    # Provisioned concurrency is drawn from the function's reserved concurrency,
+    # and a version's share cannot exceed what the other versions leave of it.
+    # CloudFormation publishes the new version before it deletes the old one,
+    # so for that moment both hold the floor: twice the floor must fit the
+    # ceiling, or the stack update that changes the function fails.
+    floor_within_ceiling: >-
+      {{- if gt (mul 2 (int .infra.min_replicas)) (int .infra.max_replicas) -}}
+      {{- fail (printf "infra.min_replicas is %d and infra.max_replicas %d, and on Lambda the floor is provisioned concurrency drawn from the reserved concurrency the ceiling sets; CloudFormation publishes a changed function's new version before it deletes the old one, so both hold the floor at once and twice the floor must fit the ceiling: set infra.min_replicas in the Release to at most half of infra.max_replicas" (int .infra.min_replicas) (int .infra.max_replicas)) -}}
+      {{- end -}}
+    role_supplied: >-
+      {{- $v := optional (optional .infra "overrides" dict) "Role" "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release runs its function under an execution role that already exists, which Lambda assumes to run it and which must be allowed to pull the image and write the function's logs, but infra.overrides.Role is %s: set infra.overrides.Role in the Release to the ARN of an existing role" (toJson $v)) -}}
+      {{- end -}}
+    optional_overrides_typed: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "LogGroup" -}}
+      {{- $v := index $o "LogGroup" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "infra.overrides.LogGroup is %s, and this Recipe reads it as the name of a CloudWatch Logs log group: set it in the Release to that name, or remove it" (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "Timeout" -}}
+      {{- $t := index $o "Timeout" -}}
+      {{- if not (and (not (typeIs "string" $t)) (regexMatch `^[0-9]+$` (toString $t)) (ge (int $t) 1) (le (int $t) 900)) -}}
+      {{- fail (printf "infra.overrides.Timeout is %s, and Lambda takes a function's time limit in whole seconds from 1 to 900: set it in the Release to such a number, or remove it to take Lambda's default of 3" (toJson $t)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if ne (hasKey $o "SubnetIds") (hasKey $o "SecurityGroupIds") -}}
+      {{- fail "this Release names only one of infra.overrides.SubnetIds and infra.overrides.SecurityGroupIds, and a Lambda function joins a VPC through both: set the two together in the Release, or remove both to run the function outside the operator's VPC" -}}
+      {{- end -}}
+      {{- range $k, $max := dict "SubnetIds" 16 "SecurityGroupIds" 5 -}}
+      {{- if hasKey $o $k -}}
+      {{- $s := index $o $k -}}
+      {{- $ok := and (kindIs "slice" $s) (gt (len $s) 0) (le (len $s) $max) -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) .) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.%s is %s, and this Recipe reads it as a list of one to %d IDs of existing resources in the operator's VPC: set it in the Release to such a list, or remove it together with its pair" $k (toJson $s) $max) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The environment is read off the inject pipe as a map, and every variable on
+  # it becomes one variable of the function's environment, under the name the
+  # Aggregate gave it on the edge; this Recipe expects no name of its own, so
+  # none is missing whatever the edges deliver. Each value is written as the
+  # variable's whole value. A value that is a CloudFormation short-form
+  # intrinsic — the Fn::GetAtt a neighbour in the same stack publishes — is
+  # written bare, so the template reads it as that intrinsic; the provider
+  # replaces a value a neighbour publishes from another stack with an
+  # Fn::ImportValue, and it can replace only a whole value. Any other value is
+  # written as a quoted string, so text such as a port number reaches the
+  # variable as text. The developer's runtime joins that map as
+  # FUNCTION_RUNTIME, and an edge delivering that name as well halts, naming
+  # the connection, rather than one value silently replacing the other. Lambda
+  # sets a list of variables itself and refuses a function configuration naming
+  # any of them, and takes a name only when it starts with a letter, is two
+  # characters long at least and holds letters, digits and underscores alone,
+  # so an edge dictating any other name halts here, naming the connection,
+  # rather than when the stack is applied.
+  #
+  # Every other mechanism on the pipe is refused, naming the entry, its
+  # mechanism and the connection that dictated it, so none is dropped: a file
+  # entry, because a Lambda function's configuration offers no way to write a
+  # file's content into the container; an arg entry, because this Recipe
+  # renders no command line, and a function's command on Lambda replaces the
+  # image's default one, which is the Release's; and any custom mechanism. This
+  # block is the one terraform/function-lambda declares, word for word; a
+  # change to it is made to both.
+  artifacts:
+    template.yaml: |
+      {{- range $mechanism, $entries := default dict .context.inject }}
+      {{- if not (has $mechanism (list "all" "env")) }}
+      {{- range $name, $_ := $entries }}
+      {{- $by := "an attachment on the component" }}
+      {{- range $alias, $edge := $.context.uses }}
+      {{- if hasKey (optional (default dict $edge.inject) $mechanism dict) $name }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+      {{- end }}
+      {{- if eq $mechanism "file" }}
+      {{- fail (printf "the component %q is handed a file at %q by %s, and a Lambda function's configuration offers no way to write a file's content into the container: dictate the value as an env entry in that inject block instead" $.context.instance_id $name $by) }}
+      {{- end }}
+      {{- if eq $mechanism "arg" }}
+      {{- fail (printf "the component %q is handed the command-line argument %q by %s, and this realization renders no command line: Lambda takes a function's command in place of the image's default one, and that command is the Release's. Dictate the value as an env entry in that inject block instead" $.context.instance_id $name $by) }}
+      {{- end }}
+      {{- fail (printf "the component %q is handed %q under the delivery mechanism %q by %s, and this realization delivers env entries only: dictate the value as an env entry in that inject block instead" $.context.instance_id $name $mechanism $by) }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- $env := dict }}
+      {{- range $k, $v := optional (default dict .context.inject) "env" dict }}{{ $_ := set $env $k $v }}{{ end }}
+      {{- range $k, $_ := $env }}
+      {{- $by := "an attachment on the component" }}
+      {{- range $alias, $edge := $.context.uses }}
+      {{- if hasKey (optional (default dict $edge.inject) "env" dict) $k }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+      {{- end }}
+      {{- if eq $k "FUNCTION_RUNTIME" }}
+      {{- fail (printf "the component %q delivers its developer value runtime to the container as FUNCTION_RUNTIME, and %s dictates a variable under that name as well, so one would silently replace the other: rename the variable in that inject block" $.context.instance_id $by) }}
+      {{- end }}
+      {{- if has $k (list "_HANDLER" "_X_AMZN_TRACE_ID" "AWS_DEFAULT_REGION" "AWS_REGION" "AWS_EXECUTION_ENV" "AWS_LAMBDA_FUNCTION_NAME" "AWS_LAMBDA_FUNCTION_MEMORY_SIZE" "AWS_LAMBDA_FUNCTION_VERSION" "AWS_LAMBDA_INITIALIZATION_TYPE" "AWS_LAMBDA_LOG_GROUP_NAME" "AWS_LAMBDA_LOG_STREAM_NAME" "AWS_ACCESS_KEY" "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY" "AWS_SESSION_TOKEN" "AWS_LAMBDA_RUNTIME_API" "LAMBDA_TASK_ROOT" "LAMBDA_RUNTIME_DIR" "AWS_LAMBDA_MAX_CONCURRENCY" "AWS_LAMBDA_METADATA_API" "AWS_LAMBDA_METADATA_TOKEN") }}
+      {{- fail (printf "the component %q is handed the variable %q by %s, and Lambda reserves that name and sets it in every function itself, so it refuses a function naming it: rename the variable in that inject block" $.context.instance_id $k $by) }}
+      {{- end }}
+      {{- if not (regexMatch `^[A-Za-z][A-Za-z0-9_]+$` $k) }}
+      {{- fail (printf "the component %q is handed the variable %q by %s, and Lambda takes a variable name that starts with a letter, is two characters long at least and holds only letters, digits and underscores: rename the variable in that inject block" $.context.instance_id $k $by) }}
+      {{- end }}
+      {{- end }}
+      {{- $_ := set $env "FUNCTION_RUNTIME" (toString .values.runtime) }}
+      {{- $o := optional .infra "overrides" dict }}
+      Resources:
+        {{ .locals.logical_id }}:
+          Type: AWS::Lambda::Function
+          Properties:
+            PackageType: Image
+            Code:
+              ImageUri: {{ toJson .infra.image }}
+            Role: {{ toJson $o.Role }}
+            MemorySize: {{ .locals.memory_mib }}
+            {{- with optional $o "Timeout" "" }}
+            Timeout: {{ . }}
+            {{- end }}
+            ReservedConcurrentExecutions: {{ .infra.max_replicas }}
+            Environment:
+              Variables:
+                {{- range $k, $v := $env }}
+                {{ toJson $k }}: {{ if regexMatch `^!(Ref|GetAtt|Sub|ImportValue|GetStackOutput|Join|Select|Split|FindInMap|Base64|Cidr|GetAZs|If) ` (toString $v) }}{{ $v }}{{ else }}{{ toJson (toString $v) }}{{ end }}
+                {{- end }}
+            {{- with optional $o "LogGroup" "" }}
+            LoggingConfig:
+              LogGroup: {{ toJson . }}
+            {{- end }}
+            {{- if hasKey $o "SubnetIds" }}
+            VpcConfig:
+              SubnetIds: {{ toJson $o.SubnetIds }}
+              SecurityGroupIds: {{ toJson $o.SecurityGroupIds }}
+            {{- end }}
+        {{- if gt (int .infra.min_replicas) 0 }}
+        {{ .locals.logical_id }}Version{{ trunc 12 (sha256sum (toJson (list .infra.image .locals.memory_mib $env $o))) }}:
+          Type: AWS::Lambda::Version
+          Properties:
+            FunctionName: !Ref {{ .locals.logical_id }}
+            ProvisionedConcurrencyConfig:
+              ProvisionedConcurrentExecutions: {{ .infra.min_replicas }}
+        {{- end }}

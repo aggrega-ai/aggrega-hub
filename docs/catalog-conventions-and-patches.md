@@ -1151,9 +1151,9 @@ after the managed product's own stem, so the RDS realizations still sort togethe
 
 **Where no realization stands the component up with nothing already in place, none
 of them takes the bare name and every one carries a distinguisher.**
-`core/compute/function` is realized only through a scaling control plane, so its
-Recipes are `function-keda` and `function-knative` and there is no plain
-`function` to be had.
+`core/compute/function` is realized only through a scaling control plane or a
+managed service, so its Recipes are `function-keda`, `function-knative` and
+`function-lambda` and there is no plain `function` to be had.
 
 #### What a distinguisher must not be
 
@@ -2073,9 +2073,12 @@ and `file` entries as read-only files from one ConfigMap, each mounted by
 subPath, refusing a path that is not absolute or that lies beneath another
 entry's; their Amazon ECS Recipes deliver `env` entries and refuse `file`,
 because a Fargate task definition offers no volume whose content it supplies
-itself. Every one refuses `arg`, because none renders a command line: each
-target takes what a container is given to run in place of the image's default
-command, and that command is the Release's. A dictated name equal to
+itself; and the function's AWS Lambda Recipes deliver `env` entries and refuse
+`file`, because a function's configuration offers no way to write one, and
+refuse a dictated name Lambda reserves for itself or cannot take. Every one
+refuses `arg`, because none renders a command line: each target takes what a
+container is given to run in place of the image's default command, and that
+command is the Release's. A dictated name equal to
 `WORKER_CONCURRENCY` or `WORKER_QUEUE_DEPTH_HINT` while the worker's value is
 set, to `TASK_TIMEOUT` while the task's timeout is set, or to `FUNCTION_RUNTIME`
 halts.
