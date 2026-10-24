@@ -17,22 +17,23 @@ metadata:
     the scaling resource.
 
     This is the queue-paced of the primitive's two realizations: work arrives on
-    an event source the Release names, rather than as an inbound call. The
-    event source is an operator value rather than a fixed property of the
-    component because the component is generic — it names no source of its own,
-    which is what leaves both pacings open to it. Where work arrives as an
-    inbound call, the Manifest maps the component to the request-paced
-    realization instead. The two are chosen there and never both at once.
+    an event source the Release names, rather than as an inbound call. Where
+    work arrives as an inbound call, the Manifest maps the component to the
+    request-paced realization instead. The two are chosen there and never both
+    at once.
 
     No Service definition and no provides contract are emitted, because the
     component declares none and because the event source invokes the function
-    rather than a caller reaching it. Where the event source requires
-    credentials to read its depth, the Release names an existing
-    trigger-authentication resource in infra.scaler.authentication_ref and the
-    recipe carries that name through without resolving it. The KEDA control
-    plane is a runtime prerequisite: the build halts unless the operator affirms
-    it is installed (infra.control_plane_present), so no custom resource is
-    emitted into a cluster that cannot reconcile it.
+    rather than a caller reaching it. The KEDA control plane is a runtime
+    prerequisite: the build halts unless the operator affirms it is installed
+    (infra.control_plane_present), so no custom resource is emitted into a
+    cluster that cannot reconcile it.
+
+    An edge's inject block dictates what reaches the container, since the image
+    is the Release's own code: each env entry a variable under that name, beside
+    FUNCTION_RUNTIME, which no edge may dictate, and each file entry a read-only
+    file from a ConfigMap. An arg entry, or any other mechanism, is refused by
+    name: the recipe renders no command line.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -51,6 +52,13 @@ spec:
   # infra keys read here: image, port, compute, min_replicas, max_replicas,
   # control_plane_present, scaler.type, scaler.metadata,
   # scaler.authentication_ref, overrides.annotations.
+  #
+  # The event source is an operator value rather than a fixed property of the
+  # component because the component is generic — it names no source of its own,
+  # which is what leaves both pacings open to it. Where the event source
+  # requires credentials to read its depth, the Release names an existing
+  # trigger-authentication resource in infra.scaler.authentication_ref and the
+  # recipe carries that name through without resolving it.
   #
   # Target-expected names: the image is the Release's, so no upstream
   # documentation names a spelling for the developer's runtime value. The recipe
@@ -106,7 +114,59 @@ spec:
       {{- if not (optional $compute "memory" "") -}}
       {{- fail "this Release sets part of infra.compute and leaves compute.memory empty, so the rendered container would carry no memory request or limit: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
       {{- end -}}
+  # Delivery from an edge. The image is the Release's own code, so no name this
+  # Recipe could choose is one that code reads: each of the component's
+  # connections dictates its own delivery in its inject block, and an edge that
+  # dictates nothing delivers nothing. The pipe is read as a map. Every env
+  # entry becomes a container variable under the name the edge gave it, its
+  # value written whole, after the runtime; an entry under the runtime's name
+  # halts, naming the connection. Every file entry becomes a read-only file at
+  # the path the edge names: one ConfigMap holds the entries, emitted only while
+  # there is one, and each is mounted by subPath, so a path that is not
+  # absolute, or one lying beneath another entry's path, is refused. An arg
+  # entry is refused, because this Recipe renders no command line: Kubernetes
+  # takes a container's arguments in place of the image's default command,
+  # which is the Release's. Any other mechanism is refused too. A refusal names
+  # the entry, its mechanism and the connection that dictated it.
+  #
+  # The block reading the pipe is the one helm/server, helm/worker and
+  # helm/task declare, word for word, and helm/function-knative adapts to the
+  # Knative Service it renders; a change to it is made to all five.
   workload: |
+    {{- $inject := default dict .context.inject }}
+    {{- $env := optional $inject "env" dict }}
+    {{- $files := optional $inject "file" dict }}
+    {{- range $mechanism, $entries := $inject }}
+    {{- if not (has $mechanism (list "all" "env" "file")) }}
+    {{- range $name, $_ := $entries }}
+    {{- $by := "an attachment on the component" }}
+    {{- range $alias, $edge := $.context.uses }}
+    {{- if hasKey (optional (default dict $edge.inject) $mechanism dict) $name }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+    {{- end }}
+    {{- if eq $mechanism "arg" }}
+    {{- fail (printf "the component %q is handed the command-line argument %q by %s, and this realization renders no command line: Kubernetes takes a container's arguments in place of the image's default command, and that command is the Release's. Dictate the value as an env or a file entry in that inject block instead" $.context.instance_id $name $by) }}
+    {{- end }}
+    {{- fail (printf "the component %q is handed %q under the delivery mechanism %q by %s, and this realization delivers env and file entries only: dictate the value as an env or a file entry in that inject block instead" $.context.instance_id $name $mechanism $by) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- range $path, $_ := $files }}
+    {{- if not (hasPrefix "/" $path) }}
+    {{- fail (printf "the component %q is handed a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $.context.instance_id $path) }}
+    {{- end }}
+    {{- range $other, $_ := $files }}
+    {{- if hasPrefix (printf "%s/" $path) $other }}
+    {{- fail (printf "the component %q is handed a file at %q and another at %q beneath it, and one path cannot be both a file and a directory: dictate the two files at paths neither of which lies beneath the other" $.context.instance_id $path $other) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if hasKey $env "FUNCTION_RUNTIME" }}
+    {{- $by := "an attachment on the component" }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if hasKey (optional (default dict $edge.inject) "env" dict) "FUNCTION_RUNTIME" }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+    {{- end }}
+    {{- fail (printf "the component %q delivers its developer value runtime to the container as FUNCTION_RUNTIME, and %s dictates a variable under that name as well, so one would silently replace the other: rename the variable in that inject block" .context.instance_id $by) }}
+    {{- end }}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # A resident workload the scaling resource below drives. It starts at the
@@ -121,6 +181,20 @@ spec:
           http: {{ .infra.port }}
         variables:
           FUNCTION_RUNTIME: "{{ .values.runtime }}"
+          {{- range $k, $v := $env }}
+          {{ toJson $k }}: {{ toJson $v }}
+          {{- end }}
+        {{- if $files }}
+        volumeMounts:
+          {{- $i := 0 }}
+          {{- range $path, $_ := $files }}
+          - name: inject-files
+            path: {{ toJson $path }}
+            subPath: "file-{{ $i }}"
+            readonly: true
+          {{- $i = add $i 1 }}
+          {{- end }}
+        {{- end }}
         resources:
           requests:
             cpu: "{{ .infra.compute.cpu }}"
@@ -128,11 +202,42 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+    {{- if $files }}
+    volumes:
+      inject-files:
+        configmap:
+          source: "{{ .context.rendered_name }}-files"
+    {{- end }}
   # The output filename carries the realization's own name rather than the bare
   # resource kind, because an artifact key is the output path used as written:
   # two realizations sharing a key cannot sit in one boundary, and the build
   # halts naming the path when they do.
+  #
+  # function-keda-files.configmap.yaml holds the file entries an edge dictates,
+  # keyed file-0, file-1 and so on in path order, the keys the workload's mounts
+  # read. It is emitted only while an edge dictates a file, so a build with none
+  # renders nothing there. The pod mounts it by name, which resolves only in the
+  # pod's own namespace, so it carries the namespace the Release declares for
+  # the component through the aggrega.ai/namespace annotation, as the
+  # workload's own resources do, and none where it declares none.
   artifacts:
+    function-keda-files.configmap.yaml: |
+      {{- $files := optional (default dict .context.inject) "file" dict }}
+      {{- if $files -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-files
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+        namespace: "{{ . }}"
+        {{- end }}
+      data:
+        {{- $i := 0 }}
+        {{- range $path, $v := $files }}
+        file-{{ $i }}: {{ toJson $v }}
+        {{- $i = add $i 1 }}
+        {{- end }}
+      {{- end }}
     function-scaledobject.yaml: |
       apiVersion: keda.sh/v1alpha1
       kind: ScaledObject
