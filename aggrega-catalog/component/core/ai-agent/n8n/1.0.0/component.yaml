@@ -15,13 +15,14 @@ metadata:
     optionally, the workflow definition itself: supplied in the Aggregate, it
     is imported before the platform starts and on every start, so the platform
     runs the workflow as authored, whatever its data directory holds. The
-    catalog pins no image for it: which n8n build to run is named by the
-    Release, and until that Release sets `infra.image` the build halts naming
-    the container image and renders nothing.
+    catalog pins no image: the Release names it in `infra.image`, and the
+    build halts naming the container image until it does.
 
     The model, and each tool and store wired into the optional `tools` and
     `vector_store` sockets, reach the platform as environment variables, each
-    credential by reference; each socket's comments and slots name them.
+    credential by reference; each socket's comments and slots name them. A
+    connection writing an `inject:` block receives the names it dictates
+    instead of those its target's values fill; its credentials stay.
 
     A workflow reads these through n8n's $env only where the Aggregate sets
     `values.allow_env_access_in_nodes` to true. By default the Recipes keep
@@ -49,10 +50,16 @@ spec:
     # endpoint, which the Recipe reads the same way from either. The flow
     # itself names the model, which through a gateway is an alias its map
     # publishes. The Recipes deliver that endpoint as OPENAI_BASE_URL, and a
-    # key attached on the connection as OPENAI_API_KEY.
+    # key attached on the connection as OPENAI_API_KEY. n8n reads neither
+    # itself: a workflow reads them through $env, so OPENAI_BASE_URL is a
+    # default, and a connection writing an inject block receives the values it
+    # dictates, under the names it gives, in its place, as variables a
+    # workflow reads through $env or as files at the paths it names; the key
+    # stays.
     model:
       selector: "component.aggrega.ai/category in (ai-model, gateway), model.aggrega.ai/api"
       required: true
+      inject: [env, file]
       # A statement about this connection's target, authored on the connection:
       # the model it reaches takes no credential. It changes nothing this
       # component renders.
@@ -83,13 +90,18 @@ spec:
     # and only where allow_env_access_in_nodes lifts n8n's block on it. So the
     # Recipe delivers each connection under variables named for its alias,
     # upper-cased with every hyphen an underscore: a tool wired under the alias
-    # docs-search arrives as AGGREGA_TOOL_DOCS_SEARCH_URL. Two aliases that
-    # differ only in letter case, or in a hyphen against an underscore, would
-    # deliver one variable twice, and the component's assertion halts the
+    # docs-search arrives as AGGREGA_TOOL_DOCS_SEARCH_URL. Those names are
+    # defaults: a connection writing an inject block receives the values it
+    # dictates, under the names it gives, in place of the address and the
+    # header variables, read through $env as every other variable, or as files
+    # at the paths it names; the credential and an endpoint secret stay. Two
+    # aliases that differ only in letter case, or in a hyphen against an
+    # underscore, would deliver one variable twice, and the Recipes halt the
     # build naming both; the vector_store socket's aliases are held to the
     # same.
     tools:
       selector: "component.aggrega.ai/category=ai-tool, tool.aggrega.ai/transport=http"
+      inject: [env, file]
       # A statement about this connection's target, authored on the
       # connection: the tool it reaches takes no credential. It changes
       # nothing this component renders.
@@ -114,7 +126,8 @@ spec:
             credential_header: as Bearer <credential> under Authorization, and
             as the whole value of any other header. When attached, the Recipe
             delivers it as AGGREGA_TOOL_<ALIAS>_CREDENTIAL (a Kubernetes
-            secretKeyRef on helm, the inject pipe on compose), and the header as
+            secretKeyRef on helm, the inject pipe on compose), and, on a
+            connection writing no inject block, the header as
             AGGREGA_TOOL_<ALIAS>_CREDENTIAL_HEADER where the tool publishes one.
         endpoint:
           selector: "feature.aggrega.ai/kind=secret"
@@ -142,9 +155,12 @@ spec:
     # PGVector node takes no connection string: it reaches the store through a
     # Postgres credential with a field for each part and the password, and a
     # field written as an expression reads its variable through $env, held by
-    # the same block as every other read.
+    # the same block as every other read. Those names are defaults, as on the
+    # tool socket: a connection writing an inject block receives what it
+    # dictates instead of the address and the parts, and its credential stays.
     vector_store:
       selector: "datastore.aggrega.ai/engine in (vector, semantic-memory, search)"
+      inject: [env, file]
       # A statement about this connection's target, authored on the
       # connection: the store it reaches takes no credential. It changes
       # nothing this component renders.
@@ -250,15 +266,6 @@ spec:
   # before a Recipe binds, so it holds whichever Recipe renders this component;
   # a self-hosted target draws nothing. The list names every socket of this
   # component that declares unauthenticated.
-  #
-  # The Recipes deliver a tools or vector_store connection under its alias
-  # upper-cased with every character other than a letter or a digit an
-  # underscore, so two aliases of one socket that differ only in letter case,
-  # or in a hyphen against an underscore, would deliver one variable twice. On
-  # Kubernetes, where one connection's address may be a plain variable and the
-  # other's a reference to a Secret, the container would carry the name twice
-  # and keep the later, so the build halts here instead, naming both
-  # connections, whichever Recipe binds.
   assertions:
     managed_target_needs_a_credential: >-
       {{- range $socket := list "model" "tools" "vector_store" -}}
@@ -268,18 +275,5 @@ spec:
       {{- if and $managed (not (hasKey $connection.features "credential")) (not $optedOut) -}}
       {{- fail (printf "the %s connection %s of %q reaches %q, whose component.aggrega.ai/hosting label is managed, with no credential: attach one under credential on that connection, or set unauthenticated: true in its values" $socket $alias $.metadata.instance_id $connection.target) -}}
       {{- end -}}
-      {{- end -}}
-      {{- end -}}
-    connection_aliases_deliver_apart: >-
-      {{- range $socket := list "tools" "vector_store" -}}
-      {{- $prefix := "AGGREGA_TOOL_" -}}
-      {{- if eq $socket "vector_store" -}}{{- $prefix = "AGGREGA_VECTOR_STORE_" -}}{{- end -}}
-      {{- $seen := dict -}}
-      {{- range $alias, $connection := (optional $.uses $socket dict) -}}
-      {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" -}}
-      {{- if hasKey $seen $name -}}
-      {{- fail (printf "the %s connections %s and %s of %q would both be delivered as %s%s_URL, because a connection's variables are named for its alias upper-cased with every character other than a letter or a digit an underscore: rename one of the two" $socket (index $seen $name) $alias $.metadata.instance_id $prefix $name) -}}
-      {{- end -}}
-      {{- $_ := set $seen $name $alias -}}
       {{- end -}}
       {{- end -}}

@@ -23,7 +23,10 @@ metadata:
     attached on that connection as OPENAI_API_KEY. Each `vector_store` and
     `tools` connection arrives as the Component describes, every credential
     by a secretKeyRef, and LANGFLOW_SSRF_ALLOWED_HOSTS admits the hosts of
-    both.
+    both. A `vector_store` connection writing an `inject:` block receives the
+    names it dictates in place of its address and connection-string
+    variables, as variables a flow reads as global variables or as files
+    mounted at the paths it names; its credential stays.
 
     With `values.metrics_enabled` true, LANGFLOW_PROMETHEUS_PORT turns on
     Langflow's metrics at port 9090, which checks no caller and joins the
@@ -106,6 +109,34 @@ spec:
   artifacts:
     langflow-flow:
       $import: LangflowFlow#/artifacts/FlowFile
+    # The ConfigMap holding the file entries the connections dictate, keyed
+    # file-0, file-1 and so on in path order, the keys the workload's mounts
+    # read. It is emitted only while a connection dictates a file, so a build
+    # with none renders nothing here, and it carries the namespace the Release
+    # declares for the component, as the flow's ConfigMap does.
+    langflow-files.configmap.yaml: |
+      {{- $pipeFiles := optional (default dict .context.inject) "file" dict }}
+      {{- $files := dict }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- range $path, $from := (optional (default dict $edge.inject) "file" dict) }}
+      {{- $_ := set $files $path (optional $pipeFiles $path "") }}
+      {{- end }}
+      {{- end }}
+      {{- if $files -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-files
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+        namespace: "{{ . }}"
+        {{- end }}
+      data:
+        {{- $i := 0 }}
+        {{- range $path, $v := $files }}
+        file-{{ $i }}: {{ toJson $v }}
+        {{- $i = add $i 1 }}
+        {{- end }}
+      {{- end }}
   # The Workload becomes a Deployment serving the Langflow editor on a ClusterIP
   # Service, backed by a persistent volume mounted at the platform's config
   # directory. The recipe directs the flow database into that config directory,
@@ -195,6 +226,15 @@ spec:
   # metrics stay off, Langflow's own default. The probes keep the editor's
   # port: an http probe goes to the container port whose name sorts first, and
   # `http` sorts before `metrics`.
+  #
+  # A vector_store connection's variables are defaults, because a flow reads
+  # them under whatever names its fields give: a connection writing an inject
+  # block receives exactly the names it dictates instead of
+  # AGGREGA_VECTOR_STORE_<ALIAS>_URL and _CONNECTION_STRING, read by a flow the
+  # same way, through a field naming a global variable of that name, while its
+  # credential stays and its host stays in LANGFLOW_SSRF_ALLOWED_HOSTS. The
+  # model's and the tools' variables are the platform's own reading, so those
+  # sockets admit no inject block.
   workload: |
     {{- $configDir := "/app/langflow-data" -}}
     {{- $flowsPath := "/app/flows" -}}
@@ -256,6 +296,130 @@ spec:
     {{- $allowedHosts = append $allowedHosts $host -}}
     {{- end -}}
     {{- end -}}
+    {{- /*
+      A connection that writes no inject block receives the defaults above. A
+      vector_store connection that writes one receives exactly what it
+      dictates instead, read off the inject pipe as a map: no
+      AGGREGA_VECTOR_STORE_<ALIAS>_URL and no _CONNECTION_STRING. Its
+      credential stays as _CREDENTIAL, and its host stays in
+      LANGFLOW_SSRF_ALLOWED_HOSTS, which the platform reads itself.
+
+      A dictated env entry becomes a container variable under the name it
+      gives, after every variable this recipe names, which a flow reads
+      through a field naming a global variable of that name; a dictated file
+      entry a read-only file at the absolute path it names, held in one
+      ConfigMap and mounted by subPath, so a path that is not absolute, or one
+      lying beneath another file's path, is refused. An arg entry is refused,
+      because this recipe renders no command line: Kubernetes takes a
+      container's arguments in place of the image's default command, which
+      starts the platform. Any other mechanism is refused too. A dictated
+      variable named like one this recipe delivers itself, a platform setting,
+      the model's or a tool's variables or another connection's, halts the
+      build, naming both, since the compiler cannot see the names a recipe
+      writes.
+
+      Two vector_store connections whose aliases differ only in letter case,
+      or in a hyphen against an underscore, are named alike, so the build
+      halts, naming both, wherever the two would deliver one variable: always
+      while both take the defaults, and otherwise wherever what each still
+      delivers meets, such as a credential attached on each.
+    */ -}}
+    {{- $pipe := default dict .context.inject -}}
+    {{- $env := optional $pipe "env" dict -}}
+    {{- $pipeFiles := optional $pipe "file" dict -}}
+    {{- $dictating := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+    {{- if $entries }}{{ $_ := set $dictating $alias true }}{{ end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $taken := dict -}}
+    {{- range $var := list "LANGFLOW_CONFIG_DIR" "LANGFLOW_SAVE_DB_IN_CONFIG_DIR" "LANGFLOW_AUTO_LOGIN" -}}
+    {{- $_ := set $taken $var "the platform's own setting" -}}
+    {{- end -}}
+    {{- if $requireAuth -}}
+    {{- $_ := set $taken "LANGFLOW_SUPERUSER" "the platform's own setting naming its administrator" -}}
+    {{- end -}}
+    {{- if $adminCredential -}}
+    {{- $_ := set $taken "LANGFLOW_SUPERUSER_PASSWORD" "the admin_password attached on the platform" -}}
+    {{- end -}}
+    {{- if .values.flow_definition -}}
+    {{- $_ := set $taken "LANGFLOW_LOAD_FLOWS_PATH" "the platform's own setting naming the flows it loads" -}}
+    {{- end -}}
+    {{- if .values.metrics_enabled -}}
+    {{- $_ := set $taken "LANGFLOW_PROMETHEUS_PORT" "the platform's own setting turning its metrics on" -}}
+    {{- end -}}
+    {{- if $toolVariables -}}
+    {{- $_ := set $taken "LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT" "the platform's own setting listing the tool credentials' variables" -}}
+    {{- end -}}
+    {{- if $allowedHosts -}}
+    {{- $_ := set $taken "LANGFLOW_SSRF_ALLOWED_HOSTS" "the platform's own setting listing the hosts of the wired tools and stores" -}}
+    {{- end -}}
+    {{- range $alias := $toolCredentials -}}
+    {{- $_ := set $taken (printf "AGGREGA_TOOL_%s_CREDENTIAL" (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_")) (printf "the credential attached on the tools connection %s" $alias) -}}
+    {{- end -}}
+    {{- range $alias := $toolAuthorizations -}}
+    {{- $_ := set $taken (printf "AGGREGA_TOOL_%s_AUTHORIZATION" (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_")) (printf "the credential attached on the tools connection %s, presented under Authorization" $alias) -}}
+    {{- end -}}
+    {{- $storeVars := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if eq $edge.socket "model" -}}
+    {{- $_ := set $taken "OPENAI_BASE_URL" (printf "the model connection %s, whose endpoint the platform reads under that name" $alias) -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $taken "OPENAI_API_KEY" (printf "the credential attached on the model connection %s" $alias) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if eq $edge.socket "vector_store" -}}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" -}}
+    {{- $byDefault := printf "the vector_store connection %s, which writes no inject block" $alias -}}
+    {{- $delivers := dict -}}
+    {{- if not (hasKey $dictating $alias) -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_URL" $name) $byDefault -}}
+    {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_CONNECTION_STRING" $name) $byDefault -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_CREDENTIAL" $name) (printf "the credential attached on the vector_store connection %s" $alias) -}}
+    {{- end -}}
+    {{- range $var, $by := $delivers -}}
+    {{- with optional $storeVars $var "" -}}
+    {{- fail (printf "the vector_store connections %s and %s of %q would both deliver the variable %s, because a connection's variables are named for its alias upper-cased with every character other than a letter or a digit an underscore: rename one of the two" . $alias $.context.instance_id $var) -}}
+    {{- end -}}
+    {{- $_ := set $storeVars $var $alias -}}
+    {{- $_ := set $taken $var $by -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $files := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+    {{- range $name, $from := $entries -}}
+    {{- if eq $mechanism "env" -}}
+    {{- with optional $taken $name "" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the variable %s, which this realization already delivers from %s: dictate another name in that connection's inject block" $edge.socket $alias $.context.instance_id $name .) -}}
+    {{- end -}}
+    {{- else if eq $mechanism "file" -}}
+    {{- if not (hasPrefix "/" $name) -}}
+    {{- fail (printf "the %s connection %s of %q dictates a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- end -}}
+    {{- $_ := set $files $name (optional $pipeFiles $name "") -}}
+    {{- else if eq $mechanism "arg" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the command-line argument %q, and this realization renders no command line: Kubernetes takes a container's arguments in place of the image's default command, which starts the platform. Dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- else -}}
+    {{- fail (printf "the %s connection %s of %q dictates %q under the delivery mechanism %q, and this realization delivers env and file entries only: dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name $mechanism) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- range $path, $_ := $files -}}
+    {{- range $other, $_ := $files -}}
+    {{- if hasPrefix (printf "%s/" $path) $other -}}
+    {{- fail (printf "the component %q is handed a file at %q and another at %q beneath it, and one path cannot be both a file and a directory: dictate the two files at paths neither of which lies beneath the other" $.context.instance_id $path $other) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     form: stateless
@@ -315,7 +479,7 @@ spec:
           LANGFLOW_PROMETHEUS_PORT: "9090"
     {{- end }}
     {{- range $alias, $edge := .context.uses }}
-    {{- if eq $edge.socket "vector_store" }}
+    {{- if and (eq $edge.socket "vector_store") (not (hasKey $dictating $alias)) }}
     {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
           AGGREGA_VECTOR_STORE_{{ $name }}_URL: "{{ index $addresses $alias }}"
     {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") }}
@@ -346,6 +510,12 @@ spec:
     {{- end }}
     {{- with $allowedHosts }}
           LANGFLOW_SSRF_ALLOWED_HOSTS: "{{ join "," . }}"
+    {{- end }}
+    {{- /* The variables connections dictate, after every variable this recipe names, in alias order. */}}
+    {{- range $alias, $edge := .context.uses }}
+    {{- range $name, $from := (optional (default dict $edge.inject) "env" dict) }}
+          {{ toJson $name }}: {{ toJson (optional $env $name "") }}
+    {{- end }}
     {{- end }}
     {{- if or $modelCredential $adminCredential $storeCredential $toolCredentials }}
         attachments:
@@ -406,6 +576,14 @@ spec:
           - name: flow
             path: "{{ $flowsPath }}"
     {{- end }}
+    {{- $i := 0 }}
+    {{- range $path, $_ := $files }}
+          - name: inject-files
+            path: {{ toJson $path }}
+            subPath: "file-{{ $i }}"
+            readonly: true
+    {{- $i = add $i 1 }}
+    {{- end }}
     volumes:
       data:
         persistent:
@@ -414,6 +592,11 @@ spec:
       flow:
         configmap:
           source: "{{ .context.rendered_name }}{{ .locals.flow_file_config_map_suffix }}"
+    {{- end }}
+    {{- if $files }}
+      inject-files:
+        configmap:
+          source: "{{ .context.rendered_name }}-files"
     {{- end }}
     services:
       default:

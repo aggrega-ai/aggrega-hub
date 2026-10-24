@@ -3453,8 +3453,8 @@ strings, and checks none of what follows.
   the connection holds one, the `credential` as
   `AGGREGA_TOOL_<ALIAS>_CREDENTIAL` and the `credential_header` the tool
   publishes as `AGGREGA_TOOL_<ALIAS>_CREDENTIAL_HEADER`, each secret by
-  reference on helm and from the inject pipe on compose. On an agent runtime's
-  connection writing an `inject:` block, the names it dictates replace the
+  reference on helm and from the inject pipe on compose. On any of these
+  connections writing an `inject:` block, the names it dictates replace the
   published address and header, while the `endpoint` slot's secret and the
   `credential` stay. Those two platforms
   and `core/ai-agent/langflow` also declare `vector_store`, selecting
@@ -3483,11 +3483,11 @@ strings, and checks none of what follows.
   aliases of one socket that fold to one name would deliver one variable
   twice — on
   Kubernetes one of them may be a plain variable and the other read from a
-  Secret, which the rendered Workload holds in two different maps — so the
-  three platforms each carry an assertion, `connection_aliases_deliver_apart`,
-  that halts the build on them, naming both connections, and the agent
-  runtimes' Recipes halt it wherever the two would still deliver one variable,
-  since a connection writing an `inject:` block delivers none of the defaults.
+  Secret, which the rendered Workload holds in two different maps — so
+  `langflow` carries an assertion, `connection_aliases_deliver_apart`, that
+  halts the build on two such `tools` aliases, naming both connections, and
+  the Recipes halt it on every other pair wherever the two would still deliver
+  one variable, since a connection writing an `inject:` block delivers no default.
   A flow reads each
   in the platform's own way: on `langflow` through a field naming a global
   variable of the same name, which Langflow reads from the environment where

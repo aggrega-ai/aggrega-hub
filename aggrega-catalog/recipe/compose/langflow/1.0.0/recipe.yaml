@@ -28,17 +28,17 @@ metadata:
     Each `vector_store` connection arrives under the variables helm/langflow
     names, a credential written as it was delivered, and a store publishing a
     database and a user also as AGGREGA_VECTOR_STORE_<ALIAS>_CONNECTION_STRING
-    for Langflow's PGVector component. Each `tools` connection's address is
-    written into the flow's MCP Tools node named for its alias, whose header
-    names AGGREGA_TOOL_<ALIAS>_CREDENTIAL, the credential written as
-    delivered, or, under Authorization, AGGREGA_TOOL_<ALIAS>_AUTHORIZATION,
-    holding Bearer and that credential. LANGFLOW_SSRF_ALLOWED_HOSTS admits the
-    hosts of both.
+    for Langflow's PGVector component; one writing an `inject:` block
+    receives the names it dictates instead, a file as a compose config
+    mounted at the path it names. Each `tools` connection's
+    address is written into the flow's MCP Tools node named for its alias,
+    whose header names the variable holding its credential, as on
+    helm/langflow. LANGFLOW_SSRF_ALLOWED_HOSTS admits the hosts of both.
 
     With `values.metrics_enabled` true, LANGFLOW_PROMETHEUS_PORT turns
     Langflow's metrics on, on port 9090, which checks no caller and which any
     peer on the compose network reaches, and provides.metrics_endpoint
-    publishes the address; false, that key is empty.
+    publishes the address.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -119,6 +119,29 @@ spec:
   artifacts:
     langflow-flow:
       $import: LangflowFlow#/artifacts/FlowFile
+    # The compose configs holding the file entries the connections dictate,
+    # one per file and numbered in path order, the names the workload's
+    # volumes read. A compose config is written as one file at the path it is
+    # mounted at, and Docker Compose substitutes a $ in its content, so each $
+    # is doubled. They are emitted only while a connection dictates a file, so
+    # a build with none renders nothing here.
+    langflow-files.compose-fragment.yaml: |
+      {{- $pipeFiles := optional (default dict .context.inject) "file" dict }}
+      {{- $files := dict }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- range $path, $from := (optional (default dict $edge.inject) "file" dict) }}
+      {{- $_ := set $files $path (optional $pipeFiles $path "") }}
+      {{- end }}
+      {{- end }}
+      {{- if $files }}
+      configs:
+        {{- $i := 0 }}
+        {{- range $path, $v := $files }}
+        {{ $.context.instance_id }}-file-{{ $i }}:
+          content: {{ toJson (replace "$" "$$" $v) }}
+        {{- $i = add $i 1 }}
+        {{- end }}
+      {{- end }}
   # Synthesized-mode Workload: image, environment, the data volume, and the
   # exposed port are translated from the Workload kind by the compose provider.
   # The named volume is mounted at the platform's config directory, and the
@@ -195,6 +218,11 @@ spec:
   # checking no caller. No port is added, since a peer on the compose network
   # reaches it as it is. With the value false the variable is not rendered and
   # the metrics stay off.
+  #
+  # A vector_store connection's variables are defaults, as on helm/langflow: a
+  # connection writing an inject block receives exactly the names it dictates
+  # instead of its address and connection-string variables, while its
+  # credential stays and its host stays in LANGFLOW_SSRF_ALLOWED_HOSTS.
   workload: |
     {{- $configDir := "/app/langflow-data" -}}
     {{- $flowsPath := "/app/flows" -}}
@@ -240,6 +268,142 @@ spec:
     {{- $host := lower (urlParse $url).hostname -}}
     {{- if and $host (not (has $host $allowedHosts)) -}}
     {{- $allowedHosts = append $allowedHosts $host -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /*
+      A connection that writes no inject block receives the defaults above. A
+      vector_store connection that writes one receives exactly what it
+      dictates instead, read off the inject pipe as a map: no
+      AGGREGA_VECTOR_STORE_<ALIAS>_URL and no _CONNECTION_STRING. Its
+      credential stays as _CREDENTIAL, and its host stays in
+      LANGFLOW_SSRF_ALLOWED_HOSTS, which the platform reads itself.
+
+      A dictated env entry becomes a service variable under the name it gives,
+      after every variable this recipe names, written as the pipe carries it,
+      so Docker Compose substitutes a $ in it as in every variable; a dictated
+      file entry becomes a compose config mounted as one file at the absolute
+      path it names, its content written with each $ doubled so the file holds
+      the value itself, and a path that is not absolute, or one lying beneath
+      another file's path, is refused. An arg entry is refused, because this
+      recipe renders no command line: the service's command replaces the
+      image's default, which starts the platform. Any other mechanism is
+      refused too. A dictated variable named like one this recipe delivers
+      itself, a platform setting, the model's or a tool's variables or another
+      connection's, or like the key an attachment's value arrives under on the
+      inject pipe, where the attachment's value would take its place, halts
+      the build, naming both, since the compiler cannot see the names a recipe
+      writes.
+
+      Two vector_store connections whose aliases differ only in letter case,
+      or in a hyphen against an underscore, are named alike, so the build
+      halts, naming both, wherever the two would deliver one variable: always
+      while both take the defaults, and otherwise wherever what each still
+      delivers meets, such as a credential attached on each.
+    */ -}}
+    {{- $pipe := default dict .context.inject -}}
+    {{- $env := optional $pipe "env" dict -}}
+    {{- $pipeFiles := optional $pipe "file" dict -}}
+    {{- $dictating := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+    {{- if $entries }}{{ $_ := set $dictating $alias true }}{{ end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $taken := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $slot, $attachment := (default dict $edge.features) -}}
+    {{- with optional (default dict $attachment.values) "key" "" -}}
+    {{- $_ := set $taken . (printf "the %s attached on the %s connection %s, whose value arrives on the inject pipe under that key" $slot $edge.socket $alias) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- with optional (default dict .features) "admin_password" "" -}}
+    {{- $key := optional (default dict .values) "key" "" -}}
+    {{- if not $key }}{{ $key = "LANGFLOW_SUPERUSER_PASSWORD" }}{{ end -}}
+    {{- $_ := set $taken $key "the admin_password attached on the platform, whose value arrives on the inject pipe under that key" -}}
+    {{- end -}}
+    {{- range $var := list "LANGFLOW_CONFIG_DIR" "LANGFLOW_SAVE_DB_IN_CONFIG_DIR" "LANGFLOW_AUTO_LOGIN" -}}
+    {{- $_ := set $taken $var "the platform's own setting" -}}
+    {{- end -}}
+    {{- if $requireAuth -}}
+    {{- $_ := set $taken "LANGFLOW_SUPERUSER" "the platform's own setting naming its administrator" -}}
+    {{- $_ := set $taken "LANGFLOW_SUPERUSER_PASSWORD" "the admin_password attached on the platform" -}}
+    {{- end -}}
+    {{- if .values.flow_definition -}}
+    {{- $_ := set $taken "LANGFLOW_LOAD_FLOWS_PATH" "the platform's own setting naming the flows it loads" -}}
+    {{- end -}}
+    {{- if .values.metrics_enabled -}}
+    {{- $_ := set $taken "LANGFLOW_PROMETHEUS_PORT" "the platform's own setting turning its metrics on" -}}
+    {{- end -}}
+    {{- if $toolVariables -}}
+    {{- $_ := set $taken "LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT" "the platform's own setting listing the tool credentials' variables" -}}
+    {{- end -}}
+    {{- if $allowedHosts -}}
+    {{- $_ := set $taken "LANGFLOW_SSRF_ALLOWED_HOSTS" "the platform's own setting listing the hosts of the wired tools and stores" -}}
+    {{- end -}}
+    {{- range $alias := $toolAuthorizations -}}
+    {{- $_ := set $taken (printf "AGGREGA_TOOL_%s_AUTHORIZATION" (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_")) (printf "the credential attached on the tools connection %s, presented under Authorization" $alias) -}}
+    {{- end -}}
+    {{- $storeVars := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if eq $edge.socket "model" -}}
+    {{- $_ := set $taken "OPENAI_BASE_URL" (printf "the model connection %s, whose endpoint the platform reads under that name" $alias) -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $taken "OPENAI_API_KEY" (printf "the credential attached on the model connection %s" $alias) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if and (eq $edge.socket "tools") (hasKey $features "credential") -}}
+    {{- $_ := set $taken (printf "AGGREGA_TOOL_%s_CREDENTIAL" (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_")) (printf "the credential attached on the tools connection %s" $alias) -}}
+    {{- end -}}
+    {{- if eq $edge.socket "vector_store" -}}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" -}}
+    {{- $byDefault := printf "the vector_store connection %s, which writes no inject block" $alias -}}
+    {{- $delivers := dict -}}
+    {{- if not (hasKey $dictating $alias) -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_URL" $name) $byDefault -}}
+    {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_CONNECTION_STRING" $name) $byDefault -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_CREDENTIAL" $name) (printf "the credential attached on the vector_store connection %s" $alias) -}}
+    {{- end -}}
+    {{- range $var, $by := $delivers -}}
+    {{- with optional $storeVars $var "" -}}
+    {{- fail (printf "the vector_store connections %s and %s of %q would both deliver the variable %s, because a connection's variables are named for its alias upper-cased with every character other than a letter or a digit an underscore: rename one of the two" . $alias $.context.instance_id $var) -}}
+    {{- end -}}
+    {{- $_ := set $storeVars $var $alias -}}
+    {{- $_ := set $taken $var $by -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $files := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+    {{- range $name, $from := $entries -}}
+    {{- if eq $mechanism "env" -}}
+    {{- with optional $taken $name "" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the variable %s, which this realization already delivers from %s: dictate another name in that connection's inject block" $edge.socket $alias $.context.instance_id $name .) -}}
+    {{- end -}}
+    {{- else if eq $mechanism "file" -}}
+    {{- if not (hasPrefix "/" $name) -}}
+    {{- fail (printf "the %s connection %s of %q dictates a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- end -}}
+    {{- $_ := set $files $name (optional $pipeFiles $name "") -}}
+    {{- else if eq $mechanism "arg" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the command-line argument %q, and this realization renders no command line: a service's command replaces the image's default command, which starts the platform. Dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- else -}}
+    {{- fail (printf "the %s connection %s of %q dictates %q under the delivery mechanism %q, and this realization delivers env and file entries only: dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name $mechanism) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- range $path, $_ := $files -}}
+    {{- range $other, $_ := $files -}}
+    {{- if hasPrefix (printf "%s/" $path) $other -}}
+    {{- fail (printf "the component %q is handed a file at %q and another at %q beneath it, and one path cannot be both a file and a directory: dictate the two files at paths neither of which lies beneath the other" $.context.instance_id $path $other) -}}
+    {{- end -}}
     {{- end -}}
     {{- end -}}
     apiVersion: aggrega.ai/v1alpha1
@@ -306,13 +470,16 @@ spec:
     {{- if eq $edge.socket "vector_store" }}
     {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
     {{- $features := default dict $edge.features }}
+    {{- $dictates := hasKey $dictating $alias }}
+    {{- if not $dictates }}
           AGGREGA_VECTOR_STORE_{{ $name }}_URL: "{{ index $addresses $alias }}"
+    {{- end }}
     {{- $credential := "" }}
     {{- if hasKey $features "credential" }}
     {{- $credential = index $.context.inject.env $features.credential.values.key }}
           AGGREGA_VECTOR_STORE_{{ $name }}_CREDENTIAL: "{{ $credential }}"
     {{- end }}
-    {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") }}
+    {{- if and (not $dictates) (optional $edge.provides "database" "") (optional $edge.provides "user" "") }}
           AGGREGA_VECTOR_STORE_{{ $name }}_CONNECTION_STRING: "postgresql://{{ $edge.provides.user }}{{ if hasKey $features "credential" }}:{{ $credential }}{{ end }}@{{ $edge.provides.host }}:{{ $edge.provides.port }}/{{ $edge.provides.database }}"
     {{- end }}
     {{- end }}
@@ -341,6 +508,12 @@ spec:
     {{- if .values.metrics_enabled }}
           LANGFLOW_PROMETHEUS_PORT: "9090"
     {{- end }}
+    {{- /* The variables connections dictate, after every variable this recipe names, in alias order. */}}
+    {{- range $alias, $edge := .context.uses }}
+    {{- range $name, $from := (optional (default dict $edge.inject) "env" dict) }}
+          {{ toJson $name }}: {{ toJson (optional $env $name "") }}
+    {{- end }}
+    {{- end }}
         ports:
           http: 7860
         # The platform documents GET /health_check, which answers once its
@@ -364,6 +537,12 @@ spec:
           - name: flow
             path: "{{ $flowsPath }}/flow.json"
     {{- end }}
+    {{- $i := 0 }}
+    {{- range $path, $_ := $files }}
+          - name: inject-file-{{ $i }}
+            path: {{ toJson $path }}
+    {{- $i = add $i 1 }}
+    {{- end }}
     volumes:
       data:
         persistent:
@@ -372,6 +551,13 @@ spec:
       flow:
         configmap:
           source: "{{ .locals.flow_file_config_name }}"
+    {{- end }}
+    {{- $i = 0 }}
+    {{- range $path, $_ := $files }}
+      inject-file-{{ $i }}:
+        configmap:
+          source: "{{ $.context.instance_id }}-file-{{ $i }}"
+    {{- $i = add $i 1 }}
     {{- end }}
     services:
       default:
