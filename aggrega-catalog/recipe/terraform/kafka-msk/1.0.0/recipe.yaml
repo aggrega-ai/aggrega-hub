@@ -22,14 +22,17 @@ metadata:
     The cluster runs one broker in each client subnet, the smallest cluster
     MSK runs, so infra.overrides.subnet_ids names two or three subnets in
     distinct Availability Zones and the cluster has two or three brokers.
-    Clients reach the brokers inside the VPC on the plaintext listener, port
-    9092, with no authentication, under protocol kafka; MSK's TLS listener on
-    9094 stays on beside it.
+    Clients reach the brokers inside the VPC with no authentication, on the
+    plaintext listener, port 9092, under protocol kafka, beside MSK's TLS
+    listener on 9094; with infra.client_tls true, on that TLS listener alone,
+    under protocol kafka-ssl, whose certificate AWS issues and default trust
+    stores trust. A certificate attached to server_certificate halts, and so
+    does infra.overrides.host with client_tls: that certificate does not name
+    it.
 
     bootstrap_servers publishes a reference to the brokers' whole list, host
-    the first broker in it, port 9092; infra.overrides.host publishes the
-    operator's DNS name instead. A client taking a list reads
-    bootstrap_servers, so it can still start while one broker is down.
+    the first broker in it, port 9092, or 9094 with client_tls;
+    infra.overrides.host publishes the operator's DNS name instead.
 
     Reach for it where Kafka is an MSK cluster in the operator's AWS account;
     reach for kafka or kafka-strimzi on helm where it runs in Kubernetes.
@@ -86,6 +89,9 @@ spec:
     # empty while it gives none. Only a string is read here; any other value is
     # refused by the assertion below rather than published.
     operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The module output listing the brokers' listener clients reach: the
+    # plaintext one, or the TLS one while infra.client_tls is true.
+    bootstrap_output: '{{ if .infra.client_tls }}bootstrap_brokers_tls{{ else }}bootstrap_brokers_plaintext{{ end }}'
 
   # This Recipe reads from infra.overrides:
   #   subnet_ids          - []string (broker_node_client_subnets), required, two or three
@@ -102,7 +108,8 @@ spec:
   # count must be a multiple of the subnet count, so one broker per subnet is
   # the smallest cluster, and the one this Recipe runs. With no security group
   # named, MSK attaches the VPC's default security group; the security groups
-  # are the operator's, who opens 9092 to the cluster's clients.
+  # are the operator's, who opens 9092 to the cluster's clients, or 9094 while
+  # infra.client_tls is true.
   #
   # The instance type is a Standard broker size (kafka.t3.small, kafka.m5.*,
   # kafka.m7g.*). The Express sizes (express.*) take no EBS volume, which this
@@ -122,8 +129,14 @@ spec:
   #   honoured — infra.engine_version (major and minor, among the versions MSK
   #     offers a new Standard-broker cluster); infra.storage.size, as each
   #     broker's EBS volume in whole GiB, 1 to 16384; infra.broker_port while it
-  #     is 9092, the port MSK serves plaintext on; and the overrides above.
-  #   refused — infra.broker_port other than 9092; values.metrics_enabled true,
+  #     is 9092, the port MSK serves plaintext on; infra.client_tls, as
+  #     client-broker encryption in transit TLS alone, served on 9094; and the
+  #     overrides above.
+  #   refused — infra.broker_port other than 9092; a certificate attached to
+  #     server_certificate, since MSK presents one AWS issues and takes none;
+  #     infra.overrides.host while infra.client_tls is true, since the
+  #     certificate AWS issues names the brokers' own DNS names and a client
+  #     verifying the host it dialed refuses it; values.metrics_enabled true,
   #     since the metrics keys name Kubernetes pods and this realization runs
   #     none; values.cluster_id other than the Component's default, since MSK
   #     names its cluster and generates its KRaft identity itself;
@@ -134,7 +147,9 @@ spec:
   #     no Kafka control plane is installed for MSK; and Kafka 4.2, which MSK
   #     runs on Express brokers alone.
   #   not read — values.cluster_id, infra.controller_port, infra.compute and
-  #     infra.control_plane_present while they hold the Component's defaults.
+  #     infra.control_plane_present while they hold the Component's defaults,
+  #     and infra.broker_port, at that default, while infra.client_tls is true:
+  #     MSK serves TLS on 9094, which this Recipe publishes as port.
   assertions:
     subnet_ids_supplied: >-
       {{- $s := optional (optional .infra "overrides" dict) "subnet_ids" "" -}}
@@ -166,7 +181,24 @@ spec:
       {{- end -}}
     broker_port_is_the_plaintext_port: >-
       {{- if ne (toString .infra.broker_port) "9092" -}}
+      {{- if .infra.client_tls -}}
+      {{- fail (printf "infra.broker_port is %v, and with infra.client_tls true MSK serves its TLS listener on port 9094 alone, which this Recipe publishes as port without reading infra.broker_port: remove infra.broker_port from the Release" .infra.broker_port) -}}
+      {{- end -}}
       {{- fail (printf "infra.broker_port is %v, and MSK serves its plaintext listener on port 9092 alone, which this Recipe publishes as port: remove infra.broker_port from the Release" .infra.broker_port) -}}
+      {{- end -}}
+    # MSK presents a certificate AWS issues on its TLS listener and takes none
+    # of the operator's, so a certificate attached to server_certificate has
+    # nothing to present it, whatever infra.client_tls says. That certificate
+    # names the brokers' own DNS names, and AWS offers no way to change it, so
+    # a client dialling the operator's name in infra.overrides.host refuses it
+    # once it verifies the host: the pairing halts while client_tls is true.
+    server_certificate_unsupported: >-
+      {{- if hasKey (default dict .features) "server_certificate" -}}
+      {{- fail (printf "a certificate is attached to the server_certificate slot of %q, and MSK presents a certificate AWS issues on its TLS listener, taking none of the operator's; clients trust it through the Amazon Trust Services authorities a default trust store holds: remove the attachment from the Release" .metadata.instance_id) -}}
+      {{- end -}}
+    client_tls_operator_host: >-
+      {{- if and .infra.client_tls .locals.operator_host -}}
+      {{- fail (printf "infra.client_tls is true on %q and infra.overrides.host is %q, but the certificate MSK presents on its TLS listener names the brokers' own DNS names, which AWS issues and offers no way to change, so a client dialling %q refuses it when it verifies the host: remove infra.overrides.host from the Release to publish the brokers' own addresses, or set infra.client_tls to false" .metadata.instance_id .locals.operator_host .locals.operator_host) -}}
       {{- end -}}
     metrics_enabled_unsupported: >-
       {{- if .values.metrics_enabled -}}
@@ -201,38 +233,48 @@ spec:
   # The String Pipe: the compiler does not interpret these strings.
   # bootstrap_servers names the module's bootstrap_brokers_plaintext output —
   # the comma-separated host:port list of the brokers' plaintext listener,
-  # which the service returns sorted — through this component's module call,
-  # which the boundary's root configuration declares under .context.instance_id
-  # for a component declared in the Aggregate the Release deploys. host is the
-  # first broker in that list: the text before its first colon, split on the
-  # colon that is the fourth character of the module's arn output, as every
-  # ARN's is; the expression holds no quoted string, because the build writes it
-  # inside an argument's quoted value. Terraform resolves both at apply time, so
-  # they resolve only for a consumer authored as a source: Recipe in the same
-  # root configuration; a consumer on another target receives them as text.
-  # The service may return a different broker first after the cluster changes,
-  # and Terraform resolves host again on every apply.
+  # which the service returns sorted — or, while infra.client_tls is true, its
+  # bootstrap_brokers_tls output, the same list for the TLS listener, through
+  # this component's module call, which the boundary's root configuration
+  # declares under .context.instance_id for a component declared in the
+  # Aggregate the Release deploys. A client taking a list reads
+  # bootstrap_servers, so it can still start while one broker is down. host is
+  # the first broker in that list: the text before its first colon, split on
+  # the colon that is the fourth character of the module's arn output, as
+  # every ARN's is; the expression holds no quoted string, because the build
+  # writes it inside an argument's quoted value. Terraform resolves both at
+  # apply time, so they resolve only for a consumer authored as a source:
+  # Recipe in the same root configuration; a consumer on another target
+  # receives them as text. The service may return a different broker first
+  # after the cluster changes, and Terraform resolves host again on every
+  # apply.
   #
   # While the Release sets infra.overrides.host, host publishes that name
   # instead of the reference, and bootstrap_servers publishes that name with
-  # the port as the whole list, so a consumer reading either receives an
-  # address it can use on any target. It is the operator's deterministic
-  # pointer: the compiler pipes it as text and looks nothing up, and this
-  # Recipe emits no DNS record or alias for it, so the operator points the name
-  # at the brokers outside the Release. A consumer in the same root
+  # the port as the whole list — with infra.client_tls false alone, since the
+  # pairing halts above while it is true — so a consumer reading either
+  # receives an address it can use on any target. It is the operator's
+  # deterministic pointer: the compiler pipes it as text and looks nothing up,
+  # and this Recipe emits no DNS record or alias for it, so the operator points
+  # the name at the brokers outside the Release. A consumer in the same root
   # configuration receives the name as well, and a name carries no reference
   # for Terraform to order its module after this one by; a later syncWave on
   # the consumer's boundary, sharing this boundary's directory, orders the two.
   #
-  # port is 9092, where MSK serves every broker's plaintext listener, so it is
-  # known ahead of time and published as that value. protocol is kafka: the
-  # listener speaks Kafka's protocol unencrypted, as the self-hosted
-  # realizations do. The metrics keys are empty.
+  # port is 9092, where MSK serves every broker's plaintext listener, or 9094,
+  # where it serves the TLS one, while infra.client_tls is true; MSK's guide
+  # fixes both for access from inside AWS, so the port is known ahead of time
+  # and published as that value. protocol is kafka: the listener speaks
+  # Kafka's protocol unencrypted, as the self-hosted realizations do; and
+  # kafka-ssl while infra.client_tls is true, when the listener accepts TLS
+  # alone, presenting a certificate that chains to Amazon Trust Services, which
+  # a default trust store holds, so a consumer needs no server_ca for it. The
+  # metrics keys are empty.
   provides:
-    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${split(substr(module.{{ .context.instance_id }}.arn, 3, 1), module.{{ .context.instance_id }}.bootstrap_brokers_plaintext)[0]}{{ end }}"
-    port: "{{ .infra.broker_port }}"
-    bootstrap_servers: "{{ if .locals.operator_host }}{{ .locals.operator_host }}:{{ .infra.broker_port }}{{ else }}${module.{{ .context.instance_id }}.bootstrap_brokers_plaintext}{{ end }}"
-    protocol: "kafka"
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${split(substr(module.{{ .context.instance_id }}.arn, 3, 1), module.{{ .context.instance_id }}.{{ .locals.bootstrap_output }})[0]}{{ end }}"
+    port: "{{ if .infra.client_tls }}9094{{ else }}{{ .infra.broker_port }}{{ end }}"
+    bootstrap_servers: "{{ if .locals.operator_host }}{{ .locals.operator_host }}:{{ .infra.broker_port }}{{ else }}${module.{{ .context.instance_id }}.{{ .locals.bootstrap_output }}}{{ end }}"
+    protocol: "{{ if .infra.client_tls }}kafka-ssl{{ else }}kafka{{ end }}"
     metrics_pod_selector: ""
     metrics_pod_port: ""
     metrics_path: ""
@@ -246,8 +288,9 @@ spec:
   # checked against both here, where it is known.
   #
   # The client-broker setting TLS_PLAINTEXT serves the plaintext listener beside
-  # the TLS one. A plaintext listener authenticates no client, and MSK lists
-  # unauthenticated access as the authentication that goes with it, so it is
+  # the TLS one; with infra.client_tls true it is TLS, which serves the TLS
+  # listener alone. Neither listener authenticates a client here, and MSK lists
+  # unauthenticated access as the authentication that goes with that, so it is
   # turned on explicitly rather than left to the service's default. Traffic
   # between brokers stays encrypted, the service's default.
   valuesMapping: |
@@ -266,6 +309,6 @@ spec:
       ebs_storage_info:
         volume_size: {{ trimSuffix "Gi" (toString .infra.storage.size) }}
     enable_storage_autoscaling: false
-    encryption_in_transit_client_broker: "TLS_PLAINTEXT"
+    encryption_in_transit_client_broker: "{{ if .infra.client_tls }}TLS{{ else }}TLS_PLAINTEXT{{ end }}"
     client_authentication:
       unauthenticated: true

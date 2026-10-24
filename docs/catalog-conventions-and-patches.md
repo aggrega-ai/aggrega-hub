@@ -4208,9 +4208,11 @@ publishes `port` `10000`, the one port Azure Managed Redis serves, and refuses
 an `infra.port` other than the Component's default by name.
 So does `recipe/terraform/kafka-msk`, a managed Kafka
 cluster rather than a datastore, whose `host` names the first broker of the module's
-`bootstrap_brokers_plaintext` output and whose `bootstrap_servers` names the whole
-list, both replaced by the operator's name, `bootstrap_servers` joined with the
-port. So do `recipe/terraform/rabbitmq-amazon-mq` and
+`bootstrap_brokers_plaintext` output, or of `bootstrap_brokers_tls` while
+`infra.client_tls` is on, and whose `bootstrap_servers` names the whole list, both
+replaced by the operator's name, `bootstrap_servers` joined with the port; it refuses
+that name while `infra.client_tls` is on, since the certificate AWS issues does not
+carry it. So do `recipe/terraform/rabbitmq-amazon-mq` and
 `recipe/cloudformation/rabbitmq-amazon-mq`, a managed RabbitMQ broker, whose
 `host` names the module's `amqp_host` output on Terraform and, on
 CloudFormation, the host read out of the first of the broker's `AmqpEndpoints`
