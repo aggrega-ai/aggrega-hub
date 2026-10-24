@@ -12,23 +12,25 @@ metadata:
     synthesis, running an image the Release supplies (no external Helm chart,
     because the project publishes none for this service, and no pinned image,
     because it publishes none of those either — the agent framework ships as a
-    language package). It renders a stateless Deployment and nothing else: no
-    Service, because the worker serves no application traffic, and no volume,
-    because it keeps a session's state in memory. The worker is configured
-    entirely on the environment, in the variables the framework itself reads:
-    the media server's WebSocket address and API key identifier, the dispatch
-    name, and the log level. The one port declared is the framework's own health
-    endpoint, which is a container port the probes reach on the pod address and
-    which no Service publishes, so the worker exposes nothing to the rest of the
-    Release. Readiness reads that endpoint, which answers unhealthy while the
-    worker cannot reach the media server, so a worker that is running but
-    unreachable is visibly not ready rather than silently idle. The
+    language package). It renders a stateless Deployment, and a ConfigMap only
+    for files a connection dictates: no Service, because the worker serves no
+    application traffic, and no volume for state, because it keeps a session's
+    state in memory. The worker is configured entirely on the environment, in
+    the variables the framework itself reads: the media server's WebSocket
+    address and API key identifier, composed from the host, port and api_key
+    the media server publishes, the dispatch name, and the log level. The one
+    port declared is the framework's own health endpoint, which is a container
+    port the probes reach on the pod address and which no Service publishes, so
+    the worker exposes nothing to the rest of the Release. The
     token-signing secret arrives from the credential on the media_server
     connection as an env secretKeyRef, so the plaintext secret never appears in
     the worker's own manifest. The public key identifier travels over the same
-    edge, so one key pair is authored once. provides.agent_name is
-    the dispatch name the Aggregate authored, republished so a consumer writing
-    a dispatch rule reads it rather than repeating it.
+    edge, so one key pair is authored once. A media_server connection writing an
+    `inject:` block also receives the names it dictates, as variables or as
+    files mounted at the paths it names, beside the framework's variables.
+    provides.agent_name is the dispatch name the Aggregate authored,
+    republished so a consumer writing a dispatch rule reads it rather than
+    repeating it.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -37,12 +39,13 @@ spec:
   implements: core/ai-agent/livekit-agent-worker:1.0.0
   # This Recipe reads no infra.overrides keys.
   #
-  # This Recipe reads three values delivered on the env pipe by the component's
-  # required media_server uses edge, under the names the component's usesSchema
-  # documents: LIVEKIT_MEDIA_SERVER_HOST, LIVEKIT_MEDIA_SERVER_PORT and
-  # LIVEKIT_MEDIA_SERVER_API_KEY.
+  # This Recipe reads the host, the port and the api_key the target of the
+  # component's required media_server connection publishes, off the connection
+  # itself, and composes the framework's own variables from them, so the
+  # connection needs no inject block. One the connection writes delivers the
+  # names it dictates beside them, as variables or as files.
   #
-  # Every variable this Recipe delivers is one the agent framework reads on its
+  # Every variable this Recipe names is one the agent framework reads on its
   # own, with no code in the supplied image required to look for it: the server
   # address, the key identifier and the secret are the three the worker refuses
   # to start without, the dispatch name selects explicit dispatch, and the log
@@ -65,30 +68,90 @@ spec:
     {{- end -}}
     {{- end -}}
     {{- /*
-      The connection variables this Recipe reads off the inject pipe, under the
-      socket whose edge delivers them, each beside the provides key the edge's
-      inject block names it from. The pipe is read as a map, and every read of
-      these variables below goes through it, so a variable nothing delivered is
-      told apart from one delivered empty: an edge on one of these sockets
-      leaving any of its variables missing halts the build, naming the edge, the
-      variables and the inject block to write, rather than rendering a
-      connection setting with an empty value. A socket in $required is read
-      whether or not anything is wired to it, so leaving it empty halts too.
+      The media server the worker registers with is the target of its one
+      media_server connection, and the worker's address and key identifier are
+      composed from what that target publishes: its host, its port and its
+      api_key. The worker registers with one server, so a second connection on
+      the socket halts the build, naming both; and a target publishing one of
+      the three empty would configure the worker with an empty server address
+      or an empty key identifier — it would deploy, register with nothing, and
+      report no reason — so each is checked for a value before anything is
+      rendered, and an empty one halts naming the connection and the key.
+
+      The image is the Release's own code, so a connection may dictate further
+      names: a dictated env entry becomes a container variable under the name it
+      gives, after every variable this recipe names; a dictated file entry a
+      read-only file at the absolute path it names, held in one ConfigMap and
+      mounted by subPath, so a path that is not absolute, or one lying beneath
+      another file's path, is refused. An arg entry is refused, because this
+      recipe renders no command line: Kubernetes takes a container's arguments
+      in place of the image's default command, which is the Release's. Any
+      other mechanism is refused too. Every variable this recipe names is read
+      by the framework itself, so none is a default a dictating connection gives
+      up, and a dictated variable named like one of them halts the build,
+      naming both, since the compiler cannot see the names a recipe writes.
+
+      The block reading the connections' inject directives is the one every helm
+      Recipe of an agent built on a framework in this catalog declares, differing
+      only in the names each delivers itself; a change to it is made to all.
     */ -}}
-    {{- $env := optional (default dict .context.inject) "env" dict -}}
-    {{- $reads := dict "media_server" (dict "LIVEKIT_MEDIA_SERVER_HOST" "host" "LIVEKIT_MEDIA_SERVER_PORT" "port" "LIVEKIT_MEDIA_SERVER_API_KEY" "api_key") -}}
-    {{- $required := list "media_server" -}}
-    {{- $gaps := list }}{{ $wired := list -}}
-    {{- range $alias, $edge := .context.uses }}{{ with get $reads $edge.socket -}}
-    {{- $wired = append $wired $edge.socket }}{{ $missing := list }}{{ $shape := list -}}
-    {{- range $var, $from := . }}{{ if not (hasKey $env $var) }}{{ $missing = append $missing $var }}{{ end }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
-    {{- if $missing }}{{ $gaps = append $gaps (printf "the edge %q on its %s socket delivers no %s, so give that edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $alias $edge.socket (join " or " $missing) (join ", " $shape)) }}{{ end -}}
-    {{- end }}{{ end -}}
-    {{- range $socket := $required }}{{ if not (has $socket $wired) -}}
-    {{- $vars := list }}{{ $shape := list }}{{ range $var, $from := get $reads $socket }}{{ $vars = append $vars $var }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
-    {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
-    {{- end }}{{ end -}}
-    {{- if $gaps }}{{ fail (printf "core/ai-agent/livekit-agent-worker %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    {{- $pipe := default dict .context.inject }}
+    {{- $env := optional $pipe "env" dict }}
+    {{- $pipeFiles := optional $pipe "file" dict }}
+    {{- $media := dict }}
+    {{- $mediaAlias := "" }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "media_server" }}
+    {{- if $mediaAlias }}
+    {{- fail (printf "the agent worker %q has two media_server connections, %s and %s, and the worker registers with one media server: keep one of the two" $.context.instance_id $mediaAlias $alias) }}
+    {{- end }}
+    {{- $mediaAlias = $alias }}
+    {{- $media = $edge }}
+    {{- end }}
+    {{- end }}
+    {{- if not $mediaAlias }}
+    {{- fail (printf "the agent worker %q has nothing wired to its media_server socket, so it has no media server to register with: wire the media server whose rooms it joins" .context.instance_id) }}
+    {{- end }}
+    {{- range $key := list "host" "port" "api_key" }}
+    {{- if not (optional (default dict $media.provides) $key "") }}
+    {{- fail (printf "the media_server connection %s of %q reaches %q, which publishes no %s, and the worker composes its address and key identifier from that target's host, port and api_key, so it would start with an empty value and could not register with the media server: wire a media server that publishes all three" $mediaAlias $.context.instance_id $media.target $key) }}
+    {{- end }}
+    {{- end }}
+    {{- $taken := dict "LIVEKIT_URL" (printf "the media_server connection %s, whose address the agent framework reads under that name" $mediaAlias) "LIVEKIT_API_KEY" (printf "the media_server connection %s, whose key identifier the agent framework reads under that name" $mediaAlias) "LIVEKIT_LOG_LEVEL" "the component's infra.log_level, which the agent framework reads under that name" }}
+    {{- if .values.agent_name }}
+    {{- $_ := set $taken "LIVEKIT_AGENT_NAME" "the component's values.agent_name, which the agent framework reads under that name" }}
+    {{- end }}
+    {{- if $mediaServerCredential }}
+    {{- $_ := set $taken "LIVEKIT_API_SECRET" (printf "the credential attached on the media_server connection %s" $mediaServerCredential) }}
+    {{- end }}
+    {{- $files := dict }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- range $mechanism, $entries := (default dict $edge.inject) }}
+    {{- range $name, $from := $entries }}
+    {{- if eq $mechanism "env" }}
+    {{- with optional $taken $name "" }}
+    {{- fail (printf "the %s connection %s of %q dictates the variable %s, which this realization already delivers from %s: dictate another name in that connection's inject block" $edge.socket $alias $.context.instance_id $name .) }}
+    {{- end }}
+    {{- else if eq $mechanism "file" }}
+    {{- if not (hasPrefix "/" $name) }}
+    {{- fail (printf "the %s connection %s of %q dictates a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $edge.socket $alias $.context.instance_id $name) }}
+    {{- end }}
+    {{- $_ := set $files $name (optional $pipeFiles $name "") }}
+    {{- else if eq $mechanism "arg" }}
+    {{- fail (printf "the %s connection %s of %q dictates the command-line argument %q, and this realization renders no command line: Kubernetes takes a container's arguments in place of the image's default command, and that command is the Release's. Dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name) }}
+    {{- else }}
+    {{- fail (printf "the %s connection %s of %q dictates %q under the delivery mechanism %q, and this realization delivers env and file entries only: dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name $mechanism) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- range $path, $_ := $files }}
+    {{- range $other, $_ := $files }}
+    {{- if hasPrefix (printf "%s/" $path) $other }}
+    {{- fail (printf "the component %q is handed a file at %q and another at %q beneath it, and one path cannot be both a file and a directory: dictate the two files at paths neither of which lies beneath the other" $.context.instance_id $path $other) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     {{- /* The catalog pins no image for this component, so a Release that
@@ -99,20 +162,6 @@ spec:
            the key and what to put in it. */}}
     {{- if not .infra.image }}
     {{- fail "this Release runs the agent worker without infra.image, and the catalog pins no image for it because the agent framework is published as a language package rather than as a container: build an image from that framework together with your own agent code, publish it where the cluster can pull it, and set infra.image to that reference" }}
-    {{- end }}
-    {{- /* The media_server socket is required, so an edge always exists — but
-           which of the target's keys an edge carries, and under which
-           environment names, is decided where the topology is authored. A name
-           the edge does not deliver halts above; one delivered empty would
-           configure the worker with an empty server address or an empty key
-           identifier: it would deploy, register with nothing, and report no
-           reason. So the three names this body reads are also checked for a
-           value before anything is rendered, and an empty one halts here
-           naming itself, where the fix is one line of topology. */}}
-    {{- range $name := list "LIVEKIT_MEDIA_SERVER_HOST" "LIVEKIT_MEDIA_SERVER_PORT" "LIVEKIT_MEDIA_SERVER_API_KEY" }}
-    {{- if not (optional $env $name "") }}
-    {{- fail (printf "the agent worker is wired without %s, so the worker would start with that value empty and could not register with the media server: bind the socket that publishes it and carry the target's key into this environment name on that edge, as the component's own socket documentation lists" $name) }}
-    {{- end }}
     {{- end }}
     {{- /* The framework serves its health endpoint on this port, and the port is
            a constructor argument of the worker rather than anything the
@@ -137,14 +186,30 @@ spec:
           # through the attachment below, which keeps the plaintext out of the
           # rendered manifest; the framework reads it from the same environment
           # either way.
-          LIVEKIT_URL: "ws://{{ $env.LIVEKIT_MEDIA_SERVER_HOST }}:{{ $env.LIVEKIT_MEDIA_SERVER_PORT }}"
-          LIVEKIT_API_KEY: "{{ $env.LIVEKIT_MEDIA_SERVER_API_KEY }}"
+          LIVEKIT_URL: "ws://{{ $media.provides.host }}:{{ $media.provides.port }}"
+          LIVEKIT_API_KEY: "{{ $media.provides.api_key }}"
           LIVEKIT_LOG_LEVEL: "{{ .infra.log_level }}"
     {{- if .values.agent_name }}
           # Present only when the Aggregate named the agent. The framework reads
           # an empty value as no name at all, so emitting the variable empty would
           # say nothing; omitting it says the same thing and says it in the bytes.
           LIVEKIT_AGENT_NAME: "{{ .values.agent_name }}"
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- range $name, $from := (optional (default dict $edge.inject) "env" dict) }}
+          {{ toJson $name }}: {{ toJson (optional $env $name "") }}
+    {{- end }}
+    {{- end }}
+    {{- if $files }}
+        volumeMounts:
+    {{- $i := 0 }}
+    {{- range $path, $_ := $files }}
+          - name: inject-files
+            path: {{ toJson $path }}
+            subPath: "file-{{ $i }}"
+            readonly: true
+    {{- $i = add $i 1 }}
+    {{- end }}
     {{- end }}
     {{- with $mediaServerCredential }}
         attachments:
@@ -184,6 +249,45 @@ spec:
           limits:
             cpu: "{{ .infra.compute.cpu }}"
             memory: "{{ .infra.compute.memory }}"
+    {{- if $files }}
+    # A volume only for the files a connection dictates; the worker itself
+    # holds no durable disk.
+    volumes:
+      inject-files:
+        configmap:
+          source: "{{ .context.rendered_name }}-files"
+    {{- end }}
     # No services block, and its absence is the point rather than an omission:
     # the worker serves no application traffic, so there is nothing for a Service
     # to front and no address for one to publish.
+  # The ConfigMap holding the file entries the connection dictates, keyed
+  # file-0, file-1 and so on in path order, the keys the workload's mounts read.
+  # It is emitted only while the connection dictates a file, so a build with
+  # none renders nothing here. The pod mounts it by name, which resolves only in
+  # the pod's own namespace, so it carries the namespace the Release declares
+  # for the component through the aggrega.ai/namespace annotation, and none
+  # where it declares none.
+  artifacts:
+    livekit-agent-worker-files.configmap.yaml: |
+      {{- $pipeFiles := optional (default dict .context.inject) "file" dict }}
+      {{- $files := dict }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- range $path, $from := (optional (default dict $edge.inject) "file" dict) }}
+      {{- $_ := set $files $path (optional $pipeFiles $path "") }}
+      {{- end }}
+      {{- end }}
+      {{- if $files -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-files
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+        namespace: "{{ . }}"
+        {{- end }}
+      data:
+        {{- $i := 0 }}
+        {{- range $path, $v := $files }}
+        file-{{ $i }}: {{ toJson $v }}
+        {{- $i = add $i 1 }}
+        {{- end }}
+      {{- end }}
