@@ -2076,10 +2076,14 @@ because a Fargate task definition offers no volume whose content it supplies
 itself; the server's and the worker's Cloud Run Recipes deliver `env` entries
 and refuse `file`, because neither a service nor a worker pool offers a volume
 whose content its configuration supplies itself, and refuse a dictated name
-Cloud Run reserves for itself or cannot take; and the function's AWS Lambda
-Recipes deliver `env` entries and refuse `file`, because a function's
-configuration offers no way to write one, and refuse a dictated name Lambda
-reserves for itself or cannot take. Every one
+Cloud Run reserves for itself or cannot take; the server's and the worker's
+Azure Container Apps Recipes deliver `env` entries, and `file` entries as
+secrets of the app, each mounted alone at its path from one Secret volume,
+refusing a path that is not absolute or that lies beneath another entry's, and
+refuse a dictated name Container Apps sets in every app itself; and the
+function's AWS Lambda Recipes deliver `env` entries and refuse `file`, because
+a function's configuration offers no way to write one, and refuse a dictated
+name Lambda reserves for itself or cannot take. Every one
 refuses `arg`, because none renders a command line: each target takes what a
 container is given to run in place of the image's default command, and that
 command is the Release's. A dictated name equal to
