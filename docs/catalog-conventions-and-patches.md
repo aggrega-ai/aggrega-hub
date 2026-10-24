@@ -2073,9 +2073,13 @@ and `file` entries as read-only files from one ConfigMap, each mounted by
 subPath, refusing a path that is not absolute or that lies beneath another
 entry's; their Amazon ECS Recipes deliver `env` entries and refuse `file`,
 because a Fargate task definition offers no volume whose content it supplies
-itself; and the function's AWS Lambda Recipes deliver `env` entries and refuse
-`file`, because a function's configuration offers no way to write one, and
-refuse a dictated name Lambda reserves for itself or cannot take. Every one
+itself; the server's and the worker's Cloud Run Recipes deliver `env` entries
+and refuse `file`, because neither a service nor a worker pool offers a volume
+whose content its configuration supplies itself, and refuse a dictated name
+Cloud Run reserves for itself or cannot take; and the function's AWS Lambda
+Recipes deliver `env` entries and refuse `file`, because a function's
+configuration offers no way to write one, and refuse a dictated name Lambda
+reserves for itself or cannot take. Every one
 refuses `arg`, because none renders a command line: each target takes what a
 container is given to run in place of the image's default command, and that
 command is the Release's. A dictated name equal to
@@ -2294,8 +2298,9 @@ by each body with a comment naming this section, for the reasons the AWS section
 gives. The major and minor are those of the provider's current release when the
 constraint is set, and never lower than the highest `hashicorp/google` floor a
 published Google module a catalog Recipe sources declares. The bodies that follow it
-are the modules `recipe/terraform/valkey-memorystore` and `memcached-memorystore`
-keep beside them, which declare only GA resources and so need no `hashicorp/google-beta`.
+are the modules `recipe/terraform/valkey-memorystore`, `memcached-memorystore`,
+`server-cloud-run` and `worker-cloud-run` keep beside them, which declare only GA
+resources and so need no `hashicorp/google-beta`.
 
 The Cloud SQL module the `-cloud-sql` Recipes vendor keeps its publisher's own
 constraint, `hashicorp/google` and `hashicorp/google-beta` `>= 7.22, < 9` and

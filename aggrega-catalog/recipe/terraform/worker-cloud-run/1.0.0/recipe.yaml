@@ -1,0 +1,311 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: worker-cloud-run
+  version: 1.0.0
+  description: >
+    The generic background-worker primitive as one Cloud Run worker pool
+    running infra.replicas instances of the Release's image, rendered by
+    vendoring a Terraform module kept beside this Recipe. Reach for it in a
+    Google Cloud project with a VPC network; for terraform/worker-ecs or
+    cloudformation/worker-ecs in an AWS account, and helm/worker on Kubernetes.
+
+    A worker pool is Cloud Run's resource for continuous background work: it
+    has no endpoint or URL, the container declares no port, and it runs a
+    fixed instance count with no autoscaling. The project, region, VPC network
+    and service account are the operator's, each required under
+    infra.overrides; a subnet and network tags are optional. Only the worker
+    pool is emitted — no service account, IAM binding, network, subnet or
+    firewall rule. Traffic to private addresses leaves through the network by
+    Direct VPC egress, so a Cloud SQL or Memorystore address there is reached.
+
+    Each env entry an edge's inject block dictates becomes a container
+    variable under that name, its value written whole, so a Terraform
+    reference a neighbour publishes is evaluated by the engine; concurrency and
+    queue_depth_hint arrive as WORKER_CONCURRENCY and WORKER_QUEUE_DEPTH_HINT.
+    No edge may dictate those, or a name Cloud Run reserves or refuses. File,
+    arg and other entries are refused by name: the worker pool writes no file,
+    and no command line is rendered. The container runs at the smallest worker
+    pool size meeting infra.compute.cpu and infra.compute.memory, so the
+    Component's defaults run at 1 vCPU and 512 MiB.
+
+    GoogleCloudPlatform/cloud-run/google is not sourced: at v0.34.2, its
+    newest version, it declares no worker pool; only the hashicorp/google
+    provider's resource does.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/compute/worker:1.0.0
+
+  # The module this Recipe vendors lives beside it, and is copied verbatim into
+  # the component's own directory; entity.lock pins its files. Its main.tf pins
+  # hashicorp/google by the one range every Google body in this catalog
+  # declares, and says why. The worker pool resource is generally available in
+  # that provider, so the module needs no hashicorp/google-beta.
+  #
+  # Google's Cloud Run module, GoogleCloudPlatform/cloud-run/google, at v0.34.2,
+  # the newest version its registry entry and its repository's tags carry,
+  # declares a Cloud Run service in its v2 directory and a service in its root,
+  # and nowhere a worker pool. A worker pool is therefore declared here, as the
+  # one resource the module beside this Recipe holds.
+  source: ./module
+
+  # This Recipe reads from infra.overrides:
+  #   project_id          - string (project_id), required
+  #   region              - string (location), required
+  #   private_network     - string (network), required
+  #   service_account     - string (service_account), required
+  #   subnetwork          - string (subnetwork)
+  #   network_tags        - []string (tags)
+  #   deletion_protection - bool (deletion_protection; default true)
+  #
+  # Each is passed to the module input named in brackets. Each module input is
+  # named for the resource argument it sets; network, subnetwork and tags set
+  # the worker pool's one network interface. Four keys reuse a spelling other
+  # Recipes already read for the same concept, so an operator writes each under
+  # one name across the catalog's terraform Google Recipes: project_id, region
+  # and private_network, as the Cloud SQL and Memorystore Recipes read them,
+  # and deletion_protection, as the Cloud SQL Recipes read it.
+  #
+  # project_id, region, private_network and service_account are required and
+  # none has a default: the project, the network and the identity the worker
+  # runs as are provisioned outside this Release, no project-independent value
+  # exists for any of them, and this Recipe never chooses a network or an
+  # identity for the operator. private_network is the network's resource link,
+  # projects/<project>/global/networks/<name>; the worker pool takes addresses
+  # from subnetwork, or from the subnet named as the network while subnetwork
+  # is unset, which must be a /26 or larger for Direct VPC egress. Egress is
+  # private ranges only: traffic to a private address goes through the network,
+  # and other traffic leaves as it would with no network named.
+  # service_account is the email of the account the worker runs as, which the
+  # worker's code calls Google Cloud with; the identity applying the
+  # configuration needs leave to act as it. network_tags are matched by the
+  # operator's egress firewall rules. deletion_protection is the provider's own
+  # guard, true unless the Release turns it off, under which Terraform refuses
+  # to destroy or replace the worker pool.
+  #
+  # Target-expected names: the image is the Release's, so no upstream
+  # documentation names a spelling for the two developer values. They are
+  # delivered under the names helm/worker delivers them under, and only when
+  # the developer set them, so an unset value renders no variable rather than
+  # an empty one.
+  #
+  # Every Component value and infra key is honoured or refused below by name:
+  #   honoured — values.concurrency and values.queue_depth_hint as above,
+  #     infra.image (required), infra.replicas as the worker pool's instance
+  #     count, infra.compute.cpu and infra.compute.memory as the size below, and
+  #     the overrides above.
+  #   refused — a compute quantity this Recipe cannot read, and a pair larger
+  #     than the largest worker pool size; a component name Cloud Run does not
+  #     take for a worker pool; an edge injecting a variable under one of the
+  #     two names the developer values are delivered under, under a name Cloud
+  #     Run reserves or refuses; and an edge's file, arg or custom-mechanism
+  #     entry, as the comment above valuesMapping describes.
+  assertions:
+    # This component packages no upstream product, so it holds no default image
+    # to fall back to: the Release names the one it runs.
+    image_supplied: >-
+      {{- if not (optional .infra "image" "") -}}
+      {{- fail "this realization runs an image the Release supplies, because the generic compute primitive packages no software and therefore holds no default: set infra.image to the container image running the worker loop in the Release" -}}
+      {{- end -}}
+    # The compute block's two sub-keys carry defaults, which fill either one a
+    # Release leaves out; one the Release sets empty leaves the container
+    # nothing to be sized by, so each must carry a quantity.
+    compute_group_complete: >-
+      {{- $compute := optional .infra "compute" dict -}}
+      {{- if not (optional $compute "cpu" "") -}}
+      {{- fail "infra.compute.cpu is empty, so the worker pool would have no CPU to be sized by: set infra.compute.cpu in the Release to a quantity, or remove it to take the component's default" -}}
+      {{- end -}}
+      {{- if not (optional $compute "memory" "") -}}
+      {{- fail "infra.compute.memory is empty, so the worker pool would have no memory to be sized by: set infra.compute.memory in the Release to a quantity, or remove it to take the component's default" -}}
+      {{- end -}}
+    compute_fits_cloud_run: >-
+      {{- if not .locals.cpu_millicores -}}
+      {{- fail (printf "infra.compute.cpu is %q, and this Recipe reads it as a Kubernetes CPU quantity, whole millicores such as 100m or vCPUs with at most three decimals such as 0.5: set infra.compute.cpu in the Release to one of those forms" (toString .infra.compute.cpu)) -}}
+      {{- end -}}
+      {{- if not .locals.memory_mib -}}
+      {{- fail (printf "infra.compute.memory is %q, and this Recipe reads it as a Kubernetes memory quantity in whole mebibytes or gibibytes, such as 128Mi or 1Gi: set infra.compute.memory in the Release to one of those forms" (toString .infra.compute.memory)) -}}
+      {{- end -}}
+      {{- if not .locals.size -}}
+      {{- fail (printf "infra.compute asks for cpu %q and memory %q, and no Cloud Run worker pool size meets both: the largest is 8 vCPU with 32 GiB, and each CPU size takes a bounded range of memory, up to 4 GiB at 1 vCPU, 8 GiB at 2, 16 GiB at 4 and 24 GiB at 6; set infra.compute in the Release to a pair one size meets" (toString .infra.compute.cpu) (toString .infra.compute.memory)) -}}
+      {{- end -}}
+    project_region_network_identity_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "project_id" "region" "private_network" "service_account" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release runs its worker as a Cloud Run worker pool in the operator's own Google Cloud project, region and VPC network, as a service account that already exists, and this Recipe never chooses any of them, but infra.overrides.%s carries none: set infra.overrides.project_id, infra.overrides.region, infra.overrides.private_network and infra.overrides.service_account in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if not (regexMatch `^projects/[^/]+/global/networks/[^/]+$` $o.private_network) -}}
+      {{- fail (printf "infra.overrides.private_network is %q, and this Recipe takes the VPC network the worker pool reaches private addresses through as the network's resource link: set it to projects/<project>/global/networks/<name>" $o.private_network) -}}
+      {{- end -}}
+    optional_overrides_typed: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "subnetwork" -}}
+      {{- $v := index $o "subnetwork" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "infra.overrides.subnetwork is %s, and this Recipe reads it as the name or resource link of an existing subnet of infra.overrides.private_network: set it in the Release to that string, or remove it to use the subnet named as the network" (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "network_tags" -}}
+      {{- $s := index $o "network_tags" -}}
+      {{- $ok := and (kindIs "slice" $s) (gt (len $s) 0) -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) .) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.network_tags is %s, and this Recipe reads it as a list of network tag names: set it in the Release to such a list, or remove it" (toJson $s)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if and (hasKey $o "deletion_protection") (not (kindIs "bool" (index $o "deletion_protection"))) -}}
+      {{- fail (printf "infra.overrides.deletion_protection is %s, and this Recipe reads it as true or false: set it in the Release to false to let Terraform destroy the worker pool, or remove it" (toJson (index $o "deletion_protection"))) -}}
+      {{- end -}}
+
+  # The worker pool's size, read off the CPU table of Cloud Run's "Configure CPU
+  # limits for worker pools" page: a CPU size in vCPU, and the range of memory
+  # each takes — 1 vCPU with 512 MiB to 4 GiB, 2 with 512 MiB to 8 GiB, 4 with 2
+  # to 16 GiB, 6 with 4 to 24 GiB and 8 with 4 to 32 GiB. The container runs at
+  # the first CPU size meeting the CPU infra.compute asks for whose range
+  # reaches the memory it asks for, with that memory, or the range's floor where
+  # less is asked. Each requested quantity is a floor: the container may be
+  # given more than was written, and is billed for what it is given. The
+  # Component's defaults, 100m and 128Mi, are below the smallest size, so they
+  # run at 1 vCPU and 512 MiB. A size the table adds later is not chosen until
+  # it is listed here. These locals are the ones terraform/server-cloud-run
+  # declares, word for word, and a change to the table is made to both;
+  # cpu_millicores and memory_mib are also the locals the Amazon ECS Recipes
+  # declare.
+  locals:
+    # The requested CPU in millicores, or empty when it is not a quantity this
+    # Recipe reads: whole millicores, or vCPUs with at most three decimals.
+    cpu_millicores: >-
+      {{- $c := toString (optional (optional .infra "compute" dict) "cpu" "") -}}
+      {{- if regexMatch `^[0-9]+m$` $c -}}{{ atoi (trimSuffix "m" $c) }}
+      {{- else if regexMatch `^[0-9]+(\.[0-9]{1,3})?$` $c -}}
+      {{- $p := splitList "." $c -}}{{- $f := 0 -}}
+      {{- if eq (len $p) 2 }}{{ $f = atoi (substr 0 3 (printf "%s000" (index $p 1))) }}{{ end -}}
+      {{- add (mul (atoi (index $p 0)) 1000) $f -}}
+      {{- end -}}
+    # The requested memory in MiB, or empty when it is not a quantity this
+    # Recipe reads: whole Mi or Gi.
+    memory_mib: >-
+      {{- $m := toString (optional (optional .infra "compute" dict) "memory" "") -}}
+      {{- if regexMatch `^[0-9]+Mi$` $m -}}{{ atoi (trimSuffix "Mi" $m) }}
+      {{- else if regexMatch `^[0-9]+Gi$` $m -}}{{ mul (atoi (trimSuffix "Gi" $m)) 1024 }}
+      {{- end -}}
+    # The first size meeting both, as vcpu/mib, or empty when none does.
+    size: >-
+      {{- $found := "" -}}
+      {{- if and .locals.cpu_millicores .locals.memory_mib -}}
+      {{- $mc := atoi .locals.cpu_millicores -}}{{- $mib := atoi .locals.memory_mib -}}
+      {{- range list (list 1 512 4096) (list 2 512 8192) (list 4 2048 16384) (list 6 4096 24576) (list 8 4096 32768) -}}
+      {{- if and (not $found) (ge (mul (index . 0) 1000) $mc) (ge (index . 2) $mib) -}}
+      {{- $found = printf "%d/%d" (index . 0) (max (index . 1) $mib) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $found -}}
+    size_cpu: '{{ if .locals.size }}{{ index (splitList "/" .locals.size) 0 }}{{ end }}'
+    size_memory: '{{ if .locals.size }}{{ index (splitList "/" .locals.size) 1 }}Mi{{ end }}'
+
+  # The component publishes nothing across an edge, so nothing is emitted for
+  # one.
+  provides: {}
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # worker pool is named after the component, so the name is checked here
+  # against what Cloud Run accepts for one.
+  #
+  # The environment is read off the inject pipe as a map, and every variable on
+  # it becomes one variable of the container, under the name the Aggregate gave
+  # it on the edge; this Recipe expects no name of its own, so none is missing
+  # whatever the edges deliver. Each value is written whole as the map's value,
+  # so a Terraform reference a neighbour publishes, such as
+  # ${module.db.private_ip_address}, reaches the root configuration as an
+  # interpolation the engine evaluates there, where the neighbour's module is
+  # declared. The two developer values join that map under their own names, and
+  # an edge delivering either name as well halts, naming the connection, rather
+  # than one value silently replacing the other. Cloud Run sets
+  # CLOUD_RUN_WORKER_POOL and CLOUD_RUN_REVISION in every worker pool itself and
+  # refuses a configuration naming either, or a name holding = or beginning
+  # X_GOOGLE_, so an edge dictating one halts here, naming the connection,
+  # rather than when the configuration is applied.
+  #
+  # Every other mechanism on the pipe is refused, naming the entry, its
+  # mechanism and the connection that dictated it, so none is dropped: a file
+  # entry, because a worker pool's volumes are Secret Manager secrets, Cloud
+  # Storage buckets, NFS shares, Cloud SQL sockets and empty directories, none
+  # of whose content the configuration supplies itself; an arg entry, because
+  # this Recipe renders no command line, and Cloud Run takes a container's
+  # arguments in place of the image's default command, which is the Release's;
+  # and any custom mechanism.
+  valuesMapping: |
+    {{- if not (regexMatch `^[a-z]([-a-z0-9]{0,47}[a-z0-9])?$` .context.instance_id) }}
+    {{- fail (printf "the component %q names its Cloud Run worker pool, and Cloud Run takes a name that begins with a lowercase letter, holds lowercase letters, digits and hyphens, does not end with a hyphen and is fewer than 50 characters long: rename the component in the Aggregate to such a name" .context.instance_id) }}
+    {{- end }}
+    {{- range $mechanism, $entries := default dict .context.inject }}
+    {{- if not (has $mechanism (list "all" "env")) }}
+    {{- range $name, $_ := $entries }}
+    {{- $by := "an attachment on the component" }}
+    {{- range $alias, $edge := $.context.uses }}
+    {{- if hasKey (optional (default dict $edge.inject) $mechanism dict) $name }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+    {{- end }}
+    {{- if eq $mechanism "file" }}
+    {{- fail (printf "the component %q is handed a file at %q by %s, and a Cloud Run worker pool offers no volume whose content its configuration supplies itself: dictate the value as an env entry in that inject block instead" $.context.instance_id $name $by) }}
+    {{- end }}
+    {{- if eq $mechanism "arg" }}
+    {{- fail (printf "the component %q is handed the command-line argument %q by %s, and this realization renders no command line: Cloud Run takes a container's arguments in place of the image's default command, and that command is the Release's. Dictate the value as an env entry in that inject block instead" $.context.instance_id $name $by) }}
+    {{- end }}
+    {{- fail (printf "the component %q is handed %q under the delivery mechanism %q by %s, and this realization delivers env entries only: dictate the value as an env entry in that inject block instead" $.context.instance_id $name $mechanism $by) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- $o := optional .infra "overrides" dict }}
+    {{- $env := dict }}
+    {{- range $k, $v := optional (default dict .context.inject) "env" dict }}{{ $_ := set $env $k $v }}{{ end }}
+    {{- range $k, $_ := $env }}
+    {{- if or (has $k (list "CLOUD_RUN_WORKER_POOL" "CLOUD_RUN_REVISION")) (contains "=" $k) (hasPrefix "X_GOOGLE_" $k) }}
+    {{- $by := "an attachment on the component" }}
+    {{- range $alias, $edge := $.context.uses }}
+    {{- if hasKey (optional (default dict $edge.inject) "env" dict) $k }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+    {{- end }}
+    {{- fail (printf "the component %q is handed the variable %q by %s, and Cloud Run refuses it: it sets CLOUD_RUN_WORKER_POOL and CLOUD_RUN_REVISION in every worker pool itself, and takes no name holding = or beginning X_GOOGLE_. Rename the variable in that inject block" $.context.instance_id $k $by) }}
+    {{- end }}
+    {{- end }}
+    {{- $developer := dict }}
+    {{- with optional .values "concurrency" "" }}{{ $_ := set $developer "WORKER_CONCURRENCY" (toString .) }}{{ end }}
+    {{- with optional .values "queue_depth_hint" "" }}{{ $_ := set $developer "WORKER_QUEUE_DEPTH_HINT" (toString .) }}{{ end }}
+    {{- range $k, $v := $developer }}
+    {{- if hasKey $env $k }}
+    {{- $by := "an attachment on the component" }}
+    {{- range $alias, $edge := $.context.uses }}
+    {{- if hasKey (optional (default dict $edge.inject) "env" dict) $k }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+    {{- end }}
+    {{- fail (printf "the component %q delivers its developer value %s to the container as %s, and %s dictates a variable under that name as well, so one would silently replace the other: rename the variable in that inject block" $.context.instance_id (index (dict "WORKER_CONCURRENCY" "concurrency" "WORKER_QUEUE_DEPTH_HINT" "queue_depth_hint") $k) $k $by) }}
+    {{- end }}
+    {{- $_ := set $env $k $v }}
+    {{- end }}
+    project_id: {{ toJson $o.project_id }}
+    location: {{ toJson $o.region }}
+    name: "{{ .context.instance_id }}"
+    image: {{ toJson .infra.image }}
+    cpu: "{{ .locals.size_cpu }}"
+    memory: "{{ .locals.size_memory }}"
+    manual_instance_count: {{ .infra.replicas }}
+    environment: {{ toJson $env }}
+    service_account: {{ toJson $o.service_account }}
+    network: {{ toJson $o.private_network }}
+    {{- with optional $o "subnetwork" "" }}
+    subnetwork: {{ toJson . }}
+    {{- end }}
+    {{- with optional $o "network_tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}
+    {{- if kindIs "bool" (optional $o "deletion_protection" "") }}
+    deletion_protection: {{ $o.deletion_protection }}
+    {{- end }}
