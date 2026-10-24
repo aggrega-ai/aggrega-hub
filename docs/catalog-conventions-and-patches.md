@@ -2396,11 +2396,12 @@ the product trusts. The shipped slots are
 slots the Component declares optional because a managed service takes none:
 each halts naming an empty `access_key_id` or `secret_access_key`. The Recipes
 presenting a store's secret key as an S3 secret key — `helm/agenta-api`,
-`helm/agenta-services` and `helm/thanos-store` — carry no default for it
-either: a store connection with nothing in its `credential` halts the build,
-naming the connection, unless its values set `unauthenticated: true`, and then
-no secret key is presented. A module filling such a slot from a parameter
-declares the parameter required with no default, as `core/harbor` does for
+`helm/agenta-services`, `helm/langfuse`, `helm/langfuse-chart` and
+`helm/thanos-store` — carry no default for it either: a store connection with
+nothing in its `credential` halts the build, naming the connection, unless its
+values set `unauthenticated: true`, and then no secret key is presented. A
+module filling such a slot from a parameter declares the parameter required
+with no default, as `core/harbor` does for
 `csrf_key`, `jobservice_secret` and `registry_http_secret`. `core/agenta` and
 `core/thanos` are the exception: each fills its object store's key pair, and the
 store connections that present it, from two parameters — `store_access_key` and
