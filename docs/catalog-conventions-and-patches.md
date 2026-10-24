@@ -2970,11 +2970,12 @@ publishes `token_url`, `oidc_discovery_url` and `scopes` (see
 - **`core/ai-tool/agent-invocation` declares the shape on its `target_agent`
   socket**, and `helm/agent-invocation-knative` delivers the secret as
   `AGENT_TOOL_TARGET_CLIENT_SECRET`, a `secretKeyRef` to the Secret it publishes,
-  beside `AGENT_TOOL_TARGET_CLIENT_ID`, `AGENT_TOOL_TARGET_AUDIENCE`,
-  `AGENT_TOOL_TARGET_TOKEN_URL`, `AGENT_TOOL_TARGET_OIDC_DISCOVERY_URL` and
-  `AGENT_TOOL_TARGET_SCOPES`, each only where it has a value and none of them on
-  a connection holding no `client_secret`, which therefore renders exactly what
-  it renders with no such slot at all.
+  beside `AGENT_TOOL_TARGET_CLIENT_ID`, `AGENT_TOOL_TARGET_AUDIENCE` and, on a
+  connection writing no `inject:` block, `AGENT_TOOL_TARGET_TOKEN_URL`,
+  `AGENT_TOOL_TARGET_OIDC_DISCOVERY_URL` and `AGENT_TOOL_TARGET_SCOPES`, each
+  only where it has a value and none of them on a connection holding no
+  `client_secret`, which therefore renders exactly what it renders with no such
+  slot at all.
 - **The token is the caller's software's job.** Obtaining it, caching it,
   obtaining another before it expires and presenting it on each request belong
   to the image the caller runs, and no build observes any of it: the catalog
@@ -4060,9 +4061,9 @@ template, not something the compiler checks: the compiler pipes the published
 - **A consumer whose product cannot reach a cache over TLS refuses the TLS value
   by name**, naming the connection and the cache's protocol: Higress's token
   limit, whose plugin's Redis settings offer no TLS connection, and the four
-  consumers that hand a store's address to the Release's own code —
-  `core/ai-tool/datastore-query`, and, on a connection writing no `inject:`
-  block, `core/ai-agent/langgraph`, `dynamiq` and
+  consumers that hand a store's address to the Release's own code, on a
+  connection writing no `inject:` block — `core/ai-tool/datastore-query`,
+  `core/ai-agent/langgraph`, `dynamiq` and
   `phidata` — which give that code no authority to check a certificate against,
   and the last three not even the store's protocol.
 - **A consumer checking `protocol` through the shared TargetProtocol check lists
