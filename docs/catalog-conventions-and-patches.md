@@ -3867,6 +3867,37 @@ names no certificate renders byte for byte as before. This is a catalog
 convention, not something the compiler checks: it pipes the Secret's name as a
 string and knows nothing of what the Secret holds.
 
+A server inside the cluster that terminates its own clients' TLS takes a
+different shape, because the certificate belongs to the server's own listener,
+which only its Recipe configures:
+
+- **The operator turns it on with `infra.client_tls`** on the server's
+  Component, off by default, and off renders exactly as a Component without
+  the setting.
+- **A self-hosted realization presents the certificate attached to the
+  server's slot `server_certificate`**, a Secret holding `tls.crt` and
+  `tls.key` mounted into its container as files; a realization whose operator
+  or service issues its own certificate presents that one instead.
+- **The caller checks it against the authority in a `server_ca` slot on its
+  own connection**, a Secret holding `ca.crt` mounted into its container, or,
+  with none attached, against its image's default trust store.
+- **The published `protocol` takes a value of its own while TLS is on**, which
+  is what tells a caller that TLS is required: a caller holding `server_ca` on
+  a connection to a server publishing a value served without TLS halts naming
+  the connection.
+
+The caches follow it, as "Encrypted client connections to a cache" below sets
+out, and so does `core/messaging/kafka`, publishing `kafka-ssl` — the wire
+protocol paired with `SSL`, the name a Kafka client's `security.protocol`
+takes. Its synthesized realization requires `server_certificate`, its Strimzi
+realization presents a certificate from the operator's cluster certificate
+authority unless one is attached, publishing that authority's certificate as
+`ca.crt` in the Secret `<instance>-cluster-ca-cert`, and its MSK realization
+presents one AWS issues, which a default trust store holds.
+`core/ai-tool/event-publisher` takes `server_ca` on its `target_messaging`
+connection and names the mounted file to the tool's code as
+`EVENT_TOOL_BROKER_SERVER_CA_FILE`.
+
 ### The datastore family template
 
 Every datastore component targets the same shape, distilled from the PostgreSQL

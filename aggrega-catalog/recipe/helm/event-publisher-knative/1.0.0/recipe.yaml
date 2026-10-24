@@ -20,7 +20,9 @@ metadata:
     the running tool addresses the broker the topology resolved rather than one
     named in its own configuration. A connection writing an `inject:` block
     receives instead the names it dictates, as variables or as files from a
-    ConfigMap emitted beside the Service. provides is the addressable name the
+    ConfigMap emitted beside the Service. A server_ca on the connection is
+    mounted read-only and named as EVENT_TOOL_BROKER_SERVER_CA_FILE, and is
+    refused on a broker served without TLS. provides is the addressable name the
     control plane gives the Service. The Knative Serving control plane is a
     runtime prerequisite: the build halts unless the operator affirms it is
     installed (infra.control_plane_present), so no custom resource is emitted
@@ -112,6 +114,32 @@ spec:
   # the tool's own, or another connection's default — halts the build, naming
   # both, since the compiler cannot see the names a recipe writes.
   #
+  # A broker serving TLS publishes a protocol saying so — kafka-ssl from a Kafka
+  # broker with infra.client_tls on, amqps from RabbitMQ on Amazon MQ — and the
+  # default connection delivers it as EVENT_TOOL_BROKER_PROTOCOL, from which the
+  # tool's code learns to connect over TLS. The connection's server_ca slot
+  # carries the authority the code checks the broker's certificate against. A
+  # filled slot becomes a volume of the whole Secret its attachment publishes by
+  # name, and a read-only mount of that volume, which Knative Serving requires of
+  # a Secret volume, at a fixed directory; the volume lists no items, so every
+  # data key becomes a file named by the key, and EVENT_TOOL_BROKER_SERVER_CA_FILE
+  # names its ca.crt. The data key the attachment publishes is not read. Both are
+  # delivered on a connection writing an inject block too, since they come from
+  # the connection's attachment, which no inject entry can name; a dictated file
+  # at, beneath or above the mount directory, and a dictated variable of that
+  # name, are refused. A connection holding no server_ca renders exactly what it
+  # renders with no such slot at all. The template halts, naming the
+  # connection, on a server_ca whose attachment publishes no Secret name, on one
+  # whose broker publishes a protocol the catalog's messaging components serve
+  # without TLS — kafka, amqp, nats, ws or sip — since no handshake would take
+  # place to check a certificate in, and on server_ca held on two connections,
+  # since one container holds one such variable and one such mount. A broker
+  # publishing no protocol is not judged here. The Service names the Secret and
+  # never its content. Of the Secret realizations, k8s-existing-secret is the
+  # one that fills the slot here: one naming its Secret after the host halts,
+  # since this recipe renders from an artifacts template, which gives the tool
+  # no rendered name.
+  #
   # event-publisher-knative-files.configmap.yaml holds the file entries the
   # connections dictate, keyed file-0, file-1 and so on in path order, the keys
   # the Service's mounts read, and is emitted only while a connection dictates a
@@ -143,6 +171,9 @@ spec:
         {{- end }}
       {{- end }}
     service.yaml: |
+      {{- $serverCaVolume := "target-messaging-server-ca" -}}
+      {{- $serverCaDir := "/var/run/secrets/event-tool/target-messaging/server-ca" -}}
+      {{- $plaintext := list "kafka" "amqp" "nats" "ws" "sip" -}}
       {{- $env := optional (default dict .context.inject) "env" dict -}}
       {{- $dictating := dict -}}
       {{- range $alias, $edge := .context.uses -}}
@@ -158,6 +189,23 @@ spec:
       {{- end -}}
       {{- if gt (len $wired) 1 -}}
       {{- fail (printf "the target_messaging connections %s and %s of %q write no inject block, so each would hand the tool its broker under the same variable names, leaving undefined which broker the tool publishes to: write an inject block on all but one of them, dictating the names the tool's code reads for each broker, or leave one edge on target_messaging and declare a second event-publishing component for a second broker" (index $wired 0) (index $wired 1) .context.instance_id) -}}
+      {{- end -}}
+      {{- $caHolder := "" -}}
+      {{- range $alias, $edge := .context.uses -}}
+      {{- if and (eq $edge.socket "target_messaging") (hasKey (default dict $edge.features) "server_ca") -}}
+      {{- $locator := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+      {{- if not (and (kindIs "map" $locator) (optional $locator "name" "")) -}}
+      {{- fail (printf "the server_ca on the target_messaging connection %s of %q publishes no Secret name, so no Secret could be mounted into the tool's container: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) -}}
+      {{- end -}}
+      {{- $proto := optional (default dict $edge.provides) "protocol" "" -}}
+      {{- if has (toString $proto) $plaintext -}}
+      {{- fail (printf "the target_messaging connection %s of %q holds a server_ca, but the broker it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn TLS on for that broker, such as infra.client_tls on a Kafka broker, or remove the server_ca" $alias $.context.instance_id $edge.target $proto) -}}
+      {{- end -}}
+      {{- if $caHolder -}}
+      {{- fail (printf "the target_messaging connections %s and %s of %q each hold a server_ca, and one container holds one EVENT_TOOL_BROKER_SERVER_CA_FILE and one mount at %s: hold server_ca on one target_messaging connection only, and declare a second event-publishing component for the other broker" $caHolder $alias $.context.instance_id $serverCaDir) -}}
+      {{- end -}}
+      {{- $caHolder = $alias -}}
+      {{- end -}}
       {{- end -}}
       {{- $taken := dict -}}
       {{- $_ := set $taken "EVENT_TOOL_TARGET_TOPIC" "the component's own value target_topic" -}}
@@ -179,6 +227,9 @@ spec:
       {{- end -}}
       {{- end -}}
       {{- end -}}
+      {{- with $caHolder -}}
+      {{- $_ := set $taken "EVENT_TOOL_BROKER_SERVER_CA_FILE" (printf "the server_ca held on the target_messaging connection %s" .) -}}
+      {{- end -}}
       {{- $files := dict -}}
       {{- range $alias, $edge := .context.uses -}}
       {{- range $mechanism, $entries := (default dict $edge.inject) -}}
@@ -190,6 +241,9 @@ spec:
       {{- else if eq $mechanism "file" -}}
       {{- if not (hasPrefix "/" $name) -}}
       {{- fail (printf "the %s connection %s of %q dictates a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $edge.socket $alias $.context.instance_id $name) -}}
+      {{- end -}}
+      {{- if and $caHolder (or (eq $name $serverCaDir) (hasPrefix (printf "%s/" $serverCaDir) $name) (hasPrefix (printf "%s/" $name) $serverCaDir)) -}}
+      {{- fail (printf "the %s connection %s of %q dictates a file at %q, and this realization mounts the server_ca at %q, so the two paths would overlap: dictate the file at a path neither at, beneath nor above that directory" $edge.socket $alias $.context.instance_id $name $serverCaDir) -}}
       {{- end -}}
       {{- $_ := set $files $name true -}}
       {{- else if eq $mechanism "arg" -}}
@@ -258,6 +312,10 @@ spec:
                     value: "{{ . }}"
                   {{- end }}
                   {{- end }}
+                  {{- if eq $alias $caHolder }}
+                  - name: EVENT_TOOL_BROKER_SERVER_CA_FILE
+                    value: "{{ $serverCaDir }}/ca.crt"
+                  {{- end }}
                   {{- end }}
                 resources:
                   requests:
@@ -266,8 +324,13 @@ spec:
                   limits:
                     cpu: "{{ .infra.compute.cpu }}"
                     memory: "{{ .infra.compute.memory }}"
-                {{- if $files }}
+                {{- if or $caHolder $files }}
                 volumeMounts:
+                  {{- if $caHolder }}
+                  - name: {{ $serverCaVolume }}
+                    mountPath: "{{ $serverCaDir }}"
+                    readOnly: true
+                  {{- end }}
                   {{- $i := 0 }}
                   {{- range $path, $_ := $files }}
                   - name: inject-files
@@ -277,9 +340,16 @@ spec:
                   {{- $i = add $i 1 }}
                   {{- end }}
                 {{- end }}
-            {{- if $files }}
+            {{- if or $caHolder $files }}
             volumes:
+              {{- with $caHolder }}
+              - name: {{ $serverCaVolume }}
+                secret:
+                  secretName: "{{ (index $.context.uses .).features.server_ca.provides.name }}"
+              {{- end }}
+              {{- if $files }}
               - name: inject-files
                 configMap:
                   name: "{{ .context.instance_id }}-files"
+              {{- end }}
             {{- end }}

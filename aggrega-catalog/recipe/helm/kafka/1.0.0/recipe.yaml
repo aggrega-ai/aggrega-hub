@@ -29,6 +29,10 @@ metadata:
     namespace qualifies the host with the target namespace on its own side
     (caller-side routing). The image serves no Prometheus metrics, so the metrics
     keys are published empty and values.metrics_enabled true halts the build.
+
+    With infra.client_tls true the client port serves TLS alone from the Secret
+    attached to server_certificate, mounted as files, and protocol is published
+    as kafka-ssl.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -41,7 +45,8 @@ spec:
   # provider names the synthesized ClusterIP Service "<rendered_name>-<service-key>"
   # (here "<rendered_name>-default"), with no namespace segment. provides.port is
   # the client bootstrap port producers and consumers connect to; protocol is
-  # "kafka". provides.bootstrap_servers is that one address joined "host:port",
+  # "kafka", and "kafka-ssl" while infra.client_tls is on, when the port accepts
+  # TLS alone. provides.bootstrap_servers is that one address joined "host:port",
   # the whole list for a client that takes one: a single node serves every
   # client. It spells the Service name a second time because a locals entry
   # cannot read the rendered name the two are built from.
@@ -53,7 +58,7 @@ spec:
     host: "{{ .context.rendered_name }}-default"
     port: "{{ .infra.broker_port }}"
     bootstrap_servers: "{{ .context.rendered_name }}-default:{{ .infra.broker_port }}"
-    protocol: "kafka"
+    protocol: "{{ if .infra.client_tls }}kafka-ssl{{ else }}kafka{{ end }}"
     metrics_pod_selector: ""
     metrics_pod_port: ""
     metrics_path: ""
@@ -67,7 +72,31 @@ spec:
       {{- if .values.metrics_enabled -}}
       {{- fail "values.metrics_enabled is true, but this realization runs the official Apache Kafka image, which keeps its metrics behind JMX and carries no Prometheus exporter, so there is no metrics endpoint to turn on or publish; set values.metrics_enabled to false, or select the controller-driven kafka-strimzi recipe in the Manifest, which turns the Strimzi metrics reporter on" -}}
       {{- end -}}
+  # With infra.client_tls true the client listener on broker_port serves TLS
+  # alone, presenting the tls.crt and tls.key of the Secret attached to
+  # server_certificate, and requests no client certificate. The build halts
+  # naming server_certificate when client_tls is true and nothing is attached,
+  # or the attachment publishes no Secret name — a core/secret-value fill is
+  # one: the image writes every Kafka variable as one line of its configuration
+  # file, so a PEM certificate delivered as a value would break it — and naming
+  # client_tls when a certificate is attached while it is false. A consumer
+  # checks the broker's certificate against the authority that signed it, which
+  # its server_ca slot holds where its image does not already trust it.
   workload: |
+    {{- $tls := .infra.client_tls }}
+    {{- $cert := hasKey (default dict .features) "server_certificate" }}
+    {{- if and $tls (not $cert) }}
+    {{- fail (printf "infra.client_tls is true on %q, so the broker serves its clients TLS alone, but nothing is attached to its server_certificate slot, so the broker has no certificate to present; attach to server_certificate a Secret holding tls.crt and tls.key, through core/referenced-secret, or set infra.client_tls to false" .context.instance_id) }}
+    {{- end }}
+    {{- if and $cert (not $tls) }}
+    {{- fail (printf "a certificate is attached to the server_certificate slot of %q, but infra.client_tls is false, so the broker serves plaintext and nothing presents the certificate; set infra.client_tls to true to serve TLS from it, or remove the attachment" .context.instance_id) }}
+    {{- end }}
+    {{- $certProvides := optional (optional (default dict .features) "server_certificate" dict) "provides" dict }}
+    {{- if and $tls (not (and (kindIs "map" $certProvides) (optional $certProvides "name" ""))) }}
+    {{- fail (printf "the server_certificate slot of %q is filled by an attachment that publishes no Secret name, but the broker reads its certificate and key from files mounted from a Secret named here, since the image writes every Kafka variable as one line of its configuration file and a PEM certificate delivered as a value would break it; bind the slot to core/referenced-secret, whose k8s-existing-secret realization names a Secret that already exists" .context.instance_id) }}
+    {{- end }}
+    {{- $client := "PLAINTEXT" }}
+    {{- if $tls }}{{ $client = "TLS" }}{{ end }}
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     # form: stateful selects a StatefulSet on the helm provider; the Kafka commit
@@ -87,15 +116,44 @@ spec:
         # delivers it as one — and quoting keeps values carrying ':' or ','
         # valid in the workload YAML. CLUSTER_ID has no KAFKA_ prefix — the
         # image reads it under that exact name.
+        #
+        # The listeners and the controller quorum bind infra.broker_port and
+        # infra.controller_port, the ports the container, the probes and both
+        # Services declare, so a broker an operator moves to other ports listens
+        # where its Services route.
+        #
+        # With infra.client_tls on, the client listener is named TLS and mapped
+        # to the SSL security protocol; it is not named SSL because the image's
+        # start-up script, on an advertised listener spelled SSL://, demands a
+        # keystore file and password files, which a kubernetes.io/tls Secret does
+        # not hold. The certificate and key reach Kafka as PEM through its
+        # directory configuration provider, which reads each file of the Secret
+        # mounted at /etc/kafka/tls as a configuration value, and is allowed to
+        # read that directory alone. On one node the broker reaches its own
+        # inter-broker listener — transaction markers go to the partition
+        # leader over it — so the inter-broker listener is the TLS listener at
+        # the advertised Service name, which the certificate names, and the
+        # broker trusts its own certificate chain for it. The controller
+        # listener stays plaintext inside the pod.
         variables:
           KAFKA_NODE_ID: "1"
           KAFKA_PROCESS_ROLES: "broker,controller"
-          KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:9093"
-          KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
-          KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://{{ .context.rendered_name }}-default:{{ .infra.broker_port }}"
+          KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:{{ .infra.controller_port }}"
+          KAFKA_LISTENERS: "{{ $client }}://:{{ .infra.broker_port }},CONTROLLER://:{{ .infra.controller_port }}"
+          KAFKA_ADVERTISED_LISTENERS: "{{ $client }}://{{ .context.rendered_name }}-default:{{ .infra.broker_port }}"
           KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
-          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
-          KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,{{ $client }}:{{ if $tls }}SSL{{ else }}PLAINTEXT{{ end }}"
+          KAFKA_INTER_BROKER_LISTENER_NAME: "{{ $client }}"
+    {{- if $tls }}
+          KAFKA_CONFIG_PROVIDERS: "dir"
+          KAFKA_CONFIG_PROVIDERS_DIR_CLASS: "org.apache.kafka.common.config.provider.DirectoryConfigProvider"
+          KAFKA_CONFIG_PROVIDERS_DIR_PARAM_ALLOWED_PATHS: "/etc/kafka/tls"
+          KAFKA_SSL_KEYSTORE_TYPE: "PEM"
+          KAFKA_SSL_KEYSTORE_CERTIFICATE_CHAIN: "${dir:/etc/kafka/tls:tls.crt}"
+          KAFKA_SSL_KEYSTORE_KEY: "${dir:/etc/kafka/tls:tls.key}"
+          KAFKA_SSL_TRUSTSTORE_TYPE: "PEM"
+          KAFKA_SSL_TRUSTSTORE_CERTIFICATES: "${dir:/etc/kafka/tls:tls.crt}"
+    {{- end }}
           KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
           KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
           KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
@@ -130,6 +188,16 @@ spec:
         volumeMounts:
           - name: data
             path: /var/lib/kafka/data
+    {{- if $tls }}
+        attachments:
+          # The certificate Secret mounts whole, read-only, one file per data
+          # key, so the configuration provider reads tls.crt and tls.key from
+          # this directory.
+          server-certificate:
+            from: server_certificate
+            as: file
+            path: /etc/kafka/tls
+    {{- end }}
     volumes:
       data:
         persistentTemplate:
