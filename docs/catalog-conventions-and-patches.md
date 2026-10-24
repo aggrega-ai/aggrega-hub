@@ -1973,14 +1973,124 @@ Recipe translates it, exactly as every Recipe already translates an attached
 credential into `OPENAI_API_KEY`.
 
 Where a target reads no variable for the value at all, the Recipe still delivers
-it under a stable name for the application's own code to read, and says so. A
-value with a named consumer is not an inert declaration, even when the framework
-itself is not the consumer; what makes it inert is nothing reading it, and that is
-the claim a Recipe's comment has to get right.
+it under a stable name for the application's own code to read, and says so. Where
+the value comes from a connection, that stable name is a default: the code is the
+Release's, and an `inject:` block on the connection replaces the default with the
+names that code reads, as the next section describes. A value with a named
+consumer is not an inert declaration, even when the framework itself is not the
+consumer; what makes it inert is nothing reading it, and that is the claim a
+Recipe's comment has to get right.
+
+### A component running the Release's own code takes `inject:` on its connections
+
+A component whose Recipes run an image the Release supplies as its own code — the
+catalog pins no image, `infra.image` carries no default, and the Component
+describes the image as the Release's: an application built on a framework, a
+tool's implementation, a generic compute primitive — runs code no Recipe can
+know. It is the White-Box case of the injection contract
+[`language-reference/vocabulary/topology-triad.md`](https://github.com/aggrega-ai/aggrega-docs/blob/main/language-reference/vocabulary/topology-triad.md)
+describes. Which variable that code reads for a connection is its author's
+choice, so the names a Recipe delivers a connection under are defaults, and the
+author's `inject:` block on the connection replaces them. A component whose image
+the Release only versions or mirrors — an operator, a gateway, a model server, a
+guardrails server — is not such a component: its Recipe writes each connection
+into the product's own configuration, under names the product defines.
+
+- **Every socket such a Component declares admits `inject:`.** Its `usesSchema`
+  entry carries `inject: [env]`, with `file` beside `env` only where every
+  Recipe of the Component writes a pipe `file` entry as a file at the path the
+  author names; where one cannot, the socket admits `env` alone and its
+  description says why. A socket that declares no allowlist refuses any
+  `inject:` block on its connections, so the allowlist is what opens the socket
+  to the author. A socket the Component does not declare carries no allowlist
+  at all, and a connection through it may dictate any mechanism.
+- **A connection that dictates nothing gets the defaults.** The Recipe derives
+  its variables from the connection's `provides` and delivers them under the
+  names it chose, so a connection needs no `inject:` block to be complete.
+- **A connection that dictates gets what it dictates, instead of the
+  defaults.** For each mechanism and each name the connection's own entry lists
+  — the Recipe reads them at `.context.uses.<alias>.inject.<mechanism>`, an
+  empty map where the connection writes no `inject:` block — it delivers the
+  resolved value at `.context.inject.<mechanism>.<name>`: any key the target
+  publishes, under any name the code reads. It delivers none of the default
+  variables it would derive from that connection's `provides`, so a dictated
+  name equal to a default replaces it rather than colliding with it. Two
+  deliveries stay on every connection, dictated or not: a variable the framework
+  or SDK in the image reads by itself, which the Recipe's comment names as read
+  by the target, since no code in the image would read a substitute; and
+  whatever an attachment on the connection delivers, since such an attachment
+  carries no `inject:` block of its own. An Aggregate dictates in the
+  array-of-entries form:
+
+  ```yaml
+  api:
+    type: core/compute/server
+    uses:
+      database:
+        orders:
+          target: db
+          inject:
+            env:
+              - in: ORDERS_DB_HOST
+                from: host
+              - in: ORDERS_DB_PORT
+                from: port
+  ```
+
+- **A dictated name equal to a name the Recipe renders itself halts.** The
+  compiler halts on a key two inject sources deliver, and knows nothing of the
+  names a Recipe writes, so the Recipe halts the build on a dictated name equal
+  to one it writes — a variable the framework reads, another connection's
+  default, an attachment's variable, a variable carrying one of the component's
+  own values — naming the name, the connection that dictated it and what else
+  delivers it.
+- **A refusal about the default delivery applies to it alone.** Where a Recipe
+  refuses because its default delivery cannot convey something — a store served
+  over TLS alone, or over HTTPS, to code handed only its host and port; two
+  connections on one socket whose default variables would share names — it
+  refuses only on a connection taking that delivery. A refusal about the
+  connection's own consistency — a certificate slot on a connection whose
+  target serves no TLS, a required socket left unwired — stands on every
+  connection.
+- **Nothing is dropped.** A Recipe delivers every mechanism its target can
+  deliver and refuses by name each pipe entry of a mechanism it cannot — an
+  `arg` where it renders no command line, a `file` where the target offers no
+  way to write one, a custom mechanism — naming the entry and the mechanism.
+- **A `core/secret-value` attachment's value is written into the rendered
+  workload in the clear.** Its realizations put the value as the author wrote it
+  into the inject pipe, and the Recipe writes what the pipe carries: a container
+  variable on Kubernetes, as in an Amazon ECS task definition. A secret that must
+  stay out of rendered output takes `core/referenced-secret` or
+  `core/random-password`, which publish only the secret resource's locator — its
+  name and data key — so no value of theirs reaches the pipe.
+
+The generic compute primitives — `core/compute/server`, `worker`, `task` and
+`function` — are the worked example. They declare no socket, so every
+connection from one is ad hoc and may dictate any mechanism, and they derive no
+default from a connection, so a connection that dictates nothing delivers
+nothing. Their Kubernetes Recipes deliver `env` entries as container variables
+and `file` entries as read-only files from one ConfigMap, each mounted by
+subPath, refusing a path that is not absolute or that lies beneath another
+entry's; their Amazon ECS Recipes deliver `env` entries and refuse `file`,
+because a Fargate task definition offers no volume whose content it supplies
+itself. Every one refuses `arg`, because none renders a command line: each
+target takes what a container is given to run in place of the image's default
+command, and that command is the Release's. A dictated name equal to
+`WORKER_CONCURRENCY` or `WORKER_QUEUE_DEPTH_HINT` while the worker's value is
+set, to `TASK_TIMEOUT` while the task's timeout is set, or to `FUNCTION_RUNTIME`
+halts.
+
+This is a catalog convention, upheld by its Recipes. The compiler enforces two
+parts of it and nothing else: a socket's `inject` allowlist, and the inject key
+collision rule. What a connection receives, which names are defaults, which
+refusals apply and what is refused by name are the Recipes' to uphold: the
+compiler pipes what a connection's `inject:` block resolves to and knows nothing
+of the names a Recipe expects or writes.
 
 ### A connection variable is read off the inject pipe as a map, and an absent one halts
 
-Many Recipes read a connection's values — a backend's host and port, a sibling's
+A Recipe whose product reads its connection settings under names the edge must
+deliver reads a connection's values — a backend's host and port, a sibling's
 endpoint — from variables the edge's `inject:` block delivers, under names the
 Recipe expects and the Aggregate writes on the edge. The render reads a variable
 nothing delivered as an empty string wherever any other variable reached the pipe,
@@ -2000,8 +2110,12 @@ that map, never through a dotted path: a template that also reads a name as
 the very gap it exists to catch. Reading the map is also what tells a variable
 delivered empty apart from one never delivered; whether an empty value is usable is
 the Recipe's own judgement about its product. The `helm/nginx` and `helm/kong`
-Recipes are worked examples. This is a catalog convention: the compiler pipes what
-the edge delivers and knows nothing of which names a Recipe expects.
+Recipes are worked examples. A Recipe for a component running the Release's own
+code asks for no such names: it reads its defaults from the connection's
+`provides`, so a connection writing no `inject:` block is complete, and it reads
+the names a connection does dictate off the pipe the same way, as a map. This is a
+catalog convention: the compiler pipes what the edge delivers and knows nothing of
+which names a Recipe expects.
 
 ### Managed-service credentials
 
