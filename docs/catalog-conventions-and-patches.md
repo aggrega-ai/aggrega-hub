@@ -985,11 +985,9 @@ clients with no way to authenticate — the store's password in `core/livekit`,
 which neither the media server nor the bridge declares a slot to present. So
 does a credential that is a slot on some consumers and a plain value on another,
 because one parameter would then be a Secret's name on one side and the literal
-credential on the other — the object store's access key in `core/agenta`, the
-`credential_id` of both API tiers' store connections and the store's own
-`root_user`. `core/keycloak`, `core/harbor`, `core/thanos`, `core/apisix`,
-`core/livekit`, `core/agenta` and `core/dify` are
-the shipped shape, the last two leaving credentials unattached for those reasons;
+credential on the other. `core/keycloak`, `core/harbor`, `core/thanos`,
+`core/apisix`, `core/livekit`, `core/agenta` and `core/dify` are the shipped
+shape, the last two leaving credentials unattached for those reasons;
 `core/kong` and `core/ferretdb` show the `compose` limit.
 
 ### Recipe/FeatureRecipe Provider Segment
@@ -2402,10 +2400,12 @@ the build, naming the connection, unless its values set `unauthenticated: true`,
 and then no secret key is presented. A module filling such a slot from a
 parameter declares the parameter required with no default, as `core/harbor` does for `csrf_key`,
 `jobservice_secret` and `registry_http_secret`. `core/agenta` and `core/thanos`
-are the exception: each fills `root_password`, and the store connection that
-presents the same secret, from one parameter — `store_secret_key` and
-`s3_secret_key` — carrying a pinned development default its description says is
-for evaluation only.
+are the exception: `core/agenta` fills its object store's key pair, and the
+store connections that present it, from two parameters, `store_access_key` and
+`store_secret_key`; `core/thanos` fills `root_password`, and the store
+connection that presents the same secret, from one, `s3_secret_key`; each
+parameter carries a pinned development default its description says is for
+evaluation only.
 
 `token_key` holds the registry's token-signing key and its certificate in one
 Secret, under `tls.key` and `tls.crt`, which the chart reads by name. No catalog
@@ -2945,7 +2945,10 @@ as on every other socket, and the identifier half is `credential_id`, declared
 beside it with the same keys and read and delivered the same way.
 `core/ai-agent/agenta-api` and `core/ai-agent/agenta-services` declare the pair
 on their `store` socket and deliver `credential_id` as `AGENTA_STORE_ACCESS_KEY`
-and `credential` as `AGENTA_STORE_SECRET_KEY`. An identifier that is a plain
+and `credential` as `AGENTA_STORE_SECRET_KEY`; `core/observability/thanos-store`
+declares it on its `objstore` socket and delivers the two as `AWS_ACCESS_KEY_ID`
+and `AWS_SECRET_ACCESS_KEY`, presenting its `s3_access_key` value where no
+`credential_id` is attached. An identifier that is a plain
 value rather than a credential stays a value on the connection:
 `core/observability/langfuse` names its object store's access-key identifier in
 the `event_store` connection's `access_key_id` value, and only the secret half
