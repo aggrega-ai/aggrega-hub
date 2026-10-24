@@ -66,7 +66,7 @@ the label section below). The 15 categories:
 | `mesh` | Service meshes | server | created when the first entity lands |
 | `network` | Network primitives | server, resource | created when the first entity lands |
 | `messaging` | Event buses, queues, streams, the realtime media services that carry voice and video between participants, and the external carriers a message leaves the Release through | stateful-server, server, resource | populated |
-| `storage` | Object/file storage: a self-hosted object-storage server with its own settings (`core/storage/minio`); a bucket reached over the S3 API (`core/storage/s3-object-store`), on Amazon S3 or Google Cloud Storage or on a SeaweedFS server the Release runs; and a managed bucket reached through Google Cloud Storage's own API (`core/storage/gcs`) | resource, server | populated |
+| `storage` | Object/file storage: a bucket reached over the S3 API (`core/storage/s3-object-store`), on Amazon S3 or Google Cloud Storage or on a SeaweedFS server the Release runs; and a managed bucket reached through Google Cloud Storage's own API (`core/storage/gcs`) | resource | populated |
 | `compute` | Generic compute primitives, plus the control planes an event-driven realization depends on | server, worker, task, function | populated |
 | `observability` | Telemetry, tracing, monitoring | varies | populated |
 | `security` | Security and compliance components | varies | populated |
@@ -693,9 +693,9 @@ Three rules bind it:
   carries no annotation.
 
 For example, `core/ai-model/vllm` carries `none`, since vLLM serves its
-metrics outside the routes its `api_key` guards, and `core/storage/minio`
-carries `separate-token`, since MinIO answers its metrics only to a token
-`mc admin prometheus generate` mints. The compiler attaches no meaning to the
+metrics outside the routes its `api_key` guards, and `core/security/openbao`
+carries `separate-token`, since OpenBao answers its metrics only to an OpenBao
+token, which the running server issues. The compiler attaches no meaning to the
 annotation, and the build checks neither rule.
 
 ### The `component.aggrega.ai/upstream-licensing` label
@@ -2385,27 +2385,27 @@ reference to a fill that publishes none. An entity that follows this shape
 applies it to every key the product signs or encrypts with and every secret its
 own services authenticate to each other with, while a password stays an
 optional slot with a development default — save a root password that opens what
-the product trusts, as `core/storage/minio`'s `root_password` opens the whole
-server, the metrics token `mc admin prometheus generate` mints included. The
-shipped slots are
+the product trusts. The shipped slots are
 `core/devtool/harbor`'s `token_key`, `core_secret`, `csrf_key`, `secret_key`,
 `jobservice_secret` and `registry_http_secret`,
-`core/observability/langfuse`'s `encryption_key` and `session_secret`,
+`core/observability/langfuse`'s `encryption_key` and `session_secret`, and
 `core/ai-agent/librechat`'s `credential_encryption_key`, `session_secret` and
-`session_refresh_secret`, and `core/storage/minio`'s `root_password`. The
-Recipes presenting that password to the store as an S3 secret key —
-`helm/agenta-api`, `helm/agenta-services` and `helm/thanos-store` — carry no
-default for it either: a store connection with nothing in its `credential` halts
-the build, naming the connection, unless its values set `unauthenticated: true`,
-and then no secret key is presented. A module filling such a slot from a
-parameter declares the parameter required with no default, as `core/harbor` does for `csrf_key`,
-`jobservice_secret` and `registry_http_secret`. `core/agenta` and `core/thanos`
-are the exception: `core/agenta` fills its object store's key pair, and the
-store connections that present it, from two parameters, `store_access_key` and
-`store_secret_key`; `core/thanos` fills `root_password`, and the store
-connection that presents the same secret, from one, `s3_secret_key`; each
-parameter carries a pinned development default its description says is for
-evaluation only.
+`session_refresh_secret`. The self-hosted realizations of
+`core/storage/s3-object-store`, `helm/s3-object-store` and
+`compose/s3-object-store`, keep the same rule for the store's key pair, whose
+slots the Component declares optional because a managed service takes none:
+each halts naming an empty `access_key_id` or `secret_access_key`. The Recipes
+presenting a store's secret key as an S3 secret key — `helm/agenta-api`,
+`helm/agenta-services` and `helm/thanos-store` — carry no default for it
+either: a store connection with nothing in its `credential` halts the build,
+naming the connection, unless its values set `unauthenticated: true`, and then
+no secret key is presented. A module filling such a slot from a parameter
+declares the parameter required with no default, as `core/harbor` does for
+`csrf_key`, `jobservice_secret` and `registry_http_secret`. `core/agenta` and
+`core/thanos` are the exception: each fills its object store's key pair, and the
+store connections that present it, from two parameters — `store_access_key` and
+`store_secret_key`, `s3_access_key` and `s3_secret_key` — each carrying a pinned
+development default its description says is for evaluation only.
 
 `token_key` holds the registry's token-signing key and its certificate in one
 Secret, under `tls.key` and `tls.crt`, which the chart reads by name. No catalog

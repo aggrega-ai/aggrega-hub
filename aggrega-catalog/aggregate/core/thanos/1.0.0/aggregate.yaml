@@ -8,57 +8,67 @@ metadata:
   version: 1.0.0
   description: >
     A self-contained Thanos metrics read tier over an object-storage backend,
-    packaged as a reusable module: a MinIO object store, a Thanos Store Gateway
-    that reads metric blocks from it, and a Thanos Query front end that fans
-    PromQL requests out over the gateway's StoreAPI. The module exports the
-    query front end as `query`, the PromQL endpoint consumers connect to.
+    packaged as a reusable module: an S3-compatible object store, a Thanos
+    Store Gateway that reads metric blocks from it, and a Thanos Query front end
+    that fans PromQL requests out over the gateway's StoreAPI. The module
+    exports the query front end as `query`, the PromQL endpoint consumers
+    connect to.
 
-    This module is the read/query tier only: the S3 bucket must be pre-created
-    and a writer (a Thanos Receive tier or a Prometheus sidecar) must feed
-    metric blocks into the object store — both are runtime prerequisites, not
-    module workloads.
+    This module is the read/query tier only: the object store creates the
+    `thanos` bucket, and a writer (a Thanos Receive tier or a Prometheus
+    sidecar) must feed metric blocks into it — a runtime prerequisite, not a
+    module workload.
 
-    The Store Gateway authenticates to the object store as its root account,
-    with one credential, `s3_secret_key`, a module parameter an importing
-    Aggregate passes down; its pinned default is a development credential, for
-    evaluation only. The module attaches `core/referenced-secret` on the
-    object store's credential slot and on the credential the gateway's
-    connection to it carries, so the Manifest of every Release whose Aggregate
-    imports the module maps `core/referenced-secret`, or the build halts.
+    The Store Gateway authenticates to the object store with the store's own
+    key pair, two module parameters an importing Aggregate passes down,
+    `s3_access_key` and `s3_secret_key`; their pinned defaults are development
+    values, for evaluation only. The module attaches `core/referenced-secret`
+    on the object store's two key slots and on the `credential_id` and
+    `credential` the gateway's connection to it carries, so the Manifest of
+    every Release whose Aggregate imports the module maps
+    `core/referenced-secret`, or the build halts.
 spec:
   parameters:
-    # The object store's root password, and the secret key the Store Gateway
-    # presents to it: the gateway's access key is the object store's root user,
-    # so the gateway authenticates as that root account. It is a module
-    # parameter attached to both slots rather than two separate attachment
-    # values so that the one secret is authored once and cannot drift between
-    # the two components that must agree on it. The module attaches
-    # core/referenced-secret on the object store's credential slot and on the
-    # credential of the gateway's connection to it, so each workload carries a
-    # reference to a Secret rather than the value itself.
+    # The object store's key pair, which the Store Gateway presents to it: the
+    # store is set up with the account these two hold, and the gateway
+    # authenticates as that account. Each is a module parameter attached to
+    # both sides rather than two separate attachment values so that it is
+    # authored once and cannot drift between the two components that must
+    # agree on it. The module attaches core/referenced-secret on the object
+    # store's slots and on the gateway's connection to it, so each workload
+    # carries a reference to a Secret rather than the value itself.
     #
-    # The pinned default is what lets the module render self-contained. It is a
-    # development credential: every reader of this catalog holds it, so it is
-    # for evaluation and local development, and a Release carrying real traffic
-    # supplies its own through the importing Aggregate, which declares a
-    # parameter of its own and passes it down through its `aggregates` entry
-    # for the Release to fulfill. It is also a valid Kubernetes object name, so
-    # it serves under either realization of the Feature.
+    # The pinned defaults are what let the module render self-contained. They
+    # are development values: every reader of this catalog holds them, so they
+    # are for evaluation and local development, and a Release carrying real
+    # traffic supplies its own through the importing Aggregate, which declares
+    # parameters of its own and passes them down through its `aggregates` entry
+    # for the Release to fulfill. Each is also a valid Kubernetes object name,
+    # so it serves under either realization of the Feature.
+    s3_access_key:
+      type: string
+      default: "admin"
+      description: Access key identifier of the object store's account, and the one the Store Gateway presents to it. What the value is depends on the core/referenced-secret realization the Manifest binds - the identifier itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the identifier under the data key s3-access-key, with k8s-existing-secret. The default is a development value shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
     s3_secret_key:
       type: string
       default: "thanos-s3-secret-for-evaluation-only"
-      description: Root password of the object store, and the secret key the Store Gateway presents to it as that root account. What the value is depends on the core/referenced-secret realization the Manifest binds - the secret itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the secret under the data key s3-secret-key, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
+      description: Secret access key of the object store's account, the pair of s3_access_key, and the one the Store Gateway presents to it. What the value is depends on the core/referenced-secret realization the Manifest binds - the secret itself with k8s-secret-from-parameter, which emits a Secret carrying it; the name of a Secret already in the namespace, holding the secret under the data key s3-secret-key, with k8s-existing-secret. The default is a development credential shipped so the module renders self-contained, for evaluation only; pass your own down from the importing Aggregate for any Release carrying real traffic.
   # Three single-workload components wired by two internal edges: over the
   # store's `objstore` edge the gateway reads the endpoint the object store
   # publishes as its S3 endpoint, and the query's `store` edge carries the
   # gateway's host and port into the StoreAPI endpoint.
   components:
     objstore:
-      type: core/storage/minio
+      type: core/storage/s3-object-store
       values:
-        root_user: admin
+        bucket: thanos
       features:
-        root_password:
+        access_key_id:
+          type: core/referenced-secret
+          values:
+            origin: "{{ .parameters.s3_access_key }}"
+            key: s3-access-key
+        secret_access_key:
           type: core/referenced-secret
           values:
             origin: "{{ .parameters.s3_secret_key }}"
@@ -66,15 +76,22 @@ spec:
     store:
       type: core/observability/thanos-store
       values:
-        s3_access_key: admin
+        # The fallback the gateway presents where its connection carries no
+        # credential_id; this module attaches one, so it is not rendered.
+        s3_access_key: "{{ .parameters.s3_access_key }}"
         bucket: thanos
       uses:
         objstore:
           s3:
             target: objstore
-            # The secret key the gateway presents to the object store, held on
+            # The key pair the gateway presents to the object store, held on
             # the connection it is presented on.
             features:
+              credential_id:
+                type: core/referenced-secret
+                values:
+                  origin: "{{ .parameters.s3_access_key }}"
+                  key: s3-access-key
               credential:
                 type: core/referenced-secret
                 values:
