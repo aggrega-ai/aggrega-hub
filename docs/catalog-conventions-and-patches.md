@@ -4046,7 +4046,8 @@ template, not something the compiler checks: the compiler pipes the published
   by name**, naming the connection and the cache's protocol: Higress's token
   limit, whose plugin's Redis settings offer no TLS connection, and the four
   consumers that hand a store's address to the Release's own code —
-  `core/ai-tool/datastore-query`, `core/ai-agent/langgraph`, `dynamiq` and
+  `core/ai-tool/datastore-query`, and, on a connection writing no `inject:`
+  block, `core/ai-agent/langgraph`, `dynamiq` and
   `phidata` — which give that code no authority to check a certificate against,
   and the last three not even the store's protocol. LiteLLM's semantic cache
   refuses it too, though there the limit is its Recipes': they give the cache
