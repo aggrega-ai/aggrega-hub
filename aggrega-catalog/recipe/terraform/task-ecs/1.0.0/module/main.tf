@@ -23,6 +23,11 @@ terraform {
 # belongs to the operator who names it, and no service, since a run ends. The
 # container maps no port: nothing connects to a run.
 #
+# While the caller passes no schedule expression, no schedule is declared and
+# the task definition stands alone, for a run someone starts with the Amazon
+# ECS RunTask operation; the cluster and network inputs then set nothing here,
+# and are the values that run is started with.
+#
 # The worker's module beside recipe/terraform/worker-ecs declares the same task
 # definition under a service. Each Recipe vendors the module kept beside it, so
 # the two are separate files by construction.
@@ -85,6 +90,8 @@ resource "aws_ecs_task_definition" "this" {
 # starts within the minute the expression names rather than within a window
 # after it. Its retry policy is the scheduler's own default.
 resource "aws_scheduler_schedule" "this" {
+  count = var.schedule_expression == null ? 0 : 1
+
   name                         = var.name
   schedule_expression          = var.schedule_expression
   schedule_expression_timezone = var.schedule_expression_timezone

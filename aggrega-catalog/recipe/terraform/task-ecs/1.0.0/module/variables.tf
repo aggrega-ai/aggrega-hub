@@ -3,7 +3,9 @@
 # cluster and scheduler_role_arn, which set the schedule target's arn and
 # role_arn. Those with no default are supplied by the caller on every call;
 # those defaulting to null leave their argument unset, so nothing is emitted for
-# them.
+# them, except schedule_expression: while it is null no schedule is declared,
+# and the caller passes neither scheduler_role_arn nor
+# schedule_expression_timezone.
 
 variable "name" {
   type        = string
@@ -32,11 +34,13 @@ variable "environment" {
 
 variable "schedule_expression" {
   type        = string
-  description = "EventBridge Scheduler cron expression naming when a run starts."
+  default     = null
+  description = "EventBridge Scheduler cron expression naming when a run starts; no schedule while null."
 }
 
 variable "schedule_expression_timezone" {
   type        = string
+  default     = null
   description = "Time zone the schedule expression is evaluated in, an IANA name such as UTC."
 }
 
@@ -47,6 +51,7 @@ variable "cluster" {
 
 variable "scheduler_role_arn" {
   type        = string
+  default     = null
   description = "ARN of the existing role EventBridge Scheduler assumes to start each run."
 }
 

@@ -14,28 +14,29 @@ metadata:
     VPC; reach for helm/task on Kubernetes, which also runs a task with no
     schedule once.
 
-    A task with no schedule is refused by name: nothing on AWS starts a run
-    that happens once. The schedule's cron fields become the scheduler's own
-    expression where the two mean the same times, evaluated in UTC unless the
-    Release names a time zone, and are refused by name where they do not, as
-    for a schedule restricting both the day of the month and the day of the
-    week.
+    A task with no schedule carrying core/manual-trigger is deployed without
+    starting, its task definition alone; the operator starts each run with
+    aws ecs run-task, giving the cluster, the task definition and the network
+    configuration from infra.overrides. A scheduled task runs on its
+    schedule, attached or not, and can be started that way too. Any other
+    unscheduled task is refused by name, as nothing on AWS starts it. The
+    cron fields become the scheduler's own expression where the two mean the
+    same times, evaluated in UTC unless the Release names a time zone, and
+    are refused by name where they do not, as for a schedule restricting
+    both the day of the month and the day of the week.
 
-    The cluster, subnets, security groups, execution role and the role the
-    scheduler starts each run under come from infra.overrides and are
-    required. Only a task definition and a schedule are emitted: no role, log
-    group or network resource, each of which the operator already runs, and
-    no service, as a run ends.
+    The cluster, subnets, security groups, execution role and, with a
+    schedule, the scheduler's role come from infra.overrides and are
+    required. Only a task definition and a schedule are emitted: no role,
+    log group or network resource, each of which the operator already runs,
+    and no service, as a run ends.
 
-    Each env entry an edge dictates becomes a container variable, its value
-    written whole; timeout arrives as TASK_TIMEOUT, which no edge may dictate
-    while it is set, for the code to honour, as ECS sets no deadline on a run.
+    Each env entry an edge dictates becomes a container variable; timeout
+    arrives as TASK_TIMEOUT, which no edge may dictate while it is set, for
+    the code to honour, as ECS sets no deadline on a run.
     File, arg and other entries are refused by name. The image is a
     linux/amd64 image; the task runs at the smallest Fargate size meeting
     infra.compute.
-
-    It is written as a fragment, as the catalog writes its CloudFormation
-    Recipes, rather than sourced from a published template.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -186,7 +187,7 @@ spec:
 
   # This Recipe reads from infra.overrides:
   #   Cluster                    - string (the schedule's Target.Arn), required
-  #   RoleArn                    - string (the schedule's Target.RoleArn), required
+  #   RoleArn                    - string (the schedule's Target.RoleArn), required with a schedule
   #   Subnets                    - []string (Target.EcsParameters' AwsvpcConfiguration.Subnets), required
   #   SecurityGroups             - []string (AwsvpcConfiguration.SecurityGroups), required
   #   ExecutionRoleArn           - string (the task definition's ExecutionRoleArn), required
@@ -224,6 +225,15 @@ spec:
   # IANA time zone the schedule is evaluated in. The task definition names no
   # runtime platform, so Fargate runs the image as linux/amd64.
   #
+  # A task carrying core/manual-trigger with no schedule renders no schedule,
+  # so nothing assumes RoleArn or evaluates a time zone: both are refused by
+  # name there rather than accepted and left unused, and RoleArn is required
+  # only where a schedule is rendered. Cluster, Subnets, SecurityGroups and
+  # AssignPublicIp stay required or checked as before, though no resource
+  # reads them then: they are what the operator gives aws ecs run-task, as its
+  # --cluster and its --network-configuration, to start a run of the task
+  # definition family named after the component.
+  #
   # The fragment sets no schedule Name, so CloudFormation names the schedule,
   # as cloudformation/server-ecs leaves the service's name to it. The task
   # definition's Family is the component's name, which ECS checks against the
@@ -241,8 +251,10 @@ spec:
   #     as above, infra.image (required), infra.compute.cpu and
   #     infra.compute.memory as the Fargate size above, and the overrides
   #     above.
-  #   refused — a task with no schedule, and a schedule with no exact
-  #     equivalent, as the comment above the locals describes;
+  #   refused — a task with no schedule and no core/manual-trigger
+  #     attachment, and a schedule with no exact equivalent, as the comment
+  #     above the locals describes; RoleArn and ScheduleExpressionTimezone on
+  #     a task rendering no schedule, as above;
   #     infra.overrides.TargetGroupArn, since nothing connects to a run; a
   #     compute quantity this Recipe cannot read, and a pair larger than the
   #     largest Fargate task; an edge injecting a variable under TASK_TIMEOUT
@@ -257,11 +269,20 @@ spec:
       {{- end -}}
     # A run that happens once has nothing on AWS to start it, and a schedule
     # the scheduler cannot carry exactly would run at other times than the
-    # developer wrote, so both halt here.
+    # developer wrote, so both halt here. A task carrying core/manual-trigger
+    # asked for a run nothing starts until the operator does, so it is not
+    # refused for having no schedule. The attachment is found by its Feature's
+    # type, with any version it was authored with set aside, and read here
+    # rather than in a local, which cannot read the attachments. Nothing else
+    # reads it: a scheduled task renders alike with the attachment or without.
     schedule_translates: >-
       {{- $s := trim (toString (optional .values "schedule" "")) -}}
-      {{- if not $s -}}
-      {{- fail (printf "the component %q has no schedule, so it runs once, and nothing on AWS starts a run that happens once: neither CloudFormation nor Terraform runs an Amazon ECS task when it applies, so the run would never happen. Give the component a schedule in the Aggregate, or map core/compute/task to helm/task in the Manifest, which runs it once on Kubernetes" .locals.instance_id) -}}
+      {{- $manual := false -}}
+      {{- range $name, $attachment := optional . "features" dict -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/manual-trigger" }}{{ $manual = true }}{{ end -}}
+      {{- end -}}
+      {{- if and (not $s) (not $manual) -}}
+      {{- fail (printf "the component %q has no schedule and carries no core/manual-trigger attachment, so it runs once, and nothing on AWS starts a run that happens once: neither CloudFormation nor Terraform runs an Amazon ECS task when it applies, so the run would never happen. Give the component a schedule in the Aggregate; attach core/manual-trigger to it there to deploy its task definition alone, for the operator to start each run with aws ecs run-task; or map core/compute/task to helm/task in the Manifest, which runs it once on Kubernetes" .locals.instance_id) -}}
       {{- end -}}
       {{- if hasPrefix "refuse:" .locals.schedule_translation -}}
       {{- fail (printf "the component %q is scheduled %q, and %s" .locals.instance_id $s (trimPrefix "refuse:" .locals.schedule_translation)) -}}
@@ -292,10 +313,17 @@ spec:
       {{- if not (and (typeIs "string" $v) (regexMatch `^arn:aws[a-z-]*:ecs:[a-z0-9-]+:[0-9]{12}:cluster/[A-Za-z0-9_-]{1,255}$` $v)) -}}
       {{- fail (printf "this Release starts its task's runs in an Amazon ECS cluster that already exists in the target account, and a schedule names the cluster by its ARN, but infra.overrides.Cluster is %s: set infra.overrides.Cluster in the Release to the ARN of an existing ECS cluster, such as arn:aws:ecs:us-east-1:123456789012:cluster/example" (toJson $v)) -}}
       {{- end -}}
+    # Only a schedule calls Amazon ECS under this role, so it is required where
+    # one is rendered and refused where none is.
     role_arn_supplied: >-
-      {{- $v := optional (optional .infra "overrides" dict) "RoleArn" "" -}}
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $v := optional $o "RoleArn" "" -}}
+      {{- if trim (toString (optional .values "schedule" "")) -}}
       {{- if not (and (typeIs "string" $v) $v) -}}
       {{- fail (printf "this Release starts its task's runs from an EventBridge Scheduler schedule, which calls Amazon ECS under a role that already exists, trusts the scheduler and may run the task definition, but infra.overrides.RoleArn is %s: set infra.overrides.RoleArn in the Release to the ARN of an existing role" (toJson $v)) -}}
+      {{- end -}}
+      {{- else if hasKey $o "RoleArn" -}}
+      {{- fail (printf "the component %q has no schedule, so no EventBridge Scheduler schedule is rendered and nothing starts a run under infra.overrides.RoleArn: each run is the one the operator starts with aws ecs run-task. Remove infra.overrides.RoleArn from the Release" .locals.instance_id) -}}
       {{- end -}}
     subnets_supplied: >-
       {{- $s := optional (optional .infra "overrides" dict) "Subnets" "" -}}
@@ -329,6 +357,9 @@ spec:
       {{- end -}}
       {{- end -}}
       {{- end -}}
+      {{- if and (hasKey $o "ScheduleExpressionTimezone") (not (trim (toString (optional .values "schedule" "")))) -}}
+      {{- fail (printf "the component %q has no schedule, so no EventBridge Scheduler schedule is rendered and infra.overrides.ScheduleExpressionTimezone names the time zone of nothing: remove it from the Release" .locals.instance_id) -}}
+      {{- end -}}
       {{- if and (hasKey $o "AssignPublicIp") (not (has (index $o "AssignPublicIp") (list "ENABLED" "DISABLED"))) -}}
       {{- fail (printf "infra.overrides.AssignPublicIp is %s, and the property takes ENABLED or DISABLED: set it in the Release to ENABLED to give each run a public IP address, or remove it" (toJson (index $o "AssignPublicIp"))) -}}
       {{- end -}}
@@ -357,12 +388,18 @@ spec:
   # cloudformation/server-ecs and cloudformation/worker-ecs declare, word for
   # word; a change to it is made to all six.
   #
+  # The template is written here as a fragment, as the catalog writes its
+  # CloudFormation Recipes, rather than sourced from a published template.
+  #
   # The schedule starts one task of the definition, which it references by its
   # logical id, resolving to its ARN, on Fargate in the operator's network. Its
   # flexible time window is off, so a run starts within the minute the
   # expression names rather than within a window after it, and its retry policy
   # is the scheduler's own default. The log Region is the stack's own, read
-  # through the AWS::Region pseudo parameter when the stack deploys.
+  # through the AWS::Region pseudo parameter when the stack deploys. The
+  # schedule is rendered only for a task with a schedule, and
+  # core/manual-trigger changes nothing in it, so a scheduled task carrying
+  # it runs on its schedule as one without it does.
   artifacts:
     template.yaml: |
       {{- if not (regexMatch `^[A-Za-z0-9_-]{1,255}$` .context.instance_id) }}
@@ -399,6 +436,7 @@ spec:
       {{- $_ := set $env "TASK_TIMEOUT" (toString .) }}
       {{- end }}
       Resources:
+        {{- if .locals.schedule_translation }}
         {{ .locals.logical_id }}Schedule:
           Type: AWS::Scheduler::Schedule
           Properties:
@@ -418,6 +456,7 @@ spec:
                     Subnets: {{ toJson $o.Subnets }}
                     SecurityGroups: {{ toJson $o.SecurityGroups }}
                     AssignPublicIp: {{ optional $o "AssignPublicIp" "DISABLED" }}
+        {{- end }}
         {{ .locals.logical_id }}TaskDefinition:
           Type: AWS::ECS::TaskDefinition
           Properties:
