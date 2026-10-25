@@ -1,0 +1,169 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: velero-chart
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Installs Velero through the project's own Helm chart, at the chart release
+    whose application version is the image the Component pins. The chart is
+    official, published by the Velero maintainers; complete, carrying the
+    custom-resource definitions, the server, its node agent and their
+    permissions; and maintained, its newest release carrying Velero 1.18.2.
+
+    It renders the server Deployment, which loads the plugin for the S3 API
+    from an init container, the node-agent DaemonSet that copies the data of
+    pod volumes, the custom-resource definitions, and a binding granting the
+    server's service account cluster-admin, which Velero's chart grants by
+    default because a backup reads and restores every kind of resource. It
+    renders no storage location and no schedule: helm/backup-velero writes
+    those for each core/backup attachment.
+
+    The chart places its objects in the namespace the Release declares for
+    the component, and Velero reads schedules only from its own namespace, so
+    the build halts unless that namespace is velero. Its chart repository must
+    be reachable from the build.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/storage/velero:1.0.0
+
+  # The project's own chart, from its own chart repository. Its default
+  # version is the release whose application version, 1.18.2, is the tag of
+  # the image the Component pins, so the chart's templates, its
+  # custom-resource definitions and the image move together;
+  # infra.source_version picks another chart release, and the image follows it
+  # only where the Release sets infra.image too. Velero has published patch
+  # releases after 1.18.2, 1.18.4 among them, that no chart release carries
+  # yet; a Release wanting one names its image in infra.image.
+  source:
+    kind: helm-https-chart
+    url: https://vmware-tanzu.github.io/helm-charts
+    chart: velero
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"12.2.1\" }}"
+
+  # This Recipe reads no infra.overrides keys; the Component declares none.
+  #
+  # The chart is read for the values below; everything else stays the chart's
+  # own default at its release.
+  #
+  # Namespace. Velero's server watches the custom resources of the namespace
+  # it runs in and no other, and the chart writes every namespaced object it
+  # renders into the release namespace, which is the namespace the Release
+  # declares for the component through the aggrega.ai/namespace annotation.
+  # helm/backup-velero writes each schedule and storage location into the
+  # namespace velero, Velero's own default, because a FeatureRecipe attached to
+  # a datastore cannot read where this component was placed. So the build
+  # halts at the top of the mapping unless the Release declares velero.
+  #
+  # Names. The chart names its Deployment velero and its DaemonSet node-agent
+  # whatever it is given, and its other objects after its release name; they
+  # are left as the chart publishes them. Velero runs once per cluster, and
+  # nothing is published for a consumer to reach.
+  #
+  # Images. The server Deployment and the node-agent DaemonSet run
+  # infra.image. The chart writes it as "<repository>:<tag>", so the reference
+  # is cut at the last colon after its last slash and the two halves join back
+  # into exactly the reference the Release names, a digest reference included;
+  # a reference with neither a tag nor a digest halts, naming it. The plugin
+  # for the S3 API is the init container the chart's documentation shows,
+  # copying the plugin into the shared plugins volume, at
+  # infra.aws_plugin_image.
+  #
+  # Custom-resource definitions. They ship in the chart's crds directory and
+  # are rendered with the chart, so applying the output installs and updates
+  # them. The chart's upgrade Job, which would install them again from a Helm
+  # hook, is off.
+  #
+  # Locations and schedules. The chart's default storage location and
+  # snapshot location are off, and so are its own schedules: a location is a
+  # bucket, and each core/backup attachment names its own through its store
+  # connection, so helm/backup-velero writes the location beside the schedule
+  # that uses it. Velero starts with no location of its own; a schedule names
+  # the location it writes to, so none needs to be the default.
+  #
+  # Node agent. On: a schedule copies the data of the volumes its pods mount
+  # through file-system backup, which the node agent performs on each node, so
+  # the backup reaches any volume rather than only those a cloud snapshot
+  # covers. The agent reads each node's pod volumes from its host path, as the
+  # chart runs it.
+  #
+  # Credentials. The chart's own credentials Secret is off: it is either
+  # written from values, which would put the key in the rendered output, or
+  # named with a fixed key, cloud. With the cloud_credentials slot attached,
+  # the Secret the credential names is mounted into the server and the node
+  # agent at /credentials, and AWS_SHARED_CREDENTIALS_FILE points both at the
+  # file under the key the credential names, so the key the credential uses is
+  # honoured as written. Velero reads that variable for every location that
+  # names no credential of its own, which is how helm/backup-velero writes
+  # them. With the slot empty, nothing is mounted and the AWS SDK in Velero's
+  # plugin uses whatever identity the pods' environment offers.
+  valuesMapping: |
+    {{- $declared := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+    {{- if not $declared }}
+    {{- fail (printf "%q is installed through Velero's chart, which places Velero in the namespace the Release declares for the component, and the Release declares none; Velero reads schedules only from its own namespace, and helm/backup-velero writes them into velero, so declare the annotation aggrega.ai/namespace: velero on %q or on its boundary in the Release" .context.instance_id .context.instance_id) }}
+    {{- else if ne $declared "velero" }}
+    {{- fail (printf "%q is installed through Velero's chart, which places Velero in the namespace the Release declares for the component, %q; Velero reads schedules only from its own namespace, and helm/backup-velero writes them into velero, so declare aggrega.ai/namespace: velero for %q in the Release" .context.instance_id $declared .context.instance_id) }}
+    {{- end }}
+    {{- $repo := .infra.image }}
+    {{- $tag := "" }}
+    {{- if contains ":" (last (splitList "/" .infra.image)) }}
+      {{- $tag = last (splitList ":" (last (splitList "/" .infra.image))) }}
+      {{- $repo = trimSuffix (printf ":%s" $tag) .infra.image }}
+    {{- end }}
+    {{- if not $tag }}
+    {{- fail (printf "infra.image is %q, which names neither a tag nor a digest, and Velero's chart writes its image as repository:tag; name the image with its tag, such as velero/velero:v1.18.2, or with its digest" .infra.image) }}
+    {{- end }}
+    {{- $cred := optional (default dict .features) "cloud_credentials" dict }}
+    {{- $credName := optional (optional $cred "provides" dict) "name" "" }}
+    {{- $credKey := optional (optional $cred "provides" dict) "key" "" }}
+    {{- if and (hasKey (default dict .features) "cloud_credentials") (or (not $credName) (not $credKey)) }}
+    {{- fail (printf "the cloud_credentials slot of %q is attached, but its credential publishes no Secret name or no key, so there is no file to mount for Velero to read; give the credential the Secret's name and the key holding the credentials file" .context.instance_id) }}
+    {{- end }}
+    image:
+      repository: "{{ $repo }}"
+      tag: "{{ $tag }}"
+    initContainers:
+      - name: velero-plugin-for-aws
+        image: "{{ .infra.aws_plugin_image }}"
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+          - mountPath: /target
+            name: plugins
+    upgradeCRDs: false
+    cleanUpCRDs: false
+    backupsEnabled: false
+    snapshotsEnabled: false
+    schedules: {}
+    deployNodeAgent: true
+    credentials:
+      useSecret: false
+    {{- if $credName }}
+    extraVolumes:
+      - name: cloud-credentials
+        secret:
+          secretName: "{{ $credName }}"
+    extraVolumeMounts:
+      - name: cloud-credentials
+        mountPath: /credentials
+        readOnly: true
+    nodeAgent:
+      extraVolumes:
+        - name: cloud-credentials
+          secret:
+            secretName: "{{ $credName }}"
+      extraVolumeMounts:
+        - name: cloud-credentials
+          mountPath: /credentials
+          readOnly: true
+    configuration:
+      extraEnvVars:
+        - name: AWS_SHARED_CREDENTIALS_FILE
+          value: "/credentials/{{ $credKey }}"
+    {{- end }}
