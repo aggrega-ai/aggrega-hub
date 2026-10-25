@@ -8,29 +8,24 @@ metadata:
   version: 1.0.0
   description: >
     The generic ephemeral compute primitive on Kubernetes via the helm
-    provider's Workload synthesis, in whichever run-to-completion shape the
-    developer's own `schedule` value asks for: a single run when they author
-    none, and a recurring run on that expression when they do. One recipe covers
-    both shapes, so the emitted shape follows the value the Aggregate's author
-    wrote and is decided by nothing else — no operator value and no Manifest
-    entry reaches that choice.
+    provider's Workload synthesis, in a run-to-completion shape decided by two
+    things the Aggregate's author writes and by nothing else: the task's
+    `schedule` value and a core/manual-trigger attachment on it. No operator
+    value and no Manifest entry reaches that choice.
 
-    This is the only realization of the component at this target, so the Manifest
-    entry mapping the component's type to it names one candidate rather than
-    choosing between several. The entry is still required: recipe resolution is
-    mapping-driven, and a component instance with no mapping for its type halts
-    the build whatever its implementers, so mapping this component is what the
-    Manifest must do before it can render.
+    With a schedule, the task is a CronJob running on it, attached or not.
+    With none, it is a Job that runs once at deploy, unless core/manual-trigger
+    is attached: then it is a suspended CronJob on the fixed schedule
+    0 0 30 2 *, a date no month holds, so no run starts at deploy, nor if
+    someone resumes it. Start a run of either CronJob with kubectl create job
+    <run-name> --from=cronjob/<cronjob>, the CronJob named as the component is
+    rendered.
 
-    No Service and no port are emitted in either shape: nothing connects to a
-    run that ends. The developer's `timeout` value is delivered to the container
-    under a stable name for the application's own code to honour, because the
-    workload contract this recipe authors against expresses no deadline for a
-    run-to-completion form — a deployment that needs the run bounded by the
-    platform sets that on the emitted resource at the target. No provides
-    contract is emitted, because the component declares none.
+    No Service and no port are emitted: nothing connects to a run that ends.
+    The developer's `timeout` value reaches the container as TASK_TIMEOUT for
+    the application's own code to honour, as no deadline is set on the run.
 
-    An edge's inject block dictates what reaches the container, in either shape:
+    An edge's inject block dictates what reaches the container, in every shape:
     each env entry a variable under that name, beside TASK_TIMEOUT, which no
     edge may dictate, and each file entry a read-only file from a ConfigMap. An
     arg entry, or any other mechanism, is refused by name: the recipe renders no
@@ -41,6 +36,19 @@ metadata:
 spec:
   capability: helm
   implements: core/compute/task:1.0.0
+  # This is the only realization of the component at this target, so the
+  # Manifest entry mapping the component's type to it names one candidate rather
+  # than choosing between several. The entry is still required: recipe
+  # resolution is mapping-driven, and a component instance with no mapping for
+  # its type halts the build whatever its implementers, so mapping this
+  # component is what the Manifest must do before it can render.
+  #
+  # The developer's timeout value is delivered under a stable name because the
+  # workload contract this recipe authors against expresses no deadline for a
+  # run-to-completion form: a Release that needs the run bounded by the
+  # platform sets that on the emitted resource at the target. No provides
+  # contract is emitted, because the component declares none.
+  #
   # The component's infra.overrides block carries the keys its Amazon ECS
   # realizations read. A synthesized workload has no provider-specific knob to
   # override, so this Recipe reads none of its keys.
@@ -52,6 +60,23 @@ spec:
   # delivers it under a stable name for the application's own code to read. The
   # `schedule` value is not delivered as a variable — it decides the emitted
   # resource's own shape instead, and the target reads it from there.
+  #
+  # The shape. A schedule renders form: scheduled on it, a CronJob, whatever is
+  # attached: core/manual-trigger promises only that a run can also be started
+  # by hand, and any CronJob can be, with kubectl create job --from=cronjob/.
+  # No schedule renders form: task, a Job that runs once at deploy, unless the
+  # task carries core/manual-trigger, which asks that no run start until
+  # someone starts one: that renders form: scheduled with suspend: true, a
+  # CronJob the controller starts no run from, in place of the Job. A CronJob
+  # requires a schedule, so it carries 0 0 30 2 *, which the developer never
+  # writes: the API server checks each cron field's range alone and accepts
+  # it, and it names 30 February, a date that never comes, so a CronJob
+  # someone resumes still has no time at which to start a run. A real date
+  # would start one there after a resume. The attachment is found by its
+  # Feature's type, with any version it was authored with set aside, as
+  # terraform/task-ecs and cloudformation/task-ecs find it; its FeatureRecipe,
+  # helm/manual-trigger, emits nothing, because a FeatureRecipe sees neither
+  # the host's schedule nor can it withdraw the Job the host would emit.
   provides: {}
   assertions:
     # This component packages no upstream product, so it holds no default image
@@ -131,10 +156,20 @@ spec:
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     {{- $schedule := optional .values "schedule" "" }}
+    {{- $manual := false }}
+    {{- range $name, $attachment := optional . "features" dict }}
+    {{- if eq (first (splitList ":" (toString $attachment.type))) "core/manual-trigger" }}{{ $manual = true }}{{ end }}
+    {{- end }}
     {{- if $schedule }}
     # The developer authored a schedule, so the run recurs on it.
     form: scheduled
     schedule: "{{ $schedule }}"
+    {{- else if $manual }}
+    # No schedule authored and core/manual-trigger attached, so no run starts
+    # until someone starts one: a suspended CronJob on a date that never comes.
+    form: scheduled
+    schedule: "0 0 30 2 *"
+    suspend: true
     {{- else }}
     # No schedule authored, so the run happens once and ends.
     form: task
