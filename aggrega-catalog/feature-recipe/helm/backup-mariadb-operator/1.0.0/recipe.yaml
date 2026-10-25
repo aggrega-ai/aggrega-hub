@@ -14,19 +14,24 @@ metadata:
     in the build checks it.
 
     Each backup is a logical dump of every database on the server, taken with
-    mariadb-dump and written to the bucket the store connection points at, on
-    infra.schedule, or daily at 03:00 where that is unset, in the time zone of
-    the cluster's CronJob controller. Each backup run deletes the backups older
-    than infra.retention_days days. The run signs its requests with the key
-    pair in the Secret infra.credentials_secret names or, unset, in one named
-    after the Backup, which the cluster must hold in the database's namespace.
+    mariadb-dump on infra.schedule, or daily at 03:00 where that is unset, in
+    the time zone of the cluster's CronJob controller; each backup run deletes
+    the backups older than infra.retention_days days. It is written to the
+    bucket the store connection points at, signing with the key pair in the
+    Secret infra.credentials_secret names or, unset, in one named after the
+    Backup, which the cluster must hold in the database's namespace; or, with
+    infra.volume set instead, to a ReadWriteOnce claim of that size which the
+    controller provisions beside the database, in infra.volume.storage_class
+    or the cluster's default class.
 
     The build halts, naming the attachment, on a database realized by another
-    Recipe, with no store connection, with a store publishing no S3 API, with
-    a store in the cluster whose namespace is not declared, on a database
-    carrying a second core/backup attachment, on a Backup name longer than a
-    CronJob's name may be, and on infra.role_arn, the role AWS Backup assumes,
-    which the Backup has no use for.
+    Recipe, with neither a store connection nor infra.volume, with a store
+    publishing no S3 API, with a store in the cluster whose namespace is not
+    declared, on a database carrying a second core/backup attachment, on a
+    Backup name longer than a CronJob's name may be, on a volume size that is
+    not a Kubernetes quantity, on infra.credentials_secret beside a volume,
+    and on infra.role_arn, the role AWS Backup assumes, which the Backup has
+    no use for.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -82,14 +87,37 @@ spec:
   # Kubernetes takes a CronJob name of 52 characters at most, so a longer name
   # halts, naming it.
   #
+  # Where the backups go. A Backup writes to exactly one storage: the bucket
+  # the store connection points at, or a volume. An attachment wiring a store
+  # and setting infra.volume halts on the Feature's own one_destination
+  # assertion before this file renders, so either the store or the volume
+  # decides the storage below. An attachment with neither halts, naming both
+  # ways to fix it.
+  #
+  # The volume. mariadb-operator provisions the claim a Backup's storage
+  # describes, in the Backup's namespace and under the Backup's name, and the
+  # backup Job keeps each dump there; the claim stays when the Backup is
+  # deleted, since the controller gives it no owner. infra.volume.size is the
+  # claim's requested storage, a Kubernetes quantity such as 50Gi, and a value
+  # the Backup's own schema refuses halts here by name instead of at apply
+  # time; infra.volume.storage_class is the class it is provisioned from, and
+  # unset, the claim names none and the cluster's default class provisions it.
+  # A claim must name an access mode — the cluster refuses one naming none —
+  # and the controller adds none, so it is written ReadWriteOnce, the mode its
+  # own example writes and every provisioning class offers. The controller
+  # runs a Backup's Jobs one at a time and, for a logical dump, places them
+  # anywhere in the cluster, so each run mounts the claim alone. No key is read
+  # on this path, so infra.credentials_secret beside a volume halts by name
+  # rather than reaching nothing.
+  #
   # The store. The attachment's store connection is the one connection on the
   # store socket that a core/backup attachment declared. A component carries
   # every such connection of every core/backup attachment on it, under the
   # Feature's name rather than the attachment's, so one attachment cannot tell
   # its own from another's; a component carrying a second core/backup
-  # attachment therefore halts while any of them wires a store. No store
-  # connection halts, and so do two on one attachment, since a Backup writes to
-  # one storage. A store publishing no S3 API — protocol other than s3, or no
+  # attachment therefore halts while any of them wires a store. Two store
+  # connections on one attachment halt, since a Backup writes to one storage.
+  # A store publishing no S3 API — protocol other than s3, or no
   # endpoint, as core/storage/gcs publishes — halts, and so does an endpoint
   # that is not a scheme and a host with an optional port: the Backup takes
   # the address without its scheme, and the scheme becomes its TLS switch,
@@ -128,9 +156,10 @@ spec:
   # where the webhook is installed, rather than at build time.
   #
   # What and how long. Each run takes a logical dump of every database on the
-  # server with mariadb-dump, uploads it, and deletes from the prefix every
-  # backup older than infra.retention_days days, the Backup's maximum
-  # retention in hours.
+  # server with mariadb-dump, writes it under the bucket's prefix or onto the
+  # claim, and deletes from there every backup older than
+  # infra.retention_days days, the Backup's maximum retention in hours: the
+  # schedule and the retention mean the same on either storage.
   #
   # Every value is written through toJson, so a value that reads as a number
   # or a boolean stays a string, and identical input renders identical bytes.
@@ -139,6 +168,7 @@ spec:
       {{- $attName := .attachment_name }}
       {{- $host := .context.instance_id }}
       {{- $name := .locals.name }}
+      {{- $vol := optional .infra "volume" dict }}
 
       {{- /* This attachment's store connection. */}}
       {{- $stores := list }}
@@ -156,21 +186,26 @@ spec:
       {{- if and (gt (len $backups) 1) $stores }}
         {{- fail (printf "core/backup attachment %q on %q: %q carries %d core/backup attachments (%s), and each one's store connection reaches every one of them under the Feature's name, so this attachment cannot tell which store is its own; attach core/backup to %q once when it is backed up through mariadb-operator" $attName $host $host (len $backups) (join ", " $backups) $host) }}
       {{- end }}
-      {{- if not $stores }}
-        {{- fail (printf "core/backup attachment %q on %q has no store connection, and this realization writes every mariadb-operator backup to a bucket; wire the attachment's store connection to the bucket the backups go to, under uses.store on the attachment in the Release" $attName $host) }}
+      {{- if and (not $stores) (not $vol) }}
+        {{- fail (printf "core/backup attachment %q on %q has no store connection and sets no infra.volume, so it names nowhere for its backups to go; wire the attachment's store connection to the bucket the backups go to, under uses.store on the attachment in the Release, or set infra.volume on the attachment, with its size, to keep the backups on a volume mariadb-operator provisions beside the database" $attName $host) }}
       {{- end }}
       {{- if gt (len $stores) 1 }}
         {{- $aliases := list }}
         {{- range $stores }}{{ $aliases = append $aliases (printf "%q" .alias) }}{{ end }}
         {{- fail (printf "core/backup attachment %q on %q wires %d store connections (%s), and a mariadb-operator Backup writes to one storage; keep one" $attName $host (len $stores) (join ", " $aliases)) }}
       {{- end }}
+      {{- $bucket := "" }}
+      {{- $region := "" }}
+      {{- $address := "" }}
+      {{- $tls := false }}
+      {{- if $stores }}
       {{- $store := index $stores 0 }}
       {{- $edge := $store.edge }}
       {{- $sp := default dict $edge.provides }}
-      {{- $bucket := toString (default "" (get $sp "bucket")) }}
+      {{- $bucket = toString (default "" (get $sp "bucket")) }}
       {{- $endpoint := toString (default "" (get $sp "endpoint")) }}
       {{- $storeHost := toString (default "" (get $sp "host")) }}
-      {{- $region := toString (default "" (get $sp "region")) }}
+      {{- $region = toString (default "" (get $sp "region")) }}
       {{- if or (ne (toString (default "" (get $sp "protocol"))) "s3") (not $endpoint) (not $bucket) }}
         {{- fail (printf "core/backup attachment %q on %q: its store connection %q reaches %q, which publishes no bucket at an S3 API endpoint, and a mariadb-operator Backup writes to a bucket over the S3 API; wire the store connection to a store published over the S3 API, such as core/storage/s3-object-store" $attName $host $store.alias $edge.target) }}
       {{- end }}
@@ -191,8 +226,23 @@ spec:
           {{- $endpoint = replace (printf "://%s" $storeHost) (printf "://%s.%s" $storeHost $sns) $endpoint }}
         {{- end }}
       {{- end }}
-      {{- $tls := hasPrefix "https://" $endpoint }}
-      {{- $address := regexReplaceAll "^https?://([^/]+)/?$" $endpoint "${1}" }}
+      {{- $tls = hasPrefix "https://" $endpoint }}
+      {{- $address = regexReplaceAll "^https?://([^/]+)/?$" $endpoint "${1}" }}
+      {{- end }}
+
+      {{- /* The volume, where no store is wired: the claim's size and class. */}}
+      {{- $size := "" }}
+      {{- $class := "" }}
+      {{- if not $stores }}
+        {{- $size = toString (get $vol "size") }}
+        {{- $class = toString (optional $vol "storage_class" "") }}
+        {{- if not (regexMatch `^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$` $size) }}
+          {{- fail (printf "core/backup attachment %q on %q sets infra.volume.size to %q, and the claim mariadb-operator provisions for a Backup takes its size as a Kubernetes quantity, such as 50Gi or 500Mi; set infra.volume.size to one" $attName $host $size) }}
+        {{- end }}
+        {{- with toString (optional .infra "credentials_secret" "") }}
+          {{- fail (printf "core/backup attachment %q on %q sets infra.credentials_secret to %q and keeps its backups on the volume infra.volume sizes, and a backup on a volume reads no key; remove infra.credentials_secret from the attachment, or wire its store connection to a bucket in place of infra.volume" $attName $host .) }}
+        {{- end }}
+      {{- end }}
 
       {{- if gt (len $name) 52 }}
         {{- fail (printf "core/backup attachment %q on %q: the Backup's name, %q, is %d characters, and the mariadb-operator controller names the CronJob running it after the Backup, which Kubernetes takes at 52 characters at most; give the attachment or the component a shorter name" $attName $host $name (len $name)) }}
@@ -224,6 +274,7 @@ spec:
           cron: {{ toJson $schedule }}
         maxRetention: {{ toJson $retention }}
         storage:
+          {{- if $stores }}
           s3:
             bucket: {{ toJson $bucket }}
             prefix: {{ toJson $prefix }}
@@ -239,3 +290,14 @@ spec:
               key: "ACCESS_SECRET_KEY"
             tls:
               enabled: {{ $tls }}
+          {{- else }}
+          persistentVolumeClaim:
+            accessModes:
+              - "ReadWriteOnce"
+            resources:
+              requests:
+                storage: {{ toJson $size }}
+            {{- with $class }}
+            storageClassName: {{ toJson . }}
+            {{- end }}
+          {{- end }}
