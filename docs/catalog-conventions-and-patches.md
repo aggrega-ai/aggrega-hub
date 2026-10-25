@@ -4855,7 +4855,10 @@ sizes in the Release.
 - **availability** — PodDisruptionBudget, priorityClass
 - **observability** — ServiceMonitor and PodMonitor, OpenTelemetry collector or
   sidecar, dashboards
-- **backup** — cluster backup tooling, database backup custom resources
+- **backup** — a datastore backed up on a schedule, `core/backup`: a managed
+  database service's own automated backup, or the resource a backup product
+  reconciles — a Velero Schedule, a CloudNativePG ScheduledBackup, a
+  mariadb-operator Backup
 - **on-demand runs** — a task held until someone starts it: a suspended
   CronJob, a Compose service behind a profile, an Amazon ECS task definition
   a RunTask call starts
