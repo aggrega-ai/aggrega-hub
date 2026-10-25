@@ -66,7 +66,7 @@ the label section below). The 15 categories:
 | `mesh` | Service meshes | server | created when the first entity lands |
 | `network` | Network primitives | server, resource | created when the first entity lands |
 | `messaging` | Event buses, queues, streams, the realtime media services that carry voice and video between participants, and the external carriers a message leaves the Release through | stateful-server, server, resource | populated |
-| `storage` | Object/file storage: a bucket reached over the S3 API (`core/storage/s3-object-store`), on Amazon S3 or Google Cloud Storage or on a SeaweedFS server the Release runs; a managed bucket reached through Google Cloud Storage's own API (`core/storage/gcs`); and the backup controllers that copy a cluster's resources and volumes into such a bucket (`core/storage/velero`) | server, resource | populated |
+| `storage` | Object/file storage: a bucket reached over the S3 API (`core/storage/s3-object-store`), on Amazon S3 or Google Cloud Storage or on a SeaweedFS server the Release runs; a managed bucket reached through Google Cloud Storage's own API (`core/storage/gcs`); and the backup controllers that copy a cluster's resources, or its volumes' files, into such a bucket (`core/storage/velero`, `core/storage/k8up`) | server, resource | populated |
 | `compute` | Generic compute primitives, plus the control planes an event-driven realization depends on | server, worker, task, function | populated |
 | `observability` | Telemetry, tracing, monitoring | varies | populated |
 | `security` | Security and compliance components | varies | populated |
@@ -4857,8 +4857,8 @@ sizes in the Release.
   sidecar, dashboards
 - **backup** — a datastore backed up on a schedule, `core/backup`: a managed
   database service's own automated backup, or the resource a backup product
-  reconciles — a Velero Schedule, a CloudNativePG ScheduledBackup, a
-  mariadb-operator Backup
+  reconciles — a Velero Schedule, a K8up Schedule, a CloudNativePG
+  ScheduledBackup, a mariadb-operator Backup
 - **on-demand runs** — a task held until someone starts it: a suspended
   CronJob, a Compose service behind a profile, an Amazon ECS task definition
   a RunTask call starts

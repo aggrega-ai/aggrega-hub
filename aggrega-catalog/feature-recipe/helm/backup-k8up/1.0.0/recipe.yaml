@@ -1,0 +1,314 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: backup-k8up
+  version: 1.0.0
+  description: >
+    Component-scope FeatureRecipe for core/backup on Kubernetes through K8up:
+    writes a K8up Schedule beside the attached component, in the namespace
+    its workloads are written into. The schedule runs only where
+    core/storage/k8up is deployed; nothing in the build checks it.
+
+    Each backup copies the files of the component's persistent volume
+    claims, those carrying the labels its workloads select their pods by,
+    into a restic repository in the bucket the store connection points at.
+    It is a copy of the volumes' files taken while the datastore runs, not a
+    database-consistent dump. It runs on infra.schedule, or daily at 03:00
+    where that is unset; K8up keeps backups by count, so a schedule must run
+    once a day or once an hour at a fixed minute, and each backup is kept for
+    infra.retention_days days.
+
+    The backup jobs read the bucket's key pair, under ACCESS_KEY_ID and
+    ACCESS_SECRET_KEY, and the repository's password, under RESTIC_PASSWORD,
+    from the Secret infra.credentials_secret names or, unset, from one named
+    after the Schedule, which the cluster must hold in the component's
+    namespace. The build halts, naming the attachment, with no store
+    connection, with a store publishing no S3 API, on any other schedule, on
+    a second core/backup attachment, and on a component whose render emits no
+    workload whose claims a schedule can select.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/backup:1.0.0
+  # executionScope omitted -> component: renders once per attached component.
+
+  # The store's render is read below, to find the namespace of a store running
+  # in the cluster, so the attachment renders once every component in the
+  # build has rendered rather than right after its own host.
+  readsTargetRenderFacts: true
+
+  # One file holding the Schedule.
+  #
+  # Where it is written. A K8up Schedule backs up the persistent volume claims
+  # of its own namespace and no other, and its backup jobs run there, so it is
+  # written into the namespace the attached component's workloads are emitted
+  # into, or into no namespace where they are emitted into none, leaving both
+  # to the applying tool. Workloads emitted into two namespaces halt: one
+  # Schedule reaches one namespace. Nothing in the build checks that K8up is
+  # deployed: applied to a cluster without K8up's custom-resource definitions,
+  # the Schedule is refused by the cluster, and with the definitions but no
+  # operator, it sits unread.
+  #
+  # The name. The host's rendered name and the attachment name, folded to
+  # hyphens; where the Recipe realizing the component reports no rendered
+  # name, its identity stands in, and an identity that is not a name
+  # Kubernetes takes halts, naming it. K8up writes the Schedule's name into a
+  # label on every job it starts, and a label value holds 63 characters at
+  # most, so a longer name halts, naming it.
+  #
+  # The store. The attachment's store connection is the one connection on the
+  # store socket that a core/backup attachment declared. A component carries
+  # every such connection of every core/backup attachment on it, under the
+  # Feature's name rather than the attachment's, so one attachment cannot tell
+  # its own from another's; a component carrying a second core/backup
+  # attachment therefore halts while any of them wires a store. No store
+  # connection halts, and so do two on one attachment, since a Schedule writes
+  # to one repository. A store publishing no S3 API — protocol other than s3,
+  # or no endpoint, as core/storage/gcs publishes — halts, and so does an
+  # endpoint that is not a scheme and a host with an optional port: restic
+  # reads everything after the host as the bucket and its path. This store
+  # handling is the one the other realizations of core/backup carry, repeated
+  # in each, since a template expression has no catalog kind to be shared from.
+  #
+  # The store's address. A store running in the cluster publishes the bare
+  # name of its Service, which resolves only inside its own namespace, while
+  # the backup jobs run beside the component. Where the store's render emitted
+  # a Service of that name, the address is qualified with the namespace the
+  # Service is emitted into; a store whose Service is emitted into no namespace
+  # halts, since its address cannot be qualified. A store outside the cluster —
+  # a managed bucket — is reached at its endpoint as published. A Schedule
+  # carries no region, so the region the store publishes is not written, and
+  # restic's S3 client asks the S3 API where the bucket is.
+  #
+  # The repository. restic keeps its repository under s3:<endpoint>/<bucket>,
+  # and K8up writes the Schedule's bucket after the endpoint as it is given, so
+  # the bucket is written with the prefix <namespace>/<name>, or <name> where
+  # no namespace is written: two components, or two Releases sharing a bucket,
+  # never write into one another's repository.
+  #
+  # The key and the password. The store connection carries no credential: a
+  # consumer of the store holds the key it presents. The backup and prune jobs
+  # read the key pair from the Secret infra.credentials_secret names or, where
+  # it is unset, from one named after the Schedule, under ACCESS_KEY_ID and
+  # ACCESS_SECRET_KEY, key names the Schedule takes as written. restic encrypts
+  # the repository with a password every job must present, and core/backup
+  # declares no input for it, so the jobs read it from the same Secret, under
+  # RESTIC_PASSWORD; a Secret holding no such key leaves every job failing,
+  # and the repository is readable only with that password. A Secret is read
+  # from the namespace of the Schedule naming it, so it must be in the
+  # component's namespace and not in the store's. The Secret is the cluster's
+  # to hold; nothing in the build checks it.
+  #
+  # What is backed up. The Schedule's backup selects the persistent volume
+  # claims of its namespace that carry the matchLabels of one of the
+  # Deployments, StatefulSets, DaemonSets and ReplicaSets the component's
+  # render emits — one label selector per controller, a claim matching any one
+  # of them — so the claims of other components in the namespace are left
+  # out. Kubernetes writes a StatefulSet's selector labels onto every claim it
+  # creates from the set's claim templates, and the helm provider writes a
+  # workload's labels onto every standalone claim it emits for it; a claim a
+  # chart writes is selected where it carries those labels. K8up mounts each
+  # selected claim read-only into a backup job, which it runs on the node of
+  # the pod mounting the claim where that claim is read-write-once, and leaves
+  # out a claim annotated k8up.io/backup: "false". A Job or CronJob writing no selector is left out,
+  # and a controller of the four writing none halts. A component whose render
+  # emits no controller halts: there is nothing to select. That is the shape of
+  # a component realized by a Recipe that renders only a custom resource, whose
+  # pods and claims a controller creates in the cluster later — a CloudNativePG
+  # cluster, for one — so the halt names the realization of core/backup through
+  # that controller to bind instead. Every key read from the render context
+  # that a host may not carry is read with a default, so no host shape reaches
+  # a template error rather than this halt.
+  #
+  # When and how long. infra.schedule is the Schedule's own backup schedule, a
+  # cron expression of five fields, which K8up reads in its operator's time
+  # zone; unset, it is 0 3 * * *. K8up keeps backups by count rather than by
+  # age: a prune job applies restic's retention, keeping the newest backup of
+  # each of the last N days, or of each of the last N hours, and deleting the
+  # rest. Each backup is kept for exactly infra.retention_days days only where
+  # one backup runs per such period, so the schedule is read: an expression
+  # naming one minute and one hour, every day of every month — 30 2 * * * —
+  # keeps the newest backup of each of the last retention_days days; one
+  # naming one minute of every hour — 15 * * * * — keeps the newest of each of
+  # the last 24 x retention_days hours. Any other expression halts, naming it.
+  # The prune runs once a day: at the backup's own minute and hour for a daily
+  # schedule, and at the backup's minute past 03:00 for an hourly one. K8up
+  # runs a prune and a backup of one repository one after the other, never
+  # together.
+  #
+  # Every value is written through toJson, so a value that reads as a number
+  # or a boolean stays a string, and every map is written in key order, so
+  # identical input renders identical bytes.
+  artifacts:
+    backup.yaml: |
+      {{- $attName := .attachment_name }}
+      {{- $att := .attachment_name | replace "_" "-" }}
+      {{- $host := .context.instance_id }}
+
+      {{- /* This attachment's store connection. */}}
+      {{- $stores := list }}
+      {{- range $alias, $edge := .context.uses }}
+        {{- if and (eq (toString $edge.socket) "store") (eq (toString (default "" $edge.origin_feature)) "core/backup") }}
+          {{- $stores = append $stores (dict "alias" $alias "edge" $edge) }}
+        {{- end }}
+      {{- end }}
+      {{- $backups := list }}
+      {{- range $n, $f := (default dict .features) }}
+        {{- if eq (toString (get $f "type")) "core/backup" }}
+          {{- $backups = append $backups (printf "%q" $n) }}
+        {{- end }}
+      {{- end }}
+      {{- if and (gt (len $backups) 1) $stores }}
+        {{- fail (printf "core/backup attachment %q on %q: %q carries %d core/backup attachments (%s), and each one's store connection reaches every one of them under the Feature's name, so this attachment cannot tell which store is its own; attach core/backup to %q once when it is backed up through K8up" $attName $host $host (len $backups) (join ", " $backups) $host) }}
+      {{- end }}
+      {{- if not $stores }}
+        {{- fail (printf "core/backup attachment %q on %q has no store connection, and K8up writes every backup to a restic repository in a bucket; wire the attachment's store connection to the bucket the backups go to, under uses.store on the attachment in the Release" $attName $host) }}
+      {{- end }}
+      {{- if gt (len $stores) 1 }}
+        {{- $aliases := list }}
+        {{- range $stores }}{{ $aliases = append $aliases (printf "%q" .alias) }}{{ end }}
+        {{- fail (printf "core/backup attachment %q on %q wires %d store connections (%s), and a K8up Schedule writes to one repository; keep one" $attName $host (len $stores) (join ", " $aliases)) }}
+      {{- end }}
+      {{- $store := index $stores 0 }}
+      {{- $edge := $store.edge }}
+      {{- $sp := default dict $edge.provides }}
+      {{- $bucket := toString (default "" (get $sp "bucket")) }}
+      {{- $endpoint := toString (default "" (get $sp "endpoint")) }}
+      {{- $storeHost := toString (default "" (get $sp "host")) }}
+      {{- if or (ne (toString (default "" (get $sp "protocol"))) "s3") (not $endpoint) (not $bucket) }}
+        {{- fail (printf "core/backup attachment %q on %q: its store connection %q reaches %q, which publishes no bucket at an S3 API endpoint, and this realization writes K8up's repository to a bucket over the S3 API; wire the store connection to a store published over the S3 API, such as core/storage/s3-object-store" $attName $host $store.alias $edge.target) }}
+      {{- end }}
+      {{- if not (regexMatch "^https?://[^/?#@]+/?$" $endpoint) }}
+        {{- fail (printf "core/backup attachment %q on %q: the store %q publishes the endpoint %q, and restic reads everything after the endpoint's host as the bucket and its path, so this realization reaches only an endpoint made of http or https, a host and an optional port, with no path; wire the store connection to a store publishing such an endpoint" $attName $host $edge.target $endpoint) }}
+      {{- end }}
+
+      {{- /* A store running in the cluster: qualify its Service name with the namespace it is emitted into. */}}
+      {{- range (default (list) (get (default (dict) $edge.render_facts) "service_selectors")) }}
+        {{- if and $storeHost (eq (toString (get . "name")) $storeHost) }}
+          {{- $sns := toString (optional . "namespace" "") }}
+          {{- if not $sns }}
+            {{- fail (printf "core/backup attachment %q on %q: the store %q runs in the cluster behind the Service %q, which is emitted into no namespace, and the backup jobs, running beside the component, reach a Service in another namespace only by a name qualified with that namespace; set aggrega.ai/namespace for %q, or on its boundary, in the Release" $attName $host $edge.target $storeHost $edge.target) }}
+          {{- end }}
+          {{- if not (contains (printf "://%s" $storeHost) $endpoint) }}
+            {{- fail (printf "core/backup attachment %q on %q: the store %q publishes the endpoint %q, which does not name its Service %q, so the address the backup jobs reach cannot be qualified with the Service's namespace; wire the store connection to a store whose endpoint names the host it publishes" $attName $host $edge.target $endpoint $storeHost) }}
+          {{- end }}
+          {{- $endpoint = replace (printf "://%s" $storeHost) (printf "://%s.%s" $storeHost $sns) $endpoint }}
+        {{- end }}
+      {{- end }}
+      {{- $endpoint = trimSuffix "/" $endpoint }}
+
+      {{- /* The attached component's claims: one selector per controller, and the namespace they are emitted into. */}}
+      {{- $facts := default dict (optional .context "render_facts" dict) }}
+      {{- $selectors := list }}
+      {{- $seenSel := dict }}
+      {{- $namespaces := list }}
+      {{- $seenNs := dict }}
+      {{- range (default (list) (get $facts "controller_selectors")) }}
+        {{- $kind := toString (get . "kind") }}
+        {{- $wname := toString (optional . "name" "") }}
+        {{- $ml := optional . "match_labels" dict }}
+        {{- if not $ml }}
+          {{- if or (eq $kind "Job") (eq $kind "CronJob") }}
+            {{- continue }}
+          {{- end }}
+          {{- fail (printf "core/backup attachment %q on %q: the %s %q that %q renders writes no matchLabels selector, so the schedule has no labels to select its claims by; realize %q with a Recipe whose workloads write a controller selector" $attName $host $kind $wname $host $host) }}
+        {{- end }}
+        {{- $wns := toString (optional . "namespace" "") }}
+        {{- $key := toJson $ml }}
+        {{- if not (hasKey $seenSel $key) }}
+          {{- $_ := set $seenSel $key true }}
+          {{- $selectors = append $selectors $ml }}
+        {{- end }}
+        {{- if not (hasKey $seenNs $wns) }}
+          {{- $_ := set $seenNs $wns true }}
+          {{- $namespaces = append $namespaces $wns }}
+        {{- end }}
+      {{- end }}
+      {{- if not $selectors }}
+        {{- fail (printf "core/backup attachment %q on %q: %q renders no Deployment, StatefulSet, DaemonSet or ReplicaSet whose claims a K8up schedule can select by their labels; where its pods are created later by a controller reconciling what it renders, such as a CloudNativePG cluster, K8up has nothing here to select, so bind the FeatureRecipe realizing core/backup through that controller for this attachment in the Manifest, such as helm/backup-cloudnative-pg, or realize %q with a Recipe whose own render emits its workloads" $attName $host $host $host) }}
+      {{- end }}
+      {{- if gt (len $namespaces) 1 }}
+        {{- $nsq := list }}
+        {{- range $namespaces }}{{ $nsq = append $nsq (printf "%q" .) }}{{ end }}
+        {{- fail (printf "core/backup attachment %q on %q: the workloads %q renders are emitted into %d namespaces (%s), and a K8up Schedule backs up the claims of its own namespace only; write %q's workloads into one namespace" $attName $host $host (len $namespaces) (join ", " $nsq) $host) }}
+      {{- end }}
+      {{- $ns := index $namespaces 0 }}
+
+      {{- /* The name: the host's rendered name, or its identity where its provider reports none and the identity is a name Kubernetes takes. */}}
+      {{- $hostName := toString (optional .context "rendered_name" "") }}
+      {{- if not $hostName }}
+        {{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $host) }}
+          {{- fail (printf "core/backup attachment %q on %q: the Recipe realizing %q reports no rendered name for it, and its identity %q is not a name Kubernetes takes, so the schedule cannot be named after it; realize %q with a Recipe that supplies a chart or a workload, or give the component a name of lowercase letters, digits and hyphens" $attName $host $host $host $host) }}
+        {{- end }}
+        {{- $hostName = $host }}
+      {{- end }}
+      {{- $name := printf "%s-%s" $hostName $att }}
+      {{- if gt (len $name) 63 }}
+        {{- fail (printf "core/backup attachment %q on %q: the schedule's name, %q, is %d characters, and K8up writes it into a label on every job it starts, which holds 63 at most; give the attachment or the component a shorter name" $attName $host $name (len $name)) }}
+      {{- end }}
+
+      {{- /* When, and how long: K8up keeps the newest backup of each day or of each hour. */}}
+      {{- $schedule := trim (toString (optional .infra "schedule" "")) }}
+      {{- $schedule = default "0 3 * * *" $schedule }}
+      {{- $f := splitList " " (regexReplaceAll "\\s+" $schedule " ") }}
+      {{- $days := int .infra.retention_days }}
+      {{- $keepKey := "" }}
+      {{- $keepCount := 0 }}
+      {{- $prune := "" }}
+      {{- if and (eq (len $f) 5) (regexMatch "^[0-5]?[0-9]$" (index $f 0)) (eq (index $f 2) "*") (eq (index $f 3) "*") (eq (index $f 4) "*") }}
+        {{- if regexMatch "^([01]?[0-9]|2[0-3])$" (index $f 1) }}
+          {{- $keepKey = "keepDaily" }}
+          {{- $keepCount = $days }}
+          {{- $prune = printf "%s %s * * *" (index $f 0) (index $f 1) }}
+        {{- else if eq (index $f 1) "*" }}
+          {{- $keepKey = "keepHourly" }}
+          {{- $keepCount = mul $days 24 }}
+          {{- $prune = printf "%s 3 * * *" (index $f 0) }}
+        {{- end }}
+      {{- end }}
+      {{- if not $keepKey }}
+        {{- fail (printf "core/backup attachment %q on %q sets infra.schedule to %q, and K8up keeps backups by count — the newest of each day, or of each hour — rather than by age, so this realization keeps each backup for infra.retention_days days only for a schedule running once a day at one minute and one hour, such as 30 2 * * *, or once an hour at one minute, such as 15 * * * *; write the schedule in one of those two forms" $attName $host $schedule) }}
+      {{- end }}
+
+      {{- $prefix := $name }}
+      {{- if $ns }}{{- $prefix = printf "%s/%s" $ns $name }}{{- end }}
+      {{- $secret := default $name (toString (optional .infra "credentials_secret" "")) -}}
+      apiVersion: k8up.io/v1
+      kind: Schedule
+      metadata:
+        name: {{ toJson $name }}
+        {{- with $ns }}
+        namespace: {{ toJson . }}
+        {{- end }}
+      spec:
+        backend:
+          repoPasswordSecretRef:
+            name: {{ toJson $secret }}
+            key: "RESTIC_PASSWORD"
+          s3:
+            endpoint: {{ toJson $endpoint }}
+            bucket: {{ toJson (printf "%s/%s" $bucket $prefix) }}
+            accessKeyIDSecretRef:
+              name: {{ toJson $secret }}
+              key: "ACCESS_KEY_ID"
+            secretAccessKeySecretRef:
+              name: {{ toJson $secret }}
+              key: "ACCESS_SECRET_KEY"
+        backup:
+          schedule: {{ toJson $schedule }}
+          labelSelectors:
+            {{- range $selectors }}
+            - matchLabels:
+                {{- range $k, $v := . }}
+                {{ toJson $k }}: {{ toJson $v }}
+                {{- end }}
+            {{- end }}
+        prune:
+          schedule: {{ toJson $prune }}
+          retention:
+            {{ $keepKey }}: {{ $keepCount }}
