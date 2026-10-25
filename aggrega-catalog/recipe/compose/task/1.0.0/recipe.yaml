@@ -1,0 +1,272 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: task
+  version: 1.0.0
+  description: >
+    The generic ephemeral compute primitive on Docker Compose: one service
+    running infra.image to completion, with restart set to no, so Compose
+    never starts it again when it exits. Reach for helm/task on Kubernetes,
+    which also runs a task on a schedule.
+
+    With nothing attached, the service runs once each time the stack is
+    started with docker compose up. With core/manual-trigger attached, it
+    carries the profile manual, so docker compose up leaves it stopped and
+    each run is one someone starts with docker compose run --rm <service>,
+    the service named after the component. A task with a schedule is refused
+    by name, as Docker Compose has no scheduler.
+
+    The service is sized from infra.compute and publishes no port. The
+    developer's timeout value reaches the container as TASK_TIMEOUT for the
+    application's own code to honour, as Compose sets no deadline on a run.
+
+    An edge's inject block dictates what reaches the container: each env
+    entry a variable under that name, beside TASK_TIMEOUT, which no edge may
+    dictate, and each file entry a file from a Compose config. An arg entry,
+    or any other mechanism, is refused by name: the recipe renders no command
+    line.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/compute/task:1.0.0
+  # This is the only realization of the component at this target, so the
+  # Manifest entry mapping the component's type to it names one candidate rather
+  # than choosing between several. The entry is still required: recipe
+  # resolution is mapping-driven, and a component instance with no mapping for
+  # its type halts the build whatever its implementers.
+  #
+  # infra keys read here: image, compute. The component's infra.overrides block
+  # carries the keys its Amazon ECS realizations read; this Recipe reads none of
+  # its keys. No provides contract is emitted, because the component declares
+  # none.
+  #
+  # Target-expected names: the image is the Release's, so no upstream
+  # documentation names a spelling for the developer's timeout value. It is
+  # delivered under the name helm/task delivers it under, for the application's
+  # own code to read, and only when the developer set it.
+  #
+  # The shape. Compose's workload synthesis writes a long-running service and
+  # has no form for a run that ends, and a service it writes cannot be gated
+  # behind a profile. So the service is written whole in the compose fragment
+  # under artifacts: below, as compose/docker-model-runner writes its one-shot
+  # service, and this Recipe declares no workload. Every key the fragment writes
+  # is one the compose provider carries into the assembled file.
+  #
+  # restart: "no" is what makes the service a run that ends: Compose does not
+  # start it again when its process exits, whatever its exit status. A plain
+  # docker compose up starts it with the rest of the stack, so it runs once at
+  # each start of the stack, and the exit status is what a reader inspects.
+  #
+  # With core/manual-trigger attached, the service also carries the profile
+  # manual. Compose starts a service carrying a profile only when that profile
+  # is enabled, or when the service is named on the command line, so docker
+  # compose up leaves it stopped, and docker compose run --rm <service> starts
+  # one run and removes its container once the run ends. The attachment is found
+  # by its Feature's type, with any version it was authored with set aside, as
+  # helm/task, terraform/task-ecs and cloudformation/task-ecs find it; its
+  # FeatureRecipe, compose/manual-trigger, emits nothing, because a
+  # FeatureRecipe can neither add a key to the host's service nor withdraw the
+  # run the host would start. The name manual is fixed: the developer attaches
+  # the Feature, and the Feature takes no values.
+  #
+  # A schedule is refused rather than accepted and left unread: Compose has no
+  # scheduler, and a service started at each docker compose up would run at
+  # none of the times the developer wrote.
+  #
+  # Every Component value and infra key is honoured or refused below by name:
+  #   honoured — values.timeout as above, infra.image (required), and
+  #     infra.compute.cpu and infra.compute.memory as the service's limits and
+  #     reservations below.
+  #   refused — values.schedule; a compute quantity this Recipe cannot read;
+  #     an edge injecting a variable under TASK_TIMEOUT while the timeout is
+  #     set; an edge's arg or custom-mechanism entry, and a file entry at a
+  #     path that is not absolute or that lies beneath another entry's path.
+  assertions:
+    # This component packages no upstream product, so it holds no default image
+    # to fall back to: the Release names the one it runs.
+    image_supplied: >-
+      {{- if not (optional .infra "image" "") -}}
+      {{- fail "this realization runs an image the Release supplies, because the generic compute primitive packages no software and therefore holds no default: set infra.image to the container image the run executes in the Release" -}}
+      {{- end -}}
+    # Docker Compose has no scheduler, so a schedule is refused naming the
+    # realization that runs one.
+    schedule_refused: >-
+      {{- with trim (toString (optional .values "schedule" "")) -}}
+      {{- fail (printf "the component %q is scheduled %q, and Docker Compose has no scheduler: nothing in a compose file starts a service at a time, so the run would happen at none of the times written. Map core/compute/task to helm/task in the Manifest, which runs it on its schedule as a Kubernetes CronJob; or remove the schedule from the component in the Aggregate to run it once at each docker compose up, or attach core/manual-trigger to it there to start each run with docker compose run --rm" $.locals.instance_id .) -}}
+      {{- end -}}
+    # The compute block's two sub-keys carry defaults, and a Release that
+    # authors the block while setting only one of them takes neither default:
+    # the service would then carry one quantity and silently lose the other.
+    # Both are required together for that reason, and each is named separately
+    # so the reader is told which one is missing.
+    compute_group_complete: >-
+      {{- $compute := optional .infra "compute" dict -}}
+      {{- if not (optional $compute "cpu" "") -}}
+      {{- fail "this Release sets part of infra.compute and leaves compute.cpu empty, so the rendered service would carry no CPU limit or reservation: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+      {{- if not (optional $compute "memory" "") -}}
+      {{- fail "this Release sets part of infra.compute and leaves compute.memory empty, so the rendered service would carry no memory limit or reservation: set both compute.cpu and compute.memory together, or remove the compute block entirely to take the component's defaults" -}}
+      {{- end -}}
+    compute_readable: >-
+      {{- if not (gt (atoi (toString .locals.cpu_millicores)) 0) -}}
+      {{- fail (printf "infra.compute.cpu is %q, and this Recipe reads it as a Kubernetes CPU quantity above zero, whole millicores such as 100m or cores with at most three decimals such as 0.5: set infra.compute.cpu in the Release to one of those forms" (toString .infra.compute.cpu)) -}}
+      {{- end -}}
+      {{- if not (gt (atoi (toString .locals.memory_mib)) 0) -}}
+      {{- fail (printf "infra.compute.memory is %q, and this Recipe reads it as a Kubernetes memory quantity above zero in whole mebibytes or gibibytes, such as 128Mi or 1Gi: set infra.compute.memory in the Release to one of those forms" (toString .infra.compute.memory)) -}}
+      {{- end -}}
+
+  # The service's size. Compose's own conversion of a Kubernetes quantity runs
+  # only for a service its workload synthesis writes, and this one is written in
+  # a fragment, so the quantities are read here, in the forms terraform/task-ecs
+  # and cloudformation/task-ecs read for the same component, and any other form
+  # is refused by name rather than guessed at. cpu_millicores and memory_mib
+  # are the locals those two Recipes declare, word for word. The service takes
+  # its CPU as a core count, a minimal decimal (100m is 0.1), and its memory as
+  # an exact count of bytes, the forms Compose's deploy.resources reads; both
+  # are its limit and its reservation alike, as helm/task sets a container's
+  # request and limit to the same quantity.
+  locals:
+    # The component's name, for the assertions' messages to name it.
+    instance_id: '{{ .context.instance_id }}'
+    # The requested CPU in millicores, or empty when it is not a quantity this
+    # Recipe reads: whole millicores, or vCPUs with at most three decimals.
+    cpu_millicores: >-
+      {{- $c := toString (optional (optional .infra "compute" dict) "cpu" "") -}}
+      {{- if regexMatch `^[0-9]+m$` $c -}}{{ atoi (trimSuffix "m" $c) }}
+      {{- else if regexMatch `^[0-9]+(\.[0-9]{1,3})?$` $c -}}
+      {{- $p := splitList "." $c -}}{{- $f := 0 -}}
+      {{- if eq (len $p) 2 }}{{ $f = atoi (substr 0 3 (printf "%s000" (index $p 1))) }}{{ end -}}
+      {{- add (mul (atoi (index $p 0)) 1000) $f -}}
+      {{- end -}}
+    # The requested memory in MiB, or empty when it is not a quantity this
+    # Recipe reads: whole Mi or Gi.
+    memory_mib: >-
+      {{- $m := toString (optional (optional .infra "compute" dict) "memory" "") -}}
+      {{- if regexMatch `^[0-9]+Mi$` $m -}}{{ atoi (trimSuffix "Mi" $m) }}
+      {{- else if regexMatch `^[0-9]+Gi$` $m -}}{{ mul (atoi (trimSuffix "Gi" $m)) 1024 }}
+      {{- end -}}
+    cpus: >-
+      {{- $mc := atoi (toString .locals.cpu_millicores) -}}
+      {{- if mod $mc 1000 -}}{{ printf "%d.%03d" (div $mc 1000) (mod $mc 1000) | trimSuffix "0" | trimSuffix "0" }}
+      {{- else -}}{{ div $mc 1000 }}
+      {{- end -}}
+    memory_bytes: '{{ mul (atoi (toString .locals.memory_mib)) 1048576 }}'
+
+  provides: {}
+
+  # The service, written whole. Its name is the component's own, the name docker
+  # compose run --rm is given.
+  #
+  # Delivery from an edge. The image is the Release's own code, so no name this
+  # Recipe could choose is one that code reads: each of the component's
+  # connections dictates its own delivery in its inject block, and an edge that
+  # dictates nothing delivers nothing. The pipe is read as a map. Every env
+  # entry becomes a variable of the service's environment under the name the
+  # edge gave it, its value written whole after the timeout, so a Compose
+  # variable reference a credential delivers, such as ${DB_PASSWORD}, stays one
+  # for Compose to substitute when the stack starts; an entry under the
+  # timeout's name halts, naming the connection, while the timeout is set.
+  # Every file entry becomes a Compose config holding the entry's content,
+  # mounted as one file at the path the edge names, so a path that is not
+  # absolute, or one lying beneath another entry's path, is refused. Compose
+  # substitutes a variable reference inside a config's content as well, so each
+  # $ in it is doubled, and the file holds the content as the edge delivered
+  # it. An arg entry is refused, because this Recipe renders no command line:
+  # Compose takes a service's command in place of the image's default command,
+  # which is the Release's. Any other mechanism is refused too. A refusal names
+  # the entry, its mechanism and the connection that dictated it. The checks
+  # are helm/task's, worded for Compose.
+  #
+  # Every string is written as a JSON string, so a quote, a colon or a leading
+  # character YAML treats specially cannot change what the line means, with
+  # U+0085 written as an escape: JSON leaves that character as it is, and YAML
+  # would read it as a line break and fold it into a space.
+  artifacts:
+    task.compose-fragment.yaml: |
+      {{- $inject := default dict .context.inject }}
+      {{- $env := optional $inject "env" dict }}
+      {{- $files := optional $inject "file" dict }}
+      {{- range $mechanism, $entries := $inject }}
+      {{- if not (has $mechanism (list "all" "env" "file")) }}
+      {{- range $name, $_ := $entries }}
+      {{- $by := "an attachment on the component" }}
+      {{- range $alias, $edge := $.context.uses }}
+      {{- if hasKey (optional (default dict $edge.inject) $mechanism dict) $name }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+      {{- end }}
+      {{- if eq $mechanism "arg" }}
+      {{- fail (printf "the component %q is handed the command-line argument %q by %s, and this realization renders no command line: Docker Compose takes a service's command in place of the image's default command, and that command is the Release's. Dictate the value as an env or a file entry in that inject block instead" $.context.instance_id $name $by) }}
+      {{- end }}
+      {{- fail (printf "the component %q is handed %q under the delivery mechanism %q by %s, and this realization delivers env and file entries only: dictate the value as an env or a file entry in that inject block instead" $.context.instance_id $name $mechanism $by) }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- range $path, $_ := $files }}
+      {{- if not (hasPrefix "/" $path) }}
+      {{- fail (printf "the component %q is handed a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $.context.instance_id $path) }}
+      {{- end }}
+      {{- range $other, $_ := $files }}
+      {{- if hasPrefix (printf "%s/" $path) $other }}
+      {{- fail (printf "the component %q is handed a file at %q and another at %q beneath it, and one path cannot be both a file and a directory: dictate the two files at paths neither of which lies beneath the other" $.context.instance_id $path $other) }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- $timeout := optional .values "timeout" "" }}
+      {{- if and $timeout (hasKey $env "TASK_TIMEOUT") }}
+      {{- $by := "an attachment on the component" }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- if hasKey (optional (default dict $edge.inject) "env" dict) "TASK_TIMEOUT" }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+      {{- end }}
+      {{- fail (printf "the component %q delivers its developer value timeout to the container as TASK_TIMEOUT, and %s dictates a variable under that name as well, so one would silently replace the other: rename the variable in that inject block" .context.instance_id $by) }}
+      {{- end }}
+      {{- $manual := false }}
+      {{- range $name, $attachment := optional . "features" dict }}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/manual-trigger" }}{{ $manual = true }}{{ end }}
+      {{- end }}
+      services:
+        {{ .context.instance_id | toJson }}:
+          image: {{ .infra.image | toJson | replace "\u0085" "\\u0085" }}
+          {{- if or $timeout $env }}
+          environment:
+            {{- with $timeout }}
+            TASK_TIMEOUT: {{ toString . | toJson | replace "\u0085" "\\u0085" }}
+            {{- end }}
+            {{- range $k, $v := $env }}
+            {{ toJson $k | replace "\u0085" "\\u0085" }}: {{ toString $v | toJson | replace "\u0085" "\\u0085" }}
+            {{- end }}
+          {{- end }}
+          {{- if $files }}
+          configs:
+            {{- $i := 0 }}
+            {{- range $path, $_ := $files }}
+            - source: {{ printf "%s-file-%d" $.context.instance_id $i | toJson }}
+              target: {{ toJson $path | replace "\u0085" "\\u0085" }}
+            {{- $i = add $i 1 }}
+            {{- end }}
+          {{- end }}
+          deploy:
+            resources:
+              limits:
+                cpus: {{ .locals.cpus | toJson }}
+                memory: {{ .locals.memory_bytes | toJson }}
+              reservations:
+                cpus: {{ .locals.cpus | toJson }}
+                memory: {{ .locals.memory_bytes | toJson }}
+          restart: "no"
+          {{- if $manual }}
+          profiles:
+            - "manual"
+          {{- end }}
+      {{- if $files }}
+      configs:
+        {{- $i := 0 }}
+        {{- range $path, $v := $files }}
+        {{ printf "%s-file-%d" $.context.instance_id $i | toJson }}:
+          content: {{ toString $v | replace "$" "$$" | toJson | replace "\u0085" "\\u0085" }}
+        {{- $i = add $i 1 }}
+        {{- end }}
+      {{- end }}
