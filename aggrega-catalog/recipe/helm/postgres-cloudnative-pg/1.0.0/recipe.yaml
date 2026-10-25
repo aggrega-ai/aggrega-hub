@@ -19,10 +19,9 @@ metadata:
     read-write Service, so a consumer wires to it exactly as it would to the
     synthesized realization. The Cluster, and the ConfigMap carrying any bootstrap
     scripts, are written into the namespace the Release names through the
-    aggrega.ai/namespace annotation, where one is set, and provides publishes the
-    pod label, port name and path a scraper discovers the instances' metrics by.
-    Credential custody is the operator's choice: infra.credentials generated
-    leaves the owner's password with the controller, and supplied points it at an
+    aggrega.ai/namespace annotation, where one is set. Credential custody is the
+    operator's choice: infra.credentials generated leaves the owner's password
+    with the controller, and supplied points it at an
     existing Secret named in infra.credentials_secret. The CloudNativePG control
     plane is a runtime prerequisite: the build halts unless the operator affirms
     it is installed (infra.control_plane_present), so no custom resource is
@@ -30,6 +29,8 @@ metadata:
     where the control plane is already in place; reach for the synthesis recipe
     where it is not, and for the reference recipe where the server already exists
     outside the deployment.
+    A core/backup attachment bound to helm/backup-cloudnative-pg is realized
+    through the Barman Cloud plugin.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -42,8 +43,16 @@ spec:
   # it and no server setting can move it. The published contract and the assertion
   # below both read this one value, so what a consumer is handed and what the
   # assertion accepts cannot drift apart.
+  #
+  # The Barman Cloud plugin's own name, which the Cluster's plugin entry carries
+  # when a core/backup attachment is backed up through it (see the Cluster
+  # below). helm/backup-cloudnative-pg reads this local from its assertions —
+  # they see the locals of the component the attachment is on — and refuses an
+  # attachment on any realization that does not declare it, since only this one
+  # writes the entry its schedule needs.
   locals:
     server_port: "5432"
+    barman_cloud_plugin: "barman-cloud.cloudnative-pg.io"
 
   # The controller creates three Services for an instance, named by appending a
   # suffix to the custom resource's own name: `-rw` routes to the primary and
@@ -132,11 +141,12 @@ spec:
   # requested read replicas, which is what makes the controller's read-only
   # endpoint answer at all. With high availability off, one instance is rendered.
   #
-  # infra.backup is read by neither this realization nor the synthesized one — the
-  # controller's backup surface names an object store this catalog does not supply
-  # — so the move between them loses nothing. values.custom_config and infra.port
-  # are honored by the synthesis realization alone, which is why they halt above
-  # rather than passing quietly. values.app_user names a role the synthesis
+  # infra.backup is read by neither this realization nor the synthesized one, so
+  # the move between them loses nothing; this realization is backed up through a
+  # core/backup attachment instead, described beside the Cluster below.
+  # values.custom_config and infra.port are honored by the synthesis realization
+  # alone, which is why they halt above rather than passing quietly.
+  # values.app_user names a role the synthesis
   # realization creates only when a credential is attached to app_user_password,
   # and that attachment halts here, so the name is never quietly dropped.
   #
@@ -160,6 +170,20 @@ spec:
   # instance pods in. The provider does not place an artifact on its own. Where
   # no namespace is named the field is omitted, and both land wherever the
   # applying tool puts them.
+  #
+  # Backup. A core/backup attachment the Manifest binds to
+  # helm/backup-cloudnative-pg publishes the name of the Barman Cloud plugin
+  # ObjectStore it writes, as provides.object_store. For such an attachment the
+  # Cluster names the plugin in its plugins list, as its write-ahead-log
+  # archiver, with that ObjectStore as the one it writes to: the controller then
+  # archives the log continuously and the attachment's ScheduledBackup takes its
+  # base backups through the plugin. The operator's own object-store backup,
+  # deprecated since CloudNativePG 1.26 in favour of the plugin, is never
+  # written. An attachment another backup product realizes publishes no
+  # object_store and leaves the Cluster as it is, and so does a Cluster carrying
+  # no attachment; two attachments publishing one halt, since a Cluster archives
+  # its log through one plugin entry. The plugin itself is installed by
+  # core/storage/barman-cloud-plugin.
   artifacts:
     # The developer's bootstrap scripts, carried as a ConfigMap the custom resource
     # references by key. The entry renders empty — and is therefore skipped,
@@ -232,6 +256,26 @@ spec:
             {{- range $name, $setting := .infra.overrides.parameters }}
             {{ $name }}: "{{ $setting }}"
             {{- end }}
+        {{- end }}
+        {{- $archive := list }}
+        {{- range $attachment, $feature := (default dict .features) }}
+          {{- if eq (toString (optional $feature "type" "")) "core/backup" }}
+            {{- with optional (optional $feature "provides" dict) "object_store" "" }}
+              {{- $archive = append $archive (dict "attachment" $attachment "store" .) }}
+            {{- end }}
+          {{- end }}
+        {{- end }}
+        {{- if gt (len $archive) 1 }}
+          {{- $names := list }}
+          {{- range $archive }}{{ $names = append $names (printf "%q" .attachment) }}{{ end }}
+          {{- fail (printf "%q carries %d core/backup attachments backed up through the Barman Cloud plugin (%s), and a CloudNativePG Cluster archives its write-ahead log through one plugin entry; attach core/backup to %q once" .context.instance_id (len $archive) (join ", " $names) .context.instance_id) }}
+        {{- end }}
+        {{- range $archive }}
+        plugins:
+          - name: {{ toJson $.locals.barman_cloud_plugin }}
+            isWALArchiver: true
+            parameters:
+              barmanObjectName: {{ toJson .store }}
         {{- end }}
         bootstrap:
           initdb:

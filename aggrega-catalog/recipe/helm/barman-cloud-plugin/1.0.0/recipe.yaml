@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: barman-cloud-plugin
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    Installs the Barman Cloud plugin for CloudNativePG through the chart the
+    CloudNativePG project publishes, at the chart release whose application
+    version is the image the Component pins. The chart is official, from
+    CloudNativePG's own chart repository; complete, carrying the plugin's
+    custom-resource definition, its Deployment, the Service the operator
+    finds it by, its permissions and its certificates; and maintained, its
+    newest release carrying the plugin's newest, 0.15.1.
+
+    The certificates are cert-manager Certificates from an Issuer the chart
+    renders, so cert-manager must already run in the cluster. It renders no
+    object store and no backup: helm/backup-cloudnative-pg writes those for
+    each core/backup attachment. The build halts unless the Release declares
+    a namespace for the component, which must be the CloudNativePG
+    operator's. Its chart repository must be reachable from the build.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/storage/barman-cloud-plugin:1.0.0
+
+  # The CloudNativePG project's chart, from its own chart repository. Its
+  # default version is the release whose application version, v0.15.1, is the
+  # tag of the images the Component pins, so the chart's templates, its
+  # custom-resource definition and the images move together;
+  # infra.source_version picks another chart release, and the images follow it
+  # only where the Release sets them too.
+  source:
+    kind: helm-https-chart
+    url: https://cloudnative-pg.github.io/charts
+    chart: plugin-barman-cloud
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"0.8.1\" }}"
+
+  # This Recipe reads no infra.overrides keys; the Component declares none.
+  #
+  # The chart is read for the values below; everything else stays the chart's
+  # own default at its release.
+  #
+  # Namespace. The plugin's documentation: it "must be installed in the same
+  # namespace as the CloudNativePG operator (typically cnpg-system)". The chart
+  # writes every object into the release namespace, which is the namespace the
+  # Release declares for the component through the aggrega.ai/namespace
+  # annotation. The operator is not a component of this catalog, so the build
+  # cannot read where it runs: it halts when the Release declares no namespace,
+  # and takes the one declared as the operator's.
+  #
+  # Names. The chart names the Service barman-cloud whatever it is given — the
+  # server certificate is issued for that name — and labels it
+  # cnpg.io/pluginName: barman-cloud.cloudnative-pg.io, which is how the
+  # operator finds the plugin. Its other objects are named after its release
+  # name, and are left as the chart publishes them. The plugin runs once per
+  # cluster, and nothing is published for a component to reach.
+  #
+  # Images. The chart writes each image as "<registry>/<repository>:<tag>", so
+  # each reference is cut at its first slash and at the last colon after its
+  # last slash, and the three parts join back into exactly the reference the
+  # Release names, a digest reference included. A reference with no slash, or
+  # with neither a tag nor a digest, halts, naming it. infra.image runs the
+  # plugin's Deployment; infra.sidecar_image is written into the ConfigMap the
+  # plugin reads it from, and the operator runs it beside each PostgreSQL
+  # instance of a Cluster that names the plugin.
+  #
+  # Custom-resource definition. The ObjectStore definition ships in the chart's
+  # templates, rendered when crds.create is on, which is the chart's default;
+  # applying the output installs and updates it.
+  #
+  # Certificates. The chart renders a self-signed cert-manager Issuer and the
+  # server and client Certificates the plugin and the operator present to each
+  # other, which cert-manager turns into the Secrets the plugin's Deployment
+  # mounts. They are left on: the plugin's documentation names cert-manager as
+  # a requirement. Without cert-manager in the cluster, the three are refused
+  # when the output is applied.
+  valuesMapping: |
+    {{- $declared := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+    {{- if not $declared }}
+    {{- fail (printf "%q is installed through the Barman Cloud plugin's chart, which places the plugin in the namespace the Release declares for the component, and the Release declares none; the plugin must run in the namespace the CloudNativePG operator runs in, typically cnpg-system, so declare that namespace with the annotation aggrega.ai/namespace on %q or on its boundary in the Release" .context.instance_id .context.instance_id) }}
+    {{- end }}
+    {{- $images := dict }}
+    {{- range $key, $ref := (dict "image" .infra.image "sidecar_image" .infra.sidecar_image) }}
+      {{- if not (contains "/" $ref) }}
+      {{- fail (printf "infra.%s is %q, which names no registry or repository path, and the Barman Cloud plugin's chart writes its images as registry/repository:tag; name the image with its registry, such as ghcr.io/cloudnative-pg/plugin-barman-cloud:v0.15.1" $key $ref) }}
+      {{- end }}
+      {{- $registry := first (splitList "/" $ref) }}
+      {{- $path := trimPrefix (printf "%s/" $registry) $ref }}
+      {{- $tag := "" }}
+      {{- if contains ":" (last (splitList "/" $path)) }}
+        {{- $tag = last (splitList ":" (last (splitList "/" $path))) }}
+        {{- $path = trimSuffix (printf ":%s" $tag) $path }}
+      {{- end }}
+      {{- if not $tag }}
+      {{- fail (printf "infra.%s is %q, which names neither a tag nor a digest, and the Barman Cloud plugin's chart writes its images as registry/repository:tag; name the image with its tag, such as v0.15.1, or with its digest" $key $ref) }}
+      {{- end }}
+      {{- $_ := set $images $key (dict "registry" $registry "repository" $path "tag" $tag) }}
+    {{- end }}
+    image:
+      registry: "{{ $images.image.registry }}"
+      repository: "{{ $images.image.repository }}"
+      tag: "{{ $images.image.tag }}"
+    sidecarImage:
+      registry: "{{ $images.sidecar_image.registry }}"
+      repository: "{{ $images.sidecar_image.repository }}"
+      tag: "{{ $images.sidecar_image.tag }}"
+    crds:
+      create: true
