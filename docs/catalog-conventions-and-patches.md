@@ -4860,7 +4860,17 @@ sizes in the Release.
   database service's own automated backup, an AWS Backup plan and selection
   run under the IAM role `infra.role_arn` names, or the resource a backup
   product reconciles — a Velero Schedule, a K8up Schedule, a CloudNativePG
-  ScheduledBackup, a mariadb-operator Backup
+  ScheduledBackup, a mariadb-operator Backup. Where a backup goes is always
+  written: the `store` connection sends it to a bucket, and `infra.volume`
+  (`size`, and `storage_class`, the cluster's default where it is unset) to a
+  disk volume in the cluster, for a product that can keep backups there. An
+  attachment carrying both halts; one carrying neither halts under a
+  realization that writes to a bucket or a volume, while a realization keeping
+  backups in storage of its own, such as AWS Backup's vault, refuses both. A
+  realization whose product cannot keep a backup on a volume refuses
+  `infra.volume` by name. A backup on a volume sits in the same cluster as
+  the data it protects, so it guards against a bad change or deletion but not
+  against losing the cluster
 - **on-demand runs** — a task held until someone starts it: a suspended
   CronJob, a Compose service behind a profile, an Amazon ECS task definition
   a RunTask call starts

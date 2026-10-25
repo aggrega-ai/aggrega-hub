@@ -14,23 +14,25 @@ metadata:
     components of type stateful-server.
 
     On a managed database service, attaching it configures the service's own
-    automated backup: the time it starts and how many days each backup is
-    kept. On AWS, the Manifest can also select AWS Backup, which backs up an
-    Amazon RDS instance into a vault of its own under the IAM role
-    infra.role_arn names; every other realization refuses that key by name.
-    On Kubernetes, a backup product the Manifest selects does the work,
-    writing its backups to the bucket the store connection points at. A
-    product that names a Secret on each backup resource reads the bucket's
-    key from the one infra.credentials_secret names, or, unset, from one
-    named <component>-<attachment>; one that takes its key at install
-    refuses the key by name.
+    automated backup: when it starts and how many days each backup is kept.
+    On AWS, the Manifest can also select AWS Backup, which backs up an Amazon
+    RDS instance into a vault of its own under the IAM role infra.role_arn
+    names. On Kubernetes, a backup product the Manifest selects writes its
+    backups to the bucket the store connection points at or, where the
+    product can, to a volume infra.volume sizes: a backup goes to one of the
+    two, and an attachment naming both, or neither for such a product, halts.
+    A backup on a volume sits in the same cluster as the data it protects, so
+    it guards against a bad change or deletion but not against losing the
+    cluster. A product naming a Secret on each backup resource reads the
+    bucket's key from the one infra.credentials_secret names, or, unset, from
+    one named <component>-<attachment>.
 
     A target whose product cannot keep a value refuses that value by name,
-    rather than running a backup other than the one written: a schedule the
-    service cannot express, a retention outside the days it keeps, a store
-    on a service that keeps backups in its own storage. Each target realizes
-    the Feature through a FeatureRecipe the Manifest binds to it, and a
-    Manifest binding none halts the build, naming the attachment.
+    rather than running a backup other than the one written: a schedule it
+    cannot express, a retention outside the days it keeps, a key, a role, a
+    store or a volume it has no use for. Each target realizes the Feature
+    through a FeatureRecipe the Manifest binds to it, and a Manifest binding
+    none halts the build, naming the attachment.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -58,10 +60,12 @@ spec:
   # can write them to a bucket reached over the S3 API: Velero through its
   # backup storage location, K8up, CloudNativePG's Barman Cloud object store,
   # mariadb-operator, KubeStash and Kasten's location profiles. A managed
-  # database service keeps its backups in its own storage, so the connection
-  # is optional: a realization that needs a bucket refuses an attachment that
-  # leaves it unwired, and a managed one refuses an attachment that wires it,
-  # each by name.
+  # database service keeps its backups in its own storage, and some products
+  # can keep them on the volume infra.volume describes instead, so the
+  # connection is optional: a realization that writes to a bucket or a volume
+  # refuses an attachment wiring no store and setting no volume, and one
+  # keeping backups in storage of its own refuses an attachment that wires
+  # it, each by name.
   #
   # The selector admits a storage resource: core/storage/s3-object-store, and
   # also core/storage/gcs, which carries the same two labels. A realization
@@ -99,7 +103,7 @@ spec:
     #     day.
     #   - where: a bucket for the Kubernetes products, some of which can also keep a
     #     volume or a snapshot; the service's own storage for every managed
-    #     one — the store connection above.
+    #     one — the store connection above, or infra.volume below.
     # How a product takes its backup — a logical dump, a physical copy, a
     # volume snapshot — differs from one product to the next and is each
     # realization's own.
@@ -167,3 +171,52 @@ spec:
       role_arn:
         type: string
         description: "ARN of an existing IAM role AWS Backup assumes to back up the datastore, such as arn:aws:iam::123456789012:role/backup, passed through as written. The AWS Backup realizations require it; every other realization refuses it by name."
+      # A disk volume in the cluster to keep the backups on, in place of a
+      # bucket. Some Kubernetes backup products can keep their backups there:
+      # mariadb-operator on a claim its Backup provisions, K8up and KubeStash in
+      # a repository on a claim they mount, Kasten through a file-store location
+      # profile naming a claim. Each takes the volume as a persistent volume
+      # claim, so the option carries what a claim is provisioned from: its size,
+      # required, and the storage class, optional, the cluster's default class
+      # where it is unset. Velero and CloudNativePG keep their backups only in a
+      # bucket — a CloudNativePG volume snapshot is a snapshot of the database's
+      # own disk, not a copy kept on another volume — and AWS Backup and the
+      # managed services keep theirs in storage of their own, so each of those
+      # realizations refuses the option by name.
+      #
+      # Where a backup goes is always written: the store connection sends it to
+      # the bucket, volume to the volume, and schedule and retention_days keep
+      # their meaning on either. An attachment carrying both halts by
+      # the assertion below, whichever realization binds. One carrying neither
+      # halts in each realization whose product writes to the store or the
+      # volume the attachment names, naming both ways to fix it; a realization
+      # keeping backups in storage of its own — AWS Backup's vault, a managed
+      # service's automated backup — refuses both, and an attachment carrying
+      # neither is its normal shape.
+      #
+      # A backup on a volume sits in the same cluster as the data it protects,
+      # so it guards against a bad change or a deletion and not against losing
+      # the cluster. The description says so, and the build gives no warning.
+      volume:
+        type: object
+        description: "A disk volume in the cluster to keep the backups on, in place of the bucket the store connection points at, for a backup product that can keep them there; a realization whose product cannot refuses it by name. A backup goes to one destination, so setting it and wiring a store halts. A backup on a volume sits in the same cluster as the data it protects, so it guards against a bad change or deletion but not against losing the cluster."
+        properties:
+          size:
+            type: string
+            minLength: 1
+            description: "Size of the volume, a Kubernetes quantity such as 50Gi. Required when volume is set."
+          storage_class:
+            type: string
+            minLength: 1
+            description: "Storage class the volume is provisioned from, such as standard. Unset, the cluster's default class."
+        required: [size]
+        additionalProperties: false
+  # One backup goes to one destination whichever realization binds, so this is
+  # a rule of the Feature rather than of one realization. It reads the
+  # attachment's own connections, under .uses.store, so an attachment is judged
+  # by what it wires itself.
+  assertions:
+    one_destination: >-
+      {{- if and (optional .infra "volume" dict) (optional (optional . "uses" dict) "store" dict) -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.volume and wires a store connection, and a backup goes to one destination: remove the store connection to keep the backups on the volume, or remove infra.volume to keep them in the bucket" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
