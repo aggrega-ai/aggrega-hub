@@ -1,0 +1,252 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: backup-aws-backup
+  version: 1.0.0
+  description: >
+    Component-scope FeatureRecipe for core/backup on CloudFormation through
+    AWS Backup: writes a backup vault, a backup plan and a selection naming
+    the attached database's Amazon RDS DB instance, as a fragment assembled
+    into its host's stack. It backs up an instance realized by
+    cloudformation/postgres-rds, cloudformation/mysql-rds or
+    cloudformation/mariadb-rds.
+
+    Each backup is a snapshot of the instance that AWS Backup takes on
+    infra.schedule, read in UTC and started within an hour of that time, or
+    daily at 05:00 UTC where it is unset, and keeps in the vault for
+    infra.retention_days days. The selection names the instance by Fn::GetAtt
+    on the logical ID the instance's Recipe declares, which CloudFormation
+    resolves to the instance's ARN when it creates the stack; the build
+    resolves no ARN, account or Region. AWS Backup runs each backup under the
+    existing IAM role infra.role_arn names, which the attachment must set.
+
+    The build halts, naming the attachment, without infra.role_arn, on a host
+    this realization cannot name — one realized by another Recipe, or a
+    datastore AWS Backup does not protect, such as an OpenSearch Service
+    domain or an Amazon MQ broker — on a schedule AWS Backup cannot keep, such as one running more than once an
+    hour or restricting both the day of the month and the day of the week, on
+    a retention over 36500 days, and on a store connection or
+    infra.credentials_secret, since AWS Backup keeps its backups in its own
+    vault. The automated backups the instance's own Recipe configures from
+    infra.backup keep running beside these.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: cloudformation
+  implements: core/backup:1.0.0
+  # executionScope omitted -> component: renders once per attached component.
+  #
+  # The fragment assembles into the same stack as its host's, so the
+  # selection names the host's instance by reference: Fn::GetAtt on the
+  # instance's logical ID returns its DBInstanceArn, which CloudFormation
+  # resolves when it creates the stack, and which also makes it create the
+  # selection after the instance. The logical ID is the one the host's Recipe
+  # declares as its local logical_id, which an attached FeatureRecipe reads
+  # beneath its own locals, so the two cannot disagree. The compiler pipes the
+  # reference and resolves none of it.
+
+  # Names. The vault, the plan, its one rule and the selection take one name:
+  # the host component and the attachment name, joined with a hyphen, such as
+  # db-backup. A vault is named once per account and Region, so two stacks
+  # deploying a component of one name into one account and Region meet on it.
+  # AWS takes 2 to 50 letters, digits, hyphens and underscores for a vault's
+  # name, the narrowest of the four, so a name outside that halts, naming it.
+  # The three resources' logical IDs compose the host component, the
+  # attachment name and the kind, since one attachment emits three: host db
+  # carrying the attachment under backup gives DbBackupVault, DbBackupPlan
+  # and DbBackupSelection. A logical ID admits only letters and digits, so
+  # every separator is read as a word boundary and each word is capitalised.
+  #
+  # The schedule's translation, from the five cron fields of infra.schedule
+  # into the six fields of an AWS cron expression, which AWS Backup reads in the
+  # form Amazon EventBridge documents, or a refusal prefixed refuse: naming what
+  # the expression cannot carry. The Feature takes five fields only. Each field
+  # is a comma list of numbers, ranges and steps, or *; month and day names in
+  # any case; ? as *. Hour, day of the month and month pass through, with names
+  # written as numbers. AWS numbers the days of the week 1 to 7 from Sunday and
+  # takes no step there, so that field becomes the explicit list of the days it
+  # names. A cron reader runs a field whose list holds * (or a step of 1 over
+  # it) as unrestricted; with both day fields restricted, a run happens on a
+  # day matching either, which an AWS cron expression cannot carry, since one
+  # of the two must be ?, so that schedule is refused. AWS Backup starts a
+  # snapshot backup at most once an hour, so the minute field must name one
+  # minute: a list, a range, a step or * there is refused. A time zone written
+  # into the expression is refused, since a rule reads its expression in UTC
+  # here. The year field is *. This is the translation terraform/task-ecs and
+  # cloudformation/task-ecs declare for an EventBridge Scheduler expression,
+  # with the minute rule added, and terraform/backup-aws-backup declares
+  # backup_name and backup_schedule word for word; a change to them is made to
+  # both.
+  locals:
+    backup_name: '{{ printf "%s-%s" .context.instance_id .attachment_name }}'
+    backup_schedule: >-
+      {{- $s := trim (toString (optional .infra "schedule" "")) -}}
+      {{- $out := "" -}}
+      {{- if $s -}}
+      {{- $f := regexSplit `\s+` $s -1 -}}
+      {{- if regexMatch `^(CRON_)?TZ=` (index $f 0) -}}
+      {{- $out = "refuse:it names a time zone inside the expression, and AWS Backup reads this rule's expression in UTC: write the five fields alone, in UTC" -}}
+      {{- else if ne (len $f) 5 -}}
+      {{- $out = printf "refuse:it has %d fields where a cron expression has five, minute, hour, day of the month, month and day of the week: write the schedule as those five fields" (len $f) -}}
+      {{- else -}}
+      {{- $item := `^(\*|\?|[0-9]+(-[0-9]+)?)(/[0-9]+)?$` -}}
+      {{- $min := index $f 0 -}}{{- $hour := index $f 1 -}}{{- $dom := index $f 2 -}}
+      {{- $mon := lower (index $f 3) -}}{{- $dow := lower (index $f 4) -}}
+      {{- range $i, $n := list "jan" "feb" "mar" "apr" "may" "jun" "jul" "aug" "sep" "oct" "nov" "dec" }}{{ $mon = replace $n (toString (add1 $i)) $mon }}{{ end -}}
+      {{- range $i, $n := list "sun" "mon" "tue" "wed" "thu" "fri" "sat" }}{{ $dow = replace $n (toString $i) $dow }}{{ end -}}
+      {{- $badField := "" -}}{{- $badValue := "" -}}
+      {{- range $pair := list (list "minute" $min (index $f 0)) (list "hour" $hour (index $f 1)) (list "day-of-month" $dom (index $f 2)) (list "month" $mon (index $f 3)) (list "day-of-week" $dow (index $f 4)) -}}
+      {{- range splitList "," (index $pair 1) -}}
+      {{- if and (not $badField) (not (regexMatch $item .)) }}{{ $badField = index $pair 0 }}{{ $badValue = index $pair 2 }}{{ end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $domStar := false -}}{{- $dowStar := false -}}
+      {{- range splitList "," $dom }}{{ $p := splitList "/" . }}{{ if and (has (index $p 0) (list "*" "?")) (or (eq (len $p) 1) (le (atoi (index $p 1)) 1)) }}{{ $domStar = true }}{{ end }}{{ end -}}
+      {{- range splitList "," $dow }}{{ $p := splitList "/" . }}{{ if and (has (index $p 0) (list "*" "?")) (or (eq (len $p) 1) (le (atoi (index $p 1)) 1)) }}{{ $dowStar = true }}{{ end }}{{ end -}}
+      {{- $days := list -}}{{- $dowBad := false -}}
+      {{- if not $badField -}}
+      {{- range splitList "," $dow -}}
+      {{- $p := splitList "/" . -}}
+      {{- $step := 1 -}}{{- if eq (len $p) 2 }}{{ $step = atoi (index $p 1) }}{{ end -}}
+      {{- $lo := 0 -}}{{- $hi := 6 -}}
+      {{- if not (has (index $p 0) (list "*" "?")) -}}
+      {{- $lh := splitList "-" (index $p 0) -}}
+      {{- $lo = atoi (index $lh 0) -}}
+      {{- if eq (len $lh) 2 }}{{ $hi = atoi (index $lh 1) }}{{ else if eq (len $p) 1 }}{{ $hi = $lo }}{{ end -}}
+      {{- end -}}
+      {{- if or (gt $hi 6) (gt $lo $hi) (lt $step 1) }}{{ $dowBad = true }}{{ else }}{{ range untilStep $lo (int (add1 $hi)) $step }}{{ $days = append $days (toString (add1 .)) }}{{ end }}{{ end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if $badField -}}
+      {{- $out = printf "refuse:its %s field %q is not a comma list of numbers, names, ranges, steps or *, the forms a cron expression and AWS Backup both read alike: write that field in those forms" $badField $badValue -}}
+      {{- else if not (regexMatch `^[0-9]+$` $min) -}}
+      {{- $out = printf "refuse:its minute field %q starts a backup more than once an hour, and AWS Backup starts a snapshot backup at most once an hour: name one minute of the hour, such as 30" $min -}}
+      {{- else if $dowBad -}}
+      {{- $out = printf "refuse:its day-of-week field %q names a day outside 0 to 6, Sunday to Saturday, or a range running backwards: write the days from 0 for Sunday to 6 for Saturday" (index $f 4) -}}
+      {{- else if and (not $domStar) (not $dowStar) -}}
+      {{- $out = "refuse:it restricts both the day of the month and the day of the week, so a backup runs on a day matching either, and an AWS cron expression leaves one of the two unrestricted, so it cannot run on a day matching either: restrict one of the two fields only, and attach core/backup a second time, under another name, for the other" -}}
+      {{- else -}}
+      {{- $domOut := $dom -}}{{- $dowOut := "?" -}}
+      {{- if $domStar }}{{ $domOut = "?" }}{{ $dowOut = join "," (sortAlpha (uniq $days)) }}{{ end -}}
+      {{- if and $domStar $dowStar }}{{ $domOut = "*" }}{{ $dowOut = "?" }}{{ end -}}
+      {{- $out = printf "cron(%s %s %s %s %s *)" $min (replace "?" "*" $hour) $domOut (replace "?" "*" $mon) $dowOut -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $out -}}
+    backup_vault_id: '{{ capitalizedWords (printf "%s %s vault" .context.instance_id .attachment_name) }}'
+    backup_plan_id: '{{ capitalizedWords (printf "%s %s plan" .context.instance_id .attachment_name) }}'
+    backup_selection_id: '{{ capitalizedWords (printf "%s %s selection" .context.instance_id .attachment_name) }}'
+
+  assertions:
+    # The host's resource is named through the logical ID its Recipe declares
+    # as its local logical_id. Among the catalog's CloudFormation Recipes,
+    # cloudformation/postgres-rds, cloudformation/mysql-rds and
+    # cloudformation/mariadb-rds realize core/datastore/postgres, mysql and
+    # mariadb, each as an AWS::RDS::DBInstance under that logical ID, and they
+    # are the only ones realizing those three. Every other datastore the
+    # catalog runs on CloudFormation is one AWS Backup does not protect:
+    # Amazon OpenSearch Service and Amazon MQ are absent from its list of
+    # supported services. The host's type reaches this check as the Aggregate
+    # wrote it, so it is compared with any version it was authored with set
+    # aside.
+    host_is_an_rds_instance_named_here: >-
+      {{- $type := first (splitList ":" .metadata.component) -}}
+      {{- if not (has $type (list "core/datastore/postgres" "core/datastore/mysql" "core/datastore/mariadb")) -}}
+      {{- fail (printf "core/backup attachment %q on %q is bound to cloudformation/backup-aws-backup, which has AWS Backup back up an Amazon RDS DB instance, and %q is a %s, which the catalog does not run as one: AWS Backup protects no Amazon OpenSearch Service domain or Amazon MQ broker. Bind this attachment in the Manifest to a FeatureRecipe for the realization %q has" .metadata.feature_instance .metadata.instance_id .metadata.instance_id $type .metadata.instance_id) -}}
+      {{- end -}}
+      {{- if not (toString (optional .locals "logical_id" "")) -}}
+      {{- fail (printf "core/backup attachment %q on %q is bound to cloudformation/backup-aws-backup, which names the Amazon RDS DB instance it backs up by the logical ID the instance's Recipe declares as its local logical_id, and the Recipe realizing %q declares none: map %s to cloudformation/%s-rds in the Manifest, which declares it, or bind this attachment to a FeatureRecipe for the realization %q has" .metadata.feature_instance .metadata.instance_id .metadata.instance_id $type (last (splitList "/" $type)) .metadata.instance_id) -}}
+      {{- end -}}
+    # AWS Backup keeps a snapshot for 1 day to 100 years, 36500 days at most.
+    retention_is_one_aws_backup_keeps: >-
+      {{- if gt (int .infra.retention_days) 36500 -}}
+      {{- fail (printf "core/backup attachment %q on %q keeps each backup for %v days, and AWS Backup keeps a backup for 36500 days at most: set infra.retention_days to 36500 or fewer" .metadata.feature_instance .metadata.instance_id .infra.retention_days) -}}
+      {{- end -}}
+    # AWS Backup writes each backup into its own vault and reads no Secret, so
+    # a Secret named here would reach no emitted byte; the build halts on it
+    # rather than ignoring it.
+    no_credentials_secret: >-
+      {{- with toString (optional .infra "credentials_secret" "") -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.credentials_secret to %q, and AWS Backup keeps each backup in its own vault and reads no Secret: remove infra.credentials_secret from the attachment" $.metadata.feature_instance $.metadata.instance_id .) -}}
+      {{- end -}}
+    # AWS Backup runs every backup under the IAM role its selection names, and
+    # a selection names one always. The role is the operator's, so an
+    # attachment leaving infra.role_arn out halts here rather than reaching
+    # AWS without one.
+    role_arn_supplied: >-
+      {{- if not (trim (toString (optional .infra "role_arn" ""))) -}}
+      {{- fail (printf "core/backup attachment %q on %q is bound to cloudformation/backup-aws-backup, and AWS Backup runs every backup under the IAM role its selection names, but infra.role_arn carries none: set infra.role_arn on the attachment in the Release to the ARN of an existing role that trusts backup.amazonaws.com and may back up the instance, such as arn:aws:iam::123456789012:role/backup" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+
+  # One fragment holding the vault, the plan and the selection.
+  #
+  # The store. AWS Backup keeps every backup in the vault below, so a store
+  # connection names a bucket nothing writes to, and the build halts on one,
+  # naming it, rather than leaving it unread. A component carries every
+  # connection of every core/backup attachment on it under the Feature's name,
+  # so any such connection on the host halts here.
+  #
+  # When. The rule's schedule is the translation above, read in UTC, the
+  # zone AWS Backup reads a rule in when none is named. Unset, the rule names
+  # none and AWS Backup runs it daily at 05:00 UTC, cron(0 5 ? * * *). The start
+  # window is 60 minutes, the least AWS Backup takes, so a backup that has not
+  # started within an hour of its time is cancelled rather than started later.
+  #
+  # How long. infra.retention_days becomes the rule's lifecycle, the days after
+  # which AWS Backup deletes each recovery point. No cold-storage transition is
+  # written: AWS Backup moves no RDS snapshot to cold storage.
+  #
+  # The vault keeps AWS Backup's own encryption key, and the stack's deletion
+  # leaves its recovery points alone: AWS Backup deletes no vault that holds
+  # recovery points, so deleting a stack whose vault holds backups stops at the
+  # vault.
+  #
+  # The role. The selection's IamRoleArn is infra.role_arn as the Release
+  # writes it, quoted as a string: the build looks nothing up, and AWS checks
+  # the role when the selection is created.
+  artifacts:
+    template.yaml: |
+      {{- range $alias, $edge := .context.uses }}
+      {{- if and (eq (toString $edge.socket) "store") (eq (toString (default "" $edge.origin_feature)) "core/backup") }}
+      {{- fail (printf "core/backup attachment %q on %q: a core/backup attachment on %q wires the store connection %q, to %q, and AWS Backup keeps each backup in its own vault and writes none to a bucket: remove the store connection from the attachment in the Release" $.attachment_name $.context.instance_id $.context.instance_id $alias $edge.target) }}
+      {{- end }}
+      {{- end }}
+      {{- if not (regexMatch `^[a-zA-Z0-9_-]{2,50}$` .locals.backup_name) }}
+      {{- fail (printf "core/backup attachment %q on %q names its AWS Backup vault, plan and selection %q, after the component and the attachment, and AWS takes 2 to 50 letters, digits, hyphens and underscores for a vault's name: give the component or the attachment a shorter name in those characters" .attachment_name .context.instance_id .locals.backup_name) }}
+      {{- end }}
+      {{- if hasPrefix "refuse:" .locals.backup_schedule }}
+      {{- fail (printf "core/backup attachment %q on %q is scheduled %q, and %s" .attachment_name .context.instance_id (trim (toString .infra.schedule)) (trimPrefix "refuse:" .locals.backup_schedule)) }}
+      {{- end }}
+      Resources:
+        {{ .locals.backup_vault_id }}:
+          Type: AWS::Backup::BackupVault
+          Properties:
+            BackupVaultName: "{{ .locals.backup_name }}"
+        {{ .locals.backup_plan_id }}:
+          Type: AWS::Backup::BackupPlan
+          Properties:
+            BackupPlan:
+              BackupPlanName: "{{ .locals.backup_name }}"
+              BackupPlanRule:
+                - RuleName: "{{ .locals.backup_name }}"
+                  TargetBackupVault: !Ref {{ .locals.backup_vault_id }}
+                  {{- if .locals.backup_schedule }}
+                  ScheduleExpression: "{{ .locals.backup_schedule }}"
+                  {{- end }}
+                  StartWindowMinutes: 60
+                  Lifecycle:
+                    DeleteAfterDays: {{ int .infra.retention_days }}
+        {{ .locals.backup_selection_id }}:
+          Type: AWS::Backup::BackupSelection
+          Properties:
+            BackupPlanId: !Ref {{ .locals.backup_plan_id }}
+            BackupSelection:
+              SelectionName: "{{ .locals.backup_name }}"
+              IamRoleArn: {{ toJson (toString .infra.role_arn) }}
+              Resources:
+                - !GetAtt {{ .locals.logical_id }}.DBInstanceArn

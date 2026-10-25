@@ -4857,8 +4857,9 @@ sizes in the Release.
 - **observability** — ServiceMonitor and PodMonitor, OpenTelemetry collector or
   sidecar, dashboards
 - **backup** — a datastore backed up on a schedule, `core/backup`: a managed
-  database service's own automated backup, or the resource a backup product
-  reconciles — a Velero Schedule, a K8up Schedule, a CloudNativePG
+  database service's own automated backup, an AWS Backup plan and selection
+  run under the IAM role `infra.role_arn` names, or the resource a backup
+  product reconciles — a Velero Schedule, a K8up Schedule, a CloudNativePG
   ScheduledBackup, a mariadb-operator Backup
 - **on-demand runs** — a task held until someone starts it: a suspended
   CronJob, a Compose service behind a profile, an Amazon ECS task definition
