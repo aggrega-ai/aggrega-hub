@@ -4616,6 +4616,10 @@ Such an attachment halts, naming each value it requires.
   for the component; the type and the values come from the Aggregate. It is
   also how the operator names the secret of a credential the Aggregate attached
   without one.
+- **When it has no inputs, the author who decides the attachment itself
+  attaches it.** `core/manual-trigger` takes none, and whether a task runs only
+  when someone starts it is part of what the task is, so the developer attaches
+  it in the Aggregate and the Release writes nothing for it.
 
 **`core/compose-bridge` is the first case.** Its port base, the port a bridged
 edge falls back to when two edges resolve to one listen port, is a seam of the
@@ -4852,6 +4856,9 @@ sizes in the Release.
 - **observability** — ServiceMonitor and PodMonitor, OpenTelemetry collector or
   sidecar, dashboards
 - **backup** — cluster backup tooling, database backup custom resources
+- **on-demand runs** — a task held until someone starts it: a suspended
+  CronJob, a Compose service behind a profile, an Amazon ECS task definition
+  a RunTask call starts
 - **RBAC**, and storage or volume snapshots
 
 ### Authoring tiers
