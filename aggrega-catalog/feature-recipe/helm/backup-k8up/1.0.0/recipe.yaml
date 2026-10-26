@@ -8,28 +8,32 @@ metadata:
   version: 1.0.0
   description: >
     Component-scope FeatureRecipe for core/backup on Kubernetes through K8up:
-    writes a K8up Schedule beside the attached component, in the namespace
-    its workloads are written into. The schedule runs only where
-    core/storage/k8up is deployed; nothing in the build checks it.
+    writes a K8up Schedule beside the attached component. The schedule runs
+    only where core/storage/k8up is deployed; nothing in the build checks it.
 
     Each backup copies the files of the component's persistent volume
-    claims, those carrying the labels its workloads select their pods by,
-    into a restic repository in the bucket the store connection points at.
+    claims, selected by its workloads' labels, into a restic repository in
+    the bucket the store connection points at or, with infra.volume set
+    instead, on a ReadWriteOnce claim of that size written beside the
+    Schedule, in infra.volume.storage_class or the cluster's default class.
     It is a copy of the volumes' files taken while the datastore runs, not a
     database-consistent dump. It runs on infra.schedule, or daily at 03:00
     where that is unset; K8up keeps backups by count, so a schedule must run
     once a day or once an hour at a fixed minute, and each backup is kept for
-    infra.retention_days days.
+    infra.retention_days days. On a volume, a datastore spread over several
+    nodes leaves its backups waiting on the claim, which one node mounts at a
+    time.
 
-    The backup jobs read the bucket's key pair, under ACCESS_KEY_ID and
-    ACCESS_SECRET_KEY, and the repository's password, under RESTIC_PASSWORD,
+    The backup jobs read the repository's password, under RESTIC_PASSWORD,
+    and for a bucket its key pair, under ACCESS_KEY_ID and ACCESS_SECRET_KEY,
     from the Secret infra.credentials_secret names or, unset, from one named
-    after the Schedule, which the cluster must hold in the component's
-    namespace. The build halts, naming the attachment, with no store
-    connection, with a store publishing no S3 API, on any other schedule, on
-    a second core/backup attachment, on a component whose render emits no
-    workload whose claims a schedule can select, and on infra.role_arn, the
-    role AWS Backup assumes, which K8up has no use for.
+    after the Schedule, in the component's namespace. The build halts, naming
+    the attachment, with neither a store connection nor infra.volume, with a
+    store publishing no S3 API, on any other schedule, on a second
+    core/backup attachment, on a component rendering no workload whose claims
+    a schedule can select, on a volume for a DaemonSet or of a size that is
+    not a Kubernetes quantity, and on infra.role_arn, which K8up has no use
+    for.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -53,33 +57,69 @@ spec:
       {{- fail (printf "core/backup attachment %q on %q sets infra.role_arn to %q, the IAM role AWS Backup assumes, and this attachment is bound to helm/backup-k8up, which backs up through K8up: its backup jobs sign with the key pair in the Secret the Schedule names and assume no role an attachment names; remove infra.role_arn from the attachment, or bind a FeatureRecipe realizing core/backup through AWS Backup" $.metadata.feature_instance $.metadata.instance_id .) -}}
       {{- end -}}
 
-  # One file holding the Schedule.
+  # One file holding the Schedule and, for a volume, the repository claim and
+  # the PodConfig its prune job runs under.
   #
   # Where it is written. A K8up Schedule backs up the persistent volume claims
   # of its own namespace and no other, and its backup jobs run there, so it is
   # written into the namespace the attached component's workloads are emitted
   # into, or into no namespace where they are emitted into none, leaving both
-  # to the applying tool. Workloads emitted into two namespaces halt: one
-  # Schedule reaches one namespace. Nothing in the build checks that K8up is
-  # deployed: applied to a cluster without K8up's custom-resource definitions,
-  # the Schedule is refused by the cluster, and with the definitions but no
-  # operator, it sits unread.
+  # to the applying tool; the claim and the PodConfig go beside it, since a job
+  # mounts a claim and reads a PodConfig of its own namespace. Workloads
+  # emitted into two namespaces halt: one Schedule reaches one namespace.
+  # Nothing in the build checks that K8up is deployed: applied to a cluster
+  # without K8up's custom-resource definitions, the Schedule is refused by the
+  # cluster, and with the definitions but no operator, it sits unread.
   #
   # The name. The host's rendered name and the attachment name, folded to
-  # hyphens; where the Recipe realizing the component reports no rendered
-  # name, its identity stands in, and an identity that is not a name
-  # Kubernetes takes halts, naming it. K8up writes the Schedule's name into a
-  # label on every job it starts, and a label value holds 63 characters at
-  # most, so a longer name halts, naming it.
+  # hyphens, names the Schedule and, on a volume, the claim and the PodConfig;
+  # where the Recipe realizing the component reports no rendered name, its
+  # identity stands in, and an identity that is not a name Kubernetes takes
+  # halts, naming it. K8up writes the Schedule's name into a label on every
+  # job it starts, and a label value holds 63 characters at most, so a longer
+  # name halts, naming it.
+  #
+  # Where the backups go. A Schedule writes to one repository: in the bucket
+  # the store connection points at, or on a volume. An attachment wiring a
+  # store and setting infra.volume halts on the Feature's own one_destination
+  # assertion before this file renders, so either the store or the volume
+  # decides the repository below. An attachment with neither halts, naming
+  # both ways to fix it.
+  #
+  # The volume. K8up mounts a claim it is given and creates none, so this
+  # realization writes the repository claim beside the Schedule, under the
+  # Schedule's name: infra.volume.size is its requested storage, a Kubernetes
+  # quantity such as 50Gi, and a value the cluster would refuse halts here by
+  # name instead of at apply time; infra.volume.storage_class is the class it
+  # is provisioned from, and unset, the claim names none and the cluster's
+  # default class provisions it. A claim must name an access mode, so it is
+  # written ReadWriteOnce, the mode every provisioning class offers. The
+  # Schedule's backend is K8up's local repository at /repository, outside
+  # the /data directory K8up mounts the backed-up claims under; the backend
+  # mounts the claim there, and the claim is listed under both the backup's
+  # and the prune's volumes, since K8up copies a Schedule's backend into each
+  # job it starts but not its volumes. The claim carries
+  # k8up.io/backup: "false", and none of the labels the backup selects claims
+  # by, so K8up never backs the repository up into itself.
+  #
+  # One node at a time. A ReadWriteOnce claim is mounted on one node at a
+  # time. K8up starts one backup job on each node holding a claim it backs up,
+  # all at once, pinned to that node, and a prune job wherever the scheduler
+  # places it. So the prune job runs under a K8up PodConfig whose required pod
+  # affinity places it on a node running the component's pods, the node the
+  # backup jobs run on, and a volume on a component that renders a DaemonSet,
+  # whose pods run on every node, halts, naming it. A datastore whose pods are
+  # spread over several nodes leaves the jobs on the other nodes waiting on the
+  # claim; where its pods run is decided in the cluster, not in the build.
   #
   # The store. The attachment's store connection is the one connection on the
   # store socket that a core/backup attachment declared. A component carries
   # every such connection of every core/backup attachment on it, under the
   # Feature's name rather than the attachment's, so one attachment cannot tell
   # its own from another's; a component carrying a second core/backup
-  # attachment therefore halts while any of them wires a store. No store
-  # connection halts, and so do two on one attachment, since a Schedule writes
-  # to one repository. A store publishing no S3 API — protocol other than s3,
+  # attachment therefore halts while any of them wires a store. Two store
+  # connections on one attachment halt, since a Schedule writes to one
+  # repository. A store publishing no S3 API — protocol other than s3,
   # or no endpoint, as core/storage/gcs publishes — halts, and so does an
   # endpoint that is not a scheme and a host with an optional port: restic
   # reads everything after the host as the bucket and its path. This store
@@ -107,10 +147,13 @@ spec:
   # read the key pair from the Secret infra.credentials_secret names or, where
   # it is unset, from one named after the Schedule, under ACCESS_KEY_ID and
   # ACCESS_SECRET_KEY, key names the Schedule takes as written. restic encrypts
-  # the repository with a password every job must present, and core/backup
-  # declares no input for it, so the jobs read it from the same Secret, under
-  # RESTIC_PASSWORD; a Secret holding no such key leaves every job failing,
-  # and the repository is readable only with that password. A Secret is read
+  # the repository with a password every job must present, on a bucket or a
+  # volume alike, and core/backup declares no input for it, so the jobs read
+  # it from the same Secret, under RESTIC_PASSWORD; a Secret holding no such
+  # key leaves every job failing, and the repository is readable only with
+  # that password. On a volume no key pair is read, and the Secret
+  # infra.credentials_secret names still holds the password, so the key is
+  # honoured there too rather than refused. A Secret is read
   # from the namespace of the Schedule naming it, so it must be in the
   # component's namespace and not in the store's. The Secret is the cluster's
   # to hold; nothing in the build checks it.
@@ -126,7 +169,8 @@ spec:
   # chart writes is selected where it carries those labels. K8up mounts each
   # selected claim read-only into a backup job, which it runs on the node of
   # the pod mounting the claim where that claim is read-write-once, and leaves
-  # out a claim annotated k8up.io/backup: "false". A Job or CronJob writing no selector is left out,
+  # out a claim annotated k8up.io/backup: "false", as the repository claim is.
+  # A Job or CronJob writing no selector is left out,
   # and a controller of the four writing none halts. A component whose render
   # emits no controller halts: there is nothing to select. That is the shape of
   # a component realized by a Recipe that renders only a custom resource, whose
@@ -147,6 +191,7 @@ spec:
   # keeps the newest backup of each of the last retention_days days; one
   # naming one minute of every hour — 15 * * * * — keeps the newest of each of
   # the last 24 x retention_days hours. Any other expression halts, naming it.
+  # The schedule and the retention mean the same on a bucket and on a volume.
   # The prune runs once a day: at the backup's own minute and hour for a daily
   # schedule, and at the backup's minute past 03:00 for an hourly one. K8up
   # runs a prune and a backup of one repository one after the other, never
@@ -160,6 +205,7 @@ spec:
       {{- $attName := .attachment_name }}
       {{- $att := .attachment_name | replace "_" "-" }}
       {{- $host := .context.instance_id }}
+      {{- $vol := optional .infra "volume" dict }}
 
       {{- /* This attachment's store connection. */}}
       {{- $stores := list }}
@@ -177,19 +223,22 @@ spec:
       {{- if and (gt (len $backups) 1) $stores }}
         {{- fail (printf "core/backup attachment %q on %q: %q carries %d core/backup attachments (%s), and each one's store connection reaches every one of them under the Feature's name, so this attachment cannot tell which store is its own; attach core/backup to %q once when it is backed up through K8up" $attName $host $host (len $backups) (join ", " $backups) $host) }}
       {{- end }}
-      {{- if not $stores }}
-        {{- fail (printf "core/backup attachment %q on %q has no store connection, and K8up writes every backup to a restic repository in a bucket; wire the attachment's store connection to the bucket the backups go to, under uses.store on the attachment in the Release" $attName $host) }}
+      {{- if and (not $stores) (not $vol) }}
+        {{- fail (printf "core/backup attachment %q on %q has no store connection and sets no infra.volume, so it names nowhere for K8up's restic repository to go; wire the attachment's store connection to the bucket the backups go to, under uses.store on the attachment in the Release, or set infra.volume on the attachment, with its size, to keep the repository on a volume claim written beside the K8up Schedule" $attName $host) }}
       {{- end }}
       {{- if gt (len $stores) 1 }}
         {{- $aliases := list }}
         {{- range $stores }}{{ $aliases = append $aliases (printf "%q" .alias) }}{{ end }}
         {{- fail (printf "core/backup attachment %q on %q wires %d store connections (%s), and a K8up Schedule writes to one repository; keep one" $attName $host (len $stores) (join ", " $aliases)) }}
       {{- end }}
+      {{- $bucket := "" }}
+      {{- $endpoint := "" }}
+      {{- if $stores }}
       {{- $store := index $stores 0 }}
       {{- $edge := $store.edge }}
       {{- $sp := default dict $edge.provides }}
-      {{- $bucket := toString (default "" (get $sp "bucket")) }}
-      {{- $endpoint := toString (default "" (get $sp "endpoint")) }}
+      {{- $bucket = toString (default "" (get $sp "bucket")) }}
+      {{- $endpoint = toString (default "" (get $sp "endpoint")) }}
       {{- $storeHost := toString (default "" (get $sp "host")) }}
       {{- if or (ne (toString (default "" (get $sp "protocol"))) "s3") (not $endpoint) (not $bucket) }}
         {{- fail (printf "core/backup attachment %q on %q: its store connection %q reaches %q, which publishes no bucket at an S3 API endpoint, and this realization writes K8up's repository to a bucket over the S3 API; wire the store connection to a store published over the S3 API, such as core/storage/s3-object-store" $attName $host $store.alias $edge.target) }}
@@ -212,6 +261,18 @@ spec:
         {{- end }}
       {{- end }}
       {{- $endpoint = trimSuffix "/" $endpoint }}
+      {{- end }}
+
+      {{- /* The volume, where no store is wired: the repository claim's size and class. */}}
+      {{- $size := "" }}
+      {{- $class := "" }}
+      {{- if not $stores }}
+        {{- $size = toString (get $vol "size") }}
+        {{- $class = toString (optional $vol "storage_class" "") }}
+        {{- if not (regexMatch `^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$` $size) }}
+          {{- fail (printf "core/backup attachment %q on %q sets infra.volume.size to %q, and the repository claim this realization writes for K8up takes its size as a Kubernetes quantity, such as 50Gi or 500Mi; set infra.volume.size to one" $attName $host $size) }}
+        {{- end }}
+      {{- end }}
 
       {{- /* The attached component's claims: one selector per controller, and the namespace they are emitted into. */}}
       {{- $facts := default dict (optional .context "render_facts" dict) }}
@@ -219,9 +280,13 @@ spec:
       {{- $seenSel := dict }}
       {{- $namespaces := list }}
       {{- $seenNs := dict }}
+      {{- $daemonSets := list }}
       {{- range (default (list) (get $facts "controller_selectors")) }}
         {{- $kind := toString (get . "kind") }}
         {{- $wname := toString (optional . "name" "") }}
+        {{- if eq $kind "DaemonSet" }}
+          {{- $daemonSets = append $daemonSets (printf "%q" $wname) }}
+        {{- end }}
         {{- $ml := optional . "match_labels" dict }}
         {{- if not $ml }}
           {{- if or (eq $kind "Job") (eq $kind "CronJob") }}
@@ -249,6 +314,9 @@ spec:
         {{- fail (printf "core/backup attachment %q on %q: the workloads %q renders are emitted into %d namespaces (%s), and a K8up Schedule backs up the claims of its own namespace only; write %q's workloads into one namespace" $attName $host $host (len $namespaces) (join ", " $nsq) $host) }}
       {{- end }}
       {{- $ns := index $namespaces 0 }}
+      {{- if and (not $stores) $daemonSets }}
+        {{- fail (printf "core/backup attachment %q on %q keeps its backups on the volume infra.volume sizes, and %q renders the DaemonSet %s, whose pods run on every node: K8up starts one backup job on each node holding a claim it backs up, all at once, and the one-node repository claim this realization writes can be mounted on one node at a time, so the other jobs would wait for it; wire the attachment's store connection to a bucket in place of infra.volume" $attName $host $host (join ", " $daemonSets)) }}
+      {{- end }}
 
       {{- /* The name: the host's rendered name, or its identity where its provider reports none and the identity is a name Kubernetes takes. */}}
       {{- $hostName := toString (optional .context "rendered_name" "") }}
@@ -301,6 +369,7 @@ spec:
           repoPasswordSecretRef:
             name: {{ toJson $secret }}
             key: "RESTIC_PASSWORD"
+          {{- if $stores }}
           s3:
             endpoint: {{ toJson $endpoint }}
             bucket: {{ toJson (printf "%s/%s" $bucket $prefix) }}
@@ -310,6 +379,13 @@ spec:
             secretAccessKeySecretRef:
               name: {{ toJson $secret }}
               key: "ACCESS_SECRET_KEY"
+          {{- else }}
+          local:
+            mountPath: "/repository"
+          volumeMounts:
+            - name: {{ toJson $name }}
+              mountPath: "/repository"
+          {{- end }}
         backup:
           schedule: {{ toJson $schedule }}
           labelSelectors:
@@ -319,7 +395,66 @@ spec:
                 {{ toJson $k }}: {{ toJson $v }}
                 {{- end }}
             {{- end }}
+          {{- if not $stores }}
+          volumes:
+            - name: {{ toJson $name }}
+              persistentVolumeClaim:
+                claimName: {{ toJson $name }}
+          {{- end }}
         prune:
           schedule: {{ toJson $prune }}
           retention:
             {{ $keepKey }}: {{ $keepCount }}
+          {{- if not $stores }}
+          podConfigRef:
+            name: {{ toJson $name }}
+          volumes:
+            - name: {{ toJson $name }}
+              persistentVolumeClaim:
+                claimName: {{ toJson $name }}
+          {{- end }}
+      {{- if not $stores }}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: {{ toJson $name }}
+        {{- with $ns }}
+        namespace: {{ toJson . }}
+        {{- end }}
+        annotations:
+          k8up.io/backup: "false"
+      spec:
+        accessModes:
+          - "ReadWriteOnce"
+        resources:
+          requests:
+            storage: {{ toJson $size }}
+        {{- with $class }}
+        storageClassName: {{ toJson . }}
+        {{- end }}
+      ---
+      apiVersion: k8up.io/v1
+      kind: PodConfig
+      metadata:
+        name: {{ toJson $name }}
+        {{- with $ns }}
+        namespace: {{ toJson . }}
+        {{- end }}
+      spec:
+        template:
+          spec:
+            affinity:
+              podAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  {{- range $selectors }}
+                  - labelSelector:
+                      matchLabels:
+                        {{- range $k, $v := . }}
+                        {{ toJson $k }}: {{ toJson $v }}
+                        {{- end }}
+                    topologyKey: "kubernetes.io/hostname"
+                  {{- end }}
+            containers:
+              - name: "prune"
+      {{- end }}
