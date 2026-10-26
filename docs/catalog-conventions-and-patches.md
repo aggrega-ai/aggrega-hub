@@ -3977,9 +3977,13 @@ copying whichever sibling happens to be nearest.
   Azure Database for PostgreSQL flexible server — with HA and backup honored
   there through the provider's native flags rather than re-implemented.
   `recipe/helm/mariadb` runs one server, so it halts on `ha.enabled` and on a
-  non-zero `ha.read_replicas` by name, naming `recipe/terraform/mariadb-rds`, which
-  provisions a standby and read replicas, rather than rendering one instance under
-  them. A managed
+  non-zero `ha.read_replicas` by name, naming `recipe/helm/mariadb-cluster`, rather
+  than rendering one instance under them. `recipe/helm/mariadb-cluster` honours
+  both through the mariadb-operator controller's replication: one primary plus
+  `ha.read_replicas` replicas, automatic failover to a replica while `ha.enabled`
+  is true — so `ha.enabled` with no replica halts by name — and `provides.host`
+  naming the controller's `<name>-primary` Service while replication is on, since
+  the instance's own Service then routes to the replicas too. A managed
   realization of a Component promising an extension enabled in its database is
   authored only where the service enables it through its own configuration of the
   database; where only a SQL statement enables it, the Component's description

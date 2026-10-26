@@ -19,7 +19,9 @@ metadata:
     annotation, where one is set. provides.host is the client Service the
     controller creates for the instance and provides.port is
     the port the custom resource carries, so a consumer wires to it exactly as it
-    would to the synthesized realization. Credential custody is the operator's
+    would to the synthesized realization. infra.ha turns on replication:
+    infra.ha.read_replicas replicas, automatic failover while infra.ha.enabled,
+    and provides.host then <name>-primary. Credential custody is the operator's
     choice: infra.credentials generated leaves both passwords with the controller,
     and the required root_password slot is bound to helm/generated-secret; supplied
     points it at an existing Secret named in infra.credentials_secret. The control
@@ -41,27 +43,40 @@ spec:
   # realization's contract so consumers are realization-agnostic. A consumer in
   # another namespace qualifies the host on its own side (caller-side routing).
   #
+  # With replication on (see infra.ha below) that Service routes to every
+  # instance, replicas included, and a write reaching a replica never reaches the
+  # primary. The controller then also creates <name>-primary, which follows the
+  # primary through every failover and switchover, and <name>-secondary, which
+  # routes to the replicas alone; it connects its own jobs, the backup's dump
+  # among them, through <name>-primary. So provides.host is <name>-primary while
+  # replication is on. <name>-secondary is not published: the provides contract
+  # is the Component's, shared by every realization, and a key only one
+  # realization can fill is one a consumer cannot depend on.
+  #
   # Unlike some controllers, this one takes the listen port as a field on the custom
   # resource, so infra.port is honored here exactly as the synthesis realization
   # honors it and provides.port reads from the same place. The controller also
-  # creates a headless Service and, where replication is configured, primary and
-  # secondary Services; the consumer contract publishes the client Service alone,
-  # which is the one that routes to every instance.
+  # creates a headless Service, which no consumer is given.
   #
   # The API version the MariaDB below is written at. helm/backup-mariadb-operator
   # reads this local from its assertions — they see the locals of the component
   # the attachment is on — and refuses an attachment on any realization that
   # does not declare it, since only this one emits the MariaDB its Backup refers
   # to.
+  #
+  # replicated is "true" while infra.ha asks for replication — high availability,
+  # read replicas or both — and empty otherwise: the one place that decision is
+  # made, read by provides.host and by the MariaDB below.
   locals:
     mariadb_api_version: "k8s.mariadb.com/v1alpha1"
+    replicated: '{{ if or .infra.ha.enabled (gt (int .infra.ha.read_replicas) 0) }}true{{ end }}'
   provides:
-    host: "{{ .context.instance_id }}"
+    host: "{{ .context.instance_id }}{{ if .locals.replicated }}-primary{{ end }}"
     port: "{{ .infra.port }}"
     user: "{{ .values.user }}"
     database: "{{ .values.database }}"
     protocol: "mariadb"
-  # Three declared conditions, each halting rather than emitting something that
+  # Five declared conditions, each halting rather than emitting something that
   # renders cleanly and does not work.
   assertions:
     # The mariadb-operator control plane must exist in the target cluster before a
@@ -88,18 +103,38 @@ spec:
       {{- if and (eq .infra.credentials "supplied") (not .infra.credentials_secret) -}}
       {{- fail "infra.credentials is supplied, so name the existing Secret the controller reads the database credentials from in infra.credentials_secret; leave infra.credentials at generated to have the controller create and own those Secrets instead" -}}
       {{- end -}}
-  # This Recipe reads from infra.overrides:
-  #   replicas - integer (MariaDB spec.replicas; default 1)
+    # The controller fails over by promoting a replica, so high availability
+    # with no read replica has nothing to promote; its admission webhook also
+    # refuses replication on a single instance.
+    mariadb_ha_needs_a_replica: >-
+      {{- if and .infra.ha.enabled (eq (int .infra.ha.read_replicas) 0) -}}
+      {{- fail "infra.ha.enabled is true and infra.ha.read_replicas is 0, and this Recipe fails over by promoting a read replica, so there is no replica to fail over to: set infra.ha.read_replicas to at least 1, or set infra.ha.enabled to false" -}}
+      {{- end -}}
+    # The instance count is infra.ha's: one primary plus infra.ha.read_replicas.
+    # infra.overrides.replicas is accepted only as 1 with replication off, which
+    # renders exactly as the key unset; any other value would set a count the
+    # Release's infra.ha does not describe.
+    mariadb_replicas_from_ha: >-
+      {{- $r := optional (optional .infra "overrides" dict) "replicas" "" -}}
+      {{- if and (ne (toString $r) "") (or (ne (toString $r) "1") .locals.replicated) -}}
+      {{- fail (printf "infra.overrides.replicas is %v, and this Recipe takes the instance count from infra.ha: one primary plus infra.ha.read_replicas replicas replicating from it; remove infra.overrides.replicas and set infra.ha.read_replicas to the number of replicas beside the primary, with infra.ha.enabled true for automatic failover" $r) -}}
+      {{- end -}}
+  # This Recipe reads no infra.overrides keys; infra.overrides.replicas is
+  # refused above unless it is 1 with replication off.
   #
-  # The default renders the single-instance server. The controller's admission
-  # webhook refuses a count above 1 unless replication or Galera is configured on
-  # the custom resource, and this Recipe configures neither, so a higher count is
-  # refused when the MariaDB is applied.
+  # infra.ha is honored through the controller's replication. With both members at
+  # their defaults the MariaDB is the single-instance server. Otherwise
+  # spec.replicas is one primary plus infra.ha.read_replicas, replication is
+  # enabled, and the primary fails over automatically to a replica exactly when
+  # infra.ha.enabled is true; with it false the replicas serve reads and no
+  # replica is promoted when the primary is lost. The controller creates a
+  # PodDisruptionBudget for a replicated MariaDB itself. Pod anti-affinity stays
+  # off, the controller's default, since turning it on needs as many nodes as
+  # instances.
   #
-  # infra.ha is not read here; the synthesis realization runs one server and halts
-  # the build on it. infra.backup is read by neither realization of this
-  # component; this realization is backed up through a core/backup attachment
-  # instead, described beside the MariaDB below.
+  # infra.backup is read by neither realization of this component; this
+  # realization is backed up through a core/backup attachment instead, described
+  # beside the MariaDB below.
   # values.init_scripts is honored by the synthesis realization alone, which is
   # why it halts above rather than passing quietly.
   #
@@ -149,8 +184,12 @@ spec:
         namespace: "{{ . }}"
         {{- end }}
       spec:
-        {{- if and .infra.overrides .infra.overrides.replicas }}
-        replicas: {{ .infra.overrides.replicas }}
+        {{- if .locals.replicated }}
+        replicas: {{ add1 (int .infra.ha.read_replicas) }}
+        replication:
+          enabled: true
+          primary:
+            autoFailover: {{ .infra.ha.enabled }}
         {{- else }}
         replicas: 1
         {{- end }}
