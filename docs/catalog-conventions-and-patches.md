@@ -4870,7 +4870,10 @@ sizes in the Release.
   realization whose product cannot keep a backup on a volume refuses
   `infra.volume` by name. A backup on a volume sits in the same cluster as
   the data it protects, so it guards against a bad change or deletion but not
-  against losing the cluster
+  against losing the cluster. `infra.run_as_user` and `infra.run_as_group` set
+  the user and group a product's own backup jobs run as, written into the
+  jobs' security context by a realization that starts them, such as K8up's,
+  and refused by name by every other
 - **on-demand runs** — a task held until someone starts it: a suspended
   CronJob, a Compose service behind a profile, an Amazon ECS task definition
   a RunTask call starts
