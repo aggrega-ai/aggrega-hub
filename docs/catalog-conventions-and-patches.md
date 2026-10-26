@@ -3975,7 +3975,11 @@ copying whichever sibling happens to be nearest.
   the managed cloud equivalents where one exists — on AWS, RDS, ElastiCache and
   Amazon OpenSearch Service; on Google Cloud, Cloud SQL and Memorystore; on Azure,
   Azure Database for PostgreSQL flexible server — with HA and backup honored
-  there through the provider's native flags rather than re-implemented. A managed
+  there through the provider's native flags rather than re-implemented.
+  `recipe/helm/mariadb` runs one server, so it halts on `ha.enabled` and on a
+  non-zero `ha.read_replicas` by name, naming `recipe/terraform/mariadb-rds`, which
+  provisions a standby and read replicas, rather than rendering one instance under
+  them. A managed
   realization of a Component promising an extension enabled in its database is
   authored only where the service enables it through its own configuration of the
   database; where only a SQL statement enables it, the Component's description
