@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: kasten-chart
+  version: 1.0.0
+  description: >
+    Installs Veeam Kasten through Kasten's own Helm chart, k10, from Kasten's
+    chart repository, at the chart release infra.source_version names, 9.0.9
+    by default. It renders Kasten's services, their permissions and volume
+    claims, its aggregated APIs, its bundled Prometheus, and the free edition
+    licence the chart carries; Kasten registers its policy and profile
+    resource definitions itself when it starts. It renders no policy and no
+    profile: helm/backup-kasten writes those for each core/backup attachment.
+
+    The chart places its objects in the namespace the Release declares for the
+    component, and Kasten reads its profiles and their Secrets only from its
+    own namespace, so the build halts unless that namespace is kasten-io.
+
+    The chart generates a new certificate for Kasten's data mover on every
+    render, so the two Secrets it would write are left out, and the Secrets
+    the data_mover_cert and data_mover_key slots name take their place: the
+    build halts unless they name kopia-tls-cert under tls.crt and
+    kopia-tls-key under tls.key, the names Kasten reads.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/storage/kasten:1.0.0
+
+  # Kasten's own chart, from Kasten's chart repository. Its default version is
+  # the release this realization was read against; the release decides every
+  # image Kasten runs, each gcr.io/kasten-images/<service> tagged with the
+  # release's application version, so the chart and its images move together.
+  source:
+    kind: helm-https-chart
+    url: https://charts.kasten.io/
+    chart: k10
+    # Default chart version. Override via infra.source_version.
+    version: "{{ optional .infra `source_version` \"9.0.9\" }}"
+
+  # Documents the chart renders that are left out.
+  #
+  # The two Secrets holding the certificate and key of Kasten's data mover
+  # service, kopia-tls-cert and kopia-tls-key. The chart generates a
+  # certificate authority and a certificate signed by it on every render, and
+  # no value stops it, so two renders of identical input would differ. Both
+  # are left out, and the Secrets the Component's data_mover_cert and
+  # data_mover_key slots name stand in their place — see the mapping below.
+  omits:
+    - kind: Secret
+      name: kopia-tls-cert
+    - kind: Secret
+      name: kopia-tls-key
+
+  # This Recipe reads no infra.overrides keys; the Component declares none.
+  #
+  # The chart is read for the values below; everything else stays the chart's
+  # own default at its release.
+  #
+  # Namespace. Kasten requires a location profile, and the Secret a profile
+  # names, to sit in the namespace Kasten is installed in, and the chart writes
+  # every namespaced object into the release namespace, the namespace the
+  # Release declares for the component through the aggrega.ai/namespace
+  # annotation. helm/backup-kasten writes each policy and profile into
+  # kasten-io, Kasten's own default, because a FeatureRecipe attached to a
+  # datastore cannot read where this component was placed. So the build halts
+  # at the top of the mapping unless the Release declares kasten-io.
+  #
+  # Names. The chart names its objects itself — gateway, catalog-svc and the
+  # rest — and they are left as it publishes them. Kasten runs once per
+  # cluster, and nothing is published for a consumer to reach.
+  #
+  # The licence. The chart writes the free edition licence it carries into
+  # the Secret k10-license, and a trial licence into k10-trial-license; both
+  # are Veeam's, the same for every reader. The chart's other form, a licence
+  # given as a value, would write the reader's own licence into a rendered
+  # Secret, so it stays unset: a licence of the reader's own goes into a Secret
+  # of their own in kasten-io.
+  #
+  # The licence agreement. The chart's eula.accept stays false, its default:
+  # accepting writes the accepting company's name and email into a ConfigMap,
+  # and the agreement is the reader's to accept, not the catalog's.
+  #
+  # The data mover's certificate and key. Kasten reads them from two Secrets of
+  # fixed names, kopia-tls-cert under tls.crt and kopia-tls-key under tls.key,
+  # in its own namespace, and the chart offers no value naming others, so the
+  # Secret each slot's credential names must be that very Secret: a credential
+  # publishing no Secret name and data key, or another name or data key,
+  # halts the build naming the slot and the Secret it must name. The material
+  # stays in the existing Secrets and is in no rendered file. An unbound slot
+  # halts before this mapping runs, on the Component's required slot. The
+  # slot names, the Secret names and their data keys are each written once,
+  # in the table below.
+  valuesMapping: |
+    {{- $declared := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" "" }}
+    {{- if not $declared }}
+    {{- fail (printf "%q is installed through Kasten's chart, which places Kasten in the namespace the Release declares for the component, and the Release declares none; Kasten reads its location profiles and their Secrets only from its own namespace, and helm/backup-kasten writes them into kasten-io, so declare the annotation aggrega.ai/namespace: kasten-io on %q or on its boundary in the Release" .context.instance_id .context.instance_id) }}
+    {{- else if ne $declared "kasten-io" }}
+    {{- fail (printf "%q is installed through Kasten's chart, which places Kasten in the namespace the Release declares for the component, %q; Kasten reads its location profiles and their Secrets only from its own namespace, and helm/backup-kasten writes them into kasten-io, so declare aggrega.ai/namespace: kasten-io for %q in the Release" .context.instance_id $declared .context.instance_id) }}
+    {{- end }}
+    {{- $dataMover := list (dict "slot" "data_mover_cert" "secret" "kopia-tls-cert" "key" "tls.crt" "what" "certificate") (dict "slot" "data_mover_key" "secret" "kopia-tls-key" "key" "tls.key" "what" "private key") }}
+    {{- range $dataMover }}
+    {{- $p := optional (optional (default dict $.features) .slot dict) "provides" dict }}
+    {{- if or (ne (toString (optional $p "name" "")) .secret) (ne (toString (optional $p "key" "")) .key) }}
+    {{- fail (printf "the %s slot of %q is bound to a credential naming the Secret %q under the data key %q, but Kasten reads its data mover's %s only from the Secret %s under the data key %s, in kasten-io, by that fixed name; bind %s to core/referenced-secret through k8s-existing-secret with origin %s and values.key %s, declared in the Aggregate, since an attachment the Release alone makes publishes the key value" .slot $.context.instance_id (toString (optional $p "name" "")) (toString (optional $p "key" "")) .what .secret .key .slot .secret .key) }}
+    {{- end }}
+    {{- end }}
+    eula:
+      accept: false

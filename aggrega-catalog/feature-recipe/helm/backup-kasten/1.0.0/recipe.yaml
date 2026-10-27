@@ -1,0 +1,428 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: backup-kasten
+  version: 1.0.0
+  description: >
+    Component-scope FeatureRecipe for core/backup on Kubernetes through Veeam
+    Kasten: writes a Kasten policy and the location profile it exports to,
+    both in the namespace kasten-io, where core/storage/kasten runs. The
+    policy runs only where that component is deployed; nothing in the build
+    checks it.
+
+    Each run snapshots the attached component's controllers, the resources
+    carrying their selector labels and the volume claims they mount, then
+    exports the snapshot, volume data included, to the bucket the store
+    connection points at or, with infra.volume set instead, to a
+    ReadWriteMany claim of that size written beside the profile. Kasten takes
+    volume snapshots through a CSI snapshot class marked for it. It runs on
+    infra.schedule, read in UTC, or daily at 03:00 UTC; Kasten keeps backups
+    by count, so a schedule must run once a day or once an hour at a fixed
+    minute, and each backup is kept for infra.retention_days days.
+
+    For a bucket, Kasten reads the key pair under aws_access_key_id and
+    aws_secret_access_key from the Secret in kasten-io that
+    infra.credentials_secret names or, unset, the one named after the policy.
+    The build halts, naming the attachment, with neither a store connection
+    nor infra.volume, with a store publishing no S3 API, on any other
+    schedule, on a second core/backup attachment, on a component rendering no
+    workload or none in a namespace, and on infra.role_arn,
+    infra.run_as_user and infra.run_as_group, which a Kasten policy has no
+    place for.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/backup:1.0.0
+  # executionScope omitted -> component: renders once per attached component.
+
+  # The store's render is read below, to find the namespace of a store running
+  # in the cluster, so the attachment renders once every component in the
+  # build has rendered rather than right after its own host.
+  readsTargetRenderFacts: true
+
+  assertions:
+    # infra.role_arn names the IAM role AWS Backup assumes. A Kasten location
+    # profile signs with the key pair in the Secret it names, and the policy an
+    # attachment writes names no role, so the role would reach no emitted
+    # byte; the build halts on it rather than ignoring it.
+    role_arn_refused: >-
+      {{- with toString (optional .infra "role_arn" "") -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.role_arn to %q, the IAM role AWS Backup assumes, and this attachment is bound to helm/backup-kasten, which backs up through Veeam Kasten: its location profile signs with the key pair in the Secret it names, and the policy names no role; remove infra.role_arn from the attachment, or bind a FeatureRecipe realizing core/backup through AWS Backup" $.metadata.feature_instance $.metadata.instance_id .) -}}
+      {{- end -}}
+    # infra.run_as_user and infra.run_as_group name the user and group a
+    # backup product's own jobs run as, written into the resource the
+    # attachment writes. A Kasten policy carries no security context: Kasten
+    # runs its snapshot and export pods from its own installation, and sets the
+    # identity they use on a storage class through a cluster-wide resource of
+    # its own, not through a policy. So neither would reach an emitted byte;
+    # the build halts on them rather than ignoring them.
+    run_as_refused: >-
+      {{- range $k := list "run_as_user" "run_as_group" -}}
+      {{- if ge (int64 (optional $.infra $k -1)) 0 -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.%s, the user or group a backup product's own jobs run as, and this attachment is bound to helm/backup-kasten, which backs up through Veeam Kasten: a Kasten policy carries no security context for the pods Kasten runs from its own installation; remove infra.%s from the attachment, or bind a FeatureRecipe that runs its backup jobs as the user an attachment sets" $.metadata.feature_instance $.metadata.instance_id $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # One file holding the location profile, the policy and, for a volume, the
+  # claim the profile names.
+  #
+  # Where they are written. Kasten reads a location profile, and the Secret it
+  # names, only from the namespace Kasten is installed in, and
+  # core/storage/kasten's chart realization halts unless the Release places
+  # Kasten in kasten-io. An attachment on a datastore cannot read where another
+  # component was placed, so everything is written into kasten-io. The policy
+  # sits beside its profile, where Kasten's own examples put it. Nothing in the
+  # build checks that Kasten is deployed: Kasten registers the Policy and
+  # Profile definitions when it starts, so applied to a cluster without
+  # Kasten, both are refused by the cluster.
+  #
+  # Names. The profile, the policy, the default Secret name and, on a volume,
+  # the claim take one name: the namespace of the attached component's
+  # workloads, its rendered name and the attachment name, folded to hyphens.
+  # The namespace is part of it because every Release on the cluster writes
+  # into the one kasten-io namespace, and two Releases can each hold a
+  # component of the same name. Kasten takes a policy or profile name of 63
+  # characters at most, so a longer name halts, naming it. Where the Recipe
+  # realizing the component reports no rendered name, its identity stands in,
+  # and an identity that is not a name Kubernetes takes halts, naming it.
+  #
+  # What is backed up. A Kasten policy selects applications, and an
+  # application is a namespace: a policy selecting the attached component's
+  # namespace alone would back up every component in it. So the policy selects
+  # that namespace and its backup action carries include filters narrowing it
+  # to the attached component: one entry per Deployment, StatefulSet,
+  # DaemonSet and ReplicaSet the component's render emits, by kind and name,
+  # and one per distinct controller selector, matching every resource of the
+  # kinds Kasten backs up by default that carries those labels — the pods'
+  # claims among them, since Kubernetes writes a StatefulSet's selector labels
+  # onto the claims it creates and the helm provider writes a workload's labels
+  # onto every standalone claim it emits for it. Kasten also adds the claims a
+  # Deployment or StatefulSet mounts when it includes the controller. A Job or
+  # CronJob writing no selector is left out, and a controller of the four
+  # writing none halts. Workloads emitted into no namespace, or into two, halt:
+  # a policy names the namespace it selects. A component whose render emits no
+  # controller halts — the shape of a database a controller runs from a custom
+  # resource — naming the realization of core/backup through that controller.
+  # Every key read from the render context that a host may not carry is read
+  # with a default, so no host shape reaches a template error rather than these
+  # halts.
+  #
+  # Where the backups go. The policy's backup action takes a snapshot of the
+  # selected resources and volumes; its export action copies the snapshot,
+  # volume data included, to the location profile. An attachment wiring a store
+  # and setting infra.volume halts on the Feature's own one_destination
+  # assertion before this file renders, so either the store or the volume
+  # decides the profile below. An attachment with neither halts, naming both
+  # ways to fix it.
+  #
+  # The store. The attachment's store connection is the one connection on the
+  # store socket that a core/backup attachment declared. A component carries
+  # every such connection of every core/backup attachment on it, under the
+  # Feature's name rather than the attachment's, so one attachment cannot tell
+  # its own from another's; a component carrying a second core/backup
+  # attachment therefore halts while any of them wires a store. Two store
+  # connections on one attachment halt, since a policy exports to one profile.
+  # A store publishing no S3 API — protocol other than s3, or no endpoint, as
+  # core/storage/gcs publishes — halts: the profile reaches its bucket through
+  # Kasten's client for the S3 API. A store running in the cluster publishes
+  # the bare name of its Service, which resolves only inside its own namespace,
+  # while Kasten runs in kasten-io: where the store's render emitted a Service
+  # of that name, the address is qualified with the namespace the Service is
+  # emitted into, and a store whose Service is emitted into no namespace halts.
+  # A store outside the cluster is reached at its endpoint as published. The
+  # region is the store's own, and empty where it publishes none, which is how
+  # Kasten takes a provider without regions. The path inside the bucket is
+  # left to Kasten, which lays out its own repository there.
+  #
+  # The key. The store connection carries no credential: a consumer of the
+  # store holds the key it presents. The profile names the Secret
+  # infra.credentials_secret names or, where it is unset, one named after the
+  # policy, in kasten-io, where Kasten requires it; Kasten reads the key pair
+  # under the data keys aws_access_key_id and aws_secret_access_key, the names
+  # its own documentation gives, and none other. The Secret is the cluster's to
+  # hold; nothing in the build checks it.
+  #
+  # The volume. A Kasten file-store profile names a claim in kasten-io, which
+  # every node running Kasten's export pods mounts, so this realization writes
+  # that claim beside the profile, under the profile's name: infra.volume.size
+  # is its requested storage, a Kubernetes quantity such as 50Gi, and a value
+  # the cluster would refuse halts here by name instead of at apply time;
+  # infra.volume.storage_class is the class it is provisioned from, and unset,
+  # the claim names none and the cluster's default class provisions it. Kasten's
+  # documentation writes such a claim ReadWriteMany, mountable on every node,
+  # and so does this realization: a class that offers no ReadWriteMany leaves
+  # the claim unbound, which is the cluster's to report, since the build cannot
+  # read what a class offers. A file-store profile names no Secret, and the
+  # Secret infra.credentials_secret names is read by no one there.
+  #
+  # When and how long. Kasten schedules a policy by frequency rather than by a
+  # cron expression — hourly, daily, weekly, monthly or yearly, with the
+  # minute and hour of each run as sub-frequencies read in UTC — and keeps
+  # backups by count at each frequency rather than by age. So the schedule is
+  # read: an expression naming one minute and one hour, every day of every
+  # month — 30 2 * * * — becomes a daily policy running at that minute and
+  # hour, keeping the newest infra.retention_days daily backups; one naming one
+  # minute of every hour — 15 * * * * — becomes an hourly policy running at
+  # that minute, keeping the newest 24 x infra.retention_days hourly backups.
+  # Either way each backup is kept for retention_days days. Any other expression
+  # halts, naming it. Unset, it is 0 3 * * *. The export runs at the policy's
+  # own frequency, and exported backups are kept by the policy's own counts.
+  #
+  # Every string value is written through toJson, so a value that reads as a
+  # number or a boolean stays a string, and every map is written in key order,
+  # so identical input renders identical bytes.
+  artifacts:
+    backup.yaml: |
+      {{- $attName := .attachment_name }}
+      {{- $att := .attachment_name | replace "_" "-" }}
+      {{- $host := .context.instance_id }}
+      {{- $vol := optional .infra "volume" dict }}
+
+      {{- /* This attachment's store connection. */}}
+      {{- $stores := list }}
+      {{- range $alias, $edge := .context.uses }}
+        {{- if and (eq (toString $edge.socket) "store") (eq (toString (default "" $edge.origin_feature)) "core/backup") }}
+          {{- $stores = append $stores (dict "alias" $alias "edge" $edge) }}
+        {{- end }}
+      {{- end }}
+      {{- $backups := list }}
+      {{- range $n, $f := (default dict .features) }}
+        {{- if eq (toString (get $f "type")) "core/backup" }}
+          {{- $backups = append $backups (printf "%q" $n) }}
+        {{- end }}
+      {{- end }}
+      {{- if and (gt (len $backups) 1) $stores }}
+        {{- fail (printf "core/backup attachment %q on %q: %q carries %d core/backup attachments (%s), and each one's store connection reaches every one of them under the Feature's name, so this attachment cannot tell which store is its own; attach core/backup to %q once when it is backed up through Kasten" $attName $host $host (len $backups) (join ", " $backups) $host) }}
+      {{- end }}
+      {{- if and (not $stores) (not $vol) }}
+        {{- fail (printf "core/backup attachment %q on %q has no store connection and sets no infra.volume, so it names nowhere for Kasten to export its backups to; wire the attachment's store connection to the bucket the backups go to, under uses.store on the attachment in the Release, or set infra.volume on the attachment, with its size, to keep them on a volume claim written beside the Kasten profile" $attName $host) }}
+      {{- end }}
+      {{- if gt (len $stores) 1 }}
+        {{- $aliases := list }}
+        {{- range $stores }}{{ $aliases = append $aliases (printf "%q" .alias) }}{{ end }}
+        {{- fail (printf "core/backup attachment %q on %q wires %d store connections (%s), and a Kasten policy exports to one location profile; keep one" $attName $host (len $stores) (join ", " $aliases)) }}
+      {{- end }}
+      {{- $bucket := "" }}
+      {{- $endpoint := "" }}
+      {{- $region := "" }}
+      {{- if $stores }}
+      {{- $store := index $stores 0 }}
+      {{- $edge := $store.edge }}
+      {{- $sp := default dict $edge.provides }}
+      {{- $bucket = toString (default "" (get $sp "bucket")) }}
+      {{- $endpoint = toString (default "" (get $sp "endpoint")) }}
+      {{- $region = toString (default "" (get $sp "region")) }}
+      {{- $storeHost := toString (default "" (get $sp "host")) }}
+      {{- if or (ne (toString (default "" (get $sp "protocol"))) "s3") (not $endpoint) (not $bucket) }}
+        {{- fail (printf "core/backup attachment %q on %q: its store connection %q reaches %q, which publishes no bucket at an S3 API endpoint, and this realization writes a Kasten location profile reaching its bucket over the S3 API; wire the store connection to a store published over the S3 API, such as core/storage/s3-object-store" $attName $host $store.alias $edge.target) }}
+      {{- end }}
+
+      {{- /* A store running in the cluster: qualify its Service name with the namespace it is emitted into. */}}
+      {{- range (default (list) (get (default (dict) $edge.render_facts) "service_selectors")) }}
+        {{- if and $storeHost (eq (toString (get . "name")) $storeHost) }}
+          {{- $sns := toString (optional . "namespace" "") }}
+          {{- if not $sns }}
+            {{- fail (printf "core/backup attachment %q on %q: the store %q runs in the cluster behind the Service %q, which is emitted into no namespace, and Kasten, running in kasten-io, reaches a Service in another namespace only by a name qualified with that namespace; set aggrega.ai/namespace for %q, or on its boundary, in the Release" $attName $host $edge.target $storeHost $edge.target) }}
+          {{- end }}
+          {{- if not (contains (printf "://%s" $storeHost) $endpoint) }}
+            {{- fail (printf "core/backup attachment %q on %q: the store %q publishes the endpoint %q, which does not name its Service %q, so the address Kasten reaches cannot be qualified with the Service's namespace; wire the store connection to a store whose endpoint names the host it publishes" $attName $host $edge.target $endpoint $storeHost) }}
+          {{- end }}
+          {{- $endpoint = replace (printf "://%s" $storeHost) (printf "://%s.%s" $storeHost $sns) $endpoint }}
+        {{- end }}
+      {{- end }}
+      {{- end }}
+
+      {{- /* The volume, where no store is wired: the claim's size and class. */}}
+      {{- $size := "" }}
+      {{- $class := "" }}
+      {{- if not $stores }}
+        {{- $size = toString (get $vol "size") }}
+        {{- $class = toString (optional $vol "storage_class" "") }}
+        {{- if not (regexMatch `^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$` $size) }}
+          {{- fail (printf "core/backup attachment %q on %q sets infra.volume.size to %q, and the claim this realization writes for Kasten's file-store profile takes its size as a Kubernetes quantity, such as 50Gi or 500Mi; set infra.volume.size to one" $attName $host $size) }}
+        {{- end }}
+      {{- end }}
+
+      {{- /* The attached component: its controllers by kind and name, one label selector per distinct controller selector, and the namespace they are emitted into. */}}
+      {{- $resources := dict "Deployment" "deployments" "StatefulSet" "statefulsets" "DaemonSet" "daemonsets" "ReplicaSet" "replicasets" }}
+      {{- $facts := default dict (optional .context "render_facts" dict) }}
+      {{- $controllers := list }}
+      {{- $selectors := list }}
+      {{- $seenSel := dict }}
+      {{- $namespaces := list }}
+      {{- $seenNs := dict }}
+      {{- range (default (list) (get $facts "controller_selectors")) }}
+        {{- $kind := toString (get . "kind") }}
+        {{- $wname := toString (optional . "name" "") }}
+        {{- $ml := optional . "match_labels" dict }}
+        {{- if not $ml }}
+          {{- if or (eq $kind "Job") (eq $kind "CronJob") }}
+            {{- continue }}
+          {{- end }}
+          {{- fail (printf "core/backup attachment %q on %q: the %s %q that %q renders writes no matchLabels selector, so the policy has no labels to narrow its backup to %q by; realize %q with a Recipe whose workloads write a controller selector" $attName $host $kind $wname $host $host $host) }}
+        {{- end }}
+        {{- if not (hasKey $resources $kind) }}
+          {{- continue }}
+        {{- end }}
+        {{- $wns := toString (optional . "namespace" "") }}
+        {{- if not $wns }}
+          {{- fail (printf "core/backup attachment %q on %q: the %s %q that %q renders is emitted into no namespace, and a Kasten policy selects the namespace it backs up by name; set aggrega.ai/namespace for %q, or on its boundary, in the Release" $attName $host $kind $wname $host $host) }}
+        {{- end }}
+        {{- $controllers = append $controllers (dict "resource" (get $resources $kind) "name" $wname) }}
+        {{- $key := toJson $ml }}
+        {{- if not (hasKey $seenSel $key) }}
+          {{- $_ := set $seenSel $key true }}
+          {{- $selectors = append $selectors $ml }}
+        {{- end }}
+        {{- if not (hasKey $seenNs $wns) }}
+          {{- $_ := set $seenNs $wns true }}
+          {{- $namespaces = append $namespaces $wns }}
+        {{- end }}
+      {{- end }}
+      {{- if not $controllers }}
+        {{- fail (printf "core/backup attachment %q on %q: %q renders no Deployment, StatefulSet, DaemonSet or ReplicaSet a Kasten policy can narrow its backup to; where its pods are created later by a controller reconciling what it renders, such as a CloudNativePG cluster, Kasten has nothing here to name, so bind the FeatureRecipe realizing core/backup through that controller for this attachment in the Manifest, such as helm/backup-cloudnative-pg, or realize %q with a Recipe whose own render emits its workloads" $attName $host $host $host) }}
+      {{- end }}
+      {{- if gt (len $namespaces) 1 }}
+        {{- $nsq := list }}
+        {{- range $namespaces }}{{ $nsq = append $nsq (printf "%q" .) }}{{ end }}
+        {{- fail (printf "core/backup attachment %q on %q: the workloads %q renders are emitted into %d namespaces (%s), and a Kasten policy backing up one component selects one namespace; write %q's workloads into one namespace" $attName $host $host (len $namespaces) (join ", " $nsq) $host) }}
+      {{- end }}
+      {{- $ns := index $namespaces 0 }}
+
+      {{- /* The name: the namespace, the host's rendered name, or its identity where its provider reports none and the identity is a name Kubernetes takes, and the attachment. */}}
+      {{- $hostName := toString (optional .context "rendered_name" "") }}
+      {{- if not $hostName }}
+        {{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $host) }}
+          {{- fail (printf "core/backup attachment %q on %q: the Recipe realizing %q reports no rendered name for it, and its identity %q is not a name Kubernetes takes, so the policy and its profile cannot be named after it; realize %q with a Recipe that supplies a chart or a workload, or give the component a name of lowercase letters, digits and hyphens" $attName $host $host $host $host) }}
+        {{- end }}
+        {{- $hostName = $host }}
+      {{- end }}
+      {{- $name := printf "%s-%s-%s" $ns $hostName $att }}
+      {{- if gt (len $name) 63 }}
+        {{- fail (printf "core/backup attachment %q on %q: the policy's name, %q, is %d characters, and Kasten takes a policy or profile name of 63 at most; give the attachment, the component or its namespace a shorter name" $attName $host $name (len $name)) }}
+      {{- end }}
+
+      {{- /* When, and how long: a daily or an hourly policy, keeping backups by count. */}}
+      {{- $schedule := trim (toString (optional .infra "schedule" "")) }}
+      {{- $schedule = default "0 3 * * *" $schedule }}
+      {{- $f := splitList " " (regexReplaceAll "\\s+" $schedule " ") }}
+      {{- $days := int .infra.retention_days }}
+      {{- $frequency := "" }}
+      {{- $keepKey := "" }}
+      {{- $keepCount := 0 }}
+      {{- $minute := 0 }}
+      {{- $hour := -1 }}
+      {{- if and (eq (len $f) 5) (regexMatch "^[0-5]?[0-9]$" (index $f 0)) (eq (index $f 2) "*") (eq (index $f 3) "*") (eq (index $f 4) "*") }}
+        {{- $minute = int (index $f 0) }}
+        {{- if regexMatch "^([01]?[0-9]|2[0-3])$" (index $f 1) }}
+          {{- $frequency = "@daily" }}
+          {{- $keepKey = "daily" }}
+          {{- $keepCount = $days }}
+          {{- $hour = int (index $f 1) }}
+        {{- else if eq (index $f 1) "*" }}
+          {{- $frequency = "@hourly" }}
+          {{- $keepKey = "hourly" }}
+          {{- $keepCount = mul $days 24 }}
+        {{- end }}
+      {{- end }}
+      {{- if not $frequency }}
+        {{- fail (printf "core/backup attachment %q on %q sets infra.schedule to %q, and Kasten schedules a policy by frequency rather than by a cron expression and keeps backups by count at that frequency, so this realization keeps each backup for infra.retention_days days only for a schedule running once a day at one minute and one hour, such as 30 2 * * *, or once an hour at one minute, such as 15 * * * *; write the schedule in one of those two forms" $attName $host $schedule) }}
+      {{- end }}
+      {{- $secret := default $name (toString (optional .infra "credentials_secret" "")) -}}
+      apiVersion: config.kio.kasten.io/v1alpha1
+      kind: Profile
+      metadata:
+        name: {{ toJson $name }}
+        namespace: kasten-io
+      spec:
+        type: Location
+        locationSpec:
+          {{- if $stores }}
+          type: ObjectStore
+          credential:
+            secretType: AwsAccessKey
+            secret:
+              apiVersion: v1
+              kind: Secret
+              name: {{ toJson $secret }}
+              namespace: kasten-io
+          objectStore:
+            objectStoreType: S3
+            name: {{ toJson $bucket }}
+            endpoint: {{ toJson $endpoint }}
+            region: {{ toJson $region }}
+          {{- else }}
+          type: FileStore
+          fileStore:
+            claimName: {{ toJson $name }}
+          {{- end }}
+      ---
+      apiVersion: config.kio.kasten.io/v1alpha1
+      kind: Policy
+      metadata:
+        name: {{ toJson $name }}
+        namespace: kasten-io
+      spec:
+        comment: {{ toJson (printf "core/backup attachment %s on %s" $attName $host) }}
+        frequency: {{ toJson $frequency }}
+        subFrequency:
+          minutes:
+            - {{ $minute }}
+          {{- if ge $hour 0 }}
+          hours:
+            - {{ $hour }}
+          {{- end }}
+        retention:
+          {{ $keepKey }}: {{ $keepCount }}
+        selector:
+          matchExpressions:
+            - key: "k10.kasten.io/appNamespace"
+              operator: "In"
+              values:
+                - {{ toJson $ns }}
+        actions:
+          - action: "backup"
+            backupParameters:
+              filters:
+                includeResources:
+                  {{- range $controllers }}
+                  - group: "apps"
+                    resource: {{ toJson .resource }}
+                    name: {{ toJson .name }}
+                  {{- end }}
+                  {{- range $selectors }}
+                  - matchLabels:
+                      {{- range $k, $v := . }}
+                      {{ toJson $k }}: {{ toJson $v }}
+                      {{- end }}
+                  {{- end }}
+          - action: "export"
+            exportParameters:
+              frequency: {{ toJson $frequency }}
+              profile:
+                name: {{ toJson $name }}
+                namespace: kasten-io
+              exportData:
+                enabled: true
+      {{- if not $stores }}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: {{ toJson $name }}
+        namespace: kasten-io
+      spec:
+        accessModes:
+          - "ReadWriteMany"
+        resources:
+          requests:
+            storage: {{ toJson $size }}
+        {{- with $class }}
+        storageClassName: {{ toJson . }}
+        {{- end }}
+      {{- end }}
