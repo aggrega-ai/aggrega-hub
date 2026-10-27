@@ -26,10 +26,11 @@ metadata:
 
     The project, region and network are the operator's, named in
     infra.overrides.project_id, region and private_network, and the Recipe
-    emits none of them: private services access is a peering between the VPC
-    network and Google's services that every service using it shares. The
-    instance gets no public address. Cloud SQL creates root with no password,
-    so root_password must be the core/random-password attachment, handed over
+    emits none of them. The instance gets no public address. Binary logging,
+    its point-in-time recovery, is on, as high availability and read
+    replicas need, unless the core/backup attachment sets
+    infra.point_in_time_recovery to false, which halts beside either.
+    Cloud SQL creates root with no password, so root_password must be the core/random-password attachment, handed over
     as a Terraform reference; the user values.user names, where set, logs in
     with the attachment on user_password, or a password the module draws. The
     rendered files carry no password, and another credential halts naming the
@@ -347,10 +348,23 @@ spec:
   # attachments by its type with any version set aside, and kept as the
   # instance's own automated backups, which this Recipe sets through the
   # module's backup_configuration:
-  #   - Backups are always on, with binary logging: Cloud SQL makes an
-  #     instance highly available, and creates a read replica of it, only
-  #     with both on, so infra.ha and read replicas always have the backups
-  #     they need, and no setting turns them off.
+  #   - Backups are always on: Cloud SQL makes an instance highly available,
+  #     and creates a read replica of it, only with backups on, so infra.ha
+  #     and read replicas always have the backups they need, and no setting
+  #     turns them off.
+  #   - Binary logging, binary_log_enabled, which is Cloud SQL for MySQL's
+  #     point-in-time recovery, is on unless the attachment sets
+  #     infra.point_in_time_recovery to false, so a Release leaving the option
+  #     out keeps it on, the default this Recipe gives: Cloud SQL makes an
+  #     instance highly available, and creates a read replica of it, only with
+  #     binary logging on, so false halts while infra.ha.enabled is true or
+  #     infra.ha.read_replicas is above zero, naming the attachment. The module
+  #     turns binary logging on by itself on a highly available instance,
+  #     whatever it is passed, so the halt is also what keeps false from being
+  #     silently overridden there. With binary logging off the transaction log
+  #     retention below is still written, and the 2-to-365 range still holds:
+  #     the module requires more backups than days of logs whether logging is
+  #     on or not, and takes 7 days of logs where none is written.
   #   - With none attached, Cloud SQL keeps 7 automated backups, one taken
   #     each day, starting at a time it chooses.
   #   - An attachment carrying no infra.role_arn, bound to
@@ -399,8 +413,13 @@ spec:
     {{- $backupStart = printf "%02d:%02d" (atoi (index $f 1)) (atoi (index $f 0)) -}}
     {{- end -}}
     {{- end -}}
+    {{- $backupPitr := true -}}
+    {{- if eq (toString (optional $backupNativeInfra "point_in_time_recovery" "")) "false" }}{{ $backupPitr = false }}{{ end -}}
     {{- if or (lt $backupRetention 2) (gt $backupRetention 365) -}}
     {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and this Recipe keeps that many daily automated backups, which Cloud SQL takes from 1 to 365, and one day fewer of binary logs, which it takes from 1 day, since the module it sources keeps more backups than days of logs: set infra.retention_days to a number from 2 to 365" $backupNative .context.instance_id $backupRetention) -}}
+    {{- end -}}
+    {{- if and (not $backupPitr) (or .infra.ha.enabled (gt (int .infra.ha.read_replicas) 0)) -}}
+    {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to false, which turns off the instance's binary logging, while infra.ha.enabled is %v and infra.ha.read_replicas is %v: Cloud SQL for MySQL makes an instance highly available, and creates a read replica of it, only with binary logging on: remove infra.point_in_time_recovery from the attachment, or set it to true, or set infra.ha.enabled to false and infra.ha.read_replicas to 0" $backupNative .context.instance_id .infra.ha.enabled .infra.ha.read_replicas) -}}
     {{- end -}}
     project_id: "{{ .infra.overrides.project_id }}"
     region: "{{ .infra.overrides.region }}"
@@ -449,7 +468,7 @@ spec:
       {{- end }}
     backup_configuration:
       enabled: true
-      binary_log_enabled: true
+      binary_log_enabled: {{ $backupPitr }}
       {{- if $backupStart }}
       start_time: "{{ $backupStart }}"
       {{- end }}

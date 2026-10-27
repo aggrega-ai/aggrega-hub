@@ -25,9 +25,12 @@ metadata:
 
     A value RDS cannot apply — an application user, init scripts, a raw
     configuration file, read replicas — halts the build naming the key;
-    compute.cpu, compute.memory, charset and collation are not read. On terraform the same
-    component is also realized by terraform/mysql-rds-terraform-aws-modules,
-    the terraform-aws-modules project's published RDS module.
+    compute.cpu, compute.memory, charset and collation are not read. On
+    terraform the same component is also realized by
+    terraform/mysql-rds-terraform-aws-modules, the terraform-aws-modules
+    project's published RDS module. Point-in-time recovery comes with the
+    automated backups, so infra.point_in_time_recovery: false on core/backup
+    halts by name.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -189,6 +192,17 @@ spec:
   #   - Two attachments carrying no infra.role_arn, or one beside an AWS
   #     Backup attachment setting infra.keep_automated_backups to false, halt
   #     naming both: an instance runs one automated backup.
+  #   - Point-in-time recovery is Amazon RDS's for as long as the instance
+  #     keeps automated backups, with no setting of its own, so left out or
+  #     true, infra.point_in_time_recovery is what the instance gives, and
+  #     false on an attachment carrying no infra.role_arn halts naming it. On
+  #     an AWS Backup attachment, true asks AWS Backup for a continuous backup,
+  #     which takes over the instance's automated backups and keeps them for
+  #     as many days as its own, so the retention written here is then that
+  #     attachment's infra.retention_days and no window is written; another
+  #     attachment configuring the automated backups or turning them off halts
+  #     naming both, and so do two asking for a continuous backup. false there
+  #     is AWS Backup's to keep, as without the option.
   # A Recipe's locals cannot read its attachments, so the reading sits at the
   # top of the template below, and every RDS Recipe of this catalog, on
   # terraform and CloudFormation, declares it word for word: a change to it
@@ -196,13 +210,19 @@ spec:
   artifacts:
     template.yaml: |
       {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
-      {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}{{- $backupKeepOn := "" -}}{{- $backupKeepOff := "" -}}
+      {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}{{- $backupKeepOn := "" -}}{{- $backupKeepOff := "" -}}{{- $backupContinuous := "" -}}{{- $backupContinuousInfra := dict -}}
       {{- range $name, $attachment := (default dict .features) -}}
       {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
       {{- $in := default dict (optional $attachment "infra" dict) -}}
       {{- if trim (toString (optional $in "role_arn" "")) -}}
       {{- if hasKey $in "keep_automated_backups" -}}
       {{- if $in.keep_automated_backups }}{{ $backupKeepOn = $name }}{{ else }}{{ $backupKeepOff = $name }}{{ end -}}
+      {{- end -}}
+      {{- if eq (toString (optional $in "point_in_time_recovery" "")) "true" -}}
+      {{- if $backupContinuous -}}
+      {{- fail (printf "core/backup attachments %q and %q on %q both set infra.point_in_time_recovery to true, each asking AWS Backup for a continuous backup of the instance, and AWS Backup keeps one continuous backup of a resource: set it on one of the two" $backupContinuous $name $.context.instance_id) -}}
+      {{- end -}}
+      {{- $backupContinuous = $name -}}{{- $backupContinuousInfra = $in -}}
       {{- end -}}
       {{- else if $backupNative -}}
       {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Amazon RDS, which runs one automated backup on an instance: remove one of the two, or bind one to AWS Backup in the Manifest" $backupNative $name $.context.instance_id) -}}
@@ -217,8 +237,18 @@ spec:
       {{- if and $backupKeepOn $backupKeepOff -}}
       {{- fail (printf "core/backup attachments %q and %q on %q set infra.keep_automated_backups to true and to false, and the instance either keeps its automated backups or does not: set the option on one of the two" $backupKeepOn $backupKeepOff .context.instance_id) -}}
       {{- end -}}
+      {{- if eq (toString (optional $backupNativeInfra "point_in_time_recovery" "")) "false" -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to false, and Amazon RDS keeps point-in-time recovery for as long as it keeps automated backups, which this attachment configures, with no setting that turns it off: remove infra.point_in_time_recovery from the attachment, or set it to true" $backupNative .context.instance_id) -}}
+      {{- end -}}
+      {{- if and $backupContinuous $backupNative -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to true, so AWS Backup keeps a continuous backup of the instance and takes over its automated backups, their window and how many days they are kept, and core/backup attachment %q configures those automated backups too: remove one of the two attachments, or infra.point_in_time_recovery" $backupContinuous .context.instance_id $backupNative) -}}
+      {{- end -}}
+      {{- if and $backupContinuous $backupKeepOff (ne $backupContinuous $backupKeepOff) -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to true, and AWS Backup's continuous backup keeps the instance's automated backups on, for as many days as its own, while core/backup attachment %q sets infra.keep_automated_backups to false, turning them off: remove one of the two attachments, or one of the two options" $backupContinuous .context.instance_id $backupKeepOff) -}}
+      {{- end -}}
       {{- $backupRetention := 7 -}}{{- $backupWindow := "" -}}
       {{- if $backupKeepOff }}{{ $backupRetention = 0 }}{{ end -}}
+      {{- if $backupContinuous }}{{ $backupRetention = int (optional $backupContinuousInfra "retention_days" 7) }}{{ end -}}
       {{- if $backupNative -}}
       {{- $backupRetention = int (optional $backupNativeInfra "retention_days" 7) -}}
       {{- if or (lt $backupRetention 1) (gt $backupRetention 35) -}}

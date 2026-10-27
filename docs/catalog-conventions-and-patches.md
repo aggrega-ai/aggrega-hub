@@ -4892,7 +4892,25 @@ sizes in the Release.
   against losing the cluster. `infra.run_as_user` and `infra.run_as_group` set
   the user and group a product's own backup jobs run as, written into the
   jobs' security context by a realization that starts them, such as K8up's,
-  and refused by name by every other realization
+  and refused by name by every other realization. `infra.point_in_time_recovery`
+  asks for restores to any moment of the retention window rather than only to
+  the moment of a backup. It declares no schema default, because there is no
+  single one: left out, each product keeps its own default, which its
+  realization's description states, and a written value the product cannot
+  keep halts by name. Amazon RDS keeps it for as long as it keeps automated
+  backups, and Azure Database for PostgreSQL flexible server for every server,
+  so `true` is what they give and `false` halts. Cloud SQL's Recipes keep it on
+  — point-in-time recovery on PostgreSQL, binary logging on MySQL — since Cloud
+  SQL makes an instance highly available, and a MySQL instance takes read
+  replicas, only with it on; `false` turns it off and halts beside either. AWS
+  Backup keeps a continuous backup only where a rule asks for one, so it is
+  off until `true` writes the rule's continuous-backup setting, which halts
+  above 35 days and beside `infra.keep_automated_backups: false`; the RDS
+  instance's own automated backups then follow AWS Backup's retention, and a
+  native attachment beside it halts. CloudNativePG archives its write-ahead
+  log continuously through the Barman Cloud plugin, so it is on and `false`
+  halts. mariadb-operator's logical Backup, Velero, K8up, KubeStash and Kasten
+  keep no log of the changes between backups, so it is off and `true` halts
 - **on-demand runs** — a task held until someone starts it: a suspended
   CronJob, a Compose service behind a profile, an Amazon ECS task definition
   a RunTask call starts

@@ -17,23 +17,28 @@ metadata:
     Each backup is a snapshot of the instance that AWS Backup takes on
     infra.schedule, read in UTC and started within an hour of that time, or
     daily at 05:00 UTC where it is unset, and keeps in the vault for
-    infra.retention_days days. The selection names the instance by Fn::GetAtt
-    on the logical ID the instance's Recipe declares, which CloudFormation
-    resolves to the instance's ARN when it creates the stack; the build
-    resolves no ARN, account or Region. AWS Backup runs each backup under the
-    existing IAM role infra.role_arn names, which the attachment must set.
+    infra.retention_days days. AWS Backup keeps a continuous backup, its
+    point-in-time recovery, only where a rule asks for one, so left out or
+    false it keeps snapshots alone; infra.point_in_time_recovery true asks,
+    for at most 35 days. AWS Backup runs each backup under the existing IAM
+    role infra.role_arn names, which the attachment must set.
 
     The build halts, naming the attachment, without infra.role_arn, on a host
     this realization cannot name — one realized by another Recipe, or a
     datastore AWS Backup does not protect, such as an OpenSearch Service
-    domain or an Amazon MQ broker — on a schedule AWS Backup cannot keep, such as one running more than once an
-    hour or restricting both the day of the month and the day of the week, on
-    a retention over 36500 days, on a store connection, infra.volume or
-    infra.credentials_secret, since AWS Backup keeps its backups in its own
-    vault, and on infra.run_as_user or infra.run_as_group, since it runs no
-    job in a cluster. The instance keeps its own automated backups beside
-    these, for 7 days, unless the attachment sets
-    infra.keep_automated_backups to false, which turns them off.
+    domain or an Amazon MQ broker — on a schedule AWS Backup cannot keep,
+    such as one starting more than once an hour, on a retention over 36500
+    days, on a store connection, infra.volume or infra.credentials_secret,
+    since AWS Backup keeps backups in its vault, on
+    infra.run_as_user or infra.run_as_group, since it runs no job in a
+    cluster, and on a continuous backup kept over 35 days or beside
+    infra.keep_automated_backups false. The instance keeps its automated
+    backups beside these, for 7 days or as long as the continuous backup,
+    unless the attachment sets infra.keep_automated_backups to false.
+  # The selection names the instance by Fn::GetAtt on the logical ID the
+  # instance's Recipe declares, which CloudFormation resolves to the
+  # instance's ARN when it creates the stack; the build resolves no ARN,
+  # account or Region.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -169,6 +174,23 @@ spec:
       {{- if gt (int .infra.retention_days) 36500 -}}
       {{- fail (printf "core/backup attachment %q on %q keeps each backup for %v days, and AWS Backup keeps a backup for 36500 days at most: set infra.retention_days to 36500 or fewer" .metadata.feature_instance .metadata.instance_id .infra.retention_days) -}}
       {{- end -}}
+    # infra.point_in_time_recovery true asks AWS Backup for a continuous
+    # backup of the instance, its point-in-time recovery, which AWS Backup
+    # keeps for 35 days at most; a retention above that halts here rather than
+    # when the stack is created. A continuous backup of an Amazon RDS instance
+    # also sets the instance's own automated backups to as many days, so it
+    # cannot stand beside infra.keep_automated_backups false, which turns them
+    # off; the build halts on the pair rather than writing both. The host's
+    # Recipe halts on the same pair across two attachments.
+    continuous_backup: >-
+      {{- if eq (toString (optional .infra "point_in_time_recovery" "")) "true" -}}
+      {{- if gt (int .infra.retention_days) 35 -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to true, asking AWS Backup for a continuous backup, which AWS Backup keeps for 35 days at most, and infra.retention_days is %v: set infra.retention_days to 35 or fewer, or remove infra.point_in_time_recovery to keep snapshots alone" .metadata.feature_instance .metadata.instance_id .infra.retention_days) -}}
+      {{- end -}}
+      {{- if and (hasKey .infra "keep_automated_backups") (not .infra.keep_automated_backups) -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to true and infra.keep_automated_backups to false, and AWS Backup's continuous backup of an Amazon RDS instance keeps the instance's own automated backups on, for as many days as its own: remove one of the two options" .metadata.feature_instance .metadata.instance_id) -}}
+      {{- end -}}
+      {{- end -}}
     # AWS Backup writes each backup into its own vault and reads no Secret, so
     # a Secret named here would reach no emitted byte; the build halts on it
     # rather than ignoring it.
@@ -222,6 +244,16 @@ spec:
   # which AWS Backup deletes each recovery point. No cold-storage transition is
   # written: AWS Backup moves no RDS snapshot to cold storage.
   #
+  # Point-in-time recovery. AWS Backup keeps a continuous backup of an Amazon
+  # RDS instance — a full backup and the transaction logs after it, restorable
+  # to any moment of the retention — only where a rule asks for one. So
+  # infra.point_in_time_recovery true writes the rule's EnableContinuousBackup,
+  # kept infra.retention_days days, 35 at most, and left out or false the rule
+  # asks for none and keeps snapshots alone, its output unchanged. AWS Backup
+  # then sets the instance's own automated backups to the same number of days
+  # and takes over their window, and the host's Recipe writes that same number
+  # and no window, so the two agree.
+  #
   # The vault keeps AWS Backup's own encryption key, and the stack's deletion
   # leaves its recovery points alone: AWS Backup deletes no vault that holds
   # recovery points, so deleting a stack whose vault holds backups stops at the
@@ -260,6 +292,9 @@ spec:
                   ScheduleExpression: "{{ .locals.backup_schedule }}"
                   {{- end }}
                   StartWindowMinutes: 60
+                  {{- if eq (toString (optional .infra "point_in_time_recovery" "")) "true" }}
+                  EnableContinuousBackup: true
+                  {{- end }}
                   Lifecycle:
                     DeleteAfterDays: {{ int .infra.retention_days }}
         {{ .locals.backup_selection_id }}:
