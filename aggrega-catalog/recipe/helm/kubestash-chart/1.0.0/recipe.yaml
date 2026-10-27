@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: kubestash-chart
+  version: 1.0.0
+  description: >
+    Installs KubeStash through AppsCode's own Helm chart, from AppsCode's
+    chart repository, at the chart release infra.source_version names; the
+    build halts when it is unset. It renders the operator and its webhook
+    server, their permissions, KubeStash's custom-resource definitions, and
+    the addons and functions the backup and restore jobs run.
+
+    The licence is read from the Secret the license slot names, under the
+    data key key.txt, and the build halts on any other key. The webhook
+    server's certificate is issued by cert-manager, which must already run in
+    the cluster.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/storage/kubestash:1.0.0
+
+  # AppsCode's chart, from AppsCode's own chart repository, at the release
+  # the Release names. No version is named here: the release decides every
+  # image KubeStash runs, and the catalog names none of them.
+  source:
+    kind: helm-https-chart
+    url: https://charts.appscode.com/stable
+    chart: kubestash
+    version: "{{ .infra.source_version }}"
+
+  # Documents the chart renders that are left out.
+  #
+  # The chart's own connection check, a Pod carrying the helm.sh/hook: test
+  # annotation that fetches the webhook server's /healthz once. It is left out
+  # of the render rather than described; the server's own probes cover the
+  # same address.
+  #
+  # cert-manager's own custom-resource definitions for Certificate and Issuer,
+  # which the operator's chart ships beside KubeStash's. cert-manager must
+  # already run in the cluster, and its installation owns those definitions;
+  # applying the chart's copies would replace them.
+  #
+  # The addons subchart's copies of the definitions of KubeStash's Addon and
+  # Function. The chart ships each of the two definitions twice, once in the
+  # operator's subchart, kubestash-operator, and once in the addons' subchart,
+  # kubestash-catalog, whose copies differ only by the annotation
+  # config.kubernetes.io/local-config: "true", the marker for a document not
+  # meant for the cluster. A render keeps one document per name and halts on
+  # two that differ, so the addons subchart's copies are left out by the
+  # subchart they come from, and the operator's are the ones rendered.
+  omits:
+    - kind: Pod
+      name: "{{ .context.rendered_name }}-test-connection"
+    - kind: CustomResourceDefinition
+      name: certificates.cert-manager.io
+    - kind: CustomResourceDefinition
+      name: issuers.cert-manager.io
+    - kind: CustomResourceDefinition
+      name: addons.addons.kubestash.com
+      subchart: kubestash-catalog
+    - kind: CustomResourceDefinition
+      name: functions.addons.kubestash.com
+      subchart: kubestash-catalog
+
+  # This Recipe reads no infra.overrides keys; the Component declares none.
+  #
+  # The chart is read for the values below; everything else stays the chart's
+  # own default at its release.
+  #
+  # Namespace. The operator acts on KubeStash resources in every namespace, so
+  # the chart writes its namespaced objects into the release namespace — the
+  # namespace the Release declares for the component, or default where it
+  # declares none — and the licence Secret is read from that namespace.
+  #
+  # Names. The chart names its objects after its release name, which the helm
+  # provider gives as the component's rendered name; they are left as the chart
+  # publishes them. KubeStash runs once per cluster, and nothing is published
+  # for a consumer to reach.
+  #
+  # The licence. The operator's chart takes the name of an existing Secret,
+  # mounts it into the operator and hands the operator the file its data key
+  # key.txt becomes. The chart's other form, the licence itself as a value,
+  # would write the licence into a rendered Secret, so it stays unset.
+  #
+  # The webhook server's certificate. The chart's default generates a
+  # certificate authority and a signed certificate on every render, so two
+  # renders of identical input would differ. In its cert-manager mode it
+  # renders a self-signed cert-manager Issuer and a Certificate whose Secret
+  # the operator and the webhook server mount, and annotates the webhook
+  # configurations so cert-manager writes their certificate authority.
+  #
+  # The cleanup Job. The chart renders, as a Helm hook run before a removal, a
+  # Job deleting the functions and tasks of AppsCode's earlier backup operator,
+  # Stash, named pvc-backup and pvc-restore. Applied without Helm it would run
+  # at once, and delete them from a cluster that runs Stash, so it is turned
+  # off with its service account and permissions.
+  valuesMapping: |
+    {{- $license := optional (optional (default dict .features) "license" dict) "provides" dict }}
+    {{- $licenseSecret := optional $license "name" "" }}
+    {{- $licenseKey := optional $license "key" "" }}
+    {{- if not (and $licenseSecret $licenseKey) }}
+    {{- fail (printf "the license slot of %q is bound to an attachment that publishes no Secret name and data key, but this realization hands KubeStash's chart the name of the Secret its licence is read from; bind the slot to core/referenced-secret, whose k8s-existing-secret realization names a Secret that already exists" .context.instance_id) }}
+    {{- end }}
+    {{- if ne $licenseKey "key.txt" }}
+    {{- fail (printf "the license slot of %q is bound to a Secret whose published data key is %q, but KubeStash's operator reads its licence from the data key key.txt alone; publish the key key.txt: declare the attachment in the Aggregate with values.key set to key.txt, since an attachment the Release alone makes publishes the key value" .context.instance_id $licenseKey) }}
+    {{- end }}
+    kubestash-operator:
+      licenseSecretName: {{ toJson $licenseSecret }}
+      cleaner:
+        skip: true
+      apiserver:
+        servingCerts:
+          certManager:
+            enabled: true

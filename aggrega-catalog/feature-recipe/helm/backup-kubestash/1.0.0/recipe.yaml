@@ -1,0 +1,514 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: backup-kubestash
+  version: 1.0.0
+  description: >
+    Component-scope FeatureRecipe for core/backup on Kubernetes through
+    KubeStash: writes a KubeStash BackupConfiguration for the attached
+    component's workload, with the BackupStorage and the RetentionPolicy it
+    reads, beside it. The backups run only where core/storage/kubestash is
+    deployed, under a licence AppsCode issues; nothing in the build checks
+    either.
+
+    Each backup copies the files under the mount path of the workload's one
+    persistent volume, with restic, into a repository in the bucket the store
+    connection points at or, with infra.volume set instead, on a
+    ReadWriteOnce claim of that size written beside it, in
+    infra.volume.storage_class or the cluster's default class. It is a copy of
+    the volume's files taken while the datastore runs, not a
+    database-consistent dump. It runs on infra.schedule, or daily at 03:00
+    where that is unset, and each backup is kept for infra.retention_days
+    days. The jobs run as infra.run_as_user and infra.run_as_group.
+
+    The jobs read the repository's password, under RESTIC_PASSWORD, and for a
+    bucket its key pair, under AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY,
+    the names KubeStash fixes, from the Secret infra.credentials_secret names
+    or, unset, one named after the BackupConfiguration, in the component's
+    namespace. The build halts, naming the attachment, with neither a store
+    connection nor infra.volume, with a store publishing no S3 API, on a
+    second core/backup attachment, on a component rendering none, or two, of
+    the Deployments, StatefulSets and DaemonSets that mount a persistent
+    volume, or one mounting persistent volumes at two paths, on a volume for a
+    DaemonSet or of a size that is not a Kubernetes quantity, and on
+    infra.role_arn, which KubeStash has no use for.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/backup:1.0.0
+  # executionScope omitted -> component: renders once per attached component.
+
+  # The store's render is read below, to find the namespace of a store running
+  # in the cluster, so the attachment renders once every component in the
+  # build has rendered rather than right after its own host.
+  readsTargetRenderFacts: true
+
+  assertions:
+    # infra.role_arn names the IAM role AWS Backup assumes. KubeStash's backup
+    # jobs sign with the key pair in the Secret the BackupStorage names and
+    # assume no role an attachment names, so the role would reach no emitted
+    # byte; the build halts on it rather than ignoring it.
+    role_arn_refused: >-
+      {{- with toString (optional .infra "role_arn" "") -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.role_arn to %q, the IAM role AWS Backup assumes, and this attachment is bound to helm/backup-kubestash, which backs up through KubeStash: its backup jobs sign with the key pair in the Secret the BackupStorage names and assume no role an attachment names; remove infra.role_arn from the attachment, or bind a FeatureRecipe realizing core/backup through AWS Backup" $.metadata.feature_instance $.metadata.instance_id .) -}}
+      {{- end -}}
+
+  # One file holding the BackupStorage, the RetentionPolicy and the
+  # BackupConfiguration and, for a volume, the repository claim.
+  #
+  # What is backed up. KubeStash backs up one workload per BackupConfiguration
+  # through its workload addon, whose backup task copies the paths it is given
+  # from the volumes of the workload it mounts into its backup job: the volume
+  # mounts the BackupConfiguration lists, by the workload's own volume names
+  # and mount paths. Those are read from the component's render, as the helm
+  # provider reports each pod template's volumes, a StatefulSet's claim
+  # templates and each container's volume mounts. The target is the one
+  # Deployment, StatefulSet or DaemonSet — the workloads KubeStash's workload
+  # addon backs up — whose containers mount a persistent volume: a volume of
+  # type persistentVolumeClaim, or one of a StatefulSet's claim templates. A
+  # component rendering none halts, since there is nothing here to back up;
+  # that is the shape of a component realized by a Recipe that renders only a
+  # custom resource, whose pods and claims a controller creates in the
+  # cluster later — a CloudNativePG cluster, for one — so the halt names the
+  # realization of core/backup through that controller to bind instead. Two
+  # such workloads halt, since a BackupConfiguration targets one. The backup
+  # copies the one mount path of that persistent volume, leaving out its
+  # lost+found directory, as KubeStash's own examples write it; KubeStash
+  # documents the task's paths with one path only, so a workload mounting
+  # persistent volumes at two paths halts, naming them, rather than being
+  # written a form KubeStash does not document. KubeStash takes a Deployment's
+  # backup from one of its pods, a StatefulSet's from every pod and a
+  # DaemonSet's from the pod on every node.
+  #
+  # Where it is written. KubeStash requires the BackupConfiguration in the
+  # namespace of the workload it backs up, so the three resources and the
+  # claim are written into the namespace the workload is emitted into, or into
+  # no namespace where it is emitted into none, leaving them to the applying
+  # tool. The BackupStorage and the RetentionPolicy can be used from that
+  # namespace alone. Nothing in the build checks that KubeStash is deployed:
+  # applied to a cluster without KubeStash's custom-resource definitions, the
+  # resources are refused by the cluster, and with the definitions but no
+  # running operator, they sit unread.
+  #
+  # The name. The host's rendered name and the attachment name, folded to
+  # hyphens, names the three resources, the repository and, on a volume, the
+  # claim; where the Recipe realizing the component reports no rendered name,
+  # its identity stands in, and an identity that is not a name Kubernetes
+  # takes halts, naming it.
+  #
+  # Where the backups go. A BackupConfiguration here writes to one
+  # repository: in the bucket the store connection points at, or on a volume.
+  # An attachment wiring a store and setting infra.volume halts on the
+  # Feature's own one_destination assertion before this file renders, so
+  # either the store or the volume decides the BackupStorage below. An
+  # attachment with neither halts, naming both ways to fix it.
+  #
+  # The volume. KubeStash mounts the volume a BackupStorage names into each of
+  # its jobs that reads or writes the repository, as a volume of that job's
+  # own pod, and a pod mounts only a claim of its own namespace; KubeStash
+  # creates no claim. So this realization writes the repository claim beside
+  # the BackupStorage, under its name, in the component's namespace, where
+  # both the backup jobs and the BackupStorage's own jobs run:
+  # infra.volume.size is its requested storage, a Kubernetes quantity such as
+  # 50Gi, and a value the cluster would refuse halts here by name instead of
+  # at apply time; infra.volume.storage_class is the class it is provisioned
+  # from, and unset, the claim names none and the cluster's default class
+  # provisions it. A claim must name an access mode, so it is written
+  # ReadWriteOnce, the mode every provisioning class offers. It is mounted at
+  # /kubestash-repository, outside the paths the backup copies. KubeStash
+  # starts the BackupStorage's own jobs as user 65534, so their pod is given
+  # the group 65534 as its file-system group, as KubeStash's own example of a
+  # claim backend writes it, for the claim to be writable by them.
+  #
+  # One node at a time. A ReadWriteOnce claim is mounted on one node at a
+  # time, and a backup job runs on the node of the pod whose volume it copies.
+  # So the BackupStorage's own jobs, which first mount the repository claim,
+  # run under a required pod affinity placing them on a node running the
+  # component's pods, the node the backup jobs run on, and a volume on a
+  # component whose target is a DaemonSet, whose pods run on every node, halts,
+  # naming it. A datastore whose pods are spread over several nodes leaves the
+  # jobs on the other nodes waiting on the claim; where its pods run is
+  # decided in the cluster, not in the build.
+  #
+  # The store. The attachment's store connection is the one connection on the
+  # store socket that a core/backup attachment declared. A component carries
+  # every such connection of every core/backup attachment on it, under the
+  # Feature's name rather than the attachment's, so one attachment cannot tell
+  # its own from another's; a component carrying a second core/backup
+  # attachment therefore halts while any of them wires a store. Two store
+  # connections on one attachment halt, since a BackupConfiguration here
+  # writes to one repository. A store publishing no S3 API — protocol other
+  # than s3, or no endpoint, as core/storage/gcs publishes — halts, and so
+  # does an endpoint that is not a scheme and a host with an optional port:
+  # KubeStash takes the URL of the S3 server, written with its scheme, and
+  # the bucket apart from it. This store handling is the one the other
+  # realizations of core/backup carry, repeated in each, since a template
+  # expression has no catalog kind to be shared from.
+  #
+  # The store's address. A store running in the cluster publishes the bare
+  # name of its Service, which resolves only inside its own namespace, while
+  # the backup jobs run beside the component. Where the store's render emitted
+  # a Service of that name, the address is qualified with the namespace the
+  # Service is emitted into; a store whose Service is emitted into no namespace
+  # halts, since its address cannot be qualified. A store outside the cluster —
+  # a managed bucket — is reached at its endpoint as published. The region the
+  # store publishes, where it publishes one, is written as the bucket's region.
+  #
+  # The repository. The BackupStorage keeps its repositories under the prefix
+  # <namespace>/<name>, or <name> where no namespace is written, so two
+  # components, or two Releases sharing a bucket, never write into one
+  # another's repository; on a volume the claim is the attachment's own and
+  # takes no prefix.
+  #
+  # The key and the password. The store connection carries no credential: a
+  # consumer of the store holds the key it presents. KubeStash reads a
+  # bucket's key pair from the Secret its BackupStorage names, under the data
+  # keys it fixes, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, and the
+  # BackupStorage names the Secret infra.credentials_secret names or, where it
+  # is unset, one named after the BackupConfiguration. restic encrypts the
+  # repository with a password every job must present, on a bucket or a volume
+  # alike, which KubeStash reads under RESTIC_PASSWORD from the Secret a
+  # repository names as its encryption secret; core/backup declares no input
+  # for it, so the repository names the same Secret. A Secret holding no such
+  # key leaves every backup failing, and the repository is readable only with
+  # that password. On a volume no key pair is read, and the Secret
+  # infra.credentials_secret names still holds the password, so the key is
+  # honoured there too rather than refused. KubeStash reads both from the
+  # component's namespace, so the Secret must be there and not in the store's.
+  # The Secret is the cluster's to hold; nothing in the build checks it.
+  #
+  # When and how long. infra.schedule is the backup session's schedule, a cron
+  # expression of five fields, which KubeStash writes into a Kubernetes
+  # CronJob, read in the time zone of the cluster's CronJob controller; unset,
+  # it is 0 3 * * *. KubeStash's RetentionPolicy keeps backups by age: with
+  # its maximum retention period written as infra.retention_days days, it
+  # removes every backup older than that, whatever the schedule, on a bucket
+  # and on a volume alike. No count of backups to keep is written.
+  #
+  # The jobs' user. KubeStash starts each backup job from the backup session's
+  # job template, whose pod security context it writes into the job's pod.
+  # infra.run_as_user and infra.run_as_group are written there, as runAsUser
+  # and runAsGroup, and on a volume also into the security context of the
+  # BackupStorage's own jobs, which write the repository's first files on the
+  # claim; either may be set alone, and 0, root, is a value like any other.
+  # Unset, no user or group is written and the jobs run as KubeStash's images
+  # say. Running the jobs as the datastore's own user is what lets the backup
+  # read files only that user may read.
+  #
+  # Every string value is written through toJson, so a value that reads as a
+  # number or a boolean stays a string, the user and group IDs and the
+  # file-system group are written as the integers Kubernetes takes, and every
+  # map is written in key order, so identical input renders identical bytes.
+  artifacts:
+    backup.yaml: |
+      {{- $attName := .attachment_name }}
+      {{- $att := .attachment_name | replace "_" "-" }}
+      {{- $host := .context.instance_id }}
+      {{- $vol := optional .infra "volume" dict }}
+
+      {{- /* This attachment's store connection. */}}
+      {{- $stores := list }}
+      {{- range $alias, $edge := .context.uses }}
+        {{- if and (eq (toString $edge.socket) "store") (eq (toString (default "" $edge.origin_feature)) "core/backup") }}
+          {{- $stores = append $stores (dict "alias" $alias "edge" $edge) }}
+        {{- end }}
+      {{- end }}
+      {{- $backups := list }}
+      {{- range $n, $f := (default dict .features) }}
+        {{- if eq (toString (get $f "type")) "core/backup" }}
+          {{- $backups = append $backups (printf "%q" $n) }}
+        {{- end }}
+      {{- end }}
+      {{- if and (gt (len $backups) 1) $stores }}
+        {{- fail (printf "core/backup attachment %q on %q: %q carries %d core/backup attachments (%s), and each one's store connection reaches every one of them under the Feature's name, so this attachment cannot tell which store is its own; attach core/backup to %q once when it is backed up through KubeStash" $attName $host $host (len $backups) (join ", " $backups) $host) }}
+      {{- end }}
+      {{- if and (not $stores) (not $vol) }}
+        {{- fail (printf "core/backup attachment %q on %q has no store connection and sets no infra.volume, so it names nowhere for KubeStash's restic repository to go; wire the attachment's store connection to the bucket the backups go to, under uses.store on the attachment in the Release, or set infra.volume on the attachment, with its size, to keep the repository on a volume claim written beside the KubeStash BackupStorage" $attName $host) }}
+      {{- end }}
+      {{- if gt (len $stores) 1 }}
+        {{- $aliases := list }}
+        {{- range $stores }}{{ $aliases = append $aliases (printf "%q" .alias) }}{{ end }}
+        {{- fail (printf "core/backup attachment %q on %q wires %d store connections (%s), and a KubeStash BackupConfiguration written here writes to one repository; keep one" $attName $host (len $stores) (join ", " $aliases)) }}
+      {{- end }}
+      {{- $bucket := "" }}
+      {{- $endpoint := "" }}
+      {{- $region := "" }}
+      {{- if $stores }}
+      {{- $store := index $stores 0 }}
+      {{- $edge := $store.edge }}
+      {{- $sp := default dict $edge.provides }}
+      {{- $bucket = toString (default "" (get $sp "bucket")) }}
+      {{- $endpoint = toString (default "" (get $sp "endpoint")) }}
+      {{- $region = toString (default "" (get $sp "region")) }}
+      {{- $storeHost := toString (default "" (get $sp "host")) }}
+      {{- if or (ne (toString (default "" (get $sp "protocol"))) "s3") (not $endpoint) (not $bucket) }}
+        {{- fail (printf "core/backup attachment %q on %q: its store connection %q reaches %q, which publishes no bucket at an S3 API endpoint, and this realization writes KubeStash's repository to a bucket over the S3 API; wire the store connection to a store published over the S3 API, such as core/storage/s3-object-store" $attName $host $store.alias $edge.target) }}
+      {{- end }}
+      {{- if not (regexMatch "^https?://[^/?#@]+/?$" $endpoint) }}
+        {{- fail (printf "core/backup attachment %q on %q: the store %q publishes the endpoint %q, and KubeStash takes the URL of the S3 server, a scheme and a host with an optional port, with the bucket apart from it, so this realization reaches only an endpoint made of http or https, a host and an optional port, with no path; wire the store connection to a store publishing such an endpoint" $attName $host $edge.target $endpoint) }}
+      {{- end }}
+
+      {{- /* A store running in the cluster: qualify its Service name with the namespace it is emitted into. */}}
+      {{- range (default (list) (get (default (dict) $edge.render_facts) "service_selectors")) }}
+        {{- if and $storeHost (eq (toString (get . "name")) $storeHost) }}
+          {{- $sns := toString (optional . "namespace" "") }}
+          {{- if not $sns }}
+            {{- fail (printf "core/backup attachment %q on %q: the store %q runs in the cluster behind the Service %q, which is emitted into no namespace, and the backup jobs, running beside the component, reach a Service in another namespace only by a name qualified with that namespace; set aggrega.ai/namespace for %q, or on its boundary, in the Release" $attName $host $edge.target $storeHost $edge.target) }}
+          {{- end }}
+          {{- if not (contains (printf "://%s" $storeHost) $endpoint) }}
+            {{- fail (printf "core/backup attachment %q on %q: the store %q publishes the endpoint %q, which does not name its Service %q, so the address the backup jobs reach cannot be qualified with the Service's namespace; wire the store connection to a store whose endpoint names the host it publishes" $attName $host $edge.target $endpoint $storeHost) }}
+          {{- end }}
+          {{- $endpoint = replace (printf "://%s" $storeHost) (printf "://%s.%s" $storeHost $sns) $endpoint }}
+        {{- end }}
+      {{- end }}
+      {{- $endpoint = trimSuffix "/" $endpoint }}
+      {{- end }}
+
+      {{- /* The volume, where no store is wired: the repository claim's size and class. */}}
+      {{- $size := "" }}
+      {{- $class := "" }}
+      {{- if not $stores }}
+        {{- $size = toString (get $vol "size") }}
+        {{- $class = toString (optional $vol "storage_class" "") }}
+        {{- if not (regexMatch `^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$` $size) }}
+          {{- fail (printf "core/backup attachment %q on %q sets infra.volume.size to %q, and the repository claim this realization writes for KubeStash takes its size as a Kubernetes quantity, such as 50Gi or 500Mi; set infra.volume.size to one" $attName $host $size) }}
+        {{- end }}
+      {{- end }}
+
+      {{- /* The target: the one Deployment, StatefulSet or DaemonSet whose containers mount a persistent volume, and its mount paths. */}}
+      {{- $facts := default dict (optional .context "render_facts" dict) }}
+      {{- $targets := list }}
+      {{- range (default (list) (get $facts "pod_template_volumes")) }}
+        {{- $kind := toString (get . "kind") }}
+        {{- if not (has $kind (list "Deployment" "StatefulSet" "DaemonSet")) }}
+          {{- continue }}
+        {{- end }}
+        {{- $persistent := dict }}
+        {{- range (default (list) (optional . "volumes" list)) }}
+          {{- if eq (toString (optional . "type" "")) "persistentVolumeClaim" }}
+            {{- $_ := set $persistent (toString (optional . "name" "")) true }}
+          {{- end }}
+        {{- end }}
+        {{- range (default (list) (optional . "volume_claim_templates" list)) }}
+          {{- $_ := set $persistent (toString .) true }}
+        {{- end }}
+        {{- $mounts := list }}
+        {{- $seenPath := dict }}
+        {{- range (default (list) (optional . "containers" list)) }}
+          {{- range (default (list) (optional . "volume_mounts" list)) }}
+            {{- $mname := toString (optional . "name" "") }}
+            {{- $mpath := toString (optional . "mount_path" "") }}
+            {{- if and (hasKey $persistent $mname) $mpath (not (hasKey $seenPath $mpath)) }}
+              {{- $_ := set $seenPath $mpath true }}
+              {{- $mounts = append $mounts (dict "name" $mname "mount_path" $mpath "sub_path" (toString (optional . "sub_path" ""))) }}
+            {{- end }}
+          {{- end }}
+        {{- end }}
+        {{- if $mounts }}
+          {{- $targets = append $targets (dict "kind" $kind "name" (toString (optional . "name" "")) "namespace" (toString (optional . "namespace" "")) "mounts" $mounts) }}
+        {{- end }}
+      {{- end }}
+      {{- if not $targets }}
+        {{- fail (printf "core/backup attachment %q on %q: %q renders no Deployment, StatefulSet or DaemonSet whose containers mount a persistent volume, so KubeStash has no workload volume here to back up; where its pods are created later by a controller reconciling what it renders, such as a CloudNativePG cluster, bind the FeatureRecipe realizing core/backup through that controller for this attachment in the Manifest, such as helm/backup-cloudnative-pg, or realize %q with a Recipe whose own render emits its workloads" $attName $host $host $host) }}
+      {{- end }}
+      {{- if gt (len $targets) 1 }}
+        {{- $tq := list }}
+        {{- range $targets }}{{ $tq = append $tq (printf "%s %q" .kind .name) }}{{ end }}
+        {{- fail (printf "core/backup attachment %q on %q: %q renders %d workloads mounting a persistent volume (%s), and a KubeStash BackupConfiguration backs up one workload; realize %q with a Recipe rendering one such workload, or bind another realization of core/backup for this attachment in the Manifest" $attName $host $host (len $targets) (join ", " $tq) $host) }}
+      {{- end }}
+      {{- $target := index $targets 0 }}
+      {{- if gt (len $target.mounts) 1 }}
+        {{- $pq := list }}
+        {{- range $target.mounts }}{{ $pq = append $pq (printf "%q" .mount_path) }}{{ end }}
+        {{- fail (printf "core/backup attachment %q on %q: the %s %q that %q renders mounts persistent volumes at %d paths (%s), and KubeStash documents the paths its workload backup copies with one path only, so this realization backs up a workload mounting its persistent volume at one path; realize %q with a Recipe whose workload mounts one, or bind another realization of core/backup for this attachment in the Manifest" $attName $host $target.kind $target.name $host (len $target.mounts) (join ", " $pq) $host) }}
+      {{- end }}
+      {{- $mount := index $target.mounts 0 }}
+      {{- $ns := $target.namespace }}
+      {{- if and (not $stores) (eq $target.kind "DaemonSet") }}
+        {{- fail (printf "core/backup attachment %q on %q keeps its backups on the volume infra.volume sizes, and %q backs up the DaemonSet %q, whose pods run on every node: KubeStash starts one backup job on each node, and the one-node repository claim this realization writes can be mounted on one node at a time, so the other jobs would wait for it; wire the attachment's store connection to a bucket in place of infra.volume" $attName $host $host $target.name) }}
+      {{- end }}
+
+      {{- /* The labels the target's pods carry, for the affinity of the BackupStorage's own jobs. */}}
+      {{- $podLabels := dict }}
+      {{- range (default (list) (get $facts "controller_selectors")) }}
+        {{- if and (eq (toString (get . "kind")) $target.kind) (eq (toString (optional . "name" "")) $target.name) (eq (toString (optional . "namespace" "")) $ns) }}
+          {{- $podLabels = optional . "match_labels" dict }}
+        {{- end }}
+      {{- end }}
+      {{- if and (not $stores) (not $podLabels) }}
+        {{- fail (printf "core/backup attachment %q on %q: the %s %q that %q renders writes no matchLabels selector, so the jobs that first mount the repository claim cannot be placed beside its pods; realize %q with a Recipe whose workloads write a controller selector, or wire the attachment's store connection to a bucket in place of infra.volume" $attName $host $target.kind $target.name $host $host) }}
+      {{- end }}
+
+      {{- /* The name: the host's rendered name, or its identity where its provider reports none and the identity is a name Kubernetes takes. */}}
+      {{- $hostName := toString (optional .context "rendered_name" "") }}
+      {{- if not $hostName }}
+        {{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $host) }}
+          {{- fail (printf "core/backup attachment %q on %q: the Recipe realizing %q reports no rendered name for it, and its identity %q is not a name Kubernetes takes, so the backup configuration cannot be named after it; realize %q with a Recipe that supplies a chart or a workload, or give the component a name of lowercase letters, digits and hyphens" $attName $host $host $host $host) }}
+        {{- end }}
+        {{- $hostName = $host }}
+      {{- end }}
+      {{- $name := printf "%s-%s" $hostName $att }}
+
+      {{- $schedule := trim (toString (optional .infra "schedule" "")) }}
+      {{- $schedule = default "0 3 * * *" $schedule }}
+      {{- $days := int .infra.retention_days }}
+      {{- $prefix := $name }}
+      {{- if $ns }}{{- $prefix = printf "%s/%s" $ns $name }}{{- end }}
+      {{- /* The user and group the jobs run as; -1 stands for unset, since 0, root, is a value. */}}
+      {{- $runUser := int64 (optional .infra "run_as_user" -1) }}
+      {{- $runGroup := int64 (optional .infra "run_as_group" -1) }}
+      {{- $secret := default $name (toString (optional .infra "credentials_secret" "")) -}}
+      apiVersion: storage.kubestash.com/v1alpha1
+      kind: BackupStorage
+      metadata:
+        name: {{ toJson $name }}
+        {{- with $ns }}
+        namespace: {{ toJson . }}
+        {{- end }}
+      spec:
+        storage:
+          {{- if $stores }}
+          provider: "s3"
+          s3:
+            endpoint: {{ toJson $endpoint }}
+            bucket: {{ toJson $bucket }}
+            prefix: {{ toJson $prefix }}
+            {{- with $region }}
+            region: {{ toJson . }}
+            {{- end }}
+            secretName: {{ toJson $secret }}
+          {{- else }}
+          provider: "local"
+          local:
+            mountPath: "/kubestash-repository"
+            persistentVolumeClaim:
+              claimName: {{ toJson $name }}
+          {{- end }}
+        usagePolicy:
+          allowedNamespaces:
+            from: "Same"
+        {{- if not $stores }}
+        runtimeSettings:
+          pod:
+            securityContext:
+              fsGroup: 65534
+              {{- if ge $runUser 0 }}
+              runAsUser: {{ $runUser }}
+              {{- end }}
+              {{- if ge $runGroup 0 }}
+              runAsGroup: {{ $runGroup }}
+              {{- end }}
+            affinity:
+              podAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchLabels:
+                        {{- range $k, $v := $podLabels }}
+                        {{ toJson $k }}: {{ toJson $v }}
+                        {{- end }}
+                    topologyKey: "kubernetes.io/hostname"
+        {{- end }}
+      ---
+      apiVersion: storage.kubestash.com/v1alpha1
+      kind: RetentionPolicy
+      metadata:
+        name: {{ toJson $name }}
+        {{- with $ns }}
+        namespace: {{ toJson . }}
+        {{- end }}
+      spec:
+        maxRetentionPeriod: {{ toJson (printf "%dd" $days) }}
+        usagePolicy:
+          allowedNamespaces:
+            from: "Same"
+      ---
+      apiVersion: core.kubestash.com/v1alpha1
+      kind: BackupConfiguration
+      metadata:
+        name: {{ toJson $name }}
+        {{- with $ns }}
+        namespace: {{ toJson . }}
+        {{- end }}
+      spec:
+        target:
+          apiGroup: "apps"
+          kind: {{ toJson $target.kind }}
+          name: {{ toJson $target.name }}
+          {{- with $ns }}
+          namespace: {{ toJson . }}
+          {{- end }}
+        backends:
+          - name: "storage"
+            storageRef:
+              name: {{ toJson $name }}
+              {{- with $ns }}
+              namespace: {{ toJson . }}
+              {{- end }}
+            retentionPolicy:
+              name: {{ toJson $name }}
+              {{- with $ns }}
+              namespace: {{ toJson . }}
+              {{- end }}
+        sessions:
+          - name: "backup"
+            scheduler:
+              schedule: {{ toJson $schedule }}
+              jobTemplate: {}
+            repositories:
+              - name: {{ toJson $name }}
+                backend: "storage"
+                directory: {{ toJson (printf "/%s" $name) }}
+                encryptionSecret:
+                  name: {{ toJson $secret }}
+                  {{- with $ns }}
+                  namespace: {{ toJson . }}
+                  {{- end }}
+            addon:
+              name: "workload-addon"
+              tasks:
+                - name: "logical-backup"
+                  targetVolumes:
+                    volumeMounts:
+                      - name: {{ toJson $mount.name }}
+                        mountPath: {{ toJson $mount.mount_path }}
+                        {{- with $mount.sub_path }}
+                        subPath: {{ toJson . }}
+                        {{- end }}
+                  params:
+                    paths: {{ toJson $mount.mount_path }}
+                    exclude: {{ toJson (printf "%s/lost+found" (trimSuffix "/" $mount.mount_path)) }}
+              {{- if or (ge $runUser 0) (ge $runGroup 0) }}
+              jobTemplate:
+                spec:
+                  securityContext:
+                    {{- if ge $runUser 0 }}
+                    runAsUser: {{ $runUser }}
+                    {{- end }}
+                    {{- if ge $runGroup 0 }}
+                    runAsGroup: {{ $runGroup }}
+                    {{- end }}
+              {{- end }}
+      {{- if not $stores }}
+      ---
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: {{ toJson $name }}
+        {{- with $ns }}
+        namespace: {{ toJson . }}
+        {{- end }}
+      spec:
+        accessModes:
+          - "ReadWriteOnce"
+        resources:
+          requests:
+            storage: {{ toJson $size }}
+        {{- with $class }}
+        storageClassName: {{ toJson . }}
+        {{- end }}
+      {{- end }}
