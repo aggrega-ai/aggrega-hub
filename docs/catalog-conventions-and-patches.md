@@ -3693,10 +3693,16 @@ note above.
 
 **A user must never change component to turn on persistence, high availability,
 active-passive or backup.** A datastore with persistence enabled is still that
-datastore. These capabilities are configurable values on the single component's
-surface, realized per target by whatever mechanism that target has: a chart's HA
-options, an operator custom resource's HA spec, a cloud provider's multi-AZ flag,
-or a synthesized StatefulSet with a PersistentVolumeClaim. Splitting a component
+datastore. Persistence, high availability and active-passive are configurable
+values on the single component's surface, realized per target by whatever
+mechanism that target has: a chart's HA options, an operator custom resource's HA
+spec, a cloud provider's multi-AZ flag, or a synthesized StatefulSet with a
+PersistentVolumeClaim. Backup is the `core/backup` attachment rather than a value
+on the component: the operator attaches it to the same component in the Release,
+and each target realizes it its own way — a managed Recipe configures the
+service's own automated backups from it, bound to `terraform/backup-native` or
+`cloudformation/backup-native`, and keeps them on with none attached; on
+Kubernetes the backup product the Manifest binds realizes it. Splitting a component
 or recipe family by stateful-ness is an antipattern — it doubles the catalog and
 forces the Aggregate's topology to be re-authored to change an operational setting.
 
@@ -3911,12 +3917,12 @@ copying whichever sibling happens to be nearest.
   Aggregate renders unchanged: the logical `database`, `user` (or `app_user` where
   an application-role split applies), `encoding` / `locale`, `init_scripts` (an
   object whose values are strings), and `custom_config` for a raw configuration
-  block. Plus the persistence, HA and backup toggles as configurable knobs, per the
-  rule above, wherever the engine has them.
+  block. Plus the persistence and HA toggles as configurable knobs, per the rule
+  above, wherever the engine has them; backup is the `core/backup` attachment, not
+  a knob.
 - **`infra`** — `port`, `engine_version`, `compute.{cpu,memory}`, and for stateful
-  engines `storage.{size,type}`; `ha.{enabled,read_replicas}`;
-  `backup.{enabled,retention_days}`; and `overrides` as the open bag for the
-  operational side. **`storage.{size,type}` is scoped to the targets that have a
+  engines `storage.{size,type}`; `ha.{enabled,read_replicas}`; and `overrides`
+  as the open bag for the operational side. **`storage.{size,type}` is scoped to the targets that have a
   volume-size concept — the `compose` realization creates the volume and honors
   neither number, which is one of this template's two named exceptions to the knob
   rule, not a silent drop.** **The other is `compute.{cpu,memory}` on a managed
@@ -3974,8 +3980,10 @@ copying whichever sibling happens to be nearest.
   and a headless Service for stateful engines), compose for local development, and
   the managed cloud equivalents where one exists — on AWS, RDS, ElastiCache and
   Amazon OpenSearch Service; on Google Cloud, Cloud SQL and Memorystore; on Azure,
-  Azure Database for PostgreSQL flexible server — with HA and backup honored
-  there through the provider's native flags rather than re-implemented.
+  Azure Database for PostgreSQL flexible server — with HA honored there through
+  the provider's native flags rather than re-implemented, and, on the managed
+  databases (RDS, Cloud SQL, the flexible server), an attached `core/backup`
+  configuring the service's own automated backups.
   `recipe/helm/mariadb` runs one server, so it halts on `ha.enabled` and on a
   non-zero `ha.read_replicas` by name, naming `recipe/helm/mariadb-cluster`, rather
   than rendering one instance under them. `recipe/helm/mariadb-cluster` honours
@@ -4865,10 +4873,13 @@ sizes in the Release.
 - **observability** — ServiceMonitor and PodMonitor, OpenTelemetry collector or
   sidecar, dashboards
 - **backup** — a datastore backed up on a schedule, `core/backup`: a managed
-  database service's own automated backup, an AWS Backup plan and selection
-  run under the IAM role `infra.role_arn` names, or the resource a backup
-  product reconciles — a Velero Schedule, a K8up Schedule, a CloudNativePG
-  ScheduledBackup, a mariadb-operator Backup. Where a backup goes is always
+  database service's own automated backup, which the database's own Recipe
+  configures from an attachment bound to `terraform/backup-native` or
+  `cloudformation/backup-native`; an AWS Backup plan and selection run under
+  the IAM role `infra.role_arn` names, beside which an Amazon RDS instance keeps
+  its own automated backups unless `infra.keep_automated_backups` is false; or
+  the resource a backup product reconciles — a Velero Schedule, a K8up
+  Schedule, a CloudNativePG ScheduledBackup, a mariadb-operator Backup. Where a backup goes is always
   written: the `store` connection sends it to a bucket, and `infra.volume`
   (`size`, and `storage_class`, the cluster's default where it is unset) to a
   disk volume in the cluster, for a product that can keep backups there. An
@@ -4881,7 +4892,7 @@ sizes in the Release.
   against losing the cluster. `infra.run_as_user` and `infra.run_as_group` set
   the user and group a product's own backup jobs run as, written into the
   jobs' security context by a realization that starts them, such as K8up's,
-  and refused by name by every other
+  and refused by name by every other realization
 - **on-demand runs** — a task held until someone starts it: a suspended
   CronJob, a Compose service behind a profile, an Amazon ECS task definition
   a RunTask call starts
