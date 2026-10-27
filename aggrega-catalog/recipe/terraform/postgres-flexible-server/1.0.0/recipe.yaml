@@ -37,8 +37,8 @@ metadata:
     files carry no password; with nothing attached, or another credential, the
     build halts naming the slot. host publishes a reference to the server's
     FQDN, or infra.overrides.host; port is 5432. Init scripts, a configuration
-    file, replicas, another port, a disk type, backups off and a storage size
-    the service does not offer halt naming the key; compute is not read,
+    file, replicas, another port, a disk type and a storage size the
+    service does not offer halt naming the key; compute is not read,
     because infra.overrides.sku_name sizes the server.
   maintainers:
     - name: Massimiliano Ferrero
@@ -94,6 +94,11 @@ spec:
     # empty while it gives none. Only a string is read here; any other value is
     # refused by the assertion below rather than published.
     operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # The FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Azure Database for PostgreSQL flexible server automated backups"
 
   # This Recipe reads from infra.overrides:
   #   resource_group_name   - string (resource_group_name), required
@@ -158,15 +163,14 @@ spec:
   #     13 to 18, which the service creates new servers on);
   #     infra.storage.size, as the server's Premium SSD storage, one of the
   #     sizes the provider takes; infra.ha.enabled, as zone-redundant high
-  #     availability; infra.backup.retention_days, 7 to 35 days; and the
-  #     overrides above.
+  #     availability; a core/backup attachment, as the comment above the
+  #     mapping says; and the overrides above.
   #   refused — values.init_scripts; values.custom_config; values.user where
   #     the provider refuses it as the login; infra.port other than 5432;
   #     infra.storage.type, since the module provisions Premium SSD and takes
   #     no disk type; infra.ha.enabled on a Burstable SKU;
-  #     infra.ha.read_replicas above zero; infra.backup.enabled false, since
-  #     the service backs up every server; a retention outside 7 to 35; an
-  #     attachment to app_user_password; and a password as set out below.
+  #     infra.ha.read_replicas above zero; an attachment to
+  #     app_user_password; and a password as set out below.
   #   not read — infra.port while it is 5432; infra.compute.cpu and
   #     infra.compute.memory, whose Component defaults would size a container:
   #     the service sizes the server by infra.overrides.sku_name, and a Recipe
@@ -263,7 +267,7 @@ spec:
       {{- with optional .infra.storage "type" "" -}}
       {{- fail (printf "infra.storage.type is %q, and the module this Recipe sources provisions the flexible server's storage as Premium SSD and takes no disk type: remove infra.storage.type from the Release" .) -}}
       {{- end -}}
-    ha_replicas_backup: >-
+    ha_replicas: >-
       {{- if and .infra.ha.enabled (hasPrefix "B_" .locals.sku) -}}
       {{- fail (printf "infra.ha.enabled is true, and infra.overrides.sku_name is %s, a Burstable SKU, which Azure Database for PostgreSQL flexible server gives no zone-redundant high availability: set infra.overrides.sku_name to a General Purpose or Memory Optimized SKU, such as GP_Standard_D2ds_v5, or infra.ha.enabled to false" .locals.sku) -}}
       {{- end -}}
@@ -272,13 +276,6 @@ spec:
       {{- end -}}
       {{- if gt (int .infra.ha.read_replicas) 0 -}}
       {{- fail (printf "infra.ha.read_replicas is %v, and this Recipe provisions the one server a call of the module creates; a read replica is a server of its own: set infra.ha.read_replicas to 0" .infra.ha.read_replicas) -}}
-      {{- end -}}
-      {{- if not .infra.backup.enabled -}}
-      {{- fail "infra.backup.enabled is false, and Azure Database for PostgreSQL flexible server backs up every server and keeps the backups 7 to 35 days: set infra.backup.enabled to true, or remove it from the Release" -}}
-      {{- end -}}
-      {{- $r := int .infra.backup.retention_days -}}
-      {{- if or (lt $r 7) (gt $r 35) -}}
-      {{- fail (printf "infra.backup.retention_days is %d, and Azure Database for PostgreSQL flexible server keeps backups 7 to 35 days, which this Recipe sets from it: set infra.backup.retention_days to a number in that range" $r) -}}
       {{- end -}}
     # The service runs no initialisation scripts and reads no configuration
     # file of the reader's; its server settings are server parameters. The
@@ -351,7 +348,49 @@ spec:
   # The administrator's password is the attachment's module output joined with
   # a dot and wrapped in an interpolation, as terraform/random-password
   # publishes it.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside. Azure Database for
+  # PostgreSQL flexible server backs up every server, once a day at a time it
+  # chooses, and keeps the backups 7 to 35 days, so no setting turns them off
+  # and no time reaches them:
+  #   - With none attached, the server keeps its backups 7 days.
+  #   - An attachment carrying no infra.role_arn, bound to
+  #     terraform/backup-native, sets backup_retention_days from
+  #     infra.retention_days, 7 to 35, and a value outside it halts naming
+  #     the attachment; infra.schedule halts naming it, since the service
+  #     takes no backup time.
+  #   - An attachment carrying infra.role_arn is AWS Backup's, whose
+  #     realizations refuse a host that is no Amazon RDS instance; this
+  #     Recipe configures nothing from it.
+  #   - Two attachments carrying no infra.role_arn halt naming both: a
+  #     server runs one automated backup.
+  # A Recipe's locals cannot read its attachments, so the reading sits at the
+  # top of the mapping below.
   valuesMapping: |
+    {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
+    {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}
+    {{- range $name, $attachment := (default dict .features) -}}
+    {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
+    {{- $in := default dict (optional $attachment "infra" dict) -}}
+    {{- if not (trim (toString (optional $in "role_arn" ""))) -}}
+    {{- if $backupNative -}}
+    {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Azure Database for PostgreSQL flexible server, which runs one automated backup on a server: remove one of the two" $backupNative $name $.context.instance_id) -}}
+    {{- end -}}
+    {{- $backupNative = $name -}}{{- $backupNativeInfra = $in -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $backupRetention := 7 -}}
+    {{- if $backupNative -}}
+    {{- with trim (toString (optional $backupNativeInfra "schedule" "")) -}}
+    {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Azure Database for PostgreSQL flexible server backs up every server once a day at a time it chooses, which no setting moves: remove infra.schedule from the attachment" $backupNative $.context.instance_id .) -}}
+    {{- end -}}
+    {{- $backupRetention = int (optional $backupNativeInfra "retention_days" 7) -}}
+    {{- if or (lt $backupRetention 7) (gt $backupRetention 35) -}}
+    {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and Azure Database for PostgreSQL flexible server keeps backups 7 to 35 days, which this Recipe sets from it: set infra.retention_days to a number in that range" $backupNative .context.instance_id $backupRetention) -}}
+    {{- end -}}
+    {{- end -}}
     {{- $prov := optional (default dict .features).password "provides" dict }}
     {{- if not (and (kindIs "map" $prov) (optional $prov "name" "") (optional $prov "key" "")) }}
     {{- fail (printf "the password slot of %q is filled by an attachment that publishes no module output, and the administrator's password is handed to the flexible server as a reference to one: bind core/random-password to terraform/random-password in the Manifest" .context.instance_id) }}
@@ -375,7 +414,7 @@ spec:
     {{- else }}
     high_availability: null
     {{- end }}
-    backup_retention_days: {{ .infra.backup.retention_days }}
+    backup_retention_days: {{ $backupRetention }}
     {{- with optional $o "zone" "" }}
     zone: "{{ . }}"
     {{- end }}

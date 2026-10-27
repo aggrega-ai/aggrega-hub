@@ -104,6 +104,11 @@ spec:
     # empty while it gives none. Only a string is read here; any other value is
     # refused by the assertion below rather than published.
     operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # The FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Cloud SQL automated backups"
 
   # This Recipe reads from infra.overrides:
   #   project_id          - string (project_id), required
@@ -151,14 +156,11 @@ spec:
   #     infra.storage.type, as the disk type, PD_SSD, PD_HDD or
   #     HYPERDISK_BALANCED, PD_SSD when unset; infra.ha.enabled, as the
   #     REGIONAL availability type; infra.ha.read_replicas, as read replicas
-  #     beside the instance; infra.backup.enabled, with binary logging;
-  #     infra.backup.retention_days, as the number of daily automated backups
-  #     kept; and the overrides above.
+  #     beside the instance; a core/backup attachment, as the comment above
+  #     the mapping says; and the overrides above.
   #   refused — values.init_scripts; values.custom_config; infra.port other
-  #     than 3306, the Component's default; infra.ha.enabled or read replicas
-  #     with backups off; a retention outside 2 to 365; an edition, tier and
-  #     disk type the service does not combine; and a password as set out
-  #     below.
+  #     than 3306, the Component's default; an edition, tier and disk type the
+  #     service does not combine; and a password as set out below.
   #   not read — infra.port while it is 3306; infra.compute.cpu and
   #     infra.compute.memory, whose Component defaults would size a container:
   #     Cloud SQL sizes the instance by infra.overrides.tier, and a Recipe
@@ -256,24 +258,14 @@ spec:
       {{- if and (eq $t "HYPERDISK_BALANCED") (or (hasPrefix "db-custom-" $tier) (hasPrefix "db-n1-" $tier) (has $tier (list "db-f1-micro" "db-g1-small"))) -}}
       {{- fail (printf "infra.storage.type is HYPERDISK_BALANCED, and the tier %s belongs to the general-purpose shared or dedicated core series, which Cloud SQL gives SSD or HDD storage: set infra.storage.type to PD_SSD or PD_HDD, or infra.overrides.tier to a C4, C4A or N4 machine type" $tier) -}}
       {{- end -}}
-    ha_backup_replicas: >-
-      {{- $b := .infra.backup -}}
-      {{- if and .infra.ha.enabled (not $b.enabled) -}}
-      {{- fail "infra.ha.enabled is true, and Cloud SQL makes an instance highly available only with automated backups and binary logging on, while infra.backup.enabled is false: set infra.backup.enabled to true, or infra.ha.enabled to false" -}}
-      {{- end -}}
+    # The module places each read replica in the zone it is given. Backups are
+    # always on here, which high availability and read replicas need, as the
+    # comment above the mapping says.
+    read_replicas_zone: >-
       {{- $n := int .infra.ha.read_replicas -}}
       {{- if gt $n 0 -}}
-      {{- if not $b.enabled -}}
-      {{- fail (printf "infra.ha.read_replicas is %d, and Cloud SQL creates a read replica only of an instance with automated backups and binary logging on, while infra.backup.enabled is false: set infra.backup.enabled to true, or infra.ha.read_replicas to 0" $n) -}}
-      {{- end -}}
       {{- if not (optional (optional .infra "overrides" dict) "zone" "") -}}
       {{- fail (printf "infra.ha.read_replicas is %d, and the module this Recipe sources places each read replica in a zone it is given and derives the replica's region from it: set infra.overrides.zone in the Release to a zone of infra.overrides.region, such as europe-west1-b" $n) -}}
-      {{- end -}}
-      {{- end -}}
-      {{- if $b.enabled -}}
-      {{- $r := int $b.retention_days -}}
-      {{- if or (lt $r 2) (gt $r 365) -}}
-      {{- fail (printf "infra.backup.retention_days is %d, and this Recipe keeps that many daily automated backups, which Cloud SQL takes from 1 to 365, and one day fewer of binary logs, which it takes from 1 day, since the module it sources keeps more backups than days of logs: set infra.backup.retention_days to a number from 2 to 365, or infra.backup.enabled to false" $r) -}}
       {{- end -}}
       {{- end -}}
     # Cloud SQL creates the database through its own API and runs no
@@ -341,20 +333,75 @@ spec:
   # the module's own default turns a public IPv4 address on, so ipv4_enabled is
   # passed false.
   #
-  # Backups on turn on binary logging too, which high availability and read
-  # replicas both need, keep infra.backup.retention_days automated backups,
-  # counted, and keep one day fewer of binary logs, up to the seven days
-  # Enterprise edition allows: the module refuses a configuration keeping as
-  # many days of logs as backups. Each read replica entry names every field the
-  # module reads from it, since an unset field of the entry reaches the module
-  # as null rather than as the instance's own value: the instance's tier,
-  # edition, disk and network, in infra.overrides.zone.
+  # Each read replica entry names every field the module reads from it, since
+  # an unset field of the entry reaches the module as null rather than as the
+  # instance's own value: the instance's tier, edition, disk and network, in
+  # infra.overrides.zone.
   #
   # Each password is the attachment's module output joined with a dot and
   # wrapped in an interpolation, as terraform/random-password publishes it;
   # with no such attachment on user_password the input is left out, and the
   # module draws one.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside, and kept as the
+  # instance's own automated backups, which this Recipe sets through the
+  # module's backup_configuration:
+  #   - Backups are always on, with binary logging: Cloud SQL makes an
+  #     instance highly available, and creates a read replica of it, only
+  #     with both on, so infra.ha and read replicas always have the backups
+  #     they need, and no setting turns them off.
+  #   - With none attached, Cloud SQL keeps 7 automated backups, one taken
+  #     each day, starting at a time it chooses.
+  #   - An attachment carrying no infra.role_arn, bound to
+  #     terraform/backup-native, configures them.
+  #     infra.retention_days is retained_backups, the number of daily
+  #     backups kept, 2 to 365: Cloud SQL keeps 1 to 365, and one day fewer
+  #     of binary logs is kept beside them, up to the seven days Enterprise
+  #     edition allows, since the module refuses as many days of logs as
+  #     backups; a value outside it halts naming the attachment.
+  #     infra.schedule, where set, must name one minute and one hour of
+  #     every day, such as 30 2 * * *: Cloud SQL takes one automated backup
+  #     a day and starts it within the four hours after a start time it
+  #     reads in UTC, so that time becomes start_time, 02:30 here; any other
+  #     expression halts naming it. Unset, Cloud SQL chooses the time.
+  #   - An attachment carrying infra.role_arn is AWS Backup's, whose
+  #     realizations refuse a host that is no Amazon RDS instance; this
+  #     Recipe configures nothing from it.
+  #   - Two attachments carrying no infra.role_arn halt naming both: an
+  #     instance runs one automated backup.
+  # A Recipe's locals cannot read its attachments, so the reading sits at the
+  # top of the mapping below, and terraform/postgres-cloud-sql and
+  # terraform/mysql-cloud-sql declare it word for word: a change to it is
+  # made to both.
   valuesMapping: |
+    {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
+    {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}
+    {{- range $name, $attachment := (default dict .features) -}}
+    {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
+    {{- $in := default dict (optional $attachment "infra" dict) -}}
+    {{- if not (trim (toString (optional $in "role_arn" ""))) -}}
+    {{- if $backupNative -}}
+    {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Cloud SQL, which runs one automated backup on an instance: remove one of the two" $backupNative $name $.context.instance_id) -}}
+    {{- end -}}
+    {{- $backupNative = $name -}}{{- $backupNativeInfra = $in -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $backupRetention := 7 -}}{{- $backupStart := "" -}}
+    {{- if $backupNative -}}
+    {{- $backupRetention = int (optional $backupNativeInfra "retention_days" 7) -}}
+    {{- with trim (toString (optional $backupNativeInfra "schedule" "")) -}}
+    {{- $f := regexSplit `\s+` . -1 -}}
+    {{- if not (and (eq (len $f) 5) (regexMatch `^[0-9]{1,2}$` (index $f 0)) (regexMatch `^[0-9]{1,2}$` (index $f 1)) (lt (atoi (index $f 0)) 60) (lt (atoi (index $f 1)) 24) (has (index $f 2) (list "*" "?")) (has (index $f 3) (list "*" "?")) (has (index $f 4) (list "*" "?"))) -}}
+    {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Cloud SQL takes one automated backup a day, starting within four hours of a time of day it reads in UTC: write a schedule naming one minute and one hour of every day, such as 30 2 * * *, or remove infra.schedule to let Cloud SQL choose the time" $backupNative $.context.instance_id .) -}}
+    {{- end -}}
+    {{- $backupStart = printf "%02d:%02d" (atoi (index $f 1)) (atoi (index $f 0)) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if or (lt $backupRetention 2) (gt $backupRetention 365) -}}
+    {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and this Recipe keeps that many daily automated backups, which Cloud SQL takes from 1 to 365, and one day fewer of binary logs, which it takes from 1 day, since the module it sources keeps more backups than days of logs: set infra.retention_days to a number from 2 to 365" $backupNative .context.instance_id $backupRetention) -}}
+    {{- end -}}
     project_id: "{{ .infra.overrides.project_id }}"
     region: "{{ .infra.overrides.region }}"
     name: "{{ .context.instance_id }}"
@@ -401,13 +448,14 @@ spec:
       allocated_ip_range: "{{ . }}"
       {{- end }}
     backup_configuration:
-      enabled: {{ .infra.backup.enabled }}
-      binary_log_enabled: {{ .infra.backup.enabled }}
-      {{- if .infra.backup.enabled }}
-      retained_backups: {{ .infra.backup.retention_days }}
-      retention_unit: "COUNT"
-      transaction_log_retention_days: "{{ min 7 (sub (int .infra.backup.retention_days) 1) }}"
+      enabled: true
+      binary_log_enabled: true
+      {{- if $backupStart }}
+      start_time: "{{ $backupStart }}"
       {{- end }}
+      retained_backups: {{ $backupRetention }}
+      retention_unit: "COUNT"
+      transaction_log_retention_days: "{{ min 7 (sub $backupRetention 1) }}"
     {{- $n := int .infra.ha.read_replicas }}
     {{- if gt $n 0 }}
     read_replicas:
