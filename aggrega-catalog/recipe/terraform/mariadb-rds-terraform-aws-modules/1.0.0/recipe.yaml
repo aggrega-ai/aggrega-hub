@@ -82,6 +82,11 @@ spec:
     # empty while it gives none. Only a string is read here; any other value is
     # refused by the assertion below rather than published.
     operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # The FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Amazon RDS automated backups"
 
   # This Recipe reads from infra.overrides:
   #   instance_class      - string (instance_class; default "db.t3.small")
@@ -113,9 +118,9 @@ spec:
   #     character_set_server and collation_server parameters of the parameter
   #     group the module creates; a Release naming parameter_group leaves them
   #     to that group), infra.port, infra.engine_version, infra.storage.size,
-  #     infra.storage.type (gp3 when unset), infra.ha.enabled,
-  #     infra.backup.enabled (no automated backups and no final snapshot when
-  #     false), infra.backup.retention_days, and the overrides above.
+  #     infra.storage.type (gp3 when unset), infra.ha.enabled, a core/backup
+  #     attachment, as the comment above the mapping says, and the overrides
+  #     above.
   #   refused — values.user, values.init_scripts, values.custom_config,
   #     infra.ha.read_replicas above zero, and an infra.engine_version that
   #     names no minor version.
@@ -204,7 +209,74 @@ spec:
   #
   # infra.storage.type is the RDS storage type here, not a storage class; the
   # Component declares no default for it, so this mapping supplies gp3.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside, and kept as the
+  # instance's own automated backups, which this Recipe sets through the
+  # module inputs backup_retention_period and backup_window:
+  #   - With none attached, RDS keeps automated backups for 7 days, in a
+  #     window it chooses.
+  #   - An attachment carrying no infra.role_arn, bound to
+  #     terraform/backup-native, configures them. infra.retention_days is
+  #     backup_retention_period, 1 to 35 days, the range RDS keeps, and a value
+  #     outside it halts naming the attachment. infra.schedule, where set,
+  #     must name one minute and one hour of every day, such as 30 2 * * *:
+  #     RDS takes one automated backup a day, in a window it reads in UTC, so
+  #     that time opens backup_window, 30 minutes long, the shortest
+  #     window RDS takes, 02:30-03:00 here; any other expression halts
+  #     naming it. Unset, RDS chooses the window.
+  #   - An attachment carrying infra.role_arn is AWS Backup's, which backs the
+  #     instance up on a schedule of its own. The instance keeps its
+  #     automated backups beside it as with none attached, unless that
+  #     attachment sets infra.keep_automated_backups to false, which sets the
+  #     retention to zero, turning them off, and skips the final snapshot.
+  #   - Two attachments carrying no infra.role_arn, or one beside an AWS
+  #     Backup attachment setting infra.keep_automated_backups to false, halt
+  #     naming both: an instance runs one automated backup.
+  # A Recipe's locals cannot read its attachments, so the reading sits at the
+  # top of the template below, and every RDS Recipe of this catalog, on
+  # terraform and CloudFormation, declares it word for word: a change to it
+  # is made to each of them.
   valuesMapping: |
+    {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
+    {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}{{- $backupKeepOn := "" -}}{{- $backupKeepOff := "" -}}
+    {{- range $name, $attachment := (default dict .features) -}}
+    {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
+    {{- $in := default dict (optional $attachment "infra" dict) -}}
+    {{- if trim (toString (optional $in "role_arn" "")) -}}
+    {{- if hasKey $in "keep_automated_backups" -}}
+    {{- if $in.keep_automated_backups }}{{ $backupKeepOn = $name }}{{ else }}{{ $backupKeepOff = $name }}{{ end -}}
+    {{- end -}}
+    {{- else if $backupNative -}}
+    {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Amazon RDS, which runs one automated backup on an instance: remove one of the two, or bind one to AWS Backup in the Manifest" $backupNative $name $.context.instance_id) -}}
+    {{- else -}}
+    {{- $backupNative = $name -}}{{- $backupNativeInfra = $in -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if and $backupNative $backupKeepOff -}}
+    {{- fail (printf "core/backup attachment %q on %q has Amazon RDS keep automated backups of the instance, and core/backup attachment %q sets infra.keep_automated_backups to false, turning them off: remove one of the two attachments, or infra.keep_automated_backups" $backupNative .context.instance_id $backupKeepOff) -}}
+    {{- end -}}
+    {{- if and $backupKeepOn $backupKeepOff -}}
+    {{- fail (printf "core/backup attachments %q and %q on %q set infra.keep_automated_backups to true and to false, and the instance either keeps its automated backups or does not: set the option on one of the two" $backupKeepOn $backupKeepOff .context.instance_id) -}}
+    {{- end -}}
+    {{- $backupRetention := 7 -}}{{- $backupWindow := "" -}}
+    {{- if $backupKeepOff }}{{ $backupRetention = 0 }}{{ end -}}
+    {{- if $backupNative -}}
+    {{- $backupRetention = int (optional $backupNativeInfra "retention_days" 7) -}}
+    {{- if or (lt $backupRetention 1) (gt $backupRetention 35) -}}
+    {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and Amazon RDS keeps automated backups for 1 to 35 days: set infra.retention_days to 35 or fewer, or bind the attachment to AWS Backup in the Manifest, which keeps backups longer" $backupNative .context.instance_id $backupRetention) -}}
+    {{- end -}}
+    {{- with trim (toString (optional $backupNativeInfra "schedule" "")) -}}
+    {{- $f := regexSplit `\s+` . -1 -}}
+    {{- if not (and (eq (len $f) 5) (regexMatch `^[0-9]{1,2}$` (index $f 0)) (regexMatch `^[0-9]{1,2}$` (index $f 1)) (lt (atoi (index $f 0)) 60) (lt (atoi (index $f 1)) 24) (has (index $f 2) (list "*" "?")) (has (index $f 3) (list "*" "?")) (has (index $f 4) (list "*" "?"))) -}}
+    {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Amazon RDS takes one automated backup a day, in a window opening at a time of day it reads in UTC: write a schedule naming one minute and one hour of every day, such as 30 2 * * *, or remove infra.schedule to let RDS choose the time" $backupNative $.context.instance_id .) -}}
+    {{- end -}}
+    {{- $start := add (mul (atoi (index $f 1)) 60) (atoi (index $f 0)) -}}
+    {{- $end := mod (add $start 30) 1440 -}}
+    {{- $backupWindow = printf "%02d:%02d-%02d:%02d" (div $start 60) (mod $start 60) (div $end 60) (mod $end 60) -}}
+    {{- end -}}
+    {{- end -}}
     identifier: "{{ .context.instance_id }}"
     engine: "mariadb"
     engine_version: "{{ .infra.engine_version }}"
@@ -218,8 +290,11 @@ spec:
     manage_master_user_password: true
     port: "{{ .infra.port }}"
     multi_az: {{ optional .infra.overrides "multi_az" .infra.ha.enabled }}
-    backup_retention_period: {{ if .infra.backup.enabled }}{{ .infra.backup.retention_days }}{{ else }}0{{ end }}
-    skip_final_snapshot: {{ not .infra.backup.enabled }}
+    backup_retention_period: {{ $backupRetention }}
+    {{- if $backupWindow }}
+    backup_window: "{{ $backupWindow }}"
+    {{- end }}
+    skip_final_snapshot: {{ not $backupRetention }}
     create_db_subnet_group: false
     db_subnet_group_name: "{{ .infra.overrides.subnet_group }}"
     {{- with optional .infra.overrides "parameter_group" "" }}

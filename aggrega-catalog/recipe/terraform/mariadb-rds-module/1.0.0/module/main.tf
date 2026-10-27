@@ -27,8 +27,9 @@ resource "aws_db_instance" "this" {
   db_subnet_group_name = var.subnet_id
 
   # A retention of zero turns automated backups off, and the caller then skips
-  # the final snapshot as well.
+  # the final snapshot as well. A null window leaves RDS to choose one.
   backup_retention_period = var.backup_retention_period
+  backup_window           = var.backup_window
   skip_final_snapshot     = var.skip_final_snapshot
 
   db_name  = var.db_name

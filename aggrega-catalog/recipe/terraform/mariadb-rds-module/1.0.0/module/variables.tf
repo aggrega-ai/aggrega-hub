@@ -28,6 +28,12 @@ variable "backup_retention_period" {
   description = "Days of automated backups to keep, zero for none; supplied by the caller."
 }
 
+variable "backup_window" {
+  type        = string
+  default     = null
+  description = "Daily window automated backups start in, hh24:mi-hh24:mi in UTC, such as 02:30-03:00; null leaves RDS to choose it."
+}
+
 variable "skip_final_snapshot" {
   type        = bool
   description = "Whether deleting the instance skips its final snapshot; supplied by the caller."
