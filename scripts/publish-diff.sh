@@ -47,11 +47,31 @@
 # never opens a browser and refuses to sign when no token source is present.
 # --key selects offline keyed signing, which needs no token.
 #
+# Concurrency. The pushes, the published-version checks before them and the
+# signatures after them each spend most of their time waiting on a registry, so a
+# run may do several at once: --push-jobs N runs up to N pushes at once and hands
+# the guard the same bound for its checks, --sign-jobs N passes `--jobs N` to
+# `aggrega sign` so it signs up to N references of the batch at once, and --jobs N
+# sets both, each of the other two overriding it. Each is a whole number of at
+# least 1, and both default to 1, which is a run one entity at a time. At any bound
+# the run prints and records what a run one at a time would: each push's output
+# whole and in selection order, its standard error before its standard output; the
+# references signed, the --record-out rows and every PUSH FAILED line in selection
+# order; the same summary, sign command and marker decision; and a failed push does
+# not stop the others. A sign bound of 1 adds nothing to the sign command, so it is
+# the command a run with no bound prints and runs. Each concurrent push fetches into
+# a workspace of its own in this run's temporary directory, because two fetches of
+# one source into one workspace's artifact cache at once can read each other's
+# partly written copy; so a run using a workspace it did not make — one
+# AGGREGA_WORKSPACE_ROOT names, or one its folders are in — pushes one at a time,
+# and says so once. Running more than one at once needs bash 5.1 or later.
+#
 # Usage:
 #   ./publish-diff.sh [--registry <host:port>] [--catalog <dir>]
 #                     [--marker <tag>] [--full] [--yes] [--dry-run] [--no-advance]
 #                     [--sign [--key <path>] [--identity-token <token>]]
 #                     [--record-out <file>]
+#                     [--jobs <n>] [--push-jobs <n>] [--sign-jobs <n>]
 #
 # Modes:
 #   (default)     differential — publish entities changed since the marker.
@@ -84,14 +104,40 @@ KEY=""
 IDTOKEN=""
 YES=""
 RECORD_OUT=""
+JOBS=""
+PUSH_JOBS=""
+SIGN_JOBS=""
 AGGREGA="${AGGREGA_BIN:-aggrega}"
 
 usage() {
-  echo "usage: $0 [--registry <host:port>] [--catalog <dir>] [--marker <tag>] [--full] [--yes] [--dry-run] [--no-advance] [--sign [--key <path>] [--identity-token <token>]] [--record-out <file>]" >&2
+  echo "usage: $0 [--registry <host:port>] [--catalog <dir>] [--marker <tag>] [--full] [--yes] [--dry-run] [--no-advance] [--sign [--key <path>] [--identity-token <token>]] [--record-out <file>] [--jobs <n>] [--push-jobs <n>] [--sign-jobs <n>]" >&2
+  echo "  --jobs sets both bounds, --push-jobs and --sign-jobs each override it; each is a whole number of at least 1, default 1 (one at a time)." >&2
+}
+
+# shellcheck source=lib/bounded-jobs.sh
+. "$DIR/lib/bounded-jobs.sh" || exit 1
+
+# bound_arg OPTION [VALUE] — prints VALUE when it is a bound (a whole number of at
+# least 1), and otherwise refuses the run, before anything is read or pushed.
+bound_arg() {
+  if [ "$#" -lt 2 ]; then
+    echo "publish-diff: $1 needs a value: a whole number of at least 1" >&2
+    usage
+    exit 2
+  fi
+  if ! bounded_jobs_bound_ok "$2"; then
+    echo "publish-diff: $1 takes a whole number of at least 1, not '$2'" >&2
+    usage
+    exit 2
+  fi
+  printf '%s\n' "$2"
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --jobs)           JOBS="$(bound_arg "$@")" || exit 2; shift 2 ;;
+    --push-jobs)      PUSH_JOBS="$(bound_arg "$@")" || exit 2; shift 2 ;;
+    --sign-jobs)      SIGN_JOBS="$(bound_arg "$@")" || exit 2; shift 2 ;;
     --registry)       REGISTRY="$2"; shift 2 ;;
     --catalog)        CATALOG="$2";  shift 2 ;;
     --marker)         MARKER="$2";   shift 2 ;;
@@ -108,6 +154,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Each override wins over --jobs; with neither, the bound is 1.
+PUSH_JOBS="${PUSH_JOBS:-${JOBS:-1}}"
+SIGN_JOBS="${SIGN_JOBS:-${JOBS:-1}}"
+if [ "$PUSH_JOBS" -gt 1 ] && ! bounded_jobs_concurrency_available; then
+  echo "publish-diff: more than one push at once needs bash 5.1 or later, and this is bash $BASH_VERSION; run with a push bound of 1" >&2
+  exit 2
+fi
+
 [ -d "$CATALOG" ] || { echo "publish-diff: catalog dir not found: $CATALOG" >&2; exit 1; }
 
 # --- The workspace every aggrega call below uses ------------------------------
@@ -122,8 +176,20 @@ done
 RUN_TMP="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/publish-diff.XXXXXX")" ||
   { echo "publish-diff: cannot make a temporary directory" >&2; exit 1; }
 trap 'rm -rf "$RUN_TMP"' EXIT
+GIVEN_WORKSPACE="${AGGREGA_WORKSPACE_ROOT:-}"
 scratch_workspace_root "$RUN_TMP" "$PWD" "$HUB_ROOT" ||
   { echo "publish-diff: cannot make a scratch workspace in $RUN_TMP" >&2; exit 1; }
+
+# Concurrent pushes each fetch into a workspace of their own (see Concurrency, at
+# the top), which this run can give them only when the workspace is one it made.
+NAMED_SCRATCH=""
+if [ -z "$GIVEN_WORKSPACE" ] && [ -n "${AGGREGA_WORKSPACE_ROOT:-}" ]; then
+  NAMED_SCRATCH=1
+fi
+if [ "$PUSH_JOBS" -gt 1 ] && [ -z "$NAMED_SCRATCH" ]; then
+  echo "publish-diff: pushes run one at a time, not $PUSH_JOBS at once: this run uses a workspace it did not make, and two fetches of one source into one workspace's artifact cache at once can read each other's partly written copy. With AGGREGA_WORKSPACE_ROOT unset, a run started outside any workspace on a checkout outside any workspace gives each concurrent push a workspace of its own." >&2
+  PUSH_JOBS=1
+fi
 
 # --- The entity kinds this publisher pushes -----------------------------------
 # Read from the binary that does the pushing, through the one reader every script
@@ -260,8 +326,17 @@ done
 # published branch, offline; the committed switch decides whether a version changed
 # in place is a warning or a refusal. A refusal stops the run here, with nothing
 # pushed, signed or marked.
+#
+# The guard checks at the push bound. When this run made the scratch workspace and
+# checks more than one entity at once, the guard is handed no workspace, so it
+# makes its own scratch one and gives each concurrent check a workspace of its own
+# exactly as the pushes below get theirs; at a bound of 1 it shares this run's.
 if [ "${#ENTITIES[@]}" -gt 0 ]; then
-  if ! AGGREGA_BIN="$AGGREGA" "$DIR/published-version-guard.sh" --files "${ENTITIES[@]}"; then
+  guard_env=(AGGREGA_BIN="$AGGREGA")
+  if [ "$PUSH_JOBS" -gt 1 ]; then
+    guard_env=(-u AGGREGA_WORKSPACE_ROOT "${guard_env[@]}")
+  fi
+  if ! env "${guard_env[@]}" "$DIR/published-version-guard.sh" --jobs "$PUSH_JOBS" --files "${ENTITIES[@]}"; then
     echo "publish-diff: the published-version guard refused this run (above); nothing was pushed." >&2
     exit 1
   fi
@@ -276,14 +351,39 @@ if [ -n "$RECORD_OUT" ]; then
 fi
 
 # --- Push loop ---------------------------------------------------------------
+# Up to PUSH_JOBS pushes run at once (scripts/lib/bounded-jobs.sh), and each one's
+# result is read back in selection order, so everything below is derived as a loop
+# over the entities one at a time would derive it.
 pushed=0; failed=0
 REFS=()
-for f in ${ENTITIES[@]+"${ENTITIES[@]}"}; do
-  # Capture stdout to recover the resolved reference, then echo it so the push
-  # output is still visible. The `if` guards the command substitution against
-  # set -e while testing push's exit status.
-  if out="$("$AGGREGA" push "$f" --registry "$REGISTRY" $DRYRUN)"; then
-    printf '%s\n' "$out"
+PUSH_DIR="$RUN_TMP/push"
+mkdir "$PUSH_DIR" || { echo "publish-diff: cannot make a directory in $RUN_TMP" >&2; exit 1; }
+
+# push_one INDEX FILE — pushes one entity. Above a push bound of 1 it fetches into
+# a workspace of its own, removed when the push ends.
+push_one() {
+  if [ "$PUSH_JOBS" -gt 1 ]; then
+    AGGREGA_WORKSPACE_ROOT="$PUSH_DIR/workspace-$1"
+    mkdir "$AGGREGA_WORKSPACE_ROOT" ||
+      { echo "publish-diff: cannot make a workspace for $2 in $PUSH_DIR" >&2; return 1; }
+    export AGGREGA_WORKSPACE_ROOT
+  fi
+  local rc=0
+  "$AGGREGA" push "$2" --registry "$REGISTRY" $DRYRUN || rc=$?
+  if [ "$PUSH_JOBS" -gt 1 ]; then
+    rm -rf "$AGGREGA_WORKSPACE_ROOT"
+  fi
+  return "$rc"
+}
+
+# push_read INDEX FILE STATUS OUTFILE — prints one push's output and counts it.
+# The output is read as a command substitution reads it, so it is printed exactly
+# as a push captured and echoed in place would print it.
+push_read() {
+  local out
+  out="$(cat "$4")"
+  printf '%s\n' "$out"
+  if [ "$3" -eq 0 ]; then
     pushed=$((pushed + 1))
     ref="$(printf '%s\n' "$out" | extract_reference)"
     [ -n "$ref" ] && REFS+=("$ref")
@@ -291,11 +391,13 @@ for f in ${ENTITIES[@]+"${ENTITIES[@]}"}; do
       printf '%s\n' "$out" | published_rows_from_push >>"$RECORD_OUT"
     fi
   else
-    printf '%s\n' "$out"
-    echo "publish-diff: PUSH FAILED: $f" >&2
+    echo "publish-diff: PUSH FAILED: $2" >&2
     failed=$((failed + 1))
   fi
-done
+  return 0
+}
+
+bounded_jobs "$PUSH_JOBS" "$PUSH_DIR" push_one push_read ${ENTITIES[@]+"${ENTITIES[@]}"}
 
 if [ "$MODE" = "full" ]; then
   echo "publish-diff: full reconcile: $pushed pushed, $failed failed -> $REGISTRY"
@@ -304,6 +406,13 @@ else
 fi
 
 # --- Sign (opt-in) -----------------------------------------------------------
+# The sign bound reaches `aggrega sign` as its own --jobs, and only above 1: at 1
+# the command is the one a run with no bound runs, and the one a binary whose sign
+# takes no bound accepts.
+SIGN_BOUND=()
+if [ "$SIGN_JOBS" -gt 1 ]; then
+  SIGN_BOUND=(--jobs "$SIGN_JOBS")
+fi
 sign_failed=0
 if [ -n "$SIGN" ]; then
   if [ "${#REFS[@]}" -eq 0 ]; then
@@ -313,13 +422,14 @@ if [ -n "$SIGN" ]; then
     # nothing. No network or OIDC contact occurs in dry-run.
     printf 'publish-diff: --sign --dry-run: would run:\n '
     printf ' %q' "$AGGREGA" sign
+    [ "$SIGN_JOBS" -gt 1 ] && printf ' %q %q' "${SIGN_BOUND[@]}"
     [ -n "$KEY" ]     && printf ' %q %q' --key "$KEY"
     [ -n "$IDTOKEN" ] && printf ' %q %q' --identity-token '<redacted>'
     printf ' %q' "${REFS[@]}"
     printf '\n'
   elif [ -n "$KEY" ]; then
     # Offline keyed signing needs no identity token.
-    if "$AGGREGA" sign --key "$KEY" "${REFS[@]}"; then
+    if "$AGGREGA" sign ${SIGN_BOUND[@]+"${SIGN_BOUND[@]}"} --key "$KEY" "${REFS[@]}"; then
       echo "publish-diff: signed ${#REFS[@]} reference(s) with key -> $REGISTRY"
     else
       echo "publish-diff: SIGN FAILED" >&2
@@ -332,7 +442,7 @@ if [ -n "$SIGN" ]; then
       echo "publish-diff: --sign: no identity token; pass --identity-token or export AGGREGA_IDENTITY_TOKEN / SIGSTORE_ID_TOKEN (non-interactive signing only), or use --key for offline keyed signing" >&2
       sign_failed=1
     else
-      sign_cmd=("$AGGREGA" sign)
+      sign_cmd=("$AGGREGA" sign ${SIGN_BOUND[@]+"${SIGN_BOUND[@]}"})
       [ -n "$IDTOKEN" ] && sign_cmd+=(--identity-token "$IDTOKEN")
       sign_cmd+=("${REFS[@]}")
       if "${sign_cmd[@]}"; then

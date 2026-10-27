@@ -23,6 +23,14 @@
 # directory every published entity lives in, with every file it carries beneath it.
 # The entity is then rebuilt from the index alone in a scratch directory, so what is
 # judged is what the commit carries, never the working tree.
+#
+# SEVERAL AT ONCE, THE SAME FINDINGS. --jobs N runs up to N of the dry runs at once
+# (default 1, one at a time), because each mostly waits on start-up and on any source
+# it fetches. Every dry run's output is read back in the order the entities were
+# queued (scripts/lib/bounded-jobs.sh), so the findings, their order and the exit
+# status are the ones a run one at a time gives. Concurrent dry runs fetch into a
+# scratch workspace each, which the guard can give them only when it made the
+# scratch workspace itself; with a workspace given to it, it judges one at a time.
 
 usage() {
   # The delimiter is not a word the text uses on a line of its own.
@@ -32,15 +40,22 @@ the digest the registry holds for it, and every path the publish workflows own t
 what they published.
 
 USAGE
-  scripts/published-version-guard.sh --staged
-  scripts/published-version-guard.sh --files ENTITY-FILE...
+  scripts/published-version-guard.sh [--jobs N] --staged
+  scripts/published-version-guard.sh [--jobs N] --files ENTITY-FILE...
   scripts/published-version-guard.sh -h | --help
 
   --staged   judge the commit being made, as the index holds it. The pre-commit
              hook runs this form.
   --files    judge the entity documents named, as they are on disk. The catalog
              publisher runs this form over the entities it is about to push,
-             before it pushes any.
+             before it pushes any, with its push bound as --jobs.
+  --jobs N   judge up to N entities at once, N a whole number of at least 1;
+             default 1, one at a time. At any bound the findings are the ones a
+             run one at a time gives, in the same order. Above 1 each dry run
+             fetches into a workspace of its own (THE RECORD, below), so with a
+             workspace given to the guard — one AGGREGA_WORKSPACE_ROOT names, or
+             one the repository is in — it judges one at a time and says so
+             once. More than one at once needs bash 5.1 or later.
 
   It judges the repository it belongs to, wherever it is run from; relative
   paths are read from where it is run. AGGREGA_BIN names the aggrega
@@ -57,7 +72,10 @@ THE RECORD
   uses: the one AGGREGA_WORKSPACE_ROOT names, else the one aggrega finds. With
   that variable unset, a repository that is in no workspace — a checkout on its
   own — gets a scratch workspace in the run's temporary directory, removed when
-  the run exits. With no published branch fetched, nothing is
+  the run exits; with --jobs above 1 each dry run gets a scratch workspace of its
+  own there instead, because two fetches of one source into one workspace's
+  artifact cache at once can read each other's partly written copy. With no
+  published branch fetched, nothing is
   recorded and nothing is judged. A record fetched before a publish
   misses only the versions published since, which aggrega push still refuses to
   overwrite when they are published again.
@@ -108,20 +126,32 @@ EXIT CODES
 END_OF_HELP
 }
 
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 2
+# shellcheck source=lib/bounded-jobs.sh
+. "$HERE/lib/bounded-jobs.sh" || exit 2
+
 MODE=""
 ARGS=()
+JOBS=1
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h | --help) usage; exit 0 ;;
+    --jobs)
+      [ "$#" -ge 2 ] || { echo "published-version-guard: --jobs needs a value: a whole number of at least 1 (see --help)" >&2; exit 2; }
+      bounded_jobs_bound_ok "$2" || { echo "published-version-guard: --jobs takes a whole number of at least 1, not '$2' (see --help)" >&2; exit 2; }
+      JOBS="$2"; shift 2 ;;
     --staged) [ -z "$MODE" ] || { echo "published-version-guard: one of --staged or --files (see --help)" >&2; exit 2; }; MODE=staged; shift ;;
     --files) [ -z "$MODE" ] || { echo "published-version-guard: one of --staged or --files (see --help)" >&2; exit 2; }; MODE=files; shift; ARGS=("$@"); break ;;
     *) echo "published-version-guard: unknown argument '$1' (see --help)" >&2; exit 2 ;;
   esac
 done
 [ -n "$MODE" ] || { echo "published-version-guard: name --staged or --files (see --help)" >&2; exit 2; }
+if [ "$JOBS" -gt 1 ] && ! bounded_jobs_concurrency_available; then
+  echo "published-version-guard: judging more than one entity at once needs bash 5.1 or later, and this is bash $BASH_VERSION; run with --jobs 1" >&2
+  exit 2
+fi
 
 set -uo pipefail
-HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 2
 # shellcheck source=lib/published-branch.sh
 . "$HERE/lib/published-branch.sh" || exit 2
 # shellcheck source=lib/catalog-entities.sh
@@ -198,16 +228,74 @@ fi
 
 # recorded_digests PATH VERSION — the digests the record holds for the reference
 # ending in /PATH at VERSION, one a line.
+# shellcheck disable=SC2329 # called from judge, which bounded_jobs reaches by name
 recorded_digests() {
   printf '%s\n' "$ROWS" | awk -F'\t' -v p="/$1" -v v="$2" '
     $2 == v && ($1 == substr(p, 2) || (length($1) > length(p) && substr($1, length($1) - length(p) + 1) == p)) { print $3 }'
 }
 
-# judge LABEL ROOT DOC — run the dry run over DOC (relative to ROOT) and judge what
-# it prints against the record. LABEL names the entity in a finding.
+# settle_workspace — names the workspace the dry runs use
+# (scripts/lib/scratch-workspace.sh), and decides how they share it: above a bound
+# of 1, a workspace of their own each when the guard made the scratch one, and one
+# at a time, said once, when a workspace was given to it.
+JUDGE_WORKSPACES=0
+settle_workspace() {
+  local given="${AGGREGA_WORKSPACE_ROOT:-}"
+  scratch_workspace_root "$TMP" "$TOP" || broken "cannot make a scratch workspace in $TMP"
+  [ "$JOBS" -gt 1 ] || return 0
+  if [ -z "$given" ] && [ -n "${AGGREGA_WORKSPACE_ROOT:-}" ]; then
+    JUDGE_WORKSPACES=1
+  else
+    echo "published-version-guard: entities are judged one at a time, not $JOBS at once: the guard uses a workspace it did not make, and two fetches of one source into one workspace's artifact cache at once can read each other's partly written copy. With AGGREGA_WORKSPACE_ROOT unset, a repository outside any workspace gives each concurrent dry run a workspace of its own." >&2
+    JOBS=1
+  fi
+}
+
+# The entities to judge, by position: the label a finding names each by, the folder
+# its dry run runs in, and its document relative to that folder.
+JUDGE_LABEL=()
+JUDGE_ROOT=()
+JUDGE_DOC=()
+
+# judge_run INDEX — run the dry run over the entity at INDEX, its standard error
+# with its standard output. Above a bound of 1 it fetches into a workspace of its
+# own when the guard made the scratch one, removed when the dry run ends.
+# shellcheck disable=SC2329 # called by name, through bounded_jobs
+judge_run() {
+  local rc=0
+  if [ "$JUDGE_WORKSPACES" = 1 ]; then
+    AGGREGA_WORKSPACE_ROOT="$TMP/judge/workspace-$1"
+    mkdir "$AGGREGA_WORKSPACE_ROOT" || { echo "cannot make a workspace in $TMP/judge"; return 1; }
+    export AGGREGA_WORKSPACE_ROOT
+  fi
+  (cd "${JUDGE_ROOT[$1]}" && "$AGGREGA" push --dry-run --pin-sources=false --registry "$GUARD_REGISTRY" "${JUDGE_DOC[$1]}" 2>&1) || rc=$?
+  if [ "$JUDGE_WORKSPACES" = 1 ]; then
+    rm -rf "$AGGREGA_WORKSPACE_ROOT"
+  fi
+  return "$rc"
+}
+
+# judge_read INDEX ITEM STATUS OUTFILE — judge what the dry run at INDEX printed,
+# and how it exited, against the record. ITEM is INDEX again: the queue is handed
+# to bounded_jobs by position.
+# shellcheck disable=SC2329 # called by name, through bounded_jobs
+judge_read() {
+  judge "${JUDGE_LABEL[$1]}" "$3" "$(cat "$4")"
+}
+
+# judge_all — judge every entity queued in JUDGE_*, up to JOBS at once, the
+# findings added in queue order.
+judge_all() {
+  [ "${#JUDGE_LABEL[@]}" -gt 0 ] || return 0
+  mkdir -p "$TMP/judge" || broken "cannot make a scratch directory"
+  bounded_jobs "$JOBS" "$TMP/judge" judge_run judge_read "${!JUDGE_LABEL[@]}"
+}
+
+# judge LABEL RC OUT — judge what one dry run printed (OUT), and the status it
+# exited with (RC), against the record. LABEL names the entity in a finding.
+# shellcheck disable=SC2329 # called from judge_read, which bounded_jobs calls by name
 judge() {
-  local label="$1" root="$2" doc="$3" out rc=0 line reftag ref tag digest path published d
-  out="$(cd "$root" && "$AGGREGA" push --dry-run --pin-sources=false --registry "$GUARD_REGISTRY" "$doc" 2>&1)" || rc=$?
+  local label="$1" rc="$2" out="$3" line reftag ref tag digest path published d
   line="$(printf '%s\n' "$out" | awk '/^aggrega push \(dry-run\): /{ print; exit }')"
   if [ "$rc" -ne 0 ] || [ -z "$line" ]; then
     # Unjudged, and whether its version is recorded cannot be read without the
@@ -240,14 +328,17 @@ if [ -n "$ROWS" ]; then
       # The workspace the dry runs use (scripts/lib/scratch-workspace.sh), settled
       # here rather than at the top, so a run with nothing to judge never calls the
       # binary.
-      scratch_workspace_root "$TMP" "$TOP" || broken "cannot make a scratch workspace in $TMP"
+      settle_workspace
       if load_publishable_kinds Plugin; then
         for f in "${ARGS[@]}"; do
           [ -f "$f" ] || { finding "$f: not judged — no such file"; continue; }
           kind="$(peek_kind "$f")"
           is_publishable "$kind" && DOCS+=("$f")
         done
-        for f in ${DOCS[@]+"${DOCS[@]}"}; do judge "$f" "$TOP" "$f"; done
+        for f in ${DOCS[@]+"${DOCS[@]}"}; do
+          JUDGE_LABEL+=("$f"); JUDGE_ROOT+=("$TOP"); JUDGE_DOC+=("$f")
+        done
+        judge_all
       else
         finding "the entities named: not judged — the entity kinds could not be read from $AGGREGA (above)"
       fi
@@ -255,7 +346,7 @@ if [ -n "$ROWS" ]; then
   else
     mapfile -d '' -t CHANGED < <(git diff --cached --name-only -z --no-renames "$BASE" -- "$CATALOG_ROOT/")
     if [ "${#CHANGED[@]}" -gt 0 ]; then
-      scratch_workspace_root "$TMP" "$TOP" || broken "cannot make a scratch workspace in $TMP"
+      settle_workspace
       if load_publishable_kinds Plugin; then
         declare -A SEEN=()
         for f in "${CHANGED[@]}"; do
@@ -278,8 +369,9 @@ if [ -n "$ROWS" ]; then
           mkdir -p "$root" || broken "cannot make a scratch directory"
           git ls-files -z -- "$(dirname -- "$doc")/" | git checkout-index -z --stdin --prefix="$root/" ||
             broken "git cannot write the staged $(dirname -- "$doc") into a scratch directory"
-          judge "$doc" "$root" "$doc"
+          JUDGE_LABEL+=("$doc"); JUDGE_ROOT+=("$root"); JUDGE_DOC+=("$doc")
         done
+        judge_all
       else
         finding "the staged catalog changes: not judged — the entity kinds could not be read from $AGGREGA (above)"
       fi
