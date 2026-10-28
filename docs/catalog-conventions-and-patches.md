@@ -5290,8 +5290,10 @@ coordinate; the overlay carries only the bare `metadata.name` and never a
 `pluginType` of its own. The entity version is the compiler build that produced it.
 The tag-driven publishing CI regenerates and signs this set from the released
 binary, so a generated entity can never promise a capability the shipped guest
-does not provide. Each generated file carries a `generated; DO NOT EDIT` header —
-edit the overlay, then regenerate.
+does not provide. Each generated file opens with the header
+``# Generated from the plugin by `aggrega plugin gen-catalog`. You may narrow its capability lists; edit nothing else here.``
+— a capability list may be narrowed in the file itself; any other change is made
+in the overlay, then regenerated.
 
 **Reserved non-kind segments.** Two top-level segments are reserved for
 artifacts that are not catalog entities: `tools/` holds tooling container images,
