@@ -9,14 +9,15 @@ metadata:
   description: >
     Network bridge for compose, between the networks of one compose file
     (each boundary's aggrega.ai/namespace, else the file's own network). Runs
-    once per boundary attachment (executionScope: boundary), producing a
-    single nginx-stream
-    gateway named "aggrega-gw" at the boundary's evaluated assembly path. The
-    gateway's stream config and the per-consumer env rewrites are derived from
-    the boundary's cross-network uses edges (no hand-authored address): each
-    bridged edge gets a `server { listen <port>; proxy_pass <target> }` block,
-    and each consumer's host env var is rewritten to "aggrega-gw:<port>" so it
-    reaches the target across the compose network seam.
+    once per boundary attachment (executionScope: boundary) and renders one
+    nginx-stream gateway named "aggrega-gw" into the boundary's own compose
+    file. Its templates compute everything from the boundary's uses edges, so
+    no address is hand-authored: an edge is bridged when both of its ends are
+    assembled into the gateway's own file and sit on different networks there.
+    Each bridged edge gets a `server { listen <port>; proxy_pass <target> }`
+    block, the gateway joins the networks of every bridged end, and each
+    consumer's variables delivered from the target's address are rewritten to
+    reach it through the gateway.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -25,22 +26,131 @@ spec:
   implements: core/compose-bridge:1.0.0
   executionScope: boundary
 
-  # Resource Generation: load the co-located gateway fragment (the bare
-  # aggrega-gw service) and forward the boundary's cross-network uses edges to
-  # the compose provider via the x-aggrega-bridge marker. The provider derives the
-  # per-edge listen ports (target-port default; portBase collision fallback),
-  # generates the nginx stream config, mounts it into the gateway as a compose
-  # config (a top-level configs: entry referenced from the service, mounted at
-  # /etc/nginx/nginx.conf), and strips the marker. The stream config carries a
-  # resolver so each upstream resolves at connection time (no static-startup
-  # failure). The per-consumer env rewrites are produced from the same edge
-  # derivation through the boundary->component env channel, so the gateway's
-  # listen and each consumer's rewrite agree per edge. The upstream is a
-  # deterministic compile-time compose service pointer; compose runtime DNS
-  # resolves it.
+  # The bridge table, computed once for the boundary.
+  #
+  # servers holds one row per bridged edge, in the order of its consumer, its
+  # target and its socket. An edge is bridged when both ends are assembled into
+  # this attachment's own compose file and their networks differ there; an
+  # end's network identity is its aggrega.ai/namespace, else the path its
+  # output is assembled at, which is what the compose provider places it by.
+  # A row's listen port is the target's own port; where an earlier row already
+  # listens on it, the row takes the first free port at or above portBase.
+  # portBase and providesField are read from .infra as the Feature's schema
+  # resolves them, defaults included, so their defaults have one home there.
+  #
+  # rewrites holds, per consumer, the value each delivered variable takes: a
+  # variable delivered from the address field becomes "aggrega-gw:<listen>",
+  # and where the same connection also delivers a variable from `port`, the
+  # address variable becomes "aggrega-gw" and the port variable the listen port.
+  locals:
+    servers: >-
+      {{- $hostField := .infra.providesField -}}
+      {{- $portBase := int .infra.portBase -}}
+      {{- $own := .boundary.assembly_path -}}
+      {{- $byKey := dict -}}
+      {{- $keys := list -}}
+      {{- range $e := .boundary.internal_uses_edges -}}
+      {{- $srcPath := toString (get $e "source_assembly_path") -}}
+      {{- $tgtPath := toString (get $e "target_assembly_path") -}}
+      {{- $srcNet := or (toString (get $e "source_namespace")) $srcPath -}}
+      {{- $tgtNet := or (toString (get $e "target_namespace")) $tgtPath -}}
+      {{- if and (eq $srcPath $own) (eq $tgtPath $own) (ne $srcNet $tgtNet) -}}
+      {{- $key := printf "%s\x00%s\x00%s" (toString (get $e "source")) (toString (get $e "target")) (toString (get $e "socket")) -}}
+      {{- $keys = append $keys $key -}}
+      {{- $_ := set $byKey $key $e -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $keys = sortAlpha $keys -}}
+      {{- $used := dict -}}
+      {{- $rows := list -}}
+      {{- range $key := $keys -}}
+      {{- $e := get $byKey $key -}}
+      {{- $provides := get $e "provides" | default dict -}}
+      {{- $targetPort := atoi (toString (get $provides "port")) -}}
+      {{- $listen := $targetPort -}}
+      {{- if hasKey $used (toString $listen) -}}
+      {{- $listen = $portBase -}}
+      {{- range $keys -}}
+      {{- if hasKey $used (toString $listen) -}}
+      {{- $listen = add $listen 1 -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $_ := set $used (toString $listen) true -}}
+      {{- $env := get (get $e "inject" | default dict) "env" | default dict -}}
+      {{- $hostVars := list -}}
+      {{- $portVars := list -}}
+      {{- range $in, $from := $env -}}
+      {{- if eq (toString $from) $hostField -}}
+      {{- $hostVars = append $hostVars $in -}}
+      {{- else if eq (toString $from) "port" -}}
+      {{- $portVars = append $portVars $in -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $consumer := get (get $.boundary.components (toString (get $e "source"))) "instance_id" -}}
+      {{- $rows = append $rows (dict "source" (get $e "source") "target" (get $e "target") "consumer" $consumer "upstream" (printf "%s:%d" (toString (get $provides $hostField)) $targetPort) "listen" $listen "host_variables" $hostVars "port_variables" $portVars) -}}
+      {{- end -}}
+      {{- toJson $rows -}}
+    rewrites: >-
+      {{- $out := dict -}}
+      {{- range $row := fromJson .locals.servers -}}
+      {{- if $row.host_variables -}}
+      {{- $consumer := get $out $row.consumer | default dict -}}
+      {{- if $row.port_variables -}}
+      {{- range $row.host_variables -}}
+      {{- $_ := set $consumer . "aggrega-gw" -}}
+      {{- end -}}
+      {{- range $row.port_variables -}}
+      {{- $_ := set $consumer . (printf "%d" (int $row.listen)) -}}
+      {{- end -}}
+      {{- else -}}
+      {{- range $row.host_variables -}}
+      {{- $_ := set $consumer . (printf "aggrega-gw:%d" (int $row.listen)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $_ := set $out $row.consumer $consumer -}}
+      {{- end -}}
+      {{- end -}}
+      {{- toJson $out -}}
+
+  # The table is published for every consumer the boundary holds to read.
+  provides:
+    servers: "{{ .locals.servers }}"
+    rewrites: "{{ .locals.rewrites }}"
+
+  # Each consumer reads its own rows of the rewrite table and delivers them over
+  # the values its connections delivered under those names. A consumer with no
+  # row receives nothing.
+  injectMapping: >-
+    {{- $rewrites := fromJson (index .features .attachment_name).provides.rewrites -}}
+    {{- with get $rewrites .context.instance_id -}}{{ toJson . }}{{- end -}}
+
+  # Resource Generation: the co-located fragment authors the aggrega-gw service.
+  # Where any edge is bridged, the values add the gateway's nginx stream config
+  # as a top-level compose config mounted at /etc/nginx/nginx.conf, and name
+  # every bridged end under x-aggrega-networks-of, so the compose provider joins
+  # the gateway to each of those ends' networks. The config carries a resolver,
+  # so each upstream resolves when a connection arrives rather than when the
+  # gateway starts. Each `$` of an nginx variable is written `$$`, because
+  # Compose interpolates the whole file, the config's content included.
   source: "./bridge-fragment.yaml"
-  valuesMapping: |
-    x-aggrega-bridge:
-      edges: {{ .boundary.internal_uses_edges | toJson }}
-      portBase: {{ optional .infra "portBase" 10000 }}
-      providesField: {{ optional .infra "providesField" "host" }}
+  valuesMapping: |-
+    {{- $servers := fromJson .locals.servers -}}
+    {{- if $servers -}}
+    {{- $conf := "events {}\nstream {\n  resolver 127.0.0.11 valid=10s;\n" -}}
+    {{- $ends := list -}}
+    {{- range $i, $s := $servers -}}
+    {{- $conf = printf "%s  server {\n    listen %d;\n    set $u%d %s;\n    proxy_pass $u%d;\n  }\n" $conf (int $s.listen) $i $s.upstream $i -}}
+    {{- $ends = append (append $ends $s.source) $s.target -}}
+    {{- end -}}
+    {{- $conf = printf "%s}\n" $conf | replace "$" "$$" }}
+    configs:
+      aggrega-gw-nginx:
+        content: {{ toJson $conf }}
+    services:
+      aggrega-gw:
+        configs:
+          - source: aggrega-gw-nginx
+            target: /etc/nginx/nginx.conf
+        x-aggrega-networks-of: {{ toJson $ends }}
+    {{- end -}}
