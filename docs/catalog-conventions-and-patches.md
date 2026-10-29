@@ -772,8 +772,7 @@ value is `mixed`:
   Component carries no `metadata.license`, since no single identifier applies,
   and its description and each Recipe's state the terms of what each
   realization runs. `core/datastore/redis` is this case: its container
-  realizations run the Redis server under its AGPL-3.0 arm and its ElastiCache
-  realizations Redis OSS under BSD-3-Clause, both `osi-approved`, while
+  Recipes declare AGPL-3.0, an `osi-approved` licence, while
   `recipe/terraform/redis-azure-managed` provisions Azure Managed Redis, which
   Microsoft offers under its terms of service, a `proprietary` relationship. A
   reader filtering on one of the other values does not match a `mixed`
