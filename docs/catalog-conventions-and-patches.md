@@ -2364,6 +2364,25 @@ attachments:
 {{- end }}
 ```
 
+The compose Recipe reads the delivered value through `index`, as
+`{{ index .context.inject.env "DB_PASSWORD" }}`, never as the dotted path
+`.context.inject.env.DB_PASSWORD`. A credential attached under another key
+leaves that name undelivered: `index` then halts the build naming the key the
+Recipe reads, where the dotted path renders an empty password and the build
+succeeds. The same holds for a credential slot on a connection, and for a
+Recipe that renders the variable only when a value arrived: the test includes
+whether the slot is attached, so an attached slot whose value arrived under
+another key reaches the `index` read and halts instead of being skipped.
+
+A Recipe that already binds the pipe's env map, as
+`{{ $env := optional (default dict .context.inject) "env" dict }}`, reads the
+credential through that binding, `{{ index $env "DB_PASSWORD" }}`. The render
+fills an absent key a template reads by name with an empty string, and a read
+of `.context.inject.env` itself names that key; with nothing delivered on the
+env pipe, the binding then holds an empty string rather than a map, and every
+check the Recipe makes over it stops with a type error in place of its own
+message.
+
 The canonical examples are
 [`recipe/helm/postgres/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/helm/postgres/1.0.0/recipe.yaml)
 and
