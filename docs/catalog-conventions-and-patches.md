@@ -66,7 +66,7 @@ the label section below). The 15 categories:
 | `mesh` | Service meshes | server | created when the first entity lands |
 | `network` | Network primitives | server, resource | created when the first entity lands |
 | `messaging` | Event buses, queues, streams, the realtime media services that carry voice and video between participants, and the external carriers a message leaves the Release through | stateful-server, server, resource | populated |
-| `storage` | Object/file storage: a bucket reached over the S3 API (`core/storage/s3-object-store`), on Amazon S3 or Google Cloud Storage or on a SeaweedFS server the Release runs; a managed bucket reached through Google Cloud Storage's own API (`core/storage/gcs`); and the backup controllers that copy a cluster's resources, or its volumes' files, into such a bucket (`core/storage/velero`, `core/storage/k8up`) | server, resource | populated |
+| `storage` | Object/file storage: a bucket reached over the S3 API (`core/storage/s3-object-store`), on Amazon S3 or Google Cloud Storage or on a SeaweedFS server the Release runs; a managed bucket reached through Google Cloud Storage's own API (`core/storage/gcs`); the backup controllers that copy a cluster's resources, or its volumes' files, into such a bucket (`core/storage/velero`, `core/storage/k8up`, `core/storage/kubestash`, `core/storage/kasten`); and the CloudNativePG plugin through which a PostgreSQL cluster archives its write-ahead log and base backups into a bucket (`core/storage/barman-cloud-plugin`) | server, resource | populated |
 | `compute` | Generic compute primitives, plus the control planes an event-driven realization depends on | server, worker, task, function | populated |
 | `observability` | Telemetry, tracing, monitoring | varies | populated |
 | `security` | Security and compliance components | varies | populated |
@@ -3612,9 +3612,12 @@ never a silent emit. Two shapes, both explicit:
   for a cluster whose definitions are already installed and a build that must
   fetch nothing. Where a companion carries both, as the KEDA, mariadb-operator,
   MySQL Operator and Strimzi companions do, the chart realization is named
-  `-chart`; a companion realized by the project's chart alone gives that Recipe
-  the bare name, as the NIM Operator companion,
-  `core/ai-model/nvidia-nim-operator`, does with `helm/nvidia-nim-operator`.
+  `-chart`. A companion realized by the project's chart alone names that Recipe
+  `-chart` as well: the chart is fetched, and the bare name belongs to the
+  realization that stands the component up with nothing fetched, as the naming
+  of a second realization above sets out, so it stays free for a bootstrap
+  Recipe. The Velero companion, `core/storage/velero`, is realized this way by
+  `helm/velero-chart`.
   Where the emitting component reaches the controller through
   a socket, that connection is the declared prerequisite: Envoy Gateway's models
   need the AI gateway controller wired to its `extension` socket, and the build
