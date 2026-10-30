@@ -3270,8 +3270,8 @@ Per engine, the wiring the reference Recipe emits:
   material arrives from the attached credential Feature described below.
 - **terraform** — a `data` source that reads the existing resource, or input
   variables carrying its coordinates. No `resource` block — nothing is created.
-- **compose** — environment variables carrying the endpoint and credentials into
-  the consuming service. No service definition for the referenced resource.
+- **compose** — environment variables carrying the endpoint into the consuming
+  service. No service definition, so a credential filling a slot is refused.
 
 Where a reference realization names the address the Component declares as
 `infra.endpoint` with no default, so the Release supplies it, the Recipe carries a
