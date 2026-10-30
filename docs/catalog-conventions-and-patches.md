@@ -2383,6 +2383,17 @@ env pipe, the binding then holds an empty string rather than a map, and every
 check the Recipe makes over it stops with a type error in place of its own
 message.
 
+The same read serves every password slot a Recipe takes off the inject pipe,
+whatever marks the slot as a credential — a selector pinning it to the secret
+kind, or `sensitive: true` on a slot with no selector — and whether the slot is
+optional or required, transparent or Black-Box (`inject: []`); a required slot
+keeps the presence test as well. Coercing the binding through `default dict`,
+as `{{ $env := default dict (optional (default dict .context.inject) "env" dict) }}`,
+keeps it a map when nothing at all reaches the pipe — a credential that
+publishes only a locator, attached to a slot whose Recipe reads the pipe — so
+the `index` read halts naming the key there too, rather than stopping on a nil
+reference.
+
 The canonical examples are
 [`recipe/helm/postgres/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/helm/postgres/1.0.0/recipe.yaml)
 and
