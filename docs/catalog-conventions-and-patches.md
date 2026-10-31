@@ -1554,6 +1554,25 @@ numeric-looking one working. Where a template can render *nothing*, guard the wh
 line with `{{- with … }}` instead of leaving it to emit an empty quoted value: an
 empty string is a value, and an absent key is not.
 
+**A value read off the inject pipe is escaped for the quotes around it.** The Recipe
+did not write that text — a credential above all is whatever its author chose — so it
+may hold a double quote or a backslash, and inside a double-quoted scalar the first
+ends the scalar early and the second starts an escape: the build halts, or a backslash
+the author wrote is dropped without a word. Write each such read through the two
+replacements that escape both characters, reading the key from the pipe's map (bound as
+`$env` the way "A connection variable is read off the inject pipe as a map" binds it)
+with an empty fallback, so a key nothing delivered renders as empty text:
+`"{{ optional $env "KEY" "" | replace "\\" "\\\\" | replace "\"" "\\\"" }}"`. A read
+that cannot reach the replacements without a value — a strict `index`, which halts on
+an absent key, a value ranged over the pipe, a key a halt earlier in the template has
+already checked, or a variable bound from any of them — takes the same two
+replacements as it stands. A value holding neither character renders exactly as it
+did. A line break is the one character this form does not carry: YAML folds it, inside
+a double-quoted scalar, to a space, so a credential holding one is delivered with a
+space in its place. A FeatureRecipe's `injectMapping`, whose whole output is read back
+as YAML, writes the value through `toJson` instead, which carries a quote, a backslash
+and a line break alike.
+
 ### Maintainer block
 
 ```yaml
