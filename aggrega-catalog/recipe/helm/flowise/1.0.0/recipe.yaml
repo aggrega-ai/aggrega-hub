@@ -9,9 +9,10 @@ metadata:
   description: >
     The Flowise visual agent-builder on Kubernetes, rendered offline as plain
     manifests by the helm provider's Workload synthesis: a Deployment serving
-    the editor on a ClusterIP Service, backed by a persistent volume holding
-    the chatflow database and the key encrypting the editor's credentials, so
-    both survive a restart; nothing else in the container does.
+    the editor on a ClusterIP Service, backed by a persistent volume at the
+    platform's home directory holding the chatflow database and the key
+    encrypting the editor's credentials, so both survive a restart; nothing
+    outside that directory does.
 
     The model endpoint wired into the `model` socket is injected as
     OPENAI_BASE_URL and a key attached on that connection as OPENAI_API_KEY,
@@ -185,8 +186,18 @@ spec:
   # that volume and survive a restart: the chatflow database, and the
   # encryption key that protects the credentials created in the editor. The
   # platform generates that key on first start and writes it under the data
-  # path, so the key and the database whose rows it protects stay together;
-  # state written anywhere else in the container does not survive.
+  # path, so the key and the database whose rows it protects stay together.
+  # The volume is mounted at /home/node, the home directory of the user the
+  # platform's image runs as, and the data path is /home/node/.flowise, the
+  # platform's own documented data directory; whatever else the platform writes
+  # under its home directory survives with them, and state written anywhere
+  # else in the container does not.
+  #
+  # The platform's image runs as `node`, uid 1000, from Flowise 3.1.4, and as
+  # root before it. A volume the cluster's storage creates is commonly owned by
+  # root, which `node` cannot write, so the pod carries fsGroup 1000: Kubernetes
+  # then gives the volume to group 1000, the group of `node`, writable by it.
+  # An image running as root writes it either way.
   #
   # The model endpoint wired into the `model` socket is injected as
   # OPENAI_BASE_URL and a model API key attached on that connection as
@@ -370,7 +381,8 @@ spec:
     {{- end -}}
     {{- end -}}
     {{- end -}}
-    {{- $dataPath := "/app/flowise-data" -}}
+    {{- $homeDir := "/home/node" -}}
+    {{- $dataPath := printf "%s/.flowise" $homeDir -}}
     {{- $secrets := false -}}
     {{- range $alias, $edge := .context.uses -}}
     {{- $features := default dict $edge.features -}}
@@ -388,18 +400,26 @@ spec:
     kind: Workload
     form: stateless
     replicas: 1
+    # Group 1000 owns the data volume, so the `node` user the platform's image
+    # runs as can write it whatever owner the storage gives the volume.
+    podSecurityContext:
+      fsGroup: 1000
     containers:
       main:
         image: "{{ .infra.image }}"
-        # $dataPath is the single authored home for the platform's data
-        # directory. Every key that has to agree on it reads the binding — the
-        # database path, the credential-key path, and the volume mount — so a
-        # future move cannot relocate one and leave the others behind.
-        # SECRETKEY_PATH is load-bearing rather than decorative: without it the
-        # platform writes the credential encryption key it generates on first
-        # start outside the mounted volume, and each restart then mints a new key
-        # while the volume keeps the database, leaving every credential created
-        # in the editor undecryptable.
+        # $homeDir is the single authored home for where the data volume is
+        # mounted, the home directory of the platform's user, and $dataPath, the
+        # platform's data directory inside it, is derived from it. The database
+        # path and the credential-key path read $dataPath and the volume mount
+        # reads $homeDir, so a future move cannot relocate one and leave the
+        # others behind.
+        # DATABASE_PATH and SECRETKEY_PATH are load-bearing rather than
+        # decorative: without them the platform keeps the database and the
+        # credential encryption key it generates on first start under its own
+        # user's home directory, which is the mounted volume only for an image
+        # running as `node`. An image running as root would write both outside
+        # the volume, and each restart would then mint a new key, leaving every
+        # credential created in the editor undecryptable.
         # The model endpoint arrives on the `model` uses-edge; the recipe ranges
         # the outbound edges and matches on the socket name to read the published
         # endpoint.
@@ -508,7 +528,7 @@ spec:
             failureThreshold: 5
         volumeMounts:
           - name: data
-            path: "{{ $dataPath }}"
+            path: "{{ $homeDir }}"
     {{- $i := 0 }}
     {{- range $path, $_ := $files }}
           - name: inject-files
