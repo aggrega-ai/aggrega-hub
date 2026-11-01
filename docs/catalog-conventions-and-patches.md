@@ -4628,10 +4628,10 @@ LiteLLM setting describes. What it refuses and withholds is proven by running it
 at LiteLLM v1.103.1, the release the gateway's `engine_version` defaults to; at
 another release the import may fail and stop the proxy, or succeed over changed
 internals and keep less. So each of the gateway's Recipes — the workload
-synthesis and the chart Recipe, which deliver the same code from the same two
-bundles — holds the releases that code is proven at in one local of its own,
-the two lists changed together, and an assertion reading it halts the build on
-any other `engine_version`, naming them. The halt holds on every Release of
+synthesis, the chart Recipe and the Docker Compose Recipe, which deliver the
+same code from the same two bundles — holds the releases that code is proven at
+in one local of its own, the lists changed together, and an assertion reading it
+halts the build on any other `engine_version`, naming them. The halt holds on every Release of
 either Recipe, masking attached or not, because the request guard each delivers
 on every Release is code of the same kind.
 

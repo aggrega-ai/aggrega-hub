@@ -13,7 +13,8 @@ metadata:
     Recipe.
 
     GatewayConfig is one ConfigMap, named after the gateway's rendered name
-    followed by -config. Its first file is the gateway's configuration: the
+    followed by -config, or on Docker Compose one compose config per file.
+    Its first file is the gateway's configuration: the
     model map, from the hand-typed entries of values.models and the models
     wired to the models socket, the registration of the request guard the
     LiteLLMGuard bundle delivers, and the settings values.metrics_enabled and
@@ -33,6 +34,9 @@ metadata:
     build naming any local it reads that the Recipe does not declare. The
     modules rest on the proxy's internals, so each importing Recipe states the
     LiteLLM releases they are proven at and halts on any other.
+  # The pipeline step runs on Kubernetes alone. On Docker Compose this bundle
+  # writes core/prompt-deny-patterns and core/fallback-chain itself, from the
+  # attachments, as the template below states.
 spec:
   artifacts:
     # The bundle. The gateway's configuration and the modules delivered beside
@@ -324,8 +328,14 @@ spec:
     # from the component, .context.uses, .context.rendered_name and
     # .context.instance_id, and those locals.
     #
-    # The bundle's one file, configmap.yaml, is the ConfigMap. It is rendered
-    # in the directory the importing Recipe's consumption key names.
+    # The bundle's one file, configmap.yaml, is the ConfigMap, or on the compose
+    # target the compose fragment holding one config per file: the
+    # configuration, and the log-masking module while values.log_masking lists
+    # something. The importing Recipe chooses through request_guard_delivery,
+    # the local the LiteLLMGuard bundle reads for the same choice, and on
+    # compose declares gateway_config_name and log_masking_config_name, the
+    # names its workload mounts those configs by. It is rendered in the
+    # directory the importing Recipe's consumption key names.
     GatewayConfig:
       configmap.yaml: |
         {{- /* The locals this file reads, each the importing Recipe's own: a name its workload, or an attachment's
@@ -379,6 +389,31 @@ spec:
         {{- if not (optional .locals "log_masking_module" "") }}{{ fail (printf "the Recipe importing %s does not declare the local log_masking_module, which is the module the log-masking guardrail is loaded from while values.log_masking lists something; declare it among the Recipe's locals" $bundle) }}{{ end }}
         {{- if not (optional .locals "log_masking_class" "") }}{{ fail (printf "the Recipe importing %s does not declare the local log_masking_class, which is the class the log-masking module defines and its guardrail entry names; declare it among the Recipe's locals" $bundle) }}{{ end }}
         {{- if not (optional .locals "log_masking_failure_callback" "") }}{{ fail (printf "the Recipe importing %s does not declare the local log_masking_failure_callback, which is the callback the log-masking module defines to withhold a failed call's text and the configuration registers; declare it among the Recipe's locals" $bundle) }}{{ end }}
+        {{- /* How the files reach the importing Recipe's workload: "config_map", one ConfigMap carrying every file, for a
+          Kubernetes target; or "compose_configs", one compose config per file, for the compose target, which delivers a
+          config as one file at the path it is mounted at. It is read from request_guard_delivery, the local the
+          LiteLLMGuard bundle reads for the same choice, because both bundles land on the one target the importing
+          Recipe renders for. Any other value, or none, stops the build. */}}
+        {{- $delivery := optional .locals "request_guard_delivery" "" }}
+        {{- if not (has $delivery (list "config_map" "compose_configs")) }}{{ fail (printf "the Recipe importing %s declares the local request_guard_delivery as %q, but it takes \"config_map\" or \"compose_configs\": whether the gateway's configuration and the modules beside it are delivered as one ConfigMap, for a Kubernetes target, or as one compose config per file, for the compose target; declare it as one of the two" $bundle $delivery) }}{{ end }}
+        {{- $compose := eq $delivery "compose_configs" }}
+        {{- /* A literal dollar sign in what the configuration carries from an author — a pattern, a fallback alias — is
+          written through $dollar: $ in a ConfigMap, which carries its data as written, and $$ in a compose config,
+          whose content Docker Compose reads a $ in as the start of a variable of its own. So the gateway reads the
+          same text on either delivery. */}}
+        {{- $dollar := "$" }}
+        {{- if $compose }}{{ $dollar = "$$" }}{{ end }}
+        {{- /* The names of the compose configs the importing Recipe's workload mounts, one per file this bundle emits
+          on the compose target. Each has its home here, and the Recipe restates it as a local because its workload
+          mounts it; one that is absent or differs stops the build, naming it. */}}
+        {{- if $compose }}
+        {{- $configName := printf "%s-config" .context.instance_id }}
+        {{- $logMaskingName := printf "%s-log-masking" .context.instance_id }}
+        {{- $have := optional .locals "gateway_config_name" "" }}
+        {{- if ne $have $configName }}{{ fail (printf "the Recipe importing %s declares the local gateway_config_name as %q, but that local is the name of the compose config its workload mounts the gateway's configuration from, which this bundle emits as %q; declare it as %q" $bundle $have $configName $configName) }}{{ end }}
+        {{- $have = optional .locals "log_masking_config_name" "" }}
+        {{- if ne $have $logMaskingName }}{{ fail (printf "the Recipe importing %s declares the local log_masking_config_name as %q, but that local is the name of the compose config its workload mounts the log-masking module from while values.log_masking lists something, which this bundle emits as %q; declare it as %q" $bundle $have $logMaskingName $logMaskingName) }}{{ end }}
+        {{- end }}
         {{- $identity := false }}
         {{- $listed := list }}
         {{- $masking := false }}
@@ -399,6 +434,32 @@ spec:
         {{- if eq (first (splitList ":" (toString $attachment.type))) "core/prompt-injection-shield" }}{{ $shield = true }}{{ end }}
         {{- if eq (first (splitList ":" (toString $attachment.type))) "core/concurrency-limit" }}{{ $cap = toString (int64 $attachment.infra.max_in_flight) }}{{ end }}
         {{- end }}
+        {{- /* On the compose target no pipeline step edits the rendered configuration, so the two Features whose Helm
+          realizations write into it through the gateway's step are written here instead, from the attachments, and
+          their Compose FeatureRecipes emit nothing and hold the refusals: a core/prompt-deny-patterns attachment's
+          guardrail entry, and a core/fallback-chain attachment's chain and bound. Each is read only on that target, so
+          on a Kubernetes target the step stays the one writer. DELIBERATE NEAR-DUPLICATE of the step inputs
+          feature-recipe/helm/prompt-deny-patterns-litellm and feature-recipe/helm/fallback-chain write: the two targets
+          render one configuration, and one realization holds one capability. If one of them changes, change both in
+          the same edit. The caller-identity and masking modules travel as further files beside the configuration,
+          and the compose Recipe mounts none of them, since neither Feature has a Compose realization; the build stops
+          rather than writing a registration for a module nothing delivers. */}}
+        {{- $denies := list }}
+        {{- $chains := list }}
+        {{- $maxHops := 0 }}
+        {{- if $compose }}
+        {{- if or $identity $masking }}{{ fail (printf "%q carries core/context-propagation or core/data-masking, whose modules the compose realization of core/gateway/litellm does not deliver: neither Feature has a Compose realization. Remove the attachment, or map core/gateway/litellm to a Kubernetes realization" .context.instance_id) }}{{ end }}
+        {{- range $name, $attachment := (default dict .features) }}
+        {{- if eq (first (splitList ":" (toString $attachment.type))) "core/prompt-deny-patterns" }}
+        {{- $denies = append $denies (dict "name" $name "patterns" (optional (optional $attachment "values" dict) "deny_patterns" list)) }}
+        {{- end }}
+        {{- if eq (first (splitList ":" (toString $attachment.type))) "core/fallback-chain" }}
+        {{- $values := optional $attachment "values" dict }}
+        {{- range $entry := optional $values "chains" list }}{{ $chains = append $chains (dict $entry.alias $entry.fallbacks) }}{{ end }}
+        {{- $maxHops = optional $values "max_hops" 0 }}
+        {{- end }}
+        {{- end }}
+        {{- end }}
         {{- $logPatterns := optional (optional .values "log_masking" dict) "patterns" list }}
         {{- $logEntities := optional (optional .values "log_masking" dict) "entities" list }}
         {{- if or $logPatterns $logEntities }}{{ $logMasking = true }}{{ end }}
@@ -411,12 +472,23 @@ spec:
         {{- if not $guardBase }}{{ fail "core/prompt-injection-shield is attached to the gateway, but nothing is wired to its guard socket, so its model map would be sent to no guard; wire a core/security/nemo-guardrails to the guard socket" }}{{ end }}
         {{- if $wired }}{{ fail (printf "core/prompt-injection-shield is attached to the gateway, which sends its model map to the guard, but its models socket holds %s, whose entries would be sent to each model's own endpoint past the guard; remove those connections, or the shield attachment" (join ", " $wired)) }}{{ end }}
         {{- end -}}
+        {{- /* The envelope. Each file is written once and wrapped by the envelope the delivery names: a ConfigMap key,
+          or a compose config's content. Both are block scalars holding the text at one indentation, so in the compose
+          fragment each config's content key sits one column deeper than its name, the shallowest place a block scalar
+          of that indentation can hang from; the compose target reads the fragment's configs and writes them into the
+          compose file, so that column reaches no emitted byte. */ -}}
+        {{- if $compose -}}
+        configs:
+          {{ .locals.gateway_config_name }}:
+           content: |
+        {{- else -}}
         apiVersion: v1
         kind: ConfigMap
         metadata:
           name: {{ .context.rendered_name }}-config
         data:
           {{ .locals.config_file }}: |
+        {{- end }}
             model_list:
         {{- range (optional .values "models" list) }}
               - model_name: {{ .name }}
@@ -466,7 +538,11 @@ spec:
         {{- end }}
         {{- if $logMasking }}
               redact_messages_in_exceptions: true
+        {{- end }}
+        {{- if or $logMasking $denies }}
             guardrails:
+        {{- end }}
+        {{- if $logMasking }}
               - guardrail_name: {{ printf "%s.log-masking" .context.instance_id | toJson }}
                 litellm_params:
                   guardrail: {{ .locals.log_masking_module }}.{{ .locals.log_masking_class }}
@@ -476,8 +552,8 @@ spec:
                   patterns:
         {{- range $p := $logPatterns }}
                     - pattern_type: regex
-                      name: {{ $p.name | toJson }}
-                      pattern: {{ $p.regex | toJson }}
+                      name: {{ $p.name | toJson | replace "$" $dollar }}
+                      pattern: {{ $p.regex | toJson | replace "$" $dollar }}
                       action: MASK
         {{- end }}
         {{- end }}
@@ -487,8 +563,39 @@ spec:
                     {{ $e | toJson }}: MASK
         {{- end }}
         {{- end }}
+        {{- end }}
+        {{- /* Compose only: one guardrail entry per core/prompt-deny-patterns attachment, the entry
+          prompt-deny-patterns-litellm's step writes on a Kubernetes target. It turns on the gateway's built-in
+          content filter before a request is forwarded, on every request, with one blocking rule per expression,
+          named by its position in the list; each expression is written as a JSON string, its $ written through
+          $dollar. The entry's name is the gateway's instance name and the attachment's, so two attachments add two
+          entries, and no name can take the log-masking entry's, which ends .log-masking. */}}
+        {{- range $deny := $denies }}
+              - guardrail_name: {{ printf "%s-%s" $.context.instance_id ($deny.name | replace "_" "-") | toJson }}
+                litellm_params:
+                  guardrail: litellm_content_filter
+                  mode: pre_call
+                  default_on: true
+                  patterns:
+        {{- range $i, $p := $deny.patterns }}
+                    - pattern_type: regex
+                      name: {{ printf "deny_pattern_%d" (add1 $i) }}
+                      pattern: {{ $p | toJson | replace "$" $dollar }}
+                      action: BLOCK
+        {{- end }}
+        {{- end }}
+        {{- if $logMasking }}
             general_settings:
               disable_error_logs: true
+        {{- end }}
+        {{- /* Compose only: the core/fallback-chain attachment's chain and bound under router_settings, the two
+          settings fallback-chain's step writes on a Kubernetes target: fallbacks, the gateway's list of one-key maps
+          from an alias to the aliases it falls back to, in the order written, and max_fallbacks, the attachment's
+          max_hops. The section is written last, as the step adds it after the rest of the body. */}}
+        {{- if $chains }}
+            router_settings:
+              fallbacks: {{ toJson $chains | replace "$" $dollar }}
+              max_fallbacks: {{ $maxHops }}
         {{- end }}
         {{- if $identity }}
           {{ .locals.caller_identity_module }}.py: |
@@ -1572,7 +1679,12 @@ spec:
                     yield convert_model_response_to_streaming(whole)
         {{- end }}
         {{- if $logMasking }}
+        {{- if $compose }}
+          {{ .locals.log_masking_config_name }}:
+           content: |
+        {{- else }}
           {{ .locals.log_masking_module }}.py: |
+        {{- end }}
             """Masking of what the gateway hands to its logs, by listed pattern and by entity type, and of a failed call's text.
 
             Delivered beside the gateway's configuration while values.log_masking lists patterns or entity types, and loaded by

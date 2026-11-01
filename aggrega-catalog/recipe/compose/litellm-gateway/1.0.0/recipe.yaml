@@ -1,0 +1,399 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: litellm-gateway
+  version: 1.0.0
+  license: MIT
+  description: >
+    The AI gateway for local development via Docker Compose, running the
+    official upstream proxy image. Its configuration, the routing table from
+    values.models and the models socket, is a compose config the proxy
+    reads, from the bundle the Kubernetes realizations import. It is proven
+    at LiteLLM v1.103.1 and halts on any other engine_version.
+
+    As on Kubernetes, a request guard forwards only the request fields the
+    proxy declares for the route, plus any in
+    infra.admitted_request_fields, and a path allowlist, the official nginx
+    image (BSD-2-Clause) in the proxy's network namespace on infra.port,
+    answers 403 to every path but the gateway's routes.
+
+    values.log_masking is honoured, entity types through the Presidio
+    services on the pii_analyzer and pii_anonymizer sockets.
+    core/prompt-deny-patterns and core/fallback-chain are written into the
+    configuration from their attachments. Compose has no env-from-secret
+    primitive, so an attached credential is rendered as a plain variable; a
+    Compose variable reference stays one. The cache_store socket is refused:
+    the semantic cache it serves has no Compose realization.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/gateway/litellm:1.0.0
+  # This Recipe reads no infra.overrides keys, and no infra.source_version, which
+  # only the chart Recipe reads. infra.compute sizes the proxy's service.
+  #
+  # Each entry below is the single authored home for a value the configuration
+  # the LiteLLMGatewayConfig bundle renders and the workload template both have
+  # to agree on, as on helm/litellm-gateway, whose locals these mirror name for
+  # name: the bundles read them by these names and stop the build naming one
+  # that is missing or differs from their own. Three entries differ, because
+  # this target delivers each file as a compose config of its own rather than
+  # as a key of one ConfigMap: request_guard_delivery is compose_configs, and
+  # the configs' names are request_guard_module_config_name,
+  # request_guard_allowlist_config_name, gateway_config_name and
+  # log_masking_config_name, the instance name followed by a suffix of each
+  # file's own.
+  locals:
+    config_file: config.yaml
+    provider_key_variable: LITELLM_PROVIDER_API_KEY
+    # The variable a models connection's credential is delivered under, which
+    # that connection's entry in the routing table names: these two fixed parts
+    # around the connection's alias, written in capitals with every character
+    # other than a letter or a digit as an underscore. Two aliases the rule maps
+    # to one variable halt the build in the workload, naming both.
+    connection_key_variable_prefix: LITELLM_MODEL_
+    connection_key_variable_suffix: _API_KEY
+    # Read by the bundle while core/prompt-injection-shield is attached, which
+    # has no Compose realization for this gateway; declared because the bundle
+    # checks every local it reads.
+    guard_api_key: the-guard-holds-the-upstream-credential
+    # The modules core/context-propagation and core/data-masking rely on. Neither
+    # Feature has a Compose realization, and the bundle stops the build on
+    # either attachment here; the names are declared because the bundle checks
+    # every local it reads.
+    caller_identity_module: caller_identity
+    masking_module: data_masking
+    field_entity_masking_class: FieldEntityMasking
+    reply_masking_class: ReplyMasking
+    buffered_reply_masking_class: BufferedReplyMasking
+    field_pattern_masking_class: FieldPatternMasking
+    held_reply_class: HeldStreamedReply
+    # The module the log-masking guardrail is loaded from, the class in it and
+    # the callback that withholds a failed call's text: the configuration names
+    # them and the file the bundle delivers defines them, mounted beside the
+    # configuration as the module's file.
+    log_masking_module: log_masking
+    log_masking_class: LogMasking
+    log_masking_failure_callback: withhold_failed_calls
+    # The request-guard module the LiteLLMGuard bundle delivers on every Release.
+    request_filter_module: request_field_filter
+    # The path allowlist in front of the gateway. The proxy listens on the
+    # loopback address only, so nothing outside the two services' shared network
+    # namespace reaches it directly, and the reverse proxy listens on infra.port.
+    # The loopback port is the one after infra.port, or the one before it when
+    # infra.port is the highest there is.
+    gateway_address: 127.0.0.1
+    gateway_port: '{{ if eq (int .infra.port) 65535 }}65534{{ else }}{{ add1 (int .infra.port) }}{{ end }}'
+    # The gateway's metrics, while values.metrics_enabled is true: the port the
+    # path allowlist serves them on, which every peer on the compose network
+    # reaches, and the proxy's own listener on the loopback address.
+    metrics_port: "9090"
+    gateway_metrics_port: "9091"
+    # The file the reverse proxy's configuration is mounted as and the file it is
+    # pointed at.
+    path_allowlist_file: path-allowlist.conf
+    # The tag of the official nginx image the reverse proxy runs, the one
+    # core/gateway/nginx defaults to.
+    path_allowlist_image_tag: 1.27.5-alpine
+    # How both bundles deliver their files: one compose config per file.
+    request_guard_delivery: compose_configs
+    request_guard_module_config_name: "{{ .context.instance_id }}-request-guard-module"
+    request_guard_allowlist_config_name: "{{ .context.instance_id }}-request-guard-allowlist"
+    request_guard_dir: /etc/litellm-request-guard
+    gateway_config_name: "{{ .context.instance_id }}-config"
+    log_masking_config_name: "{{ .context.instance_id }}-log-masking"
+    # Off: the release this Recipe pins creates organizations only under an
+    # enterprise licence, which nothing this Recipe renders supplies.
+    forward_organization_routes: "false"
+    # Published for an attachment's realization to check against, and never
+    # emitted: every alias the hand-typed entries of values.models publish, as a
+    # JSON list, and every hand-typed entry. The aliases of the models wired to
+    # the models socket are the keys of the host's .uses.models, which a
+    # realization's assertion reads beside this list.
+    model_aliases: '{{ $aliases := list }}{{ range (optional .values "models" list) }}{{ $aliases = append $aliases .name }}{{ end }}{{ toJson $aliases }}'
+    model_entries: '{{ toJson (optional .values "models" list) }}'
+    # The alias published as the gateway's model: values.model where it is set,
+    # and otherwise the one alias values.models publishes. The component's own
+    # assertion has already halted the build where neither names a served alias.
+    published_model: '{{ with optional .values "model" "" }}{{ . }}{{ else }}{{ with optional .values "models" list }}{{ (index . 0).name }}{{ end }}{{ end }}'
+    # The entity types the Presidio analyzer core/security/presidio-analyzer runs
+    # reports it recognizes in English, the list helm/litellm-gateway holds:
+    # values.log_masking's entity types are checked against it.
+    analyzer_entity_types: '["CREDIT_CARD", "CRYPTO", "DATE_TIME", "EMAIL_ADDRESS", "IBAN_CODE", "IP_ADDRESS", "LOCATION", "MAC_ADDRESS", "MEDICAL_LICENSE", "NRP", "PERSON", "PHONE_NUMBER", "UK_NHS", "URL", "US_BANK_NUMBER", "US_DRIVER_LICENSE", "US_ITIN", "US_PASSPORT", "US_SSN"]'
+    # The LiteLLM releases the code this Recipe delivers into the proxy is
+    # proven at, as a JSON list: the request guard, on every Release, and the
+    # log-masking module while values.log_masking lists something, are Python
+    # the proxy loads over its own internals. The Kubernetes realizations hold
+    # the same list, and the three change together.
+    proven_engine_versions: '["v1.103.1"]'
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences. host is the
+  # name the compose provider gives the synthesized service, the component
+  # instance's own name, which a consumer on the same compose network resolves
+  # directly; the path allowlist's service shares that service's network
+  # namespace, so the name and infra.port reach the allowlist. host and endpoint
+  # spell it out twice on purpose: a provides entry cannot read another. The
+  # contract is key for key the one the Kubernetes realizations publish.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.instance_id }}:{{ .infra.port }}/v1"
+    model: "{{ .locals.published_model }}"
+    protocol: "http"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.instance_id }}:{{ .locals.metrics_port }}/metrics{{ end }}"
+  # The assertions helm/litellm-gateway carries, each with its reason stated
+  # there, and one of this target's own: the cache_store socket refused.
+  assertions:
+    external_base_url_is_an_origin: >-
+      {{- with optional .infra "external_base_url" "" -}}
+      {{- $u := urlParse . -}}
+      {{- if and $u.host $u.path (ne $u.path "/") -}}
+      {{- fail (printf "infra.external_base_url %q carries the path %q, but the gateway takes its public address as an origin only, so the links it composes would point where it is not served; set it to the scheme, host and port alone, for example https://llm.example.com" . $u.path) -}}
+      {{- end -}}
+      {{- end -}}
+    recognizer_sockets_wired_together: >-
+      {{- $analyzer := hasKey .uses "pii_analyzer" -}}
+      {{- $anonymizer := hasKey .uses "pii_anonymizer" -}}
+      {{- if and $analyzer (not $anonymizer) -}}
+      {{- fail "the pii_analyzer socket is wired and the pii_anonymizer socket is not, but the gateway's Presidio integration hands every text the analyzer reports on to the anonymizer and cannot use either service alone; wire a core/security/presidio-anonymizer to pii_anonymizer as well, or remove the pii_analyzer edge" -}}
+      {{- end -}}
+      {{- if and $anonymizer (not $analyzer) -}}
+      {{- fail "the pii_anonymizer socket is wired and the pii_analyzer socket is not, but the gateway's Presidio integration replaces only the spans the analyzer reports and cannot use either service alone; wire a core/security/presidio-analyzer to pii_analyzer as well, or remove the pii_anonymizer edge" -}}
+      {{- end -}}
+    entity_types_the_analyzer_knows: >-
+      {{- $known := fromJson (optional .locals "analyzer_entity_types" "[]") -}}
+      {{- range $e := optional (optional .values "log_masking" dict) "entities" list -}}
+      {{- if not (has $e $known) -}}
+      {{- fail (printf "values.log_masking on %q lists the entity type %q, which the Presidio analyzer core/gateway/litellm calls does not recognize in English; listed beside types it does recognize it would mask nothing in the logs and say nothing. List only types from: %s" $.metadata.instance_id $e (join ", " $known)) -}}
+      {{- end -}}
+      {{- end -}}
+    entities_need_the_recognizer: >-
+      {{- if optional (optional .values "log_masking" dict) "entities" list -}}
+      {{- $analyzer := hasKey .uses "pii_analyzer" -}}
+      {{- $anonymizer := hasKey .uses "pii_anonymizer" -}}
+      {{- if not (and $analyzer $anonymizer) -}}
+      {{- $unwired := "neither its pii_analyzer socket nor its pii_anonymizer socket is wired" -}}
+      {{- if $analyzer }}{{ $unwired = "its pii_anonymizer socket is not wired" }}{{ end -}}
+      {{- if $anonymizer }}{{ $unwired = "its pii_analyzer socket is not wired" }}{{ end -}}
+      {{- fail (printf "values.log_masking on %q lists entities, which core/gateway/litellm finds and replaces in its logs through the Presidio analyzer and anonymizer it calls, but %s; wire a core/security/presidio-analyzer to pii_analyzer and a core/security/presidio-anonymizer to pii_anonymizer on %q, or list patterns instead of entities" .metadata.instance_id $unwired .metadata.instance_id) -}}
+      {{- end -}}
+      {{- end -}}
+    engine_version_is_proven: >-
+      {{- $proven := fromJson .locals.proven_engine_versions -}}
+      {{- if not (has .infra.engine_version $proven) -}}
+      {{- fail (printf "infra.engine_version %q is not a LiteLLM release this Recipe is proven at: the request guard it delivers on every Release, and the log masking it delivers while values.log_masking lists something, are code the proxy loads that relies on the proxy's own internals, and they are proven only at %s. Set infra.engine_version to one of these, or leave it unset for the default" .infra.engine_version (join ", " $proven)) -}}
+      {{- end -}}
+    # The store on the cache_store socket is read only by the gateway's semantic
+    # cache, which is on only while core/semantic-caching is attached, and that
+    # Feature has no Compose realization for this gateway. A store wired here
+    # would be started and read by nothing, so the connection is refused by
+    # name rather than rendered as an address nothing uses.
+    cache_store_not_on_compose: >-
+      {{- range $alias, $connection := (optional .uses "cache_store" dict) -}}
+      {{- fail (printf "the cache_store connection %s of %q is wired, but on Docker Compose nothing in the gateway reads it: the store serves the gateway's semantic cache, core/semantic-caching, which has no Compose realization for core/gateway/litellm. Remove the connection, or map core/gateway/litellm to a Kubernetes realization, where the cache runs" $alias $.metadata.instance_id) -}}
+      {{- end -}}
+  artifacts:
+    # The gateway's configuration — its routing table, the request guard's
+    # registration, the settings the component's values turn on, and the
+    # core/prompt-deny-patterns and core/fallback-chain attachments — and, while
+    # values.log_masking lists something, the log-masking module, from the bundle
+    # every Recipe realizing this gateway imports. With request_guard_delivery
+    # set to compose_configs it emits one compose config per file, named by
+    # gateway_config_name and log_masking_config_name, which the workload mounts
+    # as files beside each other in the directory the proxy is pointed at, where
+    # the proxy loads a module the configuration names.
+    litellm-gateway-config:
+      $import: LiteLLMGatewayConfig#/artifacts/GatewayConfig
+    # The request guard and the path allowlist's configuration, from the bundle
+    # every Recipe running this proxy imports, as two compose configs named by
+    # request_guard_module_config_name and request_guard_allowlist_config_name.
+    request-guard:
+      $import: LiteLLMGuard#/artifacts/RequestGuard
+  # The workload, a synthesized-mode Workload translated by the compose provider.
+  #
+  # Compose has no env-from-secret primitive, so an attached credential arrives on
+  # the inject pipe and is rendered as a plain environment variable, written as
+  # the credential delivered it, so a Compose variable reference such as
+  # ${LITELLM_MASTER_KEY} stays one for Docker Compose to substitute when the
+  # stack starts. Each is read off the pipe under the variable it is delivered
+  # as, so the attachment publishes its value under that key, and an attachment
+  # whose value arrived under another halts the build naming the variable: the
+  # administrative key as LITELLM_MASTER_KEY, the proxy's own variable; the
+  # bookkeeping database's connection string as DATABASE_URL; provider_key under
+  # the variable the hand-typed entries name; and each models connection's
+  # credential under the variable its routing-table entry names, the
+  # connection's alias in capitals between the two fixed parts the locals state.
+  #
+  # With the recognizer sockets wired, the endpoint each Presidio service
+  # publishes reaches the proxy as PRESIDIO_ANALYZER_API_BASE and
+  # PRESIDIO_ANONYMIZER_API_BASE, the variables its Presidio integration reads
+  # wherever a guardrail names no address of its own, which the log-masking
+  # guardrail does not. PROXY_BASE_URL carries infra.external_base_url only when
+  # it is set.
+  #
+  # The path allowlist runs as a service of its own, named after the component
+  # instance with -path-allowlist appended, sharing the proxy's network
+  # namespace, so a consumer reaching the component's service name on infra.port
+  # reaches the allowlist. Each service carries one health check, run inside its
+  # own image: the proxy's asks its readiness route on the loopback address with
+  # the image's Python, the allowlist's asks the same route through the allowlist
+  # with the curl the nginx image carries.
+  workload: |
+    {{- $configDir := "/etc/litellm" -}}
+    {{- $env := default dict (optional (default dict .context.inject) "env" dict) -}}
+    {{- $features := default dict .features -}}
+    {{- $logMasking := or (optional (optional .values "log_masking" dict) "patterns" list) (optional (optional .values "log_masking" dict) "entities" list) -}}
+    {{- $recognizer := false -}}
+    {{- $modelKeys := dict -}}
+    {{- range $alias, $edge := .context.uses }}{{ if or (eq $edge.socket "pii_analyzer") (eq $edge.socket "pii_anonymizer") }}{{ $recognizer = true }}{{ end }}{{ end -}}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if and (eq $edge.socket "models") (hasKey (default dict $edge.features) "credential") }}
+    {{- $variable := printf "%s%s%s" $.locals.connection_key_variable_prefix (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_") $.locals.connection_key_variable_suffix }}
+    {{- with get $modelKeys $variable }}{{ fail (printf "the models connections %s and %s of %q would each deliver their credential as %s, because the gateway names a connection's variable after its alias in capitals, with every character other than a letter or a digit as an underscore; rename one of the two connections" . $alias $.context.instance_id $variable) }}{{ end }}
+    {{- $_ := set $modelKeys $variable $alias }}
+    {{- end }}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    form: stateless
+    containers:
+      main:
+        image: "ghcr.io/berriai/litellm:{{ .infra.engine_version }}"
+        # The image entrypoint execs the proxy with the container args as its
+        # command line, so the configuration, the listen address and the port
+        # are passed here, each read from its single authored home. The proxy
+        # listens on the loopback address only; callers reach it through the
+        # path allowlist below.
+        args:
+          - "--config"
+          - "{{ $configDir }}/{{ .locals.config_file }}"
+          - "--host"
+          - "{{ .locals.gateway_address }}"
+          - "--port"
+          - "{{ .locals.gateway_port }}"
+    {{- if .values.metrics_enabled }}
+          - "--prometheus_metrics_port"
+          - "{{ .locals.gateway_metrics_port }}"
+    {{- end }}
+    {{- if or .infra.external_base_url $recognizer (hasKey $features "api_key") (hasKey $features "provider_key") (hasKey $features "database_url") $modelKeys }}
+        variables:
+    {{- end }}
+    {{- with .infra.external_base_url }}
+          PROXY_BASE_URL: "{{ . }}"
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "pii_analyzer" }}
+          PRESIDIO_ANALYZER_API_BASE: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- if eq $edge.socket "pii_anonymizer" }}
+          PRESIDIO_ANONYMIZER_API_BASE: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- end }}
+    {{- if hasKey $features "api_key" }}
+          LITELLM_MASTER_KEY: "{{ index $env "LITELLM_MASTER_KEY" | replace "\\" "\\\\" | replace "\"" "\\\"" }}"
+    {{- end }}
+    {{- if hasKey $features "provider_key" }}
+          {{ .locals.provider_key_variable }}: "{{ index $env .locals.provider_key_variable | replace "\\" "\\\\" | replace "\"" "\\\"" }}"
+    {{- end }}
+    {{- if hasKey $features "database_url" }}
+          DATABASE_URL: "{{ index $env "DATABASE_URL" | replace "\\" "\\\\" | replace "\"" "\\\"" }}"
+    {{- end }}
+    {{- range $variable, $alias := $modelKeys }}
+          {{ $variable }}: "{{ index $env $variable | replace "\\" "\\\\" | replace "\"" "\\\"" }}"
+    {{- end }}
+        # The check the product's own Compose file runs, a request from the
+        # image's Python, sent to the documented readiness route on the loopback
+        # address, where the proxy listens.
+        health:
+          ready:
+            exec:
+              - python3
+              - "-c"
+              - "import urllib.request; urllib.request.urlopen('http://{{ .locals.gateway_address }}:{{ .locals.gateway_port }}/health/readiness', timeout=10)"
+            initialDelaySeconds: 40
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        # The configuration as the file the proxy is pointed at, the log-masking
+        # module beside it while values.log_masking lists something, where the
+        # proxy loads a module the configuration names, and the guard's module in
+        # a directory of its own, where the configuration's registration finds it.
+        volumeMounts:
+          - name: config
+            path: "{{ $configDir }}/{{ .locals.config_file }}"
+    {{- if $logMasking }}
+          - name: log-masking
+            path: "{{ $configDir }}/{{ .locals.log_masking_module }}.py"
+    {{- end }}
+          - name: request-guard-module
+            path: "{{ .locals.request_guard_dir }}/{{ .locals.request_filter_module }}.py"
+      # The path allowlist, configured only by the file the guard bundle's second
+      # config carries, run in the foreground in place of the image's own start-up
+      # scripts. While values.metrics_enabled is true it also listens on
+      # metrics_port, which every peer on the compose network reaches.
+      path-allowlist:
+        image: "nginx:{{ .locals.path_allowlist_image_tag }}"
+        command:
+          - nginx
+          - -c
+          - "{{ .locals.request_guard_dir }}/{{ .locals.path_allowlist_file }}"
+          - -g
+          - "daemon off;"
+        ports:
+          http: {{ .infra.port }}
+    {{- if .values.metrics_enabled }}
+          metrics: {{ .locals.metrics_port }}
+    {{- end }}
+        health:
+          ready:
+            http: /health/readiness
+            initialDelaySeconds: 40
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: 250m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 128Mi
+        volumeMounts:
+          - name: request-guard-allowlist
+            path: "{{ .locals.request_guard_dir }}/{{ .locals.path_allowlist_file }}"
+    volumes:
+      config:
+        configmap:
+          source: "{{ .locals.gateway_config_name }}"
+    {{- if $logMasking }}
+      log-masking:
+        configmap:
+          source: "{{ .locals.log_masking_config_name }}"
+    {{- end }}
+      request-guard-module:
+        configmap:
+          source: "{{ .locals.request_guard_module_config_name }}"
+      request-guard-allowlist:
+        configmap:
+          source: "{{ .locals.request_guard_allowlist_config_name }}"
+    # A ClusterIP service entry keeps the gateway on the compose network, where
+    # its consumers sit; nothing is published to the host.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
+    {{- if .values.metrics_enabled }}
+          metrics: {{ .locals.metrics_port }}
+    {{- end }}
