@@ -1,0 +1,342 @@
+name: Publish and sign the quickstart images
+
+# Builds the two small applications the quickstarts run, from
+# quickstart-images/web and quickstart-images/agent, for Linux on x86-64
+# (linux/amd64) and on ARM (linux/arm64); publishes each to the registry's
+# reserved tools/ segment as tools/quickstart-web:<version> and
+# tools/quickstart-agent:<version>; and signs each published reference keyless
+# via the GitHub Actions OIDC identity against public Sigstore, with the same
+# command and the same identity the catalog's own publish workflow signs with.
+#
+# Three jobs, in this order:
+#
+#   registry       checks that the registry accepts the stored credential (one
+#                  authenticated GET /v2/, which pushes nothing), and on a real
+#                  publish waits for the tooling image the sign job runs inside.
+#                  The script and the settings are catalog-publish-sign.yml's.
+#   build-publish  holds each image to its version rule, builds both images for
+#                  both platforms, and on a real publish pushes each version the
+#                  registry does not hold yet.
+#   sign           runs inside the tooling image and signs both version
+#                  references with `aggrega sign`. A reference already carrying
+#                  a signature the registry's trust policy verifies is reported
+#                  as signed and left as it is.
+#
+# Versions. Each image's version is the one line of its VERSION file, and a
+# published version is final. Two checks keep it so:
+#   - the last commit that changed what goes into an image — any file in its
+#     directory but README.md — must also change its VERSION file; otherwise the
+#     run stops and says so, a dry run included, because the changed image would
+#     otherwise sit unpublished behind a version the registry already holds;
+#   - a version the registry already holds is not pushed again: the run reports
+#     it, with its digest, and moves on.
+# A Recipe names an image by the digest this workflow reports for it.
+#
+# Reproducible builds. Each Dockerfile pins its base image by the digest of its
+# multi-platform index, the dependencies are pinned by go.sum and by the hashed
+# requirements.txt, and the BuildKit that builds them is pinned by digest below.
+# SOURCE_DATE_EPOCH is the time of the last commit that changed the image's
+# sources, and the image output rewrites every file's timestamp in the layers to
+# it. No provenance or SBOM attestation is attached, because its content names
+# the run that built it.
+#
+# The manual entry defaults to a dry run: it checks the stored credential, holds
+# both images to the version rule and builds both for both platforms, pushing,
+# signing and recording nothing.
+#   gh workflow run quickstart-images-publish-sign.yml -f dry_run=false
+# publishes for real.
+#
+# Settings, by name — the same as catalog-publish-sign.yml's:
+#   variables  CATALOG_REGISTRY   the registry to publish to, as its host
+#              REGISTRY_USERNAME  the registry username
+#              TOOLING_IMAGE_TAG  the tag of the tooling image the sign job runs
+#                                 inside, such as stable
+#   secrets    REGISTRY_PASSWORD  the registry password
+
+on:
+  # A release tag publishes every image version the registry does not hold yet.
+  # A merge to main publishes nothing.
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Check the stored registry credential, hold both images to their version rule and build them for both platforms, without any push or signing."
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+# Two runs never publish at once: the second waits for the first, which may
+# already have published the version it would publish.
+concurrency:
+  group: quickstart-images-publish
+  cancel-in-progress: false
+
+env:
+  # Destination registry host. The placeholder default names a host that never
+  # resolves, so an unset variable fails the credential check, which names it.
+  REGISTRY: ${{ vars.CATALOG_REGISTRY || 'registry.invalid' }}
+  # "true" on a real publish — a release tag, or a manual run with dry_run
+  # false — and "false" on a dry run.
+  PUBLISH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
+
+jobs:
+  registry:
+    runs-on: ubuntu-latest
+    # The image wait below gives up after 30 minutes; this bounds the job even
+    # if a request hangs.
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Read by registry-gate.sh from the environment, never placed on a
+      # command line.
+      REGISTRY_USERNAME: ${{ vars.REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Check out the registry gate script
+        uses: actions/checkout@v4
+
+      - name: Check the stored registry credential
+        # One GET /v2/ with the stored credential; anything but 200 fails,
+        # naming the settings to check and reporting only the HTTP status.
+        run: |
+          .github/scripts/registry-gate.sh credential \
+            --registry-url "https://$REGISTRY" \
+            --registry-setting CATALOG_REGISTRY \
+            --username-setting REGISTRY_USERNAME \
+            --password-setting REGISTRY_PASSWORD
+
+      - name: Wait for the tooling image
+        # The sign job runs inside hub.aggrega.ai/tools/aggrega, which only the
+        # CLI's release publisher creates; on an empty registry this waits for
+        # it, checking every 30 seconds for at most 30 minutes. A dry run signs
+        # nothing and skips the wait.
+        if: ${{ env.PUBLISH == 'true' }}
+        id: image
+        env:
+          TOOLING_IMAGE_TAG: ${{ vars.TOOLING_IMAGE_TAG }}
+        run: |
+          .github/scripts/registry-gate.sh image \
+            --registry-url https://hub.aggrega.ai \
+            --repository tools/aggrega \
+            --tag "$TOOLING_IMAGE_TAG" \
+            --tag-setting TOOLING_IMAGE_TAG \
+            --username-setting REGISTRY_USERNAME \
+            --password-setting REGISTRY_PASSWORD \
+            --timeout 1800 \
+            --interval 30
+
+  build-publish:
+    needs: registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      REGISTRY_USERNAME: ${{ vars.REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      # The emulator registration image, pinned by digest: the same one the
+      # CLI's release workflow registers ARM emulation with.
+      BINFMT_IMAGE: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+      # The BuildKit the builder runs, pinned by the digest of its index.
+      BUILDKIT_IMAGE: docker.io/moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+    outputs:
+      refs: ${{ steps.build.outputs.refs }}
+    steps:
+      - name: Check out the images' sources with their history
+        uses: actions/checkout@v4
+        with:
+          # The version rule and SOURCE_DATE_EPOCH read each image's history.
+          fetch-depth: 0
+
+      - name: Hold each image to its version rule
+        # Reads each image's version, stops the run when the last commit that
+        # changed what goes into an image left its VERSION file alone, and
+        # writes the version and the time of that commit for the build step.
+        run: |
+          set -euo pipefail
+          for app in web agent; do
+            dir="quickstart-images/$app"
+            version="$(tr -d '[:space:]' < "$dir/VERSION")"
+            if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::$dir/VERSION holds '$version'; write one version such as 1.0.0"
+              exit 1
+            fi
+            last="$(git log -1 --format=%H -- "$dir" ":(exclude)$dir/README.md")"
+            if [ -z "$(git diff-tree --no-commit-id --name-only -r "$last" -- "$dir/VERSION")" ]; then
+              echo "::error::commit ${last:0:12} changed what goes into the quickstart-$app image and left $dir/VERSION at $version. A published version is final, so a changed image is published under a new version: raise $dir/VERSION in a new commit."
+              exit 1
+            fi
+            upper="$(printf '%s' "$app" | tr '[:lower:]' '[:upper:]')"
+            echo "${upper}_VERSION=$version" >> "$GITHUB_ENV"
+            echo "${upper}_EPOCH=$(git log -1 --format=%ct "$last")" >> "$GITHUB_ENV"
+            echo "quickstart-$app $version, sources last changed by ${last:0:12}"
+          done
+
+      - name: Use a Docker configuration of this run's own
+        # The builder and the push read this run's own configuration, and the
+        # last step removes it, so no credential outlives the run.
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/docker-config"
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/docker-config" >> "$GITHUB_ENV"
+
+      - name: Authenticate to the registry
+        # Only a real publish authenticates. The credential is written into this
+        # run's own configuration, the form docker and the builder read, and into
+        # a netrc file for the version check; both are built by the shell from
+        # the environment, so no secret is placed on a command line, and the
+        # encoded form is masked in the log.
+        if: ${{ env.PUBLISH == 'true' }}
+        run: |
+          set -euo pipefail
+          auth="$(printf '%s:%s' "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" | base64 -w0)"
+          echo "::add-mask::$auth"
+          umask 077
+          printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$auth" > "$DOCKER_CONFIG/config.json"
+          printf 'machine %s\nlogin %s\npassword %s\n' "$REGISTRY" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" > "$RUNNER_TEMP/registry.netrc"
+
+      - name: Register ARM emulation
+        # The agent image's dependency install runs as the code of the platform
+        # being built, so the ARM half needs an emulator for aarch64 registered
+        # with this machine's kernel. The web image is compiled on this
+        # machine's own platform for the target and needs none. The action is
+        # pinned by its commit (its release tag in the comment) and its image by
+        # digest; cache-image is off, so a failed pull never runs a cached copy
+        # the digest does not name.
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: ${{ env.BINFMT_IMAGE }}
+          platforms: arm64
+          cache-image: false
+
+      - name: Make the image builder available
+        # A builder running the pinned BuildKit, which builds both platforms in
+        # one invocation and writes the multi-platform index.
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+
+      - name: Build, and on a real publish push, each image
+        # On a real publish, a version the registry already holds is reported
+        # with its digest and not built again; any other answer than 200 or 404
+        # to the version check stops the run rather than risk pushing over a
+        # published version. A dry run builds both images for both platforms and
+        # keeps the result in the builder only.
+        id: build
+        run: |
+          set -euo pipefail
+          refs=()
+          for app in web agent; do
+            upper="$(printf '%s' "$app" | tr '[:lower:]' '[:upper:]')"
+            version_var="${upper}_VERSION"; epoch_var="${upper}_EPOCH"
+            version="${!version_var}"; epoch="${!epoch_var}"
+            repo="tools/quickstart-$app"
+            ref="$REGISTRY/$repo:$version"
+            refs+=("$ref")
+            if [ "$PUBLISH" = "true" ]; then
+              status="$(curl -sS --connect-timeout 15 --max-time 60 --retry 3 --retry-delay 5 \
+                --netrc-file "$RUNNER_TEMP/registry.netrc" --head -o /dev/null -D "$RUNNER_TEMP/$app.head" -w '%{http_code}' \
+                -H 'Accept: application/vnd.oci.image.index.v1+json' \
+                -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+                "https://$REGISTRY/v2/$repo/manifests/$version")"
+              case "$status" in
+                200)
+                  digest="$(tr -d '\r' < "$RUNNER_TEMP/$app.head" | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')"
+                  echo "$ref is already published as $digest; nothing is pushed"
+                  continue
+                  ;;
+                404) ;;
+                *)
+                  echo "::error::the registry answered HTTP $status when asked whether $ref is published; nothing is pushed"
+                  exit 1
+                  ;;
+              esac
+            fi
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              --provenance=false --sbom=false \
+              --build-arg SOURCE_DATE_EPOCH="$epoch" \
+              --output "type=image,name=$ref,push=$PUBLISH,rewrite-timestamp=true" \
+              --metadata-file "$RUNNER_TEMP/$app.json" \
+              "quickstart-images/$app"
+            digest="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "$RUNNER_TEMP/$app.json")"
+            if [ "$PUBLISH" = "true" ]; then
+              echo "published $ref as $digest — a Recipe names it as ${ref%:*}@$digest"
+            else
+              echo "dry run: built $ref for linux/amd64 and linux/arm64 as $digest; nothing is pushed"
+            fi
+          done
+          echo "refs=${refs[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Remove the credential
+        if: ${{ always() }}
+        run: |
+          rm -rf "$RUNNER_TEMP/docker-config" "$RUNNER_TEMP/registry.netrc"
+
+  sign:
+    needs: [registry, build-publish]
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Lets the job mint the short-lived OIDC identity token keyless signing
+      # signs with.
+      id-token: write
+    # Inside a container job the default shell resolves to sh, which on Debian
+    # is dash and rejects `set -o pipefail`; the shell is named instead.
+    defaults:
+      run:
+        shell: bash
+    # The tooling image carries `aggrega`, which signs, and curl, which mints the
+    # identity token. The registry authenticates pulls as well as pushes.
+    container:
+      image: ${{ needs.registry.outputs.image }}
+      credentials:
+        username: ${{ vars.REGISTRY_USERNAME }}
+        password: ${{ secrets.REGISTRY_PASSWORD }}
+    env:
+      REGISTRY_USERNAME: ${{ vars.REGISTRY_USERNAME }}
+      AGGREGA_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      REFS: ${{ needs.build-publish.outputs.refs }}
+    steps:
+      - name: Authenticate to the registry
+        # login reads the password from AGGREGA_REGISTRY_PASSWORD; the username
+        # comes from the environment. No secret is placed on the command line.
+        run: |
+          aggrega login "$REGISTRY" --username "$REGISTRY_USERNAME"
+
+      - name: Mint the Sigstore OIDC identity token
+        # Requests a short-lived identity token from the Actions runtime,
+        # audience-scoped to sigstore, and exports it as SIGSTORE_ID_TOKEN for
+        # `aggrega sign`. The request credential reaches curl on its standard
+        # input, never on its command line. The request is bounded and retried.
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          token_json="$(printf 'Authorization: bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
+            curl -sSL --connect-timeout 15 --max-time 60 --retry 5 --retry-delay 5 --retry-all-errors \
+              -H @- "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sigstore")"
+          id_token="$(printf '%s' "$token_json" | grep -o '"value":"[^"]*"' | head -1 | cut -d'"' -f4)"
+          [ -n "$id_token" ] || { echo "OIDC: runtime returned no token value" >&2; exit 1; }
+          echo "::add-mask::$id_token"
+          echo "SIGSTORE_ID_TOKEN=$id_token" >> "$GITHUB_ENV"
+
+      - name: Sign both images
+        # Each version reference resolves to its multi-platform index, so the
+        # signature covers both platforms' images.
+        run: |
+          set -euo pipefail
+          read -ra refs <<< "$REFS"
+          [ "${#refs[@]}" -gt 0 ] || { echo "no image reference to sign" >&2; exit 1; }
+          aggrega sign "${refs[@]}"
