@@ -1,0 +1,158 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Component
+metadata:
+  name: core/security/nemoguard-jailbreak-detect
+  version: 1.0.0
+  # NVIDIA's documentation for the microservice: it "classifies jailbreak
+  # attempts from a user-supplied prompt", with a random forest NVIDIA trained
+  # on the embeddings of the Snowflake Arctic Embed M Long model; "The container
+  # uses an embedding model that can use GPU acceleration or run on CPU and a
+  # classification model that uses CPU only." Its classify route takes
+  # {"input": <text>} and answers {"jailbreak": <boolean>, "score": <number>},
+  # the score running from -1 to 1, positive for a jailbreak.
+  #
+  # The image the Release names is the jailbreak-detection NIM's, published by
+  # NVIDIA as nvcr.io/nim/nvidia/nemoguard-jailbreak-detect, 1.10.1 being the tag
+  # NVIDIA's getting-started page pulls. Pulling it takes a registry login to
+  # nvcr.io with the NGC API key, which on Kubernetes is the Secret
+  # infra.image_pull_secret names.
+  description: >
+    NVIDIA's NemoGuard JailbreakDetect, served by its NIM: a classifier that
+    reads a text and reports whether it is an attempt to make a model ignore
+    its instructions, with a score. It changes and forwards nothing.
+    core/security/nemo-guardrails points its jailbreak-detection rail at it
+    through its jailbreak_detection socket.
+
+    Running it requires an NVIDIA AI Enterprise licence or NVIDIA Developer
+    Program membership, and an NGC API key: NVIDIA restricts access to the image
+    and the model, and the container fetches its model from NVIDIA with the key
+    when it starts. The Release names the image in infra.image and the catalog
+    names none, so nothing renders until it is set.
+
+    Realized on Kubernetes by helm/nemoguard-jailbreak-detect, one replica that
+    requests a GPU. It authenticates no caller, so it is published on an
+    in-cluster address only.
+  labels:
+    component.aggrega.ai/type: server
+    component.aggrega.ai/category: security
+    # Every Recipe of this component runs the classifier as a container the
+    # Release itself operates, so a single posture is its identity.
+    component.aggrega.ai/hosting: self-hosted
+    # NVIDIA publishes the container under the NVIDIA Software License
+    # Agreement and the Product-Specific Terms for NVIDIA AI Products, and the
+    # model under the NVIDIA Community Model License Agreement; no single SPDX
+    # identifier names them, so metadata.license is absent. The catalog names
+    # no image of it: the Release supplies one in infra.image.
+    component.aggrega.ai/upstream-licensing: proprietary
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  featuresSchema:
+    # NGC API key the container fetches its model from NVIDIA GPU Cloud with
+    # when it starts. When a credential is attached here, the Recipe delivers it
+    # to the container as an environment variable read from a Secret by
+    # reference; when unattached, the container starts without it, and fetching
+    # the model then fails when the container starts, not at compile time.
+    # `required` omitted → optional, as on core/ai-model/nvidia-nim, because a
+    # cache volume already holding the model needs no key. The selector is
+    # secret-kind-pinned but family-agnostic.
+    ngc_api_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Optional NGC API key the container fetches its model with when it starts. When attached, the container receives it as the NGC_API_KEY environment variable, read from a Secret by reference. Unattached, the container starts without it and can serve only a model already in its cache volume."
+  schema:
+    # The classifier has no developer-facing setting: NVIDIA's service loads
+    # one model and takes no options with a request.
+    values: {}
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      port:
+        type: integer
+        min: 1024
+        max: 65535
+        default: 8000
+        description: Port the classifier listens on and its Service accepts callers on, handed to the container as NIM_HTTP_API_PORT, the variable NVIDIA documents for it. Most operators should omit this and let the Recipe assign the default (8000).
+      image:
+        type: string
+        required: true
+        description: Full reference of the jailbreak-detection NIM image, including its tag — the image the operator is entitled to pull. There is no default, because access to NIM images is governed by NVIDIA's terms rather than by the catalog, and the catalog therefore names none.
+      # NVIDIA documents no CPU or memory figure for this NIM, and the defaults
+      # are a starting point rather than a measurement. Its documented run gives
+      # the container 64 GB of shared memory, which the Recipe does not reproduce:
+      # the container gets the platform's default.
+      compute:
+        cpu:
+          type: string
+          default: "2"
+        memory:
+          type: string
+          default: 8Gi
+      model_cache:
+        type: object
+        description: Volume the container fetches its model into and reads it from, kept across restarts so the model is fetched once. NVIDIA lists the model at about 530 MB.
+        properties:
+          size:
+            type: string
+            default: 2Gi
+          class:
+            type: string
+      gpu:
+        type: object
+        description: GPU scheduling for the classifier's container. NVIDIA supports the NIM on one GPU and its documented run hands the container the host's GPUs, so the container always requests at least one; a runtime_class selects the GPU-enabled container runtime. Requires a GPU-capable cluster.
+        properties:
+          count:
+            type: integer
+            min: 1
+            default: 1
+            description: Number of GPUs requested for the container, delivered as the extended resource nvidia.com/gpu. Defaults to 1 GPU.
+          runtime_class:
+            type: string
+            description: Name of the RuntimeClass selecting the GPU-enabled container runtime (for example nvidia). Omit to use the cluster default runtime.
+      image_pull_secret:
+        type: string
+        description: Name of a pre-created Kubernetes image-pull Secret granting access to NVIDIA's registry, nvcr.io, where the NIM image is published. Omit when the cluster can pull the image without credentials, as from a mirror it already reaches.
+    provides:
+      # Public API Contract — keys exported to consumers via uses topology edges.
+      #
+      # The classifier authenticates no caller: whatever reaches its address
+      # can submit text to it. It is published on an in-cluster address for the
+      # component that calls it, and is not meant to be exposed beyond the
+      # cluster.
+      host:
+        type: string
+        required: true
+        description: >
+          In-cluster DNS name of the Service fronting the classifier. Every
+          caller reaching this name can submit text, so it is an address for the
+          component that calls the service rather than one to publish.
+      port:
+        type: integer
+        required: true
+        description: >
+          TCP port that Service accepts callers on. It follows the port an
+          operator set in the Release, so a consumer reads it rather than
+          assuming a default.
+      endpoint:
+        type: string
+        required: true
+        description: >
+          Base URL of the classifier's API, with the host, the port and the API
+          path /v1 already composed. A caller posts the text to check to the
+          classify route under it.
+      protocol:
+        type: string
+        description: URL scheme to reach `host` and `port` over, for a consumer composing its own address rather than reading `endpoint`.
+      # NVIDIA documents the microservice's metrics in the Prometheus format at
+      # /v1/metrics on the API port.
+      metrics_endpoint:
+        type: string
+        description: >
+          The full address Prometheus scrapes this component's metrics at —
+          scheme, host, port and path, `http://<host>:<port>/v1/metrics` on the
+          port callers reach.

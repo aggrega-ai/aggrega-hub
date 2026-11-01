@@ -21,8 +21,9 @@ metadata:
     that keeps a request body from switching that rail off. Each file is
     mounted on its own at the path the image's start-up reads, so the guard
     starts in the product's single-configuration mode and refuses a request
-    naming any other configuration. The upstream address is handed to the
-    guard through the MAIN_MODEL_BASE_URL variable it reads, from
+    naming any other configuration. A NemoGuard model wired on content_safety
+    or jailbreak_detection adds its own input rail. The upstream address is
+    handed to the guard through the MAIN_MODEL_BASE_URL variable it reads, from
     infra.upstream_endpoint. When the optional upstream_key slot is attached,
     config.yaml names the variable the credential is delivered under as an
     env secretKeyRef, so its value never appears in the rendered manifest;
@@ -56,6 +57,9 @@ spec:
     # The name the classifier rail's configuration is declared under and the
     # input flow refers to it by.
     classifier_name: prompt_injection
+    # The model type the content-safety model is declared under, which the
+    # content-safety rail's flow and its prompt name it by.
+    content_safety_model: content_safety
   # provides is evaluated before the workload and cannot read it, so the port has
   # one authored home in .infra.port that every reader dereferences — provides.port
   # and provides.endpoint here, and below the PORT variable the image's start-up
@@ -119,14 +123,67 @@ spec:
     # to the socket would leave one of them unused without saying which. The
     # edges are counted here, where each carries its socket, and the build halts
     # on a second one; a halting check elsewhere sees one edge per socket.
+    #
+    # The two NemoGuard sockets are optional, and with nothing wired to either
+    # the configuration below is byte for byte the one written before they
+    # existed. Each takes one target, of one component type, checked here
+    # against the type the edge carries: the content-safety prompt and parser
+    # are NVIDIA's for core/ai-model/nemoguard-content-safety, and the
+    # jailbreak-detection rail calls the classify route of
+    # core/security/nemoguard-jailbreak-detect.
+    #
+    # Wired on content_safety, the model is declared as a content_safety model
+    # on the openai engine at the endpoint and under the model name its edge
+    # publishes — the API the NIM serves, reached by the library's own
+    # OpenAI-compatible client — with the placeholder key EMPTY that NeMo
+    # Guardrails' model configuration names for a server asking none; the
+    # content-safety input rail runs on it, with the prompt and parser from
+    # NVIDIA's NeMo Guardrails tutorial for this model ("Check Harmful Content
+    # with Nemotron Content Safety NIM"), its {{ user_input }} written so this
+    # template passes it through. The guard does not run the model's output
+    # rail: it judges no reply, as its other rail judges none.
+    #
+    # Wired on jailbreak_detection, the classifier's endpoint becomes the
+    # rail's nim_base_url, written with a trailing slash so the classify route
+    # is joined under /v1, and the jailbreak-detection model rail runs. No key is
+    # configured for it: the in-cluster classifier asks none. The rail fails
+    # open, as the Component's comment on that socket says.
+    #
+    # The main model is declared, as before, only when upstream_key is
+    # attached: the server builds the main model of each request from
+    # MAIN_MODEL_BASE_URL whatever other models the configuration declares, so
+    # a configuration declaring only the content-safety model forwards as one
+    # declaring none.
     nemo-guardrails-config.configmap.yaml: |
       {{- $detector := dict -}}
       {{- $wired := 0 -}}
+      {{- $safety := list -}}
+      {{- $jailbreak := list -}}
       {{- range $alias, $edge := .context.uses -}}
       {{- if eq $edge.socket "detector" -}}{{- $detector = $edge -}}{{- $wired = add1 $wired -}}{{- end -}}
+      {{- if eq $edge.socket "content_safety" -}}{{- $safety = append $safety $edge -}}{{- end -}}
+      {{- if eq $edge.socket "jailbreak_detection" -}}{{- $jailbreak = append $jailbreak $edge -}}{{- end -}}
       {{- end -}}
       {{- if gt $wired 1 -}}
       {{- fail (printf "%d components are wired to the guard's detector socket, but its classifier rail calls one detector; wire a single core/security/trustyai-huggingface-detector to detector" $wired) -}}
+      {{- end -}}
+      {{- if gt (len $safety) 1 -}}
+      {{- fail (printf "%d components are wired to the guard's content_safety socket, but its content-safety rail asks one model; wire a single core/ai-model/nemoguard-content-safety to content_safety" (len $safety)) -}}
+      {{- end -}}
+      {{- if gt (len $jailbreak) 1 -}}
+      {{- fail (printf "%d components are wired to the guard's jailbreak_detection socket, but its jailbreak-detection rail calls one classifier; wire a single core/security/nemoguard-jailbreak-detect to jailbreak_detection" (len $jailbreak)) -}}
+      {{- end -}}
+      {{- range $safety -}}
+      {{- $type := first (splitList ":" (toString .component)) -}}
+      {{- if ne $type "core/ai-model/nemoguard-content-safety" -}}
+      {{- fail (printf "the guard's content_safety socket is wired to %q, a %s, but the content-safety rail's prompt and verdict parser are NVIDIA's for core/ai-model/nemoguard-content-safety, which another model answers in a shape the parser does not read; wire a core/ai-model/nemoguard-content-safety to content_safety" .target $type) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- range $jailbreak -}}
+      {{- $type := first (splitList ":" (toString .component)) -}}
+      {{- if ne $type "core/security/nemoguard-jailbreak-detect" -}}
+      {{- fail (printf "the guard's jailbreak_detection socket is wired to %q, a %s, but the jailbreak-detection rail calls the classify route of core/security/nemoguard-jailbreak-detect and lets every request through when that route does not answer; wire a core/security/nemoguard-jailbreak-detect to jailbreak_detection" .target $type) -}}
+      {{- end -}}
       {{- end -}}
       apiVersion: v1
       kind: ConfigMap
@@ -134,12 +191,22 @@ spec:
         name: {{ .context.rendered_name }}-config
       data:
         config.yaml: |
-      {{- if hasKey (default dict .features) "upstream_key" }}
+      {{- if or (hasKey (default dict .features) "upstream_key") $safety }}
           models:
+      {{- if hasKey (default dict .features) "upstream_key" }}
             - type: main
               engine: openai
               model: named-by-each-request
               api_key_env_var: {{ .locals.upstream_key_variable }}
+      {{- end }}
+      {{- range $safety }}
+            - type: {{ $.locals.content_safety_model }}
+              engine: openai
+              model: {{ .provides.model | toJson }}
+              parameters:
+                base_url: {{ .provides.endpoint | toJson }}
+                api_key: EMPTY
+      {{- end }}
       {{- end }}
           passthrough: true
           rails:
@@ -151,9 +218,64 @@ spec:
                   base_url: {{ $detector.provides.endpoint | toJson }}
                   threshold: {{ .values.threshold }}
                   blocked_labels: {{ .values.blocked_labels | toJson }}
+      {{- range $jailbreak }}
+              jailbreak_detection:
+                nim_base_url: {{ printf "%s/" .provides.endpoint | toJson }}
+                nim_server_endpoint: classify
+      {{- end }}
             input:
               flows:
                 - hf classifier check input $classifier={{ .locals.classifier_name }}
+      {{- if $jailbreak }}
+                - jailbreak detection model
+      {{- end }}
+      {{- if $safety }}
+                - content safety check input $model={{ .locals.content_safety_model }}
+          prompts:
+            - task: content_safety_check_input $model={{ .locals.content_safety_model }}
+              content: |
+                Task: Check if there is unsafe content in the user or agent messages in the below conversation in accordance with our safety policy with the below categories. Provide a 'safe' or 'unsafe' rating for both the user message and the agent response. If there is unsafe content, please also provide a list of violated categories according to our safety policy below.
+
+                <BEGIN UNSAFE CONTENT CATEGORIES>
+                S1: Violence.
+                S2: Sexual.
+                S3: Criminal Planning/Confessions.
+                S4: Guns and Illegal Weapons.
+                S5: Controlled/Regulated Substances.
+                S6: Suicide and Self Harm.
+                S7: Sexual (minor).
+                S8: Hate/Identity Hate.
+                S9: PII/Privacy.
+                S10: Harassment.
+                S11: Threat.
+                S12: Profanity.
+                S13: Needs Caution.
+                S14: Other.
+                S15: Manipulation.
+                S16: Fraud/Deception.
+                S17: Malware.
+                S18: High Risk Gov Decision Making.
+                S19: Political/Misinformation/Conspiracy.
+                S20: Copyright/Trademark/Plagiarism.
+                S21: Unauthorized Advice.
+                S22: Illegal Activity.
+                S23: Immoral/Unethical.
+                <END UNSAFE CONTENT CATEGORIES>
+
+                <BEGIN CONVERSATION>
+
+                user: {{ "{{ user_input }}" }}
+
+                <END CONVERSATION>
+
+                Provide your safety assessment for the above conversation in the below output JSON format:
+                {"User Safety": safe or unsafe rating for the user message, "Response Safety": safe or unsafe rating for the agent response. Omit if no agent response present. "Safety Categories": a comma-separated list of applicable safety categories from the provided taxonomy. Omit if all safe.}
+
+                Do not include anything other than the output JSON in your response.
+                Output JSON:
+              output_parser: nemoguard_parse_prompt_safety
+              max_tokens: 50
+      {{- end }}
         rails.co: |
           # Redefines the library's "process user input" with its
           # generation-options condition removed, so the input rails run on

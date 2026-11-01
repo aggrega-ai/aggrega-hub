@@ -504,7 +504,7 @@ Three rules bind it:
 Components today: `core/gateway/litellm`, `core/gateway/kong`,
 `core/gateway/kong-enterprise`, `core/gateway/apisix`, `core/gateway/envoy-gateway`,
 `core/gateway/traefik-hub`, `core/gateway/agentgateway` and
-`core/gateway/higress` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `docker-model-runner`, `tgi`, `tei`, `nvidia-nim`, `litellm`, `openai`,
+`core/gateway/higress` carry `openai`, as do `core/ai-model/vllm`, `ollama`, `docker-model-runner`, `tgi`, `tei`, `nvidia-nim`, `nemoguard-content-safety`, `litellm`, `openai`,
 `openai-embedding`, `nvidia-api` and `openai-compatible` — the broker, whose
 whole contract is to be pointed at a service speaking that API, and which stays
 the handle for an endpoint the catalog does not model.

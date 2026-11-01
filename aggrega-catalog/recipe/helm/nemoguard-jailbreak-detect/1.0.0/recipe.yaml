@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: Recipe
+metadata:
+  name: nemoguard-jailbreak-detect
+  version: 1.0.0
+  license: Apache-2.0
+  # The image is a deterministic pointer the cluster pulls, and the model is
+  # fetched by the container at start; the compiler fetches neither. With the
+  # ngc_api_key slot unattached the container starts without the key,
+  # byte-identically to a Recipe with no slot. provides.host carries no
+  # namespace, so a consumer in another namespace qualifies it on its own side.
+  description: >
+    NVIDIA's NemoGuard JailbreakDetect NIM on Kubernetes via the helm
+    provider's Workload synthesis, running the NIM container directly with no
+    chart, since NVIDIA publishes none for it. Using it requires an NVIDIA AI
+    Enterprise licence or NVIDIA Developer Program membership, and an NGC API
+    key: the image comes from infra.image, a NIM image the reader must be
+    entitled to pull, and the catalog names none.
+
+    Renders a StatefulSet of one replica whose container fetches its model
+    into a model-cache volume at start and serves the classify route behind a
+    ClusterIP Service. It always requests a GPU (nvidia.com/gpu), schedules the
+    pod under infra.gpu.runtime_class when one is named, and pulls with the
+    Secret infra.image_pull_secret names. An attached ngc_api_key reaches the
+    container as an env secretKeyRef, so the key never appears in the rendered
+    manifest. provides.host is the bare in-cluster Service name.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/security/nemoguard-jailbreak-detect:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides is evaluated before the workload and cannot read it, so the port has
+  # one authored home in .infra.port that every reader dereferences — provides
+  # here, and below the NIM_HTTP_API_PORT variable, the container port and both
+  # Services; the literal is never repeated. host, endpoint and metrics_endpoint
+  # spell the Service name out three times on purpose: a provides entry cannot
+  # read another provides entry, and the name has to match the Service the helm
+  # provider derives from the service key below, so the three are edited
+  # together.
+  provides:
+    host: "{{ .context.rendered_name }}-default"
+    port: "{{ .infra.port }}"
+    endpoint: "http://{{ .context.rendered_name }}-default:{{ .infra.port }}/v1"
+    protocol: "http"
+    metrics_endpoint: "http://{{ .context.rendered_name }}-default:{{ .infra.port }}/v1/metrics"
+  workload: |
+    apiVersion: aggrega.ai/v1alpha1
+    kind: Workload
+    # form: stateful gives the replica a stable model-cache claim
+    # (persistentTemplate below), so the model is fetched once rather than at
+    # every start. One replica: the component declares no replica count.
+    form: stateful
+    replicas: 1
+    {{- with (default dict .infra.gpu).runtime_class }}
+    runtimeClassName: "{{ . }}"
+    {{- end }}
+    {{- with .infra.image_pull_secret }}
+    imagePullSecrets:
+      - "{{ . }}"
+    {{- end }}
+    containers:
+      main:
+        # The image is operator-supplied; the compiler pipes the string
+        # unresolved.
+        image: "{{ .infra.image }}"
+        # NVIDIA documents NIM_HTTP_API_PORT as the port the microservice serves
+        # HTTP on (8000 unless set) and NIM_CACHE_PATH as where it keeps the
+        # model it fetches (/opt/nim/.cache unless set). The port carries
+        # .infra.port, the one the container port, both Services, the probes and
+        # provides already use.
+        variables:
+          NIM_CACHE_PATH: /opt/nim/.cache
+          NIM_HTTP_API_PORT: "{{ .infra.port }}"
+    {{- if hasKey (default dict .features) "ngc_api_key" }}
+        # NGC API key, delivered as an env secretKeyRef so the value never lands
+        # in the manifest. Emitted only when the slot is attached.
+        attachments:
+          NGC_API_KEY:
+            from: ngc_api_key
+            as: env
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # NVIDIA documents /v1/health/ready for this microservice, answering once
+        # it is ready to serve requests, and documents no other health route, so
+        # all three probes ask it. The container fetches its model at start, so
+        # the start-up probe carries the download and the load, with the timings
+        # NVIDIA's own operator gives a NIM's probes: readiness asked for up to
+        # 1230 s before the liveness probe takes over.
+        health:
+          startup:
+            http: /v1/health/ready
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 120
+          ready:
+            http: /v1/health/ready
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          live:
+            http: /v1/health/ready
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+            "nvidia.com/gpu": "{{ (default dict .infra.gpu).count | default 1 }}"
+        volumeMounts:
+          - name: model-cache
+            path: /opt/nim/.cache
+    volumes:
+      model-cache:
+        persistentTemplate:
+          size: "{{ .infra.model_cache.size }}"
+    {{- with .infra.model_cache.class }}
+          class: "{{ . }}"
+    {{- end }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
+      headless:
+        type: Headless
+        ports:
+          http: {{ .infra.port }}
