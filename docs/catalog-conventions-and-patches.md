@@ -2418,6 +2418,43 @@ The canonical examples are
 and
 [`recipe/compose/postgres/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/compose/postgres/1.0.0/recipe.yaml).
 
+### A development default is named where its slot is declared
+
+A Recipe that falls back on a literal credential when its slot is unattached —
+a password, a key, a token, a salt or an initialization vector — ships that
+literal in the catalog, so every reader of the catalog holds it and every
+Release that leaves the slot unattached runs on the same value. That is an
+accepted convention of the standard library: a Release with nothing attached
+still renders and runs, which is what evaluation needs, and whether a Release
+keeps the published value stays the choice of whoever writes it.
+
+The convention is that the value is visible where that choice is made. The
+slot's `description` names the literal, says that every Release leaving the
+slot unattached shares it, and names the Recipes that render it wherever the
+Component's Recipes differ — one Recipe renders the literal while another owns
+the credential through a controller, takes one the target generates, or halts
+the build. A setting a Release writes in `infra` rather than in a slot, whose
+Recipe falls back on a literal when the setting is left unset, states its
+literal the same way in that key's description. A slot with no development
+default (see "A key with no development default" below) has none to state.
+
+```yaml
+password:
+  selector: "feature.aggrega.ai/kind=secret"
+  sensitive: true
+  inject: [env]
+  description: "Optional database password credential. When attached, supplies POSTGRES_PASSWORD via the credential subsystem. Unattached, compose/postgres and helm/postgres set POSTGRES_PASSWORD to the development literal `apppass`, which this catalog publishes, so every Release that leaves the slot unattached shares that password."
+```
+
+This is a convention catalog authors uphold, not something the compiler
+checks: the compiler is content-neutral, renders the fallback like any other
+value, and prints no advisory when it does, so a build that renders a
+development literal exits as a build with a credential attached does. The
+description is where an author learns the value is shared. A Release that must
+not run on it attaches a credential to the slot — one it supplies, or one the
+target generates (see "A credential the target generates" below) — or, for an
+`infra` setting, sets the value.
+
 ### A key with no development default
 
 Some credentials are keys a product signs or encrypts with, where a default every
