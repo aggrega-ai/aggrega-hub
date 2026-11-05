@@ -593,7 +593,7 @@ component to carry it.
 A component whose product serves metrics in the Prometheus format publishes
 where, so a scraper reads that fact rather than guessing a port and a path.
 `core/observability/prometheus` reads it off each connection of its
-`scrape_target` socket, which admits any `server` or `stateful-server`. The
+`scrape_target` socket, which admits any `server`, `stateful-server` or `worker`. The
 keys are declared in the Component's `provides` pillar, and every Recipe of it
 publishes them — empty where that realization offers no such address. They
 come in three shapes:
@@ -2956,7 +2956,7 @@ connection the Release wires, so it is the same word on every socket.
   certificate the other holds, are what the target is presented.
   `core/observability/prometheus`'s `scrape_target` socket declares no
   `unauthenticated` and no such assertion names it, because the socket selects
-  only `server` and `stateful-server` components and every Component this
+  only `server`, `stateful-server` and `worker` components and every Component this
   catalog labels `managed` is a `resource`, so no managed target can be wired
   there.
 - **Several consumers share one credential by authoring.** Nothing cascades into
@@ -5016,9 +5016,9 @@ server's pods — so, with both attached, a connection the Aggregate declares
 stays open at both ends, and one it does not declare can be refused at either.
 Every input of both is `infra`, so the operator attaches them in the Release,
 under `components.<id>.features`, as "Who writes each input, and where a
-Feature is attached" sets out. caller-allowlist applies to `server` and
-`stateful-server`, the types that serve connections; egress-allowlist to every
-type that runs pods: `server`, `stateful-server`, `worker`, `task` and
+Feature is attached" sets out. caller-allowlist applies to `server`,
+`stateful-server` and `worker`, the types that serve connections; egress-allowlist
+to every type that runs pods: `server`, `stateful-server`, `worker`, `task` and
 `function`.
 
 **Pods are selected from what each render emitted, never restated by hand.**
