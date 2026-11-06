@@ -2383,19 +2383,40 @@ attachments:
 {{- end }}
 ```
 
-The compose Recipe reads the delivered value through `index`, as
-`{{ index .context.inject.env "DB_PASSWORD" }}`, never as the dotted path
-`.context.inject.env.DB_PASSWORD`. A credential attached under another key
-leaves that name undelivered: `index` then halts the build naming the key the
-Recipe reads, where the dotted path renders an empty password and the build
-succeeds. The same holds for a credential slot on a connection, and for a
-Recipe that renders the variable only when a value arrived: the test includes
-whether the slot is attached, so an attached slot whose value arrived under
-another key reaches the `index` read and halts instead of being skipped.
+The compose Recipe reads the delivered value under the key its attachment
+delivered it under, falling back to a name of its own where the attachment names
+none:
+
+```gotemplate
+{{- $key := default "DB_PASSWORD" (optional (default dict .features.password.values) "key" "") }}
+  DB_PASSWORD: "{{ index .context.inject.env $key }}"
+```
+
+A `core/secret-value` delivers its value under the key its attachment names in
+`values.key`, which defaults to `value`. A Release writes no `values` on an
+attachment, so a credential the Release alone attaches always arrives under
+`value`, and only an attachment the Aggregate declares can name another key. A
+Recipe reading one fixed name therefore halts every Release that attaches the
+credential itself; reading the attachment's own key serves both. An attachment
+naming no key at all — a credential Feature whose realization delivers under a
+name of its own choosing — is read under the fallback name. Whichever key the
+value arrived under, the variable the Recipe renders keeps its own name.
+
+The read goes through `index`, never the dotted path
+`.context.inject.env.DB_PASSWORD`. Where nothing arrived under the key read,
+`index` halts the build naming that key, where the dotted path renders an empty
+password and the build succeeds. The same holds for a credential slot on a
+connection, whose key the Recipe reads from that connection's attachment,
+`$edge.features.<slot>.values`, and for a Recipe that renders the variable only
+when a value arrived: the test includes whether the slot is attached, so an
+attached slot whose value did not arrive reaches the `index` read and halts
+instead of being skipped. No catalog kind holds a template expression for
+several entities to share, so each Recipe that reads a credential off the pipe
+repeats this one.
 
 A Recipe that already binds the pipe's env map, as
 `{{ $env := optional (default dict .context.inject) "env" dict }}`, reads the
-credential through that binding, `{{ index $env "DB_PASSWORD" }}`. The render
+credential through that binding, `{{ index $env $key }}`. The render
 fills an absent key a template reads by name with an empty string, and a read
 of `.context.inject.env` itself names that key; with nothing delivered on the
 env pipe, the binding then holds an empty string rather than a map, and every
@@ -2414,9 +2435,10 @@ the `index` read halts naming the key there too, rather than stopping on a nil
 reference.
 
 The canonical examples are
-[`recipe/helm/postgres/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/helm/postgres/1.0.0/recipe.yaml)
-and
-[`recipe/compose/postgres/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/compose/postgres/1.0.0/recipe.yaml).
+[`recipe/helm/postgres/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/helm/postgres/1.0.0/recipe.yaml),
+for the presence test and the `attachments` form, and
+[`recipe/compose/postgres/1.0.0/recipe.yaml`](../aggrega-catalog/recipe/compose/postgres/1.0.0/recipe.yaml),
+for the keyed read off the inject pipe.
 
 ### A development default is named where its slot is declared
 
