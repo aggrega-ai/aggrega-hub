@@ -2687,8 +2687,8 @@ The two terraform and cloudformation realizations share the name
   selects it.
 - **Where it cannot be used.** Compose runs no controller and has no resource
   that generates a value, so no realization ships for it, and a build binding
-  `core/random-password` on compose halts with `E0099`: *"no feature recipe
-  implements this type"*. Supply the credential with `core/secret-value` there.
+  `core/random-password` on compose halts with `E0099`, which names the
+  realizations other capabilities have. Supply the credential with `core/secret-value` there.
 - **Its settings are the ones every generator honours.** `length` and
   `symbols` are read off the four products: each takes a length, and each can
   leave punctuation out. Finer control over character classes exists on some
