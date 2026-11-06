@@ -7,3 +7,7 @@ The catalog is `aggrega-catalog/`, with one directory per entity kind: `componen
 A change merged to `main` under `aggrega-catalog/` is published by the [Publish and sign catalog](.github/workflows/catalog-publish-sign.yml) workflow, which publishes only the entities that changed and signs each one keyless through Sigstore. Plugin entities are the exception: they are generated and published with each compiler release, not from this repository.
 
 A build reaches these entities through `hub.aggrega.ai`, the default registry: `aggrega pull`, or a build run with `--auto-pull`, fetches the ones a Release needs into the local cache and pins them in the Release's lockfile. To build against a checkout of this repository instead, list its `aggrega-catalog/` directory under `workspace.catalog_dirs` in your `.aggrega-config.yaml`. [Catalog and Registry](https://aggrega.ai/docs/architecture/13-catalog-and-registry/) describes how a reference is resolved.
+
+## License
+
+The Aggrega standard-library catalog is released under the Apache License, Version 2.0; the full text is in the [`LICENSE`](LICENSE) file.
