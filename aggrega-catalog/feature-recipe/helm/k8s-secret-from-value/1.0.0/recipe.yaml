@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1alpha1
+kind: FeatureRecipe
+metadata:
+  name: k8s-secret-from-value
+  version: 1.0.0
+  description: >
+    Helm realization of core/secret-value that a consuming Recipe can read by
+    reference. It renders one Kubernetes Secret holding the value and
+    publishes the Secret's name and data key, so a Recipe reading the slot as
+    a secretKeyRef points at it, and it also delivers the value into the
+    component's inject pipe, as env-secret does, so a Recipe reading the pipe
+    receives it as a variable.
+
+    The value is written into the emitted Secret, and a Recipe reading the
+    pipe writes it into its own manifest as well, so the material sits in the
+    rendered output: for evaluation and local work, not for a production
+    credential. The Secret is emitted for every attachment, whether or not
+    its host reads it by reference.
+
+    Reach for this realization where a host reads the credential by
+    reference, or where one Manifest maps core/secret-value for hosts of both
+    kinds. Reach for env-secret where every host reads the inject pipe and no
+    Secret is wanted, and for core/referenced-secret where the Secret already
+    exists or a secret-store operator fetches the credential.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: helm
+  implements: core/secret-value:1.0.0
+
+  # The Secret's identity, published so a consumer references it (a Kubernetes
+  # secretKeyRef) without re-deriving the name; the emitted Secret below derives
+  # from these provides, so the name is authored once, here. core/secret-value
+  # declares no provides contract of its own, and publishing keys a Feature does
+  # not declare is allowed; name and key are the two a Workload reference reads.
+  # The name is {rendered_name}-{attachment_name}: the host part is
+  # .context.rendered_name, never .context.instance_id, because a component's
+  # name may carry an underscore or a capital, which the rendered name writes
+  # out; the attachment name is folded from underscores to hyphens, so the
+  # published name is a valid RFC-1123 label. The data key is values.key, the key
+  # the attachment also delivers the value under on the inject pipe. DELIBERATE
+  # NEAR-DUPLICATE of
+  # k8s-secret-from-parameter's provides: each realization publishes its own,
+  # and no catalog kind holds a provides block for two entities to share.
+  provides:
+    name: '{{ .context.rendered_name }}-{{ .attachment_name | replace "_" "-" }}'
+    key: "{{ .values.key }}"
+
+  # Delivery into the inject pipe, under the key the attachment names, exactly as
+  # env-secret delivers it: a host Recipe reading .context.inject.env receives
+  # the value as a container variable, or maps it onto a chart's auth values. A
+  # host that references the slot renders a secretKeyRef from the provides above,
+  # and the value waiting on its pipe reaches its manifest only where that host
+  # also reads the pipe under this key. The value is written through
+  # toJson, as a JSON string, which the mapping's YAML reads back exactly: a quote
+  # or a backslash in the value is delivered as authored rather than breaking the
+  # mapping. DELIBERATE NEAR-DUPLICATE of env-secret's injectMapping: the two
+  # realizations deliver the pipe identically, and an injectMapping is a plain
+  # string that takes no $import:, so no MappingLibrary entry can supply it to
+  # both; a change to one is made to both.
+  #
+  # origin is read from whichever pillar carries it — values where the developer
+  # wrote it, infra where the operator did; the Feature halts the build when both
+  # or neither do. DELIBERATE NEAR-DUPLICATE: each realization of a credential
+  # Feature that reads the locator repeats this one expression, because it sits
+  # inside a template the realization owns, and no catalog kind holds a single
+  # template expression for several entities to share. values is read only
+  # through optional, and that is load-bearing: a template that also read
+  # .values.origin as a path would find the key present and empty, and never
+  # fall through to infra.
+  injectMapping: |
+    env:
+      {{ .values.key }}: {{ optional .values "origin" (optional .infra "origin" "") | toJson }}
+
+  # Resource Generation via a co-located Helm chart: the chart renders one
+  # Kubernetes Secret whose name and data key are fed from the published provides
+  # — so the rendered Secret and the consumer's .features.<slot>.provides are one
+  # authored source — with the origin as its value. The chart is the one
+  # k8s-secret-from-parameter renders, copied beside this entity because each
+  # entity is published with its own files. The chart is also passed the scope's
+  # namespace, when the scope declares one, so the Secret lands beside the
+  # workload that references it rather than wherever the applying tool defaults
+  # to — a reference does not resolve a Secret in another namespace. Empty when
+  # no scope declares one, and the chart then omits the field, matching a
+  # synthesized workload, which also emits no namespace and is placed by the
+  # applying tool.
+  #
+  # DELIBERATE NEAR-DUPLICATE: the valuesMapping below is k8s-secret-from-parameter's,
+  # byte for byte. A MappingLibrary entry could hold it, but it feeds the chart this
+  # entity carries as a copy anyway, and two users stay below the three at which
+  # the conventions make a shared mapping a library candidate; a change to one is
+  # made to both.
+  source: ./chart
+  valuesMapping: |
+    secretName: "{{ .provides.name }}"
+    dataKey: "{{ .provides.key }}"
+    origin: {{ optional .values "origin" (optional .infra "origin" "") | toJson }}
+    {{- $ns := "" }}
+    {{- if .context.annotations }}
+      {{- $raw := optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" (optional (optional (default dict .context.annotations) "aggregate" dict) "aggrega.ai/namespace" "") }}
+      {{- if $raw }}{{- $ns = $raw }}{{- end }}
+    {{- end }}
+    namespace: "{{ $ns }}"
