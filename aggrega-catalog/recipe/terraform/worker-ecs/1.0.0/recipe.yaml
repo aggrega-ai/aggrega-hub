@@ -22,11 +22,12 @@ metadata:
     connects to the worker. No container health check is declared, because
     ECS runs one inside an image this Recipe does not name.
 
-    Each env entry an edge's inject block dictates becomes an entry of the
-    container's environment under that name, its value written whole, so a
-    Terraform reference a neighbour publishes is evaluated by the engine;
-    concurrency and queue_depth_hint arrive as WORKER_CONCURRENCY and
-    WORKER_QUEUE_DEPTH_HINT, which no edge may dictate. File, arg and other
+    Each env entry an edge's inject block, or the component's own, dictates
+    becomes an entry of the container's environment under that name, its value
+    written whole, so a Terraform reference a neighbour publishes is evaluated
+    by the engine; concurrency and queue_depth_hint arrive by default as
+    WORKER_CONCURRENCY and WORKER_QUEUE_DEPTH_HINT, which no edge may dictate
+    while they are the defaults. File, arg and other
     entries are refused by name: Fargate writes no file, and no command line is
     rendered.
     The task runs at the smallest Fargate size meeting both infra.compute.cpu
@@ -35,14 +36,15 @@ metadata:
 
     The terraform-aws-modules ECS module is not sourced: its root runs
     services only in a cluster it creates itself, so it is not complete for a
-    service in the operator's cluster. AWS App Runner is not used: it is no
-    longer open to new customers.
+    service in the operator's cluster.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
 spec:
   capability: terraform
   implements: core/compute/worker:1.0.0
+
+  # AWS App Runner is not used: it is no longer open to new customers.
 
   # The module this Recipe vendors lives beside it, and is copied verbatim into
   # the component's own directory: no fetch and no lockfile pin. Its main.tf pins
@@ -98,7 +100,8 @@ spec:
   # documentation names a spelling for the two developer values. They are
   # delivered under the names helm/worker delivers them under, and only when
   # the developer set them, so an unset value renders no variable rather than
-  # an empty one.
+  # an empty one; those names are defaults, which the component's own inject
+  # block may replace, as the comment above valuesMapping describes.
   #
   # Every Component value and infra key is honoured or refused below by name:
   #   honoured — values.concurrency and values.queue_depth_hint as above,
@@ -107,8 +110,9 @@ spec:
   #     and the overrides above.
   #   refused — infra.overrides.target_group_arn, since nothing connects to a
   #     worker; a compute quantity this Recipe cannot read, and a pair larger
-  #     than the largest Fargate task; an edge injecting a variable under one
-  #     of the two names the developer values are delivered under; and an
+  #     than the largest Fargate task; an edge or the component's own inject
+  #     block injecting a variable under one of the two default names the
+  #     developer values are delivered under; and an
   #     edge's file, arg or custom-mechanism entry, as the comment above
   #     valuesMapping describes.
   assertions:
@@ -243,9 +247,10 @@ spec:
   # the map's value, so a Terraform reference a neighbour publishes, such as
   # ${module.db.address}, reaches the root configuration as an interpolation
   # the engine evaluates there, where the neighbour's module is declared. The
-  # two developer values join that map under their own names, and an edge
-  # delivering either name as well halts, naming the connection, rather than
-  # one value silently replacing the other.
+  # two developer values join that map under their default names, unless the
+  # component's own inject block delivers them, and an edge or that block
+  # delivering either name as well halts, naming which, rather than one value
+  # silently replacing the other.
   #
   # Every other mechanism on the pipe is refused, naming the entry, its
   # mechanism and the connection that dictated it, so none is dropped: a file
@@ -256,6 +261,23 @@ spec:
   # terraform/server-ecs, terraform/task-ecs, cloudformation/server-ecs,
   # cloudformation/worker-ecs and cloudformation/task-ecs declare, word for word;
   # a change to it is made to all six.
+  #
+  # The component's own values. The developer may also write an inject block on
+  # the component itself, whose env entries reach the pipe under the names the
+  # developer chose and so reach the container with every other env entry. The
+  # names this Recipe gives the two developer values are defaults: each is
+  # rendered only while no entry of that block, in any mechanism, delivers its
+  # value. The template reads that at .context.self_inject, which maps each name
+  # the developer wrote to values.<key> for an entry whose template reads that
+  # one own value. A refusal naming a variable that block delivers names the
+  # block, rather than an attachment.
+  #
+  # DELIBERATE NEAR-DUPLICATE of the reading of .context.self_inject every
+  # realization of core/compute/function, task and worker declares, and the two
+  # of core/compute/server that refuse a variable by name declare in its env
+  # half alone: the same lines, save the own values each looks up. It is part of
+  # a workload or a values mapping, and no catalog kind holds part of one for
+  # several Recipes to share; a change to it is made to all fifteen.
   valuesMapping: |
     {{- if not (regexMatch `^[A-Za-z0-9_-]{1,255}$` .context.instance_id) }}
     {{- fail (printf "the component %q names its Amazon ECS service and task definition family, and ECS takes up to 255 letters, digits, hyphens and underscores for each: rename the component in the Aggregate to such a name" .context.instance_id) }}
@@ -280,12 +302,21 @@ spec:
     {{- $o := optional .infra "overrides" dict }}
     {{- $env := dict }}
     {{- range $k, $v := optional (default dict .context.inject) "env" dict }}{{ $_ := set $env $k $v }}{{ end }}
+    {{- $named := dict }}
+    {{- $ownEnv := dict }}
+    {{- range $mechanism, $names := default dict .context.self_inject }}
+    {{- range $name, $key := $names }}
+    {{- if $key }}{{ $_ := set $named (toString $key) true }}{{ end }}
+    {{- if eq $mechanism "env" }}{{ $_ := set $ownEnv $name true }}{{ end }}
+    {{- end }}
+    {{- end }}
     {{- $developer := dict }}
-    {{- with optional .values "concurrency" "" }}{{ $_ := set $developer "WORKER_CONCURRENCY" (toString .) }}{{ end }}
-    {{- if hasKey .values "queue_depth_hint" }}{{ $_ := set $developer "WORKER_QUEUE_DEPTH_HINT" (toString (index .values "queue_depth_hint")) }}{{ end }}
+    {{- if not (hasKey $named "values.concurrency") }}{{ with optional .values "concurrency" "" }}{{ $_ := set $developer "WORKER_CONCURRENCY" (toString .) }}{{ end }}{{ end }}
+    {{- if and (hasKey .values "queue_depth_hint") (not (hasKey $named "values.queue_depth_hint")) }}{{ $_ := set $developer "WORKER_QUEUE_DEPTH_HINT" (toString (index .values "queue_depth_hint")) }}{{ end }}
     {{- range $k, $v := $developer }}
     {{- if hasKey $env $k }}
     {{- $by := "an attachment on the component" }}
+    {{- if hasKey $ownEnv $k }}{{ $by = "the component's own inject block" }}{{ end }}
     {{- range $alias, $edge := $.context.uses }}
     {{- if hasKey (optional (default dict $edge.inject) "env" dict) $k }}{{ $by = printf "its connection %q" $alias }}{{ end }}
     {{- end }}
