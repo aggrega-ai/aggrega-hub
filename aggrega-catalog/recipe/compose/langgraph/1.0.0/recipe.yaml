@@ -11,17 +11,22 @@ metadata:
     Synthesized-mode Workload: image and environment are translated from the
     Workload kind by the compose provider. The model endpoint wired into the
     `model` socket is rendered as OPENAI_BASE_URL; the checkpointer datastore
-    wired into the `checkpointer_db` socket contributes its host and port; a
-    model API key attached on the `model` connection is rendered as
-    OPENAI_API_KEY, read from the inject pipe under the key the attachment
-    names in `values.key` (`value` for a `core/secret-value` the Release alone
-    attaches), or under OPENAI_API_KEY where it names none. A connection
-    writing an `inject:` block receives the
-    names it dictates instead of these defaults, as variables or as files
-    mounted at the paths it names, while OPENAI_BASE_URL and the API key stay. A
-    checkpointer datastore served over TLS alone or over HTTPS halts the build
-    on a connection writing no `inject:` block, naming the connection, since
-    such a connection hands the application only the store's host and port.
+    wired into the `checkpointer_db` socket contributes its host and port as
+    LANGGRAPH_CHECKPOINTER_HOST and LANGGRAPH_CHECKPOINTER_PORT; a model API
+    key attached on the `model` connection is rendered as OPENAI_API_KEY, and
+    a password attached on the `checkpointer_db` connection as
+    LANGGRAPH_CHECKPOINTER_PASSWORD, each read from the inject pipe under the
+    key the attachment names in `values.key` (`value` for a
+    `core/secret-value` the Release alone attaches), or under the variable's
+    own name where it names none. `values.recursion_limit` is rendered as
+    LANGGRAPH_DEFAULT_RECURSION_LIMIT, which LangGraph reads as the limit of a
+    run whose configuration sets none. A connection writing an `inject:` block
+    receives the names it dictates instead of these defaults, as variables or
+    as files mounted at the paths it names, while OPENAI_BASE_URL, the API key
+    and the checkpointer password stay. A checkpointer datastore served over
+    TLS alone or over HTTPS halts the build on a connection writing no
+    `inject:` block, naming the connection, since such a connection hands the
+    application the store's host and port and not its protocol.
 
     With infra.image unset it runs the catalog's quickstart agent, a small
     LangGraph application that reads exactly these default variables; a
@@ -38,9 +43,10 @@ spec:
       connection that writes no inject block receives the variables this recipe
       derives from its target's provides, and a connection that writes one
       receives exactly what it dictates instead, read off the inject pipe as a
-      map. Two deliveries stay on every connection either way: OPENAI_BASE_URL,
-      which the client SDK reads by itself, and the API key a credential
-      attached on a model connection carries. A dictated env entry becomes a
+      map. Three deliveries stay on every connection either way: OPENAI_BASE_URL,
+      which the client SDK reads by itself, the API key a credential attached on
+      a model connection carries, and the password a credential attached on a
+      checkpointer connection carries. A dictated env entry becomes a
       service variable under the name it gives, written as the pipe carries it,
       so Docker Compose substitutes a $ in it as in every variable; a dictated
       file entry becomes a compose config mounted as one file at the absolute
@@ -58,8 +64,8 @@ spec:
       in -tls, such as valkey-tls or memcached-tls, and one served over HTTPS
       alone publishes https; neither accepts a plaintext connection. A
       checkpointer connection taking the defaults hands the application the
-      store's host and port alone, so its code could not tell that TLS is
-      required: such a connection halts the build, naming it, rather than
+      store's host and port and not its protocol, so its code could not tell
+      that TLS is required: such a connection halts the build, naming it, rather than
       rendering an address the application would reach in plaintext. A
       connection that dictates its delivery can hand the code the protocol too,
       and is not refused.
@@ -78,7 +84,7 @@ spec:
     {{- if $entries }}{{ $_ := set $dictating $alias true }}{{ end }}
     {{- end }}
     {{- end }}
-    {{- $taken := dict }}
+    {{- $taken := dict "LANGGRAPH_DEFAULT_RECURSION_LIMIT" "the component's values.recursion_limit, which LangGraph reads under that name" }}
     {{- range $alias, $edge := .context.uses }}
     {{- range $slot, $attachment := (default dict $edge.features) }}
     {{- with optional (default dict $attachment.values) "key" "" }}
@@ -93,6 +99,9 @@ spec:
     {{- $_ := set $taken "OPENAI_API_KEY" (printf "the credential attached on the model connection %s" $alias) }}
     {{- end }}
     {{- end }}
+    {{- if and (eq $edge.socket "checkpointer_db") (hasKey (default dict $edge.features) "credential") }}
+    {{- $_ := set $taken "LANGGRAPH_CHECKPOINTER_PASSWORD" (printf "the credential attached on the checkpointer_db connection %s" $alias) }}
+    {{- end }}
     {{- if not (hasKey $dictating $alias) }}
     {{- $by := printf "the %s connection %s, which writes no inject block" $edge.socket $alias }}
     {{- if eq $edge.socket "model" }}
@@ -105,7 +114,7 @@ spec:
     {{- $needs := "" }}
     {{- if hasSuffix "-tls" $proto }}{{ $needs = "TLS" }}{{ else if eq $proto "https" }}{{ $needs = "HTTPS" }}{{ end }}
     {{- if $needs }}
-    {{- fail (printf "the %s connection %s of %q reaches %q, which publishes protocol %s, a store served over %s alone, but a connection writing no inject block hands the application only the store's host and port, so its code could not tell that %s is required: write an inject block on that connection delivering the store's protocol with whatever else the code reads, under names it reads, or wire a store served without %s" $edge.socket $alias $.context.instance_id $edge.target $proto $needs $needs $needs) }}
+    {{- fail (printf "the %s connection %s of %q reaches %q, which publishes protocol %s, a store served over %s alone, but a connection writing no inject block hands the application the store's host and port and not its protocol, so its code could not tell that %s is required: write an inject block on that connection delivering the store's protocol with whatever else the code reads, under names it reads, or wire a store served without %s" $edge.socket $alias $.context.instance_id $edge.target $proto $needs $needs $needs) }}
     {{- end }}
     {{- end }}
     {{- end }}
@@ -157,7 +166,8 @@ spec:
         # This agent consumes two sockets. The recipe ranges its outbound edges
         # and matches on the socket name: the `model` edge contributes the endpoint
         # and the model name; the `checkpointer_db` edge contributes the datastore
-        # host and port the LangGraph checkpointer persists graph state to.
+        # host and port the LangGraph checkpointer persists graph state to, and a
+        # credential attached on it the store's password.
         # The client SDK reads the base URL and the API key from the environment.
         # LangGraph reads no model-name environment variable at all — a model named
         # as a string is resolved by the LangChain chat-model factory, which
@@ -171,7 +181,14 @@ spec:
         # OPENAI_MODEL and the checkpointer coordinates are the defaults: a
         # connection writing an inject block receives the variables it dictates
         # in their place, on its own position among the edges.
+        # values.recursion_limit is delivered as LANGGRAPH_DEFAULT_RECURSION_LIMIT,
+        # which LangGraph itself reads when it is imported, as the most steps a
+        # run may take when the configuration it is invoked with sets no limit of
+        # its own. values.graph_entrypoint is not delivered: LangGraph reads no
+        # environment variable naming the graph to run, which the application's
+        # own code chooses.
         variables:
+          LANGGRAPH_DEFAULT_RECURSION_LIMIT: "{{ .values.recursion_limit }}"
     {{- range $alias, $edge := .context.uses }}
     {{- $dictates := hasKey $dictating $alias }}
     {{- if eq $edge.socket "model" }}
@@ -200,6 +217,20 @@ spec:
     {{- if and (eq $edge.socket "model") (hasKey $features "credential") }}
     {{- $credentialKey := default "OPENAI_API_KEY" (optional (default dict $features.credential.values) "key" "") }}
           OPENAI_API_KEY: "{{ index $env $credentialKey | replace "\\" "\\\\" | replace "\"" "\\\"" }}"
+    {{- end }}
+    {{- end }}
+        # A password attached on the `checkpointer_db` connection is read off the
+        # inject pipe the same way, under the key the attachment names in
+        # `values.key`, or under LANGGRAPH_CHECKPOINTER_PASSWORD where it names
+        # none, and renders as LANGGRAPH_CHECKPOINTER_PASSWORD whether or not the
+        # connection writes an inject block, since an inject block can name only
+        # what the store publishes and a store publishes no password. A
+        # connection carrying no credential emits no password env.
+    {{- range $alias, $edge := .context.uses }}
+    {{- $features := default dict $edge.features }}
+    {{- if and (eq $edge.socket "checkpointer_db") (hasKey $features "credential") }}
+    {{- $credentialKey := default "LANGGRAPH_CHECKPOINTER_PASSWORD" (optional (default dict $features.credential.values) "key" "") }}
+          LANGGRAPH_CHECKPOINTER_PASSWORD: "{{ index $env $credentialKey | replace "\\" "\\\\" | replace "\"" "\\\"" }}"
     {{- end }}
     {{- end }}
     {{- if $files }}
