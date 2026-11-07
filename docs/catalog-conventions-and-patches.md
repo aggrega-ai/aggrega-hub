@@ -1992,12 +1992,16 @@ Where a target reads no variable for the value at all, the Recipe still delivers
 it under a stable name for the application's own code to read, and says so. Where
 the value comes from a connection, that stable name is a default: the code is the
 Release's, and an `inject:` block on the connection replaces the default with the
-names that code reads, as the next section describes. A value with a named
+names that code reads, as the next section describes. Where the value is one of
+the component's own, that stable name is a default too: the developer's `inject:`
+block on the component itself replaces it with a name of their own, as the next
+section also describes. A name the framework or SDK reads by itself is no
+default, whichever block the developer writes. A value with a named
 consumer is not an inert declaration, even when the framework itself is not the
 consumer; what makes it inert is nothing reading it, and that is the claim a
 Recipe's comment has to get right.
 
-### A component running the Release's own code takes `inject:` on its connections
+### A component running the Release's own code takes `inject:` on its connections and on itself
 
 A component whose Recipes run an image the Release supplies as its own code — the
 catalog pins no image, `infra.image` carries no default, and the Component
@@ -2058,8 +2062,9 @@ into the product's own configuration, under names the product defines.
   names a Recipe writes, so the Recipe halts the build on a dictated name equal
   to one it writes — a variable the framework reads, another connection's
   default, an attachment's variable, a variable carrying one of the component's
-  own values — naming the name, the connection that dictated it and what else
-  delivers it.
+  own values while that value is delivered under its default name — naming the
+  name, the connection or the component's own block that dictated it and what
+  else delivers it.
 - **A refusal about the default delivery applies to it alone.** Where a Recipe
   refuses because its default delivery cannot convey something — a store served
   over TLS alone, or over HTTPS, to code handed only its host and port; two
@@ -2072,6 +2077,45 @@ into the product's own configuration, under names the product defines.
   deliver and refuses by name each pipe entry of a mechanism it cannot — an
   `arg` where it renders no command line, a `file` where the target offers no
   way to write one, a custom mechanism — naming the entry and the mechanism.
+- **The component's own values take an `inject:` block on the component
+  itself.** The Component declares `spec.inject`, the mechanisms every one of
+  its Recipes delivers — `env` where some Recipe can deliver nothing else, `env`
+  and `file` where every Recipe writes a file — and the compiler refuses that
+  block on a Component declaring none, and an entry of it under a mechanism
+  `spec.inject` does not list. Each entry reaches the container as a
+  connection's does: an `env` entry under the name the developer gives, read off
+  `.context.inject`, a `file` entry at the absolute path it names, checked as a
+  connection's file is. A name the Recipe chose for one of the component's own
+  values — `TASK_TIMEOUT`, `EMAIL_TOOL_ACTION`, `CREWAI_ROLE` — is a default:
+  the Recipe reads `.context.self_inject`, which maps each name in that block to
+  `values.<key>` for an entry whose template reads that one own value, and
+  renders the default, and halts on another source dictating it, only while no
+  entry of the block, in either mechanism, maps to that value. An entry reading
+  two values, one reading a value beside infra, metadata or the component's
+  identity, or a literal, replaces no default. An optional value left unset
+  renders no variable, and an own value that is a list or a map is written as
+  its JSON text. A name the framework reads by itself — LangGraph's
+  `LANGGRAPH_DEFAULT_RECURSION_LIMIT` — is rendered whatever the block
+  dictates, and an entry under it halts. A realization that delivers nothing of
+  the block refuses each of its entries by name.
+
+  ```yaml
+  researcher:
+    type: core/ai-agent/crewai
+    values:
+      role: Support researcher
+      goal: Find what each plan covers
+      backstory: You know the plans.
+    inject:
+      env:
+        - in: AGENT_ROLE
+          value: '{{"{{"}} .values.role }}'
+  ```
+
+  Here the container receives `AGENT_ROLE` in place of `CREWAI_ROLE`, and every
+  other own value under its default name. The template opens with `{{"{{"}}`
+  because the Aggregate's text is read once as a template before the block's
+  own templates are evaluated.
 - **A `core/secret-value` attachment's value is written into the rendered
   workload in the clear.** Its realizations put the value as the author wrote it
   into the inject pipe, and the Recipe writes what the pipe carries: a container
@@ -2105,13 +2149,17 @@ container is given to run in place of the image's default command, and that
 command is the Release's. A dictated name equal to
 `WORKER_CONCURRENCY` or `WORKER_QUEUE_DEPTH_HINT` while the worker's value is
 set, to `TASK_TIMEOUT` while the task's timeout is set, or to `FUNCTION_RUNTIME`
-halts.
+halts while that value is delivered under that default name, which it is until
+an entry of the component's own `inject:` block reads it alone. Each of the four
+declares `spec.inject: [env]`, the one mechanism every one of its Recipes
+delivers, so that block takes `env` entries alone.
 
-This is a catalog convention, upheld by its Recipes. The compiler enforces two
-parts of it and nothing else: a socket's `inject` allowlist, and the inject key
-collision rule. What a connection receives, which names are defaults, which
-refusals apply and what is refused by name are the Recipes' to uphold: the
-compiler pipes what a connection's `inject:` block resolves to and knows nothing
+This is a catalog convention, upheld by its Recipes. The compiler enforces three
+parts of it and nothing else: a socket's `inject` allowlist, a Component's
+`spec.inject` allowlist for the block on the component itself, and the inject
+key collision rule. What a connection or that block receives, which names are
+defaults, which refusals apply and what is refused by name are the Recipes' to
+uphold: the compiler pipes what an `inject:` block resolves to and knows nothing
 of the names a Recipe expects or writes.
 
 ### A connection variable is read off the inject pipe as a map, and an absent one halts
@@ -4148,7 +4196,8 @@ template, not something the compiler checks: the compiler pipes the published
   Every consumer Recipe checks `protocol` on a connection it delivers under its default
   variables: one taught the TLS value reaches the cache over TLS; every other refuses
   it, naming the connection. A connection that dictates gets what it dictates (see "A
-  component running the Release's own code takes `inject:` on its connections").
+  component running the Release's own code takes `inject:` on its connections and on
+  itself").
 - **A self-hosted realization presents the certificate attached to the slot
   `server_certificate`**, declared optional with `selector:
   "feature.aggrega.ai/kind=secret"`, `sensitive: true` and `inject: [file]`. Its
