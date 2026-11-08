@@ -91,14 +91,28 @@ spec:
   # Cookie header and under the names the server gave them, with the CSRF token
   # repeated in X-CSRF-Token: the server marks those cookies secure when its
   # external address is https, and a client would then withhold them from the
-  # in-cluster http address. Nothing the step prints repeats the password.
+  # in-cluster http address. A refused call prints its step and HTTP status
+  # beside the message Dify's reply carries, and the details where they differ;
+  # a 422, Dify's refusal of a request it finds invalid, prints the message
+  # alone. Dify refuses an owner account it finds invalid, a password too weak
+  # say, with a generic message rather than the rule the account broke, so that
+  # refusal prints the generic message. Nothing the step prints repeats the
+  # password: a text from Dify's reply holding the password, as given or
+  # Base64-encoded, or carrying input_value, the marker a validation error
+  # writes before the value it refused, is left out.
   #
   # The Job runs the server's own image, whose Python environment carries the
   # HTTP and YAML libraries the script uses, so the step adds no image. It has
-  # the form the provider gives a run-to-completion workload — restartPolicy
-  # Never, and no deadline or retry count, so the cluster's defaults apply — and
-  # each attempt stops waiting for the server after about ten minutes. The
-  # address is the Service the Workload below is served on,
+  # the form the provider gives a run-to-completion workload, restartPolicy
+  # Never, and sets no deadline and no retry count, so a failure a retry can
+  # fix is retried as often as the cluster's default allows, six times; each
+  # attempt stops waiting for the server after about ten minutes, and a reply
+  # of the server's own failure, a 5xx, is retried too. A refusal no retry can
+  # fix — Dify refusing the setup, the sign-in, the listing, the import or its
+  # confirmation with a 4xx other than 408 or 429, Dify reporting the import
+  # failed, or a definition naming no application — exits with status 2, and
+  # the Job's podFailurePolicy fails the Job at that attempt, so it reports
+  # Failed at once rather than at the retry limit. The address is the Service the Workload below is served on,
   # <rendered_name>-default, on infra.port. That bare name resolves only inside
   # the Service's own namespace, and the Secret the password is read from must
   # sit beside the Job too, so the ConfigMap and the Job carry the namespace the
@@ -109,7 +123,8 @@ spec:
   # template unchanged. A Job's pod template cannot be changed once
   # created, so a Release changing anything else the Job's pod carries — the
   # owner's email, the image tag, the port — deletes the completed Job before
-  # applying.
+  # applying. A Job that failed is deleted before applying again too: applied
+  # unchanged, it stays failed and runs no further attempt.
   #
   # The owner password reaches the step by reference: OWNER_PASSWORD is a
   # secretKeyRef to the Secret name and data key the owner_password credential
@@ -140,11 +155,13 @@ spec:
           API = os.environ["DIFY_API_URL"].rstrip("/") + "/console/api"
           EMAIL = os.environ["OWNER_EMAIL"]
           PASSWORD = os.environ["OWNER_PASSWORD"]
+          ENCODED = base64.b64encode(PASSWORD.encode("utf-8")).decode("ascii")
+          FINAL = 2
 
 
-          def fail(message):
+          def fail(message, code=1):
               print(message, file=sys.stderr)
-              sys.exit(1)
+              sys.exit(code)
 
 
           def read_json(response):
@@ -152,6 +169,30 @@ spec:
                   return response.json()
               except ValueError:
                   return {}
+
+
+          def said(text):
+              if not isinstance(text, str) or "input_value" in text:
+                  return ""
+              if PASSWORD and (PASSWORD in text or ENCODED in text):
+                  return ""
+              return text.strip()
+
+
+          def refused(step, response):
+              body = read_json(response)
+              error = body.get("error") if isinstance(body, dict) else None
+              fields = error if isinstance(error, dict) else body if isinstance(body, dict) else {}
+              status = response.status_code
+              reasons = []
+              for key in ("message",) if status == 422 else ("message", "details"):
+                  text = said(fields.get(key))
+                  if text and text not in reasons:
+                      reasons.append(text)
+              message = f"{step} was refused with HTTP {status}"
+              if reasons:
+                  message += ": " + "; ".join(reasons)
+              fail(message, FINAL if 400 <= status < 500 and status not in (408, 429) else 1)
 
 
           def setup_step(client):
@@ -173,18 +214,17 @@ spec:
               app = (yaml.safe_load(definition) or {}).get("app") or {}
               name = app.get("name") or ""
               if not name:
-                  fail("the definition names no application under app.name")
+                  fail("the definition names no application under app.name", FINAL)
               with httpx.Client(timeout=60) as client:
                   if setup_step(client) != "finished":
                       owner = {"email": EMAIL, "name": EMAIL.split("@")[0][:30], "password": PASSWORD}
                       response = client.post(API + "/setup", json=owner)
                       if response.status_code != 201:
-                          fail(f"first-time setup was refused with HTTP {response.status_code}")
+                          refused("first-time setup", response)
                       print(f"first-time setup done: owner account {EMAIL}")
-                  encoded = base64.b64encode(PASSWORD.encode("utf-8")).decode("ascii")
-                  response = client.post(API + "/login", json={"email": EMAIL, "password": encoded})
+                  response = client.post(API + "/login", json={"email": EMAIL, "password": ENCODED})
                   if response.status_code != 200 or read_json(response).get("result") != "success":
-                      fail(f"signing in as {EMAIL} was refused with HTTP {response.status_code}")
+                      refused(f"signing in as {EMAIL}", response)
                   session = {cookie.name: cookie.value for cookie in response.cookies.jar}
                   client.cookies.clear()
                   csrf = next((value for key, value in session.items() if key.endswith("csrf_token")), "")
@@ -197,7 +237,7 @@ spec:
                       query = {"page": page, "limit": 100, "name": name}
                       response = client.get(API + "/apps", params=query, headers=headers)
                       if response.status_code != 200:
-                          fail(f"listing the applications was refused with HTTP {response.status_code}")
+                          refused("listing the applications", response)
                       listing = read_json(response)
                       if any(item.get("name") == name for item in listing.get("data", [])):
                           print(f"an application named {name!r} is already present; leaving it as it is")
@@ -212,8 +252,10 @@ spec:
                       response = client.post(API + "/apps/imports/" + result.get("id", "") + "/confirm", headers=headers)
                       result = read_json(response)
                   if result.get("status") not in ("completed", "completed-with-warnings"):
-                      reason = result.get("error") or f"HTTP {response.status_code}"
-                      fail(f"importing {name!r} failed: {reason}")
+                      if result.get("status") != "failed":
+                          refused(f"importing {name!r}", response)
+                      reason = said(result.get("error")) or f"HTTP {response.status_code}"
+                      fail(f"importing {name!r} failed: {reason}", FINAL)
                   print(f"imported {name!r} as application {result.get('app_id')}")
 
 
@@ -233,6 +275,13 @@ spec:
         namespace: "{{ . }}"
         {{- end }}
       spec:
+        podFailurePolicy:
+          rules:
+            - action: FailJob
+              onExitCodes:
+                containerName: import
+                operator: In
+                values: [2]
         template:
           spec:
             restartPolicy: Never

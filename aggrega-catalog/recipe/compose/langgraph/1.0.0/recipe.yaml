@@ -107,6 +107,12 @@ spec:
       differing only in the names each delivers itself and the refusals its own
       connections call for; a change to it is made to all.
     */ -}}
+    {{- /*
+      The catalog's quickstart agent, written once: the graph runs it when the
+      Release sets no infra.image, and the wait for the checkpointer store
+      below runs it whatever the Release sets.
+    */ -}}
+    {{- $quickstart := "hub.aggrega.ai/tools/quickstart-agent:1.0.0@sha256:99816fe5ab1015d2576bd7bffe5a51ca07fec41fe650bda17c5555143367acab" }}
     {{- $pipe := default dict .context.inject }}
     {{- $env := optional $pipe "env" dict }}
     {{- $pipeFiles := optional $pipe "file" dict }}
@@ -202,6 +208,48 @@ spec:
     apiVersion: aggrega.ai/v1alpha1
     kind: Workload
     form: stateless
+    # The graph may open its checkpointer as it starts, and Docker Compose
+    # starts it once the store's container has started, not once the store
+    # accepts connections: a program that opens its store at start can then
+    # exit while the store initialises, and nothing starts it again. So a step
+    # runs first for each checkpointer_db connection whose store publishes both
+    # a host and a port, and waits until that address accepts a TCP connection;
+    # a store publishing either one alone or neither gets no wait, and the graph
+    # starts as it would without one. Bash opens the connection through
+    # /dev/tcp, each attempt bounded to 5 s and repeated every 2 s, and once the
+    # limit below has passed it gives up, exits non-zero and names the address,
+    # and Docker Compose does not start the graph. It reads the store's host and
+    # port from what the store publishes, which the connection carries whether
+    # or not it writes an inject block, and nothing else, so no credential
+    # reaches it. Each step becomes a service of its own that runs once, and the
+    # graph's service waits for it to complete successfully. This is the wait
+    # recipe/helm/dify-plugin-daemon writes, adapted to this target: it runs in
+    # the catalog's quickstart agent, pinned above, whose image holds bash and
+    # timeout, rather than in the graph's image, which is the Release's and may
+    # hold no shell; Docker Compose reads every $ in the file before any shell
+    # runs, so the step's own shell variables are written $$, which reaches the
+    # shell as one $; and it sets no resources, as the graph's own container
+    # sets none. DELIBERATE NEAR-DUPLICATE of that block: no catalog kind holds
+    # part of a workload template for several Recipes to share, so a change to
+    # the wait is made to both.
+    {{- $wait := 0 }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- $published := default dict $edge.provides }}
+    {{- if and (eq $edge.socket "checkpointer_db") (hasKey $published "host") (hasKey $published "port") }}
+    {{- if eq $wait 0 }}
+    initContainers:
+    {{- end }}
+    {{- $wait = add $wait 1 }}
+      - name: "wait-for-store{{ if gt $wait 1 }}-{{ $wait }}{{ end }}"
+        image: "{{ $quickstart }}"
+        command: ["/bin/bash", "-c"]
+        args:
+          - 'limit=300; end=$$SECONDS; ((end += limit)); until timeout 5 bash -c "exec 3<>/dev/tcp/$$STORE_HOST/$$STORE_PORT" 2>/dev/null; do if ((SECONDS >= end)); then echo "the store at $$STORE_HOST:$$STORE_PORT accepted no TCP connection within $$limit s" >&2; exit 1; fi; sleep 2; done; echo "the store at $$STORE_HOST:$$STORE_PORT accepts TCP connections"'
+        variables:
+          STORE_HOST: "{{ $edge.provides.host }}"
+          STORE_PORT: "{{ $edge.provides.port }}"
+    {{- end }}
+    {{- end }}
     containers:
       main:
         # The image is the Release's own code, so infra.image, where the Release
@@ -214,7 +262,7 @@ spec:
         # defaults below, so it runs with no inject block on either connection.
         # It is pinned by the digest of its published image index, so every
         # build runs the same image on every platform it is published for.
-        image: "{{ default "hub.aggrega.ai/tools/quickstart-agent:1.0.0@sha256:99816fe5ab1015d2576bd7bffe5a51ca07fec41fe650bda17c5555143367acab" (optional .infra "image" "") }}"
+        image: "{{ default $quickstart (optional .infra "image" "") }}"
         # This agent consumes two sockets. The recipe ranges its outbound edges
         # and matches on the socket name: the `model` edge contributes the endpoint
         # and the model name; the `checkpointer_db` edge contributes the datastore
