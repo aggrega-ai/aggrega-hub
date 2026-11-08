@@ -92,6 +92,11 @@ spec:
     {{- end -}}
     {{- end -}}
     {{- /*
+      The runtime's image, written once: the wait step and the runtime itself
+      both run it.
+    */ -}}
+    {{- $image := printf "langgenius/dify-plugin-daemon:%s" .infra.engine_version -}}
+    {{- /*
       The connection variables this Recipe reads off the inject pipe, under the
       socket whose edge delivers them, each beside the provides key the edge's
       inject block names it from. The pipe is read as a map, and every read of
@@ -149,9 +154,38 @@ spec:
     # prepared runtime environments.
     form: stateful
     replicas: 1
+    # The runtime connects to its database as it starts, and a runtime started
+    # before the database accepts connections panics and is restarted by the
+    # cluster. So this step runs first, in the runtime's own image, and waits
+    # until the database's address accepts a TCP connection: bash opens the
+    # connection through /dev/tcp, each attempt bounded to 5 s and repeated
+    # every 2 s, and once the limit below has passed it gives up, exits
+    # non-zero and names the address, and the cluster runs it again. It reads
+    # the database's host and port and nothing else, so no credential reaches
+    # it. The wait is written once, here, so a later Recipe whose process has
+    # to wait for a connection's address before it starts copies this block.
+    # Its requests equal its limits, as the runtime's do, so the pod keeps its
+    # Guaranteed quality-of-service class; they are the runtime's own
+    # quantities, so the wait never raises what the pod reserves.
+    initContainers:
+      - name: wait-for-database
+        image: "{{ $image }}"
+        command: ["/bin/bash", "-c"]
+        args:
+          - 'limit=300; end=$SECONDS; ((end += limit)); until timeout 5 bash -c "exec 3<>/dev/tcp/$DB_HOST/$DB_PORT" 2>/dev/null; do if ((SECONDS >= end)); then echo "the database at $DB_HOST:$DB_PORT accepted no TCP connection within $limit s" >&2; exit 1; fi; sleep 2; done; echo "the database at $DB_HOST:$DB_PORT accepts TCP connections"'
+        variables:
+          DB_HOST: "{{ $env.DB_HOST }}"
+          DB_PORT: "{{ $env.DB_PORT }}"
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
     containers:
       main:
-        image: "langgenius/dify-plugin-daemon:{{ .infra.engine_version }}"
+        image: "{{ $image }}"
         variables:
           SERVER_PORT: "{{ .infra.port }}"
           # The backend identity arrives on the inject pipe under the names the
