@@ -973,8 +973,9 @@ its parameter required and with no default, because the key it carries guards
 the API that writes the gateway's routes and a pinned one would be a key every
 reader of the catalog holds: an importer passes one down and its Release
 fulfills it, or the build halts. `core/harbor` does the same for its three keys,
-`core/livekit` for its API secret and `core/agenta` for its signing and
-encryption keys (see "A key with no development default"). The shape stops where
+`core/livekit` for its API secret, `core/agenta` for its signing and encryption
+keys and `core/dify` for its application secret (see "A key with no development
+default"). The shape stops where
 the Feature cannot follow. A
 module that also builds on `compose` attaches nothing, because that target has no
 realization of a Feature holding a credential by reference; its description says
@@ -2548,7 +2549,8 @@ a root password that opens what the product trusts. `core/devtool/harbor`'s
 `token_key`, `core_secret`, `csrf_key` and `secret_key`,
 `core/observability/langfuse`'s `encryption_key` and `salt`,
 `core/ai-agent/librechat`'s `credential_encryption_key` and
-`credential_encryption_iv`, `core/ai-agent/open-webui`'s `session_secret`, and
+`credential_encryption_iv`, `core/ai-agent/open-webui`'s `session_secret`, the
+`secret_key` slot of `core/ai-agent/dify` and `core/ai-agent/dify-worker`, and
 the `auth_key` and `crypt_key` slots of the Agenta Components are slots of this
 shape. The self-hosted realizations of
 `core/storage/s3-object-store`, `helm/s3-object-store` and
@@ -2562,7 +2564,8 @@ nothing in its `credential` halts the build, naming the connection, unless its
 values set `unauthenticated: true`, and then no secret key is presented. A
 module filling such a slot from a parameter declares the parameter required
 with no default, as `core/harbor` does for `csrf_key`, `core/livekit` for
-`api_secret` and `core/agenta` for `auth_key` and `crypt_key`. `core/agenta` and
+`api_secret`, `core/agenta` for `auth_key` and `crypt_key`, and `core/dify` for
+`secret_key`. `core/agenta` and
 `core/thanos` are the exception: each fills its object store's key pair, and the
 store connections that present it, from two parameters — `store_access_key` and
 `store_secret_key`, `s3_access_key` and `s3_secret_key` — each carrying a pinned
