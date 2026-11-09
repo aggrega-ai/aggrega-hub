@@ -1726,7 +1726,7 @@ A SchemaLibrary entry carries one or more named schema definitions under `spec.s
 
 ```yaml
 # schemalibrary/base-components/1.0.0/library.yaml — the library
-apiVersion: aggrega.ai/v1alpha1
+apiVersion: aggrega.ai/v1beta1
 kind: SchemaLibrary
 metadata:
   name: BaseComponents
@@ -2675,7 +2675,7 @@ the attached secret publishes:
 ```yaml
 spec:
   workload: |
-    apiVersion: aggrega.ai/v1alpha1
+    apiVersion: aggrega.ai/v1beta1
     kind: Workload
     containers:
       main:
@@ -3263,7 +3263,7 @@ scalar (`workload: |`). The Recipe envelope accepts a string or a single-key
 # CORRECT
 spec:
   workload: |
-    apiVersion: aggrega.ai/v1alpha1
+    apiVersion: aggrega.ai/v1beta1
     kind: Workload
     form: stateless
 
@@ -3278,7 +3278,7 @@ rendered text is parsed as a standalone Workload document, so the first two line
 of the template are always:
 
 ```yaml
-    apiVersion: aggrega.ai/v1alpha1
+    apiVersion: aggrega.ai/v1beta1
     kind: Workload
 ```
 
