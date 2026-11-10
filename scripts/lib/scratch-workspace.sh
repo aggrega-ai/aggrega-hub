@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # scripts/lib/scratch-workspace.sh — the Aggrega workspace a run uses when nothing
 # else gives it one. Sourced by scripts/publish-diff.sh and
-# scripts/published-version-guard.sh; it defines a function and a constant and runs
+# scripts/published-version-guard.sh; it defines a function and two constants and runs
 # nothing.
 #
 # WHY A RUN NEEDS ONE. A Recipe or FeatureRecipe whose source is fetched from a
@@ -21,15 +21,30 @@
 # found to be in a workspace is the binary's rule, and a copy of it here would agree
 # with the binary only until either changed — after which it could name a scratch
 # root over a real workspace, replacing its configuration without a word. The answer
-# read is the sentence the binary writes to standard error when it finds no
-# workspace, matched by its opening words. That stream is written for people rather
-# than scripts, so the sentence may change; if it does, no scratch root is named and
-# the fetch refuses as it would with no helper at all, naming AGGREGA_WORKSPACE_ROOT:
-# loudly, never with a quiet wrong answer.
+# read is the line the binary writes to standard error when a command whose result
+# depends on the workspace runs in a folder that is in none. `aggrega cache status`
+# is asked because it is such a command — it reads the cache kept beneath the
+# workspace root — it needs no network, and it exits zero in a folder that is in no
+# workspace. A command whose result does not depend on the workspace, such as
+# `aggrega config show`, writes no such line on a binary that only warns where the
+# workspace matters.
+#
+# Two wordings are recognised, one per binary this file meets:
+#   - 0.9.0-rc.2 and earlier write, for every command that reads its workspace,
+#     "note: no Aggrega workspace was found from <folder>, so it is used as the
+#     workspace root; ...".
+#   - Later binaries write, only for a command whose result depends on the
+#     workspace, "warning: <folder> is not inside an Aggrega workspace. To make it
+#     one, run: aggrega config init --workspace".
+# That stream is written for people rather than scripts, so the line may change
+# again; if it does, no scratch root is named and the fetch refuses as it would with
+# no helper at all, naming AGGREGA_WORKSPACE_ROOT: loudly, never with a quiet wrong
+# answer.
 
-# The opening words of the sentence the binary writes to standard error when it
-# finds no workspace from the folder it runs in.
+# The words each binary's line carries when it finds no workspace from the folder it
+# runs in: the earlier note, and the later warning.
 NO_WORKSPACE_NOTICE="no Aggrega workspace was found from"
+NO_WORKSPACE_WARNING=" is not inside an Aggrega workspace"
 
 # scratch_workspace_root PARENT DIR... — names a scratch workspace root for the rest
 # of the run when nothing else names one. When AGGREGA_WORKSPACE_ROOT is unset or
@@ -54,9 +69,9 @@ scratch_workspace_root() {
     */*) bin="$PWD/$bin" ;;
   esac
   for dir in "$@"; do
-    said="$(cd "$dir" && "$bin" config show --workspace 2>&1 >/dev/null)" || return 0
+    said="$(cd "$dir" && "$bin" cache status 2>&1 >/dev/null)" || return 0
     case "$said" in
-      *"$NO_WORKSPACE_NOTICE"*) ;;
+      *"$NO_WORKSPACE_NOTICE"* | *"$NO_WORKSPACE_WARNING"*) ;;
       *) return 0 ;;
     esac
   done
