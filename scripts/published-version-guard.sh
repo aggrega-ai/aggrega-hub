@@ -18,6 +18,20 @@
 # THE COMMITTED SWITCH, NOT THE STAGED ONE. A commit is judged under the switch as
 # it stood before that commit, so no commit can loosen the guard for itself.
 #
+# ONE NAME FOR THE MARKER. Which tag marks where the last successful publish left
+# the catalog is PUBLISH_MARKER_TAG in scripts/lib/published-branch.sh, the
+# constant scripts/publish-diff.sh defaults its marker from, so the guard and the
+# publisher cannot hold different tags. --help prints the name from it too. The
+# marker is read through published_marker_read in the same library, the seam
+# scripts/publish-diff.sh reads and moves it through, so a marker kept some other
+# way than as a git tag is changed in one place for both.
+#
+# A RELEASED VERSION DIRECTORY NEEDS ONLY GIT. Which version directories the tag
+# holds is read from the tag's tree, and a staged path's version directory from its
+# path: the first directory below the kind named as a version, which is the layout
+# the catalog conventions give every kind. No binary is asked, so this half judges
+# every kind, a Plugin entity included, and judges it where the dry run cannot run.
+#
 # Which entity a staged path belongs to is answered by walking up from the path to
 # the nearest directory holding an entity document in the index — the per-version
 # directory every published entity lives in, with every file it carries beneath it.
@@ -33,8 +47,11 @@
 # scratch workspace itself; with a workspace given to it, it judges one at a time.
 
 usage() {
-  # The delimiter is not a word the text uses on a line of its own.
-  cat <<'END_OF_HELP'
+  # The delimiter is not a word the text uses on a line of its own. The text is
+  # held quoted, so nothing in it expands, and @MARKER@ is then replaced by the
+  # marker tag's name from its one constant.
+  local text
+  text="$(cat <<'END_OF_HELP'
 published-version-guard.sh — hold every published version of a catalog entity to
 the digest the registry holds for it, and every path the publish workflows own to
 what they published.
@@ -44,11 +61,12 @@ USAGE
   scripts/published-version-guard.sh [--jobs N] --files ENTITY-FILE...
   scripts/published-version-guard.sh -h | --help
 
-  --staged   judge the commit being made, as the index holds it. The pre-commit
-             hook runs this form.
-  --files    judge the entity documents named, as they are on disk. The catalog
-             publisher runs this form over the entities it is about to push,
-             before it pushes any, with its push bound as --jobs.
+  --staged   judge the commit being made, as the index holds it, by all three
+             rules below. The pre-commit hook runs this form.
+  --files    judge the entity documents named, as they are on disk, by A
+             PUBLISHED VERSION CHANGED IN PLACE only. The catalog publisher runs
+             this form over the entities it is about to push, before it pushes
+             any, with its push bound as --jobs.
   --jobs N   judge up to N entities at once, N a whole number of at least 1;
              default 1, one at a time. At any bound the findings are the ones a
              run one at a time gives, in the same order. Above 1 each dry run
@@ -64,8 +82,9 @@ USAGE
   else origin).
 
 THE RECORD
-  The guard reads .ci-published-digests from <remote>/published as last fetched
-  and contacts no git remote, and the dry run it runs contacts no registry. The
+  The guard reads .ci-published-digests from <remote>/published as last fetched,
+  and the publish marker tag as this clone holds it, and contacts no git remote;
+  the dry run it runs contacts no registry. The
   one fetch a run can make is the dry run's own: for a Recipe or FeatureRecipe
   whose remote source is written out in full, aggrega push --dry-run fetches that
   source to compare its pin, into the cache of the Aggrega workspace the dry run
@@ -95,20 +114,58 @@ A PUBLISHED VERSION CHANGED IN PLACE
   there.
 
   An entity at a version the record does not hold — a new version directory —
-  passes. A Plugin entity is not judged here: its digest covers its .wasm, which
-  this repository does not carry, and the plugin entities are owned paths
-  (below). A removed version directory is not judged: the registry keeps what it
-  holds.
+  passes. A Plugin entity is not judged by this comparison: its digest covers its
+  .wasm, which this repository does not carry, and the plugin entities are owned
+  paths (below). A removed version directory is not judged by it either. With
+  --staged, both are judged by A RELEASED VERSION DIRECTORY CHANGED, below.
 
-  The switch: .published-version-guard, committed, holds warn or block. With
-  warn, a finding is printed as a warning and the run passes; with block, the
-  run refuses. A switch that is absent, or holds anything else, blocks and says
-  so. It is read from the committed HEAD, never from what is staged, so a commit
-  cannot loosen the guard for itself.
+  The switch: .published-version-guard, committed, holds warn or block, and it
+  decides this finding and the next one alike. With warn, a finding is printed
+  as a warning and the run passes; with block, the run refuses. A switch that is
+  absent, or holds anything else, blocks and says so. It is read from the
+  committed HEAD, never from what is staged, so a commit cannot loosen the guard
+  for itself.
 
   What the guard cannot judge for a recorded version — no binary, a binary whose
   dry run prints no digest, an entity the dry run refuses — is reported with the
   reason: a warning with warn, a refusal with block.
+
+A RELEASED VERSION DIRECTORY CHANGED (--staged)
+  The catalog is released where the last successful publish left it: the tag
+  @MARKER@, the marker scripts/publish-diff.sh diffs from and moves to
+  what it published after every successful real publish. The guard judges
+  every staged addition, change or removal under aggrega-catalog/ against that
+  tag's tree: a file under a version directory that exists at the tag is part
+  of a released version, whatever the entity's kind, so a Plugin entity's
+  version directory, a removal and a file added beside the entity are held as
+  an edit is. For each such version directory it
+  names the entity, the version, the tag and the files the commit adds, changes
+  or removes, and says to copy the entity into a new version directory — patch,
+  minor or major, as "Choosing a new version" in
+  docs/catalog-conventions-and-patches.md says — and change it there.
+
+  A version directory is the first directory below aggrega-catalog/<kind>/ whose
+  name is a version (1.0.0, 0.9.0-rc.2), the layout every kind follows. One the
+  tag does not hold — a new version directory — passes. This rule asks no
+  binary and no registry: git alone answers it. A path the publish workflows own
+  (below) staged exactly as <remote>/published holds it — the sync commit — is
+  what the publishers wrote, and this rule does not judge it. The switch above
+  decides a finding here as it decides one there: warn prints it, block refuses.
+
+  A clone that holds no tag @MARKER@ cannot be judged by this
+  rule: a commit there that changes a file under a version directory draws a
+  finding saying so, under the same switch — a warning with warn, a refusal
+  with block. Fetch the tag (git fetch origin tag @MARKER@) and
+  commit again.
+
+  What it does not reach:
+    - a commit made with the hook bypassed (git commit --no-verify), and a
+      commit in a clone outside the workspace, where no hook runs;
+    - a tag fetched before the latest publish: it holds what that publish held.
+      A fetch does not move a tag the clone already has;
+      git fetch --force origin tag @MARKER@ moves it;
+    - a publish whose push of the tag failed: the tag stays where the publish
+      before it left the catalog until the next successful publish moves it.
 
 A PATH THE PUBLISH WORKFLOWS OWN (--staged)
   .ci-owned-paths on <remote>/published names the paths the publish workflows
@@ -124,11 +181,17 @@ EXIT CODES
   2  a usage error, or the guard could not run — the published branch's list
      unreadable, a git command failing — and nothing was judged
 END_OF_HELP
+)"
+  printf '%s\n' "${text//@MARKER@/$PUBLISH_MARKER_TAG}"
 }
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 2
 # shellcheck source=lib/bounded-jobs.sh
 . "$HERE/lib/bounded-jobs.sh" || exit 2
+# Sourced before the arguments are read, because --help prints the marker tag's
+# name from it.
+# shellcheck source=lib/published-branch.sh
+. "$HERE/lib/published-branch.sh" || exit 2
 
 MODE=""
 ARGS=()
@@ -152,8 +215,6 @@ if [ "$JOBS" -gt 1 ] && ! bounded_jobs_concurrency_available; then
 fi
 
 set -uo pipefail
-# shellcheck source=lib/published-branch.sh
-. "$HERE/lib/published-branch.sh" || exit 2
 # shellcheck source=lib/catalog-entities.sh
 . "$HERE/lib/catalog-entities.sh" || exit 2
 # shellcheck source=lib/scratch-workspace.sh
@@ -201,6 +262,10 @@ if [ "$MODE" = staged ]; then
 fi
 
 # --- the paths the publish workflows own --------------------------------------
+# SYNCED: the owned paths this commit changes to exactly what the published branch
+# holds there — what the publishers wrote, which the released-version rule leaves
+# alone.
+SYNCED=()
 if [ "$MODE" = staged ] && [ "$HAVE_PUB" = 1 ]; then
   git show "$PUB:$OWNED_PATHS_FILE" >"$TMP/owned" 2>/dev/null ||
     broken "$REMOTE/$PUBLISHED_BRANCH carries no $OWNED_PATHS_FILE, so the paths the publish workflows own are unknown"
@@ -214,9 +279,104 @@ if [ "$MODE" = staged ] && [ "$HAVE_PUB" = 1 ]; then
     rc=0
     git --literal-pathspecs diff --cached --quiet "$PUB" -- "$p" || rc=$?
     [ "$rc" -le 1 ] || broken "git cannot compare what is staged under $p with $REMOTE/$PUBLISHED_BRANCH"
-    [ "$rc" -eq 1 ] || continue
+    if [ "$rc" -eq 0 ]; then SYNCED+=("$p"); continue; fi
     refuse "$p is owned by the publish workflows ($REMOTE/$PUBLISHED_BRANCH:$OWNED_PATHS_FILE), and this commit stages content there that $REMOTE/$PUBLISHED_BRANCH does not hold. Only the publish workflows change it; take what they published with the sync commit, or unstage the change: git restore --staged --worktree --source=HEAD -- $p"
   done
+fi
+
+# --- a released version directory changed ---------------------------------------
+# version_dir PATH — prints the version directory PATH lies under: the first
+# directory below aggrega-catalog/<kind>/ whose name is a version. Returns 1 when
+# PATH lies under none.
+version_dir() {
+  local rest="${1#"$CATALOG_ROOT"/}" dir="$CATALOG_ROOT" seg
+  local -a segs=()
+  IFS=/ read -r -a segs <<<"$rest"
+  # The last segment is the file itself and the first is the kind; a version
+  # directory is one of the directories between them.
+  [ "${#segs[@]}" -ge 3 ] || return 1
+  dir="$dir/${segs[0]}"
+  for seg in "${segs[@]:1:${#segs[@]}-2}"; do
+    dir="$dir/$seg"
+    if [[ $seg =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# synced PATH — whether PATH lies under an owned path this commit stages exactly as
+# the published branch holds it.
+synced() {
+  local p
+  for p in ${SYNCED[@]+"${SYNCED[@]}"}; do
+    case "$1" in "$p" | "$p"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+if [ "$MODE" = staged ]; then
+  MARKER="${PUBLISH_MARKER_TAG:-}"
+  [ -n "$MARKER" ] || broken "scripts/lib/published-branch.sh sets no PUBLISH_MARKER_TAG, so the publish marker is unknown"
+  git diff --cached --name-status -z --no-renames "$BASE" -- "$CATALOG_ROOT/" >"$TMP/catalog-changes" ||
+    broken "git cannot list what is staged under $CATALOG_ROOT/"
+  # The staged changes under a version directory, the sync's own excepted: the
+  # status, the path and its version directory, three to an entry.
+  CANDIDATES=()
+  mapfile -d '' -t STAGED < "$TMP/catalog-changes"
+  for ((i = 0; i + 1 < ${#STAGED[@]}; i += 2)); do
+    f="${STAGED[i + 1]}"
+    synced "$f" && continue
+    vdir="$(version_dir "$f")" || continue
+    CANDIDATES+=("${STAGED[i]}" "$f" "$vdir")
+  done
+  if [ "${#CANDIDATES[@]}" -gt 0 ]; then
+    # Read through the marker seam the publisher reads it through
+    # (scripts/lib/published-branch.sh), the one place the mechanism lives.
+    if ! MARKER_SHA="$(published_marker_read "$TOP" "$MARKER")"; then
+      # Unjudged is a finding, as an unjudged recorded version is: a missing tag
+      # never passes a commit at block.
+      finding "$CATALOG_ROOT: not judged — this commit changes files under a version directory, and this clone holds no tag $MARKER, so which version directories are released cannot be read. Fetch it, then commit again: git fetch origin tag $MARKER"
+    else
+      HELD_DIRS=()
+      declare -A HELD_FILES=() HELD_COUNT=()
+      for ((i = 0; i + 2 < ${#CANDIDATES[@]}; i += 3)); do
+        st="${CANDIDATES[i]}"
+        f="${CANDIDATES[i + 1]}"
+        vdir="${CANDIDATES[i + 2]}"
+        git cat-file -e "$MARKER_SHA:$vdir" 2>/dev/null || continue
+        case "$st" in
+          A*) verb="adds" ;;
+          D*) verb="removes" ;;
+          *) verb="changes" ;;
+        esac
+        if [ -z "${HELD_FILES[$vdir]+set}" ]; then
+          HELD_DIRS+=("$vdir")
+          HELD_COUNT[$vdir]=0
+        fi
+        n="${HELD_COUNT[$vdir]}"
+        HELD_COUNT[$vdir]=$((n + 1))
+        # The first few files are named; the rest are counted.
+        if [ "$n" -lt 5 ]; then
+          HELD_FILES[$vdir]="${HELD_FILES[$vdir]:+${HELD_FILES[$vdir]}, }$verb ${f#"$vdir"/}"
+        fi
+      done
+      for vdir in ${HELD_DIRS[@]+"${HELD_DIRS[@]}"}; do
+        entity="${vdir#"$CATALOG_ROOT"/}"
+        entity="${entity%/*}"
+        version="${vdir##*/}"
+        if [ -z "$(git ls-files -- "$vdir/")" ]; then
+          what="removes the whole version directory"
+        else
+          what="${HELD_FILES[$vdir]}"
+          n="${HELD_COUNT[$vdir]}"
+          [ "$n" -le 5 ] || what="$what, and $((n - 5)) more file(s)"
+        fi
+        finding "$vdir: $entity $version is released — the version directory is in the catalog where the last successful publish left it (tag $MARKER, at ${MARKER_SHA:0:12}) — and this commit $what. A released version is final: copy the entity into a new version directory, choosing patch, minor or major as \"Choosing a new version\" in docs/catalog-conventions-and-patches.md says, change it there, and leave $version as it was released."
+      done
+    fi
+  fi
 fi
 
 # --- a published version changed in place ---------------------------------------

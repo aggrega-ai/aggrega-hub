@@ -5416,6 +5416,62 @@ is nothing to compare against — and the bytes that land are what that version
 means from then on. An entity's declared version is therefore worth settling
 before its first publish rather than after.
 
+### Choosing a new version
+
+A version this catalog was released with is final in this repository too, not
+only in the registry. The tag `catalog-published` marks where the last successful
+publish left the catalog, and every version directory that tag holds is
+released: none of its files is edited, added or removed again, whatever the
+entity's kind. A change to a released entity is made by copying its version
+directory to a new one, setting `metadata.version` to the new directory's name,
+and changing the copy; the released directory stays as it was published.
+
+`scripts/published-version-guard.sh --staged` holds a commit to that: it names
+each released version directory the commit changes or removes, with the entity,
+the version and the tag, and the committed `.published-version-guard` switch
+decides whether it warns or refuses. A checkout with the project's commit hook
+installed runs it on every commit; its `--help` says what it reads and what it
+does not reach.
+
+Which new version a change takes is a convention, and nothing checks the choice.
+Three rules decide it:
+
+- **Patch** — a fix that changes no parameter, no provided value, no default
+  name, and nothing else a working Release depends on: a bug fix, a corrected
+  description, an image moved within the same upstream minor version. Moving the
+  `volume-permissions` init container of `recipe/helm/docker-model-runner` from
+  `busybox:1.38.0` to a later `busybox:1.38` release takes the Recipe from
+  `1.0.0` to `1.0.1`.
+- **Minor** — an additive change: a new optional parameter, a new provided
+  value, a new default name, or an upstream minor version. A new provided value
+  on `core/datastore/mariadb` — a ready-made connection URL beside `host`,
+  `port` and `database` — takes the Component from `1.0.0` to `1.1.0`: a
+  consumer that does not read it is unaffected.
+- **Major** — anything removed or renamed, a default that changes what an
+  existing Release renders, or an upstream major version. Renaming
+  `provides.host` on `core/datastore/mariadb` takes the Component to `2.0.0`:
+  every consumer that reads `host` no longer finds it.
+
+**Whatever pins the old version moves to the new one in the same change**: an
+Aggregate whose component `type:` names the old version, a Recipe whose
+`implements:` names it — every Recipe realizing `core/datastore/mariadb` names
+`core/datastore/mariadb:1.0.0` — an example that names it, a lockfile that
+records it. A pinning entity
+whose own version directory is released takes a new version of its own, chosen
+by the same three rules, rather than an edit in place.
+
+**When a change fits none of the rules, or more than one, ask rather than
+guess.** Moving the default `infra.engine_version` of `core/datastore/mariadb`
+from `"11.4"` to a later MariaDB release is such a case: it is an upstream minor
+version, and it is also a default that changes what every Release leaving that
+value unset renders. `aggrega lint --pre-publish`, run on an entity, compares a
+proposed version with the previously published one by its own classification and
+halts on a smaller bump than that classification requires; where its answer and
+these rules differ, the case is unclear too.
+
+A Plugin entity takes no part in this choice: its version is the compiler build
+that produced it (see "Registry repository segments" below).
+
 ### Registry repository segments
 
 Every artifact in the registry lives under a top-level repository segment. There

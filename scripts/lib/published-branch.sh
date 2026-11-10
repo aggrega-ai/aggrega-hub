@@ -27,11 +27,17 @@
 # takes the branch into a checkout, the published-version guard and the commit
 # refusal all read it from the branch, and nothing else names an owned path.
 #
-# THE SWITCH. .published-version-guard, committed on the main branch and owned by
-# no publisher, holds one word: warn or block. It selects whether the
-# published-version guard warns about an entity edited in place at a published
-# version or refuses it. A switch that is absent, or holds anything else, is read
-# as block and says so, so removing it never quietly weakens the guard.
+# THE MARKER. The tag the catalog publisher moves to what it published after every
+# successful real publish, so it marks where the last successful publish left the
+# catalog. scripts/publish-diff.sh diffs from it and moves it; the
+# published-version guard holds every version directory it holds as released.
+#
+# THE SWITCH. .published-version-guard, committed and owned by no publisher, holds
+# one word: warn or block. It selects whether the published-version guard warns
+# about its findings or refuses them — an entity edited in place at a published
+# version, and a change under a version directory the marker holds. A switch that
+# is absent, or holds anything else, is read as block and says so, so removing it
+# never quietly weakens the guard.
 
 # Every constant, and every variable a function here sets, is read by the scripts
 # that source this file, which a lint of this file alone cannot see. Placed before
@@ -41,6 +47,7 @@ PUBLISHED_BRANCH="published"
 OWNED_PATHS_FILE=".ci-owned-paths"
 DIGESTS_FILE=".ci-published-digests"
 GUARD_SWITCH_FILE=".published-version-guard"
+PUBLISH_MARKER_TAG="catalog-published"
 
 # published_remote DIR — the remote DIR's checked-out branch tracks, else origin.
 published_remote() {
@@ -98,6 +105,28 @@ published_switch() {
     warn | block) SWITCH="$word" ;;
     *) SWITCH_NOTE="$GUARD_SWITCH_FILE holds '${word}', which is neither warn nor block, so the guard blocks" ;;
   esac
+}
+
+# --- The marker seam ------------------------------------------------------------
+# The ONLY two places the marker mechanism is touched, for every script that reads
+# or moves it — scripts/publish-diff.sh and the published-version guard. The
+# mechanism is a git tag on the repository: read = the commit the tag points at;
+# advance = move the tag to HEAD. To back the marker with a remote object instead,
+# replace the bodies of these two functions and nothing else. TAG defaults to
+# PUBLISH_MARKER_TAG only when it is not given at all, so a caller passing its own
+# value — an empty one included — reads and moves exactly that.
+
+# published_marker_read DIR [TAG] — prints the commit the marker names in the
+# repository at DIR and returns 0, or prints nothing and returns 1 when there is
+# no such marker.
+published_marker_read() {
+  git -C "$1" rev-parse --verify --quiet "refs/tags/${2-$PUBLISH_MARKER_TAG}^{commit}" 2>/dev/null
+}
+
+# published_marker_advance DIR [TAG] — moves the marker in the repository at DIR
+# to its current HEAD commit.
+published_marker_advance() {
+  git -C "$1" tag -f "${2-$PUBLISH_MARKER_TAG}" HEAD >/dev/null
 }
 
 # published_rows < RECORD — the record's rows, the note lines and blank lines

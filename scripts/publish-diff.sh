@@ -10,10 +10,11 @@
 # "Already published" no-ops the unchanged), which is also how the marker is
 # first established.
 #
-# The marker is a git tag on this repository (default `catalog-published`).
-# Reading and advancing it are isolated behind a single function pair
-# (marker_read / marker_advance) so the mechanism can later be swapped for a
-# remote object without touching the selection logic.
+# The marker is a git tag on this repository (default PUBLISH_MARKER_TAG from
+# lib/published-branch.sh). Reading and advancing it are isolated behind a single
+# function pair in that library (published_marker_read / published_marker_advance)
+# so the mechanism can later be swapped for a remote object without touching the
+# selection logic, and the published-version guard reads it through the same pair.
 #
 # Enumeration is entity-files-only, by peeking each YAML's top-level `kind:`.
 # Co-located non-entity files (recipe fragments, source/ trees) are never
@@ -93,9 +94,15 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 HUB_ROOT="$(cd "$DIR/.." && pwd)"
 
+# The published branch's contract — the marker tag's name among it, which the
+# published-version guard reads from the same constant — and the row reader both
+# publish workflows share.
+# shellcheck source=lib/published-branch.sh
+. "$DIR/lib/published-branch.sh" || exit 1
+
 REGISTRY="127.0.0.1:5000"
 CATALOG="$HUB_ROOT/aggrega-catalog"
-MARKER="catalog-published"
+MARKER="$PUBLISH_MARKER_TAG"
 MODE="diff"
 DRYRUN=""
 NO_ADVANCE=""
@@ -244,21 +251,10 @@ if [ "$MODE" = "full" ] && [ -z "$DRYRUN" ]; then
 fi
 
 # --- Marker seam --------------------------------------------------------------
-# The ONLY two places the marker mechanism is touched. Default mechanism is a
-# git tag on this repo: read = the commit the tag points at; advance = move the
-# tag to HEAD. To back the marker with a remote object instead, replace the
-# bodies of these two functions and nothing else.
-
-# marker_read prints the marker commit on stdout and returns 0 when the marker
-# exists, or prints nothing and returns 1 when it does not.
-marker_read() {
-  git -C "$HUB_ROOT" rev-parse --verify --quiet "refs/tags/${MARKER}^{commit}" 2>/dev/null
-}
-
-# marker_advance moves the marker to the current HEAD commit.
-marker_advance() {
-  git -C "$HUB_ROOT" tag -f "$MARKER" HEAD >/dev/null
-}
+# The marker is read and moved only through published_marker_read and
+# published_marker_advance in lib/published-branch.sh, the one place to change
+# if the marker moves off a git tag; the published-version guard reads it through
+# the same function.
 # -----------------------------------------------------------------------------
 
 # extract_reference reads captured `aggrega push` stdout and prints the
@@ -286,7 +282,7 @@ else
   # to the catalog subtree. --diff-filter=ACMR keeps added/copied/modified/
   # renamed (present-on-disk) files and drops deletions — a removed entity has
   # nothing to push and retirement is a separate concern.
-  if ! base="$(marker_read)"; then
+  if ! base="$(published_marker_read "$HUB_ROOT" "$MARKER")"; then
     echo "publish-diff: marker tag '$MARKER' not found, so a differential run has no commit to diff from." >&2
     echo "  The first publish into an empty registry, including one emptied since the catalog was" >&2
     echo "  last published, is an explicit full run: it publishes the whole catalog and" >&2
@@ -343,9 +339,8 @@ if [ "${#ENTITIES[@]}" -gt 0 ]; then
 fi
 
 # The rows a real run records are read from each push's output by the one row
-# reader both publish workflows share, published_rows_from_push.
-# shellcheck source=lib/published-branch.sh
-. "$DIR/lib/published-branch.sh" || exit 1
+# reader both publish workflows share, published_rows_from_push
+# (lib/published-branch.sh, sourced at the top).
 if [ -n "$RECORD_OUT" ]; then
   : >"$RECORD_OUT" || { echo "publish-diff: cannot write $RECORD_OUT" >&2; exit 1; }
 fi
@@ -462,7 +457,7 @@ if [ "$failed" -eq 0 ] && [ "$sign_failed" -eq 0 ]; then
   elif [ -n "$NO_ADVANCE" ]; then
     echo "publish-diff: --no-advance: marker '$MARKER' left unchanged"
   else
-    marker_advance
+    published_marker_advance "$HUB_ROOT" "$MARKER"
     echo "publish-diff: marker '$MARKER' advanced to $(git -C "$HUB_ROOT" rev-parse --short HEAD)"
   fi
 fi
