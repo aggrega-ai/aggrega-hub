@@ -1,0 +1,405 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: librechat-chart
+  version: 1.1.0
+  license: MIT
+  description: >
+    A self-hosted LibreChat installation on Kubernetes via the project's own
+    Helm chart, pulled from its OCI registry: one platform process with a
+    ClusterIP Service on the listen port and one persistent volume for the
+    files people upload; the accounts, conversations, agents and stored
+    per-user credentials live in the document store wired on the `backend`
+    edge. The chart was checked for being official, complete and maintained
+    against the chart itself, and its bundled document store, search server,
+    cache and retrieval service all stay off.
+
+    The model edge's endpoint becomes the platform's OpenAI-compatible base
+    URL and its model name the one model offered, and the backend edge's host
+    and port compose the connection string, with the sign-in attached on that
+    connection, by reference, as its user part. Every credential reaches the
+    platform by a secretKeyRef to the Secret its slot names; the two token
+    secrets, the credential-encryption key and its initialization vector are
+    required.
+
+    The chart's own connection check, a Pod carrying the `helm.sh/hook: test`
+    annotation whose image no setting pins, is left out of the render.
+
+    Reach for this realization where a chart repository is reachable at
+    build time; reach for `librechat`, the workload-synthesis realization,
+    where the build must complete with nothing fetched.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/librechat:1.1.0
+
+  # The chart is published by LibreChat's own maintainers, built from the
+  # project's own repository under the MIT licence, and named official on the
+  # project's documentation; it is released beside the platform, the platform
+  # version it packages at or past the release this Component targets. It
+  # carries everything this Component exposes: a value for each variable the
+  # platform reads, a list of environment entries that takes a reference to a
+  # Secret, extra volumes and mounts, and a switch for each service it can
+  # bundle. Those were the three checks a chart is held to before a Recipe
+  # points at it.
+  source:
+    kind: helm-oci-chart
+    url: oci://ghcr.io/librechat-ai/librechat-chart/librechat
+    # Default chart version. Override via infra.source_version; a version
+    # other than this one may need a different value mapping.
+    version: "{{ optional .infra `source_version` \"3.0.0\" }}"
+
+  # provides.host is the platform's Service name. The valuesMapping below pins
+  # the chart's fullnameOverride to the rendered name, the release name the
+  # helm provider gives the chart, which spells the Component's name in the
+  # alphabet a Kubernetes name allows; this chart names its Service, its
+  # Deployment and its ServiceAccount by that name with no suffix — read from a
+  # render of the chart made both with and without the pin, not assumed. The
+  # name carries no namespace, so a consumer in another namespace qualifies it
+  # on its own side.
+  #
+  # metrics_endpoint is where the platform serves its Prometheus metrics while
+  # values.metrics_enabled is true, when the secret attached to metrics_secret
+  # reaches it as METRICS_SECRET: /metrics on the listen port of the same
+  # Service, the name spelled out again because a provides entry cannot read
+  # another. Empty while the value is false. metrics_credential_required
+  # follows it, true exactly while there is an address to scrape, since the
+  # platform answers its metrics only to a bearer token equal to that secret.
+  provides:
+    host: "{{ .context.rendered_name }}"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}:{{ .infra.port }}/metrics{{ end }}"
+    metrics_credential_required: "{{ if .values.metrics_enabled }}true{{ else }}false{{ end }}"
+
+  # The platform answers /metrics only to a bearer token equal to
+  # METRICS_SECRET, and to every request with 401 while that variable is unset,
+  # so turning its metrics on without a secret would publish an address no
+  # scrape could read. The build halts here instead, naming the slot and the
+  # value, exactly as the workload-synthesis realization does.
+  assertions:
+    metrics_need_a_secret: >-
+      {{- if and (optional .values "metrics_enabled" false) (not (hasKey (default dict .features) "metrics_secret")) -}}
+      {{- fail (printf "the LibreChat platform %q has values.metrics_enabled true but nothing fills its metrics_secret slot, and the platform answers its metrics only to a bearer token equal to that secret: attach a secret credential to metrics_secret, the token a scrape presents on its connection's credential slot, or set metrics_enabled to false" .metadata.instance_id) -}}
+      {{- end -}}
+
+  # The chart's own connection check, a Pod carrying the helm.sh/hook: test
+  # annotation that fetches the platform's address once, runs an image written
+  # with no tag, which no chart setting pins, so what a cluster pulls for it
+  # would move under unchanged rendered bytes. It is left out of the render
+  # rather than described; the platform's own probes cover the same address.
+  omits:
+    - kind: Pod
+      name: "{{ .context.rendered_name }}-test-connection"
+
+  # The volume for the files people upload, the one the Component sizes in
+  # infra.storage.size. The chart's own volume is for the images the interface
+  # serves and is mounted at that directory, so it is switched off below, and
+  # this claim, named after the rendered name like every object the chart
+  # emits, is mounted at the platform's uploads directory through the chart's
+  # own volume settings — the directory, the single claim and its access mode
+  # the workload-synthesis realization renders. The pod mounts the claim by
+  # name, which resolves only in the pod's own namespace, so the claim carries
+  # the namespace the Release, or else the Aggregate, declares for the component through the
+  # aggrega.ai/namespace annotation, and none where it declares none.
+  artifacts:
+    librechat-uploads.pvc.yaml: |
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: {{ .context.rendered_name }}-uploads
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" (optional (optional (default dict .context.annotations) "aggregate" dict) "aggrega.ai/namespace" "") }}
+        namespace: "{{ . }}"
+        {{- end }}
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: "{{ .infra.storage.size }}"
+
+  # This Recipe reads from infra.overrides:
+  #   image          - map[string]string (the chart's image.* fields: registry,
+  #                    repository, tag, pullPolicy; replaces the pin below)
+  #
+  # Under this configuration the chart renders one Deployment running the
+  # platform, a ClusterIP Service on the listen port, the ConfigMap the
+  # platform reads its plain variables from, and the ServiceAccount the pod
+  # runs under. Its Ingress, autoscaler, configuration-file ConfigMap and trace
+  # forwarder are left off, because the Component describes none of them.
+  #
+  # The chart can also stand up a document store, a search server, a cache and
+  # a retrieval service beside the platform, and the first two are on in its
+  # own defaults. Each is switched off below: the document store is the one
+  # wired on the `backend` edge, and none of the others is compute the
+  # Aggregate declared.
+  #
+  # Two edges are translated rather than passed through, because the variables
+  # the platform reads are not the names the targets publish. The model edge
+  # carries a published endpoint and a published model name: the endpoint
+  # becomes OPENAI_REVERSE_PROXY, the platform's OpenAI-compatible base URL,
+  # and the model name OPENAI_MODELS, the one model it offers, so the name a
+  # person picks in the interface is the name the wired component serves
+  # under. The backend edge carries a host and a port, which compose MONGO_URI
+  # with the logical database name the developer declared. Both are read by
+  # socket name rather than by the alias the topology chose.
+  #
+  # The bind address is set to every interface, because the platform's own
+  # default binds the loopback address only, which in a container leaves the
+  # Service in front of it reaching nothing; the listen port is set because the
+  # process reads it from the environment. infra.external_base_url, when set,
+  # reaches the platform as DOMAIN_CLIENT and DOMAIN_SERVER; unset, both carry
+  # the installation's own in-cluster address.
+  #
+  # A sign-in attached on the `backend` connection is delivered as
+  # MONGO_CREDENTIAL, a secretKeyRef to the Secret that connection's slot
+  # names, and MONGO_URI then moves from the ConfigMap into the list of
+  # environment entries, after MONGO_CREDENTIAL, naming it as the string's
+  # user part in the $(MONGO_CREDENTIAL) form: Kubernetes expands that form
+  # when the container starts, from an entry written before it in that list,
+  # and never inside a ConfigMap the container reads whole. So the string
+  # carries the sign-in while no rendered file does. The value is the user and
+  # password as <user>:<password>, percent-encoded where a part holds a
+  # reserved character. With none attached MONGO_URI stays in the ConfigMap,
+  # with no user part.
+  #
+  # Seven credential slots are wired, and every credential value the rendered
+  # Deployment carries has one, so attaching a slot leaves no partner of it
+  # behind on a published literal. The chart's single-Secret setting is
+  # emptied, because it would read every credential from one Secret by name,
+  # and each credential is written instead into the chart's list of
+  # environment entries as a secretKeyRef to the Secret its own slot's
+  # realization names, with that realization's key, so no credential value is
+  # written into any rendered file. A component slot whose realization
+  # publishes no Secret name halts the build naming the slot, because the
+  # reference would name no Secret. A model API key attached on the `model`
+  # connection is delivered as OPENAI_API_KEY; with none attached the platform
+  # runs in its per-user mode, where each person enters their own key in the
+  # interface and no key is rendered at all. The session secret signs the
+  # access tokens as JWT_SECRET and the refresh secret the refresh tokens as
+  # JWT_REFRESH_SECRET; the credential-encryption key, CREDS_KEY, and the
+  # initialization vector, CREDS_IV, are the pair the stored credentials are
+  # encrypted under. The two token secrets, the key and the vector are always
+  # attached, because the Component requires their slots. The
+  # secret attached to metrics_secret is delivered as METRICS_SECRET only while
+  # values.metrics_enabled is true, because setting that variable is what turns
+  # the platform's metrics on.
+  #
+  # The plain variables travel in the chart's ConfigMap, which the platform's
+  # container reads whole, and the credentials in its list of environment
+  # entries, which Kubernetes applies over the ConfigMap; no name is written in
+  # both. The chart sets no namespace on anything it renders, and the helm
+  # provider places each object in the namespace the Release, or else the Aggregate, declares.
+  #
+  # DELIBERATE NEAR-DUPLICATE: the variables and their names repeat the
+  # workload-synthesis realization's, because that realization writes them as a
+  # synthesized workload's variables and attachments and this one as a chart's
+  # values, and no catalog kind lets one template feed both. A variable added to
+  # one is added to the other.
+  valuesMapping: |
+    {{- $selfUrl := printf "http://%s:%v" .context.rendered_name .infra.port }}
+    {{- $features := default dict .features }}
+    {{- /* The alias of the `model` connection carrying a credential, or empty. */}}
+    {{- $modelCredential := "" }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if and (eq $edge.socket "model") (hasKey (default dict $edge.features) "credential") }}
+    {{- $modelCredential = $alias }}
+    {{- end }}
+    {{- end }}
+    {{- /* The `backend` connection carrying a sign-in, or empty, and the store address it reaches. */}}
+    {{- $backendCredential := "" }}
+    {{- $mongoAddress := "" }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "backend" }}
+    {{- $mongoAddress = printf "%v:%v/%v" $edge.provides.host $edge.provides.port $.values.database_name }}
+    {{- if hasKey (default dict $edge.features) "credential" }}
+    {{- $backendCredential = $alias }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- $metricsSecret := and .values.metrics_enabled (hasKey $features "metrics_secret") }}
+
+    ## ── Pin the chart's resource names to the rendered name ────
+    ## Names the platform's Service exactly "<rendered_name>", matching
+    ## provides.host.
+    fullnameOverride: "{{ .context.rendered_name }}"
+
+    ## ── Platform image pin ─────────────────────────────────────
+    ## The chart's own default is its project registry at the platform
+    ## version it packages, which moves with the chart. This realization runs the image the
+    ## workload-synthesis realization runs, at the Component's engine_version,
+    ## so the two realizations of one Release run the same platform build.
+    ## Override the whole block via infra.overrides.image.
+    image:
+      {{- if and .infra.overrides .infra.overrides.image }}
+      {{- range $k, $v := .infra.overrides.image }}
+      {{ $k }}: "{{ $v }}"
+      {{- end }}
+      {{- else }}
+      registry: ghcr.io
+      repository: danny-avila/librechat
+      tag: "{{ .infra.engine_version }}"
+      {{- end }}
+
+    replicaCount: 1
+
+    ## ── The chart's bundled services, all declined ─────────────
+    mongodb:
+      enabled: false
+    meilisearch:
+      enabled: false
+    redis:
+      enabled: false
+    librechat-rag-api:
+      enabled: false
+    langfuseFanout:
+      enabled: false
+    ingress:
+      enabled: false
+    autoscaling:
+      enabled: false
+
+    ## ── Credentials, each by reference to its own slot's Secret ─
+    global:
+      librechat:
+        existingSecretName: ""
+        {{- if or $modelCredential $backendCredential (hasKey $features "session_secret") (hasKey $features "session_refresh_secret") (hasKey $features "credential_encryption_key") (hasKey $features "credential_encryption_iv") $metricsSecret }}
+        env:
+        {{- with $modelCredential }}
+        {{- $credential := (index $.context.uses .).features.credential.provides }}
+          - name: OPENAI_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: "{{ $credential.name }}"
+                key: "{{ $credential.key }}"
+        {{- end }}
+        {{- with $backendCredential }}
+        {{- $credential := (index $.context.uses .).features.credential.provides }}
+          - name: MONGO_CREDENTIAL
+            valueFrom:
+              secretKeyRef:
+                name: "{{ $credential.name }}"
+                key: "{{ $credential.key }}"
+          - name: MONGO_URI
+            value: "mongodb://$(MONGO_CREDENTIAL)@{{ $mongoAddress }}"
+        {{- end }}
+        {{- /* The next four are always present in a build: the Component requires the session_secret,
+          session_refresh_secret, credential_encryption_key and credential_encryption_iv slots. The
+          guards let a single-entity
+          validate, which attaches nothing, still render the rest of this Recipe. */}}
+        {{- range $variable, $slot := dict "JWT_SECRET" "session_secret" "JWT_REFRESH_SECRET" "session_refresh_secret" "CREDS_KEY" "credential_encryption_key" "CREDS_IV" "credential_encryption_iv" }}
+        {{- if hasKey $features $slot }}
+        {{- if not (and (index $features $slot).provides.name (index $features $slot).provides.key) }}
+        {{- fail (printf "the %s slot of the LibreChat platform %q is filled by a realization that publishes no Secret name and data key, so the platform could not read %s from a Secret: bind that slot's Feature to a realization that names the Secret it holds and the key inside it" $slot $.context.instance_id $variable) }}
+        {{- end }}
+          - name: {{ $variable }}
+            valueFrom:
+              secretKeyRef:
+                name: "{{ (index $features $slot).provides.name }}"
+                key: "{{ (index $features $slot).provides.key }}"
+        {{- end }}
+        {{- end }}
+        {{- if $metricsSecret }}
+          - name: METRICS_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: "{{ .features.metrics_secret.provides.name }}"
+                key: "{{ .features.metrics_secret.provides.key }}"
+        {{- end }}
+        {{- else }}
+        env: []
+        {{- end }}
+
+    librechat:
+      ## The connection string is supplied, so the chart injects none of its
+      ## own bundled-store credentials.
+      injectBundledCredentials:
+        mongodb: false
+        redis: false
+      configYamlContent: ""
+      existingConfigYaml: ""
+      ## The chart's own volume is for the images the interface serves; the
+      ## Component's volume is the uploads volume mounted below.
+      imageVolume:
+        enabled: false
+      configEnv:
+        HOST: "0.0.0.0"
+        PORT: "{{ .infra.port }}"
+        ## Quoted because a title is free text: unquoted, a title spelled like
+        ## a number or a boolean would be read as one.
+        APP_TITLE: "{{ .values.app_title }}"
+        ALLOW_REGISTRATION: "{{ .values.allow_registration }}"
+        {{- range $alias, $edge := .context.uses }}
+        {{- if eq $edge.socket "model" }}
+        OPENAI_REVERSE_PROXY: "{{ $edge.provides.endpoint }}"
+        OPENAI_MODELS: "{{ $edge.provides.model }}"
+        {{- end }}
+        {{- if and (eq $edge.socket "backend") (not $backendCredential) }}
+        MONGO_URI: "mongodb://{{ $mongoAddress }}"
+        {{- end }}
+        {{- end }}
+        {{- with .infra.external_base_url }}
+        DOMAIN_CLIENT: "{{ . }}"
+        DOMAIN_SERVER: "{{ . }}"
+        {{- else }}
+        DOMAIN_CLIENT: "{{ $selfUrl }}"
+        DOMAIN_SERVER: "{{ $selfUrl }}"
+        {{- end }}
+        {{- if not $modelCredential }}
+        ## The platform's per-user mode: each person enters their own key.
+        OPENAI_API_KEY: "user_provided"
+        {{- end }}
+
+    ## ── Interface and API Service ──────────────────────────────
+    ## infra.port sets the Service port, the container port and, above, the
+    ## platform's own listen variable, all three from one value.
+    service:
+      type: ClusterIP
+      port: {{ .infra.port }}
+      targetPort: {{ .infra.port }}
+      containerPort: {{ .infra.port }}
+
+    ## ── Health probes ──────────────────────────────────────────
+    ## The chart probes GET /health on a literal port, so the probes are
+    ## restated on the named container port, which follows infra.port, with
+    ## the timing the workload-synthesis realization gives them: the server
+    ## connects to its document store before it listens and no start-up time
+    ## is documented, so liveness waits 30 s and allows six misses 10 s apart.
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: http
+      periodSeconds: 10
+      timeoutSeconds: 5
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: http
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 6
+
+    ## ── The uploads volume ─────────────────────────────────────
+    volumes:
+      - name: uploads
+        persistentVolumeClaim:
+          claimName: {{ .context.rendered_name }}-uploads
+    volumeMounts:
+      - name: uploads
+        mountPath: /app/uploads
+
+    ## ── Platform resources ─────────────────────────────────────
+    ## Quoted so a whole-core quantity stays a string.
+    resources:
+      requests:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
+      limits:
+        cpu: "{{ .infra.compute.cpu }}"
+        memory: "{{ .infra.compute.memory }}"
