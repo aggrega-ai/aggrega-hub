@@ -51,6 +51,10 @@ messages the store held for it when the turn began, and `agent_started_at` is wh
 the restart, the second turn reports `"turn": 2` and `"messages_before_this_turn": 2` from a process started later
 than the first turn's.
 
+A turn that fails — the model endpoint refuses the request, say — answers HTTP 502 with `{"error": "the turn failed:
+<error type>: <error>"}`, and the agent removes the message that turn added, so the conversation is left as it was
+before the turn and the next turn on it does not send the failed message again.
+
 Another service on the same network reaches the agent at `http://agent:8000`:
 
 | Request | Does |

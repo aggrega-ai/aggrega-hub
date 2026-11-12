@@ -9,6 +9,10 @@
 A turn's answer says how many messages the conversation already held when the
 turn began, read back from the store, and when the serving process started, so
 a conversation continuing across a restart is visible in the answer itself.
+
+A turn that fails leaves its conversation as it was before the turn: the
+message it added is removed again, so a later turn on the same conversation
+does not send it to the model a second time.
 """
 
 from __future__ import annotations
@@ -18,10 +22,11 @@ import re
 import signal
 import sys
 import threading
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, RemoveMessage
 
 from quickstart.graph import _ROLES, app, store
 
@@ -32,6 +37,20 @@ THREAD = re.compile(r"^/threads/([A-Za-z0-9._-]{1,64})(/turns)?$")
 
 def _turns(messages) -> int:
     return sum(1 for m in messages if m.type == "human")
+
+
+def _forget(config: dict, message_id: str) -> None:
+    """Remove the message a failed turn added, where the store holds it.
+
+    The store keeps a turn's message before the model is asked, so a turn whose
+    answer fails leaves it behind. The removal is recorded as the answer node's
+    update, which ends the turn, so the conversation is left with no step
+    pending. The answer node writes nothing when it fails, so the turn's own
+    message is the only one to remove.
+    """
+    held = app.get_state(config).values.get("messages", [])
+    if any(m.id == message_id for m in held):
+        app.update_state(config, {"messages": [RemoveMessage(id=message_id)]}, as_node="answer")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -88,10 +107,22 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(400, {"error": 'send a JSON body such as {"message": "Hello"}'})
             return
         config = {"configurable": {"thread_id": thread}}
+        # The turn's message carries an ID of its own, so a failed turn can name
+        # it to remove it again.
+        message_id = str(uuid.uuid4())
         try:
             held = app.get_state(config).values.get("messages", [])
-            result = app.invoke({"messages": [HumanMessage(content=message)]}, config)
+            result = app.invoke({"messages": [HumanMessage(content=message, id=message_id)]}, config)
         except Exception as error:
+            try:
+                _forget(config, message_id)
+            except Exception as cleanup:
+                # The reply still reports the turn's own error; this one is logged.
+                print(
+                    f"turn thread={thread} failed, and removing its message failed too: "
+                    f"{type(cleanup).__name__}: {cleanup}",
+                    flush=True,
+                )
             self._reply(502, {"error": f"the turn failed: {type(error).__name__}: {error}"})
             return
         messages = result["messages"]
