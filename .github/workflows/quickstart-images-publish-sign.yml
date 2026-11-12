@@ -1,12 +1,13 @@
 name: Publish and sign the quickstart images
 
-# Builds the two small applications the quickstarts run, from
-# quickstart-images/web and quickstart-images/agent, for Linux on x86-64
-# (linux/amd64) and on ARM (linux/arm64); publishes each to the registry's
-# reserved tools/ segment as tools/quickstart-web:<version> and
-# tools/quickstart-agent:<version>; and signs each published reference keyless
-# via the GitHub Actions OIDC identity against public Sigstore, with the same
-# command and the same identity the catalog's own publish workflow signs with.
+# Builds the small applications the quickstarts run — the directories under
+# quickstart-images/ that hold a VERSION file are the list, one image per
+# directory <name> — for Linux on x86-64 (linux/amd64) and on ARM
+# (linux/arm64); publishes each to the registry's reserved tools/ segment as
+# tools/quickstart-<name>:<version>; and
+# signs each published reference keyless via the GitHub Actions OIDC identity
+# against public Sigstore, with the same command and the same identity the
+# catalog's own publish workflow signs with.
 #
 # Three jobs, in this order:
 #
@@ -14,11 +15,11 @@ name: Publish and sign the quickstart images
 #                  authenticated GET /v2/, which pushes nothing), and on a real
 #                  publish waits for the tooling image the sign job runs inside.
 #                  The script and the settings are catalog-publish-sign.yml's.
-#   build-publish  holds each image to its version rule, builds both images for
+#   build-publish  holds each image to its version rule, builds every image for
 #                  both platforms, and on a real publish pushes each version the
 #                  registry does not hold yet.
-#   sign           runs inside the tooling image and signs both version
-#                  references with `aggrega sign`. A reference already carrying
+#   sign           runs inside the tooling image and signs every version
+#                  reference with `aggrega sign`. A reference already carrying
 #                  a signature the registry's trust policy verifies is reported
 #                  as signed and left as it is.
 #
@@ -34,14 +35,14 @@ name: Publish and sign the quickstart images
 #
 # Reproducible builds. Each Dockerfile pins its base image by the digest of its
 # multi-platform index, the dependencies are pinned by go.sum and by the hashed
-# requirements.txt, and the BuildKit that builds them is pinned by digest below.
-# SOURCE_DATE_EPOCH is the time of the last commit that changed the image's
-# sources, and the image output rewrites every file's timestamp in the layers to
-# it. No provenance or SBOM attestation is attached, because its content names
-# the run that built it.
+# requirements.txt (the chat image has none), and the BuildKit that builds them
+# is pinned by digest below. SOURCE_DATE_EPOCH is the time of the last commit
+# that changed the image's sources, and the image output rewrites every file's
+# timestamp in the layers to it. No provenance or SBOM attestation is attached,
+# because its content names the run that built it.
 #
 # The manual entry defaults to a dry run: it checks the stored credential, holds
-# both images to the version rule and builds both for both platforms, pushing,
+# every image to the version rule and builds each for both platforms, pushing,
 # signing and recording nothing.
 #   gh workflow run quickstart-images-publish-sign.yml -f dry_run=false
 # publishes for real.
@@ -62,7 +63,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Check the stored registry credential, hold both images to their version rule and build them for both platforms, without any push or signing."
+        description: "Check the stored registry credential, hold every image to its version rule and build each for both platforms, without any push or signing."
         required: false
         default: true
         type: boolean
@@ -159,12 +160,32 @@ jobs:
           fetch-depth: 0
 
       - name: Hold each image to its version rule
-        # Reads each image's version, stops the run when the last commit that
-        # changed what goes into an image left its VERSION file alone, and
-        # writes the version and the time of that commit for the build step.
+        # Lists the images — every directory under quickstart-images/ holding a
+        # VERSION file, in byte order of their names — reads each image's
+        # version, stops the run when the last commit that changed what goes
+        # into an image left its VERSION file alone, and writes the list, each
+        # version and the time of that commit for the build step.
         run: |
           set -euo pipefail
-          for app in web agent; do
+          export LC_ALL=C
+          shopt -s nullglob
+          apps=()
+          for file in quickstart-images/*/VERSION; do
+            app="$(basename "$(dirname "$file")")"
+            # The name becomes a repository name and part of a variable name.
+            if ! [[ "$app" =~ ^[a-z0-9]+$ ]]; then
+              echo "::error::quickstart-images/$app is named with characters other than lowercase letters and digits; rename the directory"
+              exit 1
+            fi
+            apps+=("$app")
+          done
+          if [ "${#apps[@]}" -eq 0 ]; then
+            echo "::error::no quickstart-images/*/VERSION file was found"
+            exit 1
+          fi
+          echo "IMAGES=${apps[*]}" >> "$GITHUB_ENV"
+          echo "images: ${apps[*]}"
+          for app in "${apps[@]}"; do
             dir="quickstart-images/$app"
             version="$(tr -d '[:space:]' < "$dir/VERSION")"
             if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -208,8 +229,8 @@ jobs:
       - name: Register ARM emulation
         # The agent image's dependency install runs as the code of the platform
         # being built, so the ARM half needs an emulator for aarch64 registered
-        # with this machine's kernel. The web image is compiled on this
-        # machine's own platform for the target and needs none. The action is
+        # with this machine's kernel. The web and chat images are compiled on
+        # this machine's own platform for the target and need none. The action is
         # pinned by its commit (its release tag in the comment) and its image by
         # digest; cache-image is off, so a failed pull never runs a cached copy
         # the digest does not name.
@@ -230,13 +251,15 @@ jobs:
         # On a real publish, a version the registry already holds is reported
         # with its digest and not built again; any other answer than 200 or 404
         # to the version check stops the run rather than risk pushing over a
-        # published version. A dry run builds both images for both platforms and
+        # published version. A dry run builds every image for both platforms and
         # keeps the result in the builder only.
         id: build
         run: |
           set -euo pipefail
           refs=()
-          for app in web agent; do
+          # The list the version-rule step derived from the directories.
+          read -ra apps <<< "$IMAGES"
+          for app in "${apps[@]}"; do
             upper="$(printf '%s' "$app" | tr '[:lower:]' '[:upper:]')"
             version_var="${upper}_VERSION"; epoch_var="${upper}_EPOCH"
             version="${!version_var}"; epoch="${!epoch_var}"
@@ -332,7 +355,7 @@ jobs:
           echo "::add-mask::$id_token"
           echo "SIGSTORE_ID_TOKEN=$id_token" >> "$GITHUB_ENV"
 
-      - name: Sign both images
+      - name: Sign every image
         # Each version reference resolves to its multi-platform index, so the
         # signature covers both platforms' images.
         run: |

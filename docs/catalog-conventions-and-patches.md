@@ -5520,8 +5520,9 @@ in the overlay, then regenerated.
 
 **Reserved non-kind segments.** Two top-level segments are reserved for
 artifacts that are not catalog entities: `tools/` holds tooling container images
-and the small application images the quickstarts run (`tools/quickstart-web` and
-`tools/quickstart-agent`, built from `quickstart-images/` in this repository),
+and the small application images the quickstarts run (`tools/quickstart-<name>`,
+one per directory `quickstart-images/<name>/` in this repository that holds a
+`VERSION` file),
 and `docs/` holds documentation bundles. These names are reserved so that no
 future entity kind can lowercase into a collision with them — no entity kind is
 named `tool` or `docs`, and none may be introduced.
