@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Cognitio S.r.l.
 #
-# The quickstart web app: one static binary on an empty image.
+# The quickstart web app: one static binary on an empty image, its page and
+# the page's images embedded in it.
 #
 # The Go toolchain image is pinned by the digest of its multi-platform index,
 # so every build starts from the same bytes, and the module graph is pinned by
@@ -21,12 +22,13 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 COPY main.go ./
+COPY page ./page
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o /out/quickstart-web .
 
 FROM scratch
 LABEL org.opencontainers.image.title="quickstart-web" \
-      org.opencontainers.image.description="A small web app keeping notes in PostgreSQL and answering them from a Redis cache when one is wired." \
+      org.opencontainers.image.description="A small web app keeping notes in PostgreSQL and answering them from a Redis cache when one is wired, with a page for the browser." \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/aggrega-ai/aggrega-hub"
 COPY --from=build /out/quickstart-web /quickstart-web

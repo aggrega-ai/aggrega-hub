@@ -14,22 +14,31 @@
 //
 //	POST /notes        the request body is stored as a new note
 //	GET  /notes/{id}   one note, from the cache when it holds it
-//	GET  /             what the service is connected to
+//	GET  /notes        the most recent notes, from PostgreSQL
+//	GET  /             what the service is connected to; to a browser, the page
+//	GET  /page/{file}  the page's script, stylesheets and images
 //	GET  /healthz      whether PostgreSQL answers
+//
+// The page is served only to a request whose Accept header prefers HTML, as a
+// browser's does; every other request to / gets the JSON. Everything the page
+// loads is served from this binary; the page loads nothing from anywhere else.
 package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -43,7 +52,16 @@ const (
 	listenAddr = ":8080"
 	cacheTTL   = 5 * time.Minute
 	maxNote    = 4096
+	// How many notes GET /notes answers with, the most recent first.
+	listLimit = 50
 )
+
+//go:embed page
+var pageFiles embed.FS
+
+// The page's own policy: everything it loads, and every request it sends,
+// comes from this server.
+const contentSecurityPolicy = "default-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 
 // note is one stored note, and the answer about it.
 type note struct {
@@ -61,12 +79,22 @@ type service struct {
 	cacheAddr  string
 	schemaMu   sync.Mutex
 	schemaDone bool
+	page       []byte
 }
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+
+	page, err := pageFiles.ReadFile("page/index.html")
+	if err != nil {
+		log.Fatal(err)
+	}
+	static, err := fs.Sub(pageFiles, "page")
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// An empty connection string makes the driver read the PG* variables.
 	cfg, err := pgxpool.ParseConfig("")
@@ -82,6 +110,7 @@ func main() {
 	s := &service{
 		db:     db,
 		dbAddr: fmt.Sprintf("%s:%d/%s", cfg.ConnConfig.Host, cfg.ConnConfig.Port, cfg.ConnConfig.Database),
+		page:   page,
 	}
 
 	if host := os.Getenv("REDIS_HOST"); host != "" {
@@ -96,9 +125,13 @@ func main() {
 	log.Printf("quickstart-web: database %s, cache %s", s.dbAddr, s.cacheDescription())
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", s.info)
+	mux.HandleFunc("GET /{$}", s.index)
+	mux.Handle("GET /page/{file}", secured(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFileFS(w, r, static, r.PathValue("file"))
+	})))
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("POST /notes", s.create)
+	mux.HandleFunc("GET /notes", s.list)
 	mux.HandleFunc("GET /notes/{id}", s.read)
 	srv := &http.Server{Addr: listenAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 
@@ -121,6 +154,20 @@ func (s *service) cacheDescription() string {
 	return s.cacheAddr
 }
 
+// secured sets the headers the page and its files carry. The JSON answers are
+// left as they are. It is this program's own: each quickstart image builds from
+// its own directory and module, so the chat image's helper of the same name
+// cannot be shared.
+func secured(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", contentSecurityPolicy)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // ensureSchema creates the notes table on first use. The database may still be
 // starting when the service does, so a failure is returned to the request and
 // tried again by the next one.
@@ -139,6 +186,75 @@ func (s *service) ensureSchema(ctx context.Context) error {
 		s.schemaDone = true
 	}
 	return err
+}
+
+// index answers / with the page when the request prefers HTML, and with what
+// the service is connected to otherwise. Both answers vary with Accept, so a
+// cache between the two never hands one to the other.
+func (s *service) index(w http.ResponseWriter, r *http.Request) {
+	w.Header().Add("Vary", "Accept")
+	if !prefersHTML(r.Header.Values("Accept")) {
+		s.info(w, r)
+		return
+	}
+	secured(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(s.page)
+	})).ServeHTTP(w, r)
+}
+
+// prefersHTML reports whether an Accept header names text/html itself with a
+// higher preference than JSON gets, as a browser's header does. JSON's
+// preference is the one of the most specific range matching it:
+// application/json, then application/*, then */*. A missing header, curl's
+// default */*, a request for application/json and a tie all get JSON.
+func prefersHTML(accept []string) bool {
+	html := 0.0
+	jsonQ, jsonRank := 0.0, 0
+	for _, field := range accept {
+		for _, part := range strings.Split(field, ",") {
+			mediaRange, q := parseMediaRange(part)
+			rank := 0
+			switch mediaRange {
+			case "text/html":
+				html = max(html, q)
+				continue
+			case "application/json":
+				rank = 3
+			case "application/*":
+				rank = 2
+			case "*/*":
+				rank = 1
+			default:
+				continue
+			}
+			if rank > jsonRank || (rank == jsonRank && q > jsonQ) {
+				jsonQ, jsonRank = q, rank
+			}
+		}
+	}
+	return html > jsonQ
+}
+
+// parseMediaRange reads one element of an Accept header: its media range in
+// lower case and its q value, 1 when absent. A q value that is not a number
+// from 0 to 1 counts as 0, so the range it qualifies is not preferred.
+func parseMediaRange(part string) (string, float64) {
+	params := strings.Split(part, ";")
+	mediaRange := strings.ToLower(strings.TrimSpace(params[0]))
+	q := 1.0
+	for _, param := range params[1:] {
+		name, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(name), "q") {
+			continue
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil || v < 0 || v > 1 {
+			v = 0
+		}
+		q = v
+	}
+	return mediaRange, q
 }
 
 func (s *service) info(w http.ResponseWriter, r *http.Request) {
@@ -176,6 +292,35 @@ func (s *service) create(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("note %d stored in postgresql", n.ID)
 	writeJSON(w, http.StatusCreated, n)
+}
+
+// list answers the most recent notes, read from PostgreSQL. It neither reads
+// nor fills the cache, so listing the notes never changes where the next read
+// of one comes from.
+func (s *service) list(w http.ResponseWriter, r *http.Request) {
+	if err := s.ensureSchema(r.Context()); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "PostgreSQL is not ready: "+err.Error())
+		return
+	}
+	rows, err := s.db.Query(r.Context(),
+		`SELECT id, text, created_at FROM notes ORDER BY id DESC LIMIT $1`, listLimit)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "listing the notes: "+err.Error())
+		return
+	}
+	notes, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (note, error) {
+		n := note{Source: "postgresql"}
+		return n, row.Scan(&n.ID, &n.Text, &n.CreatedAt)
+	})
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "listing the notes: "+err.Error())
+		return
+	}
+	if notes == nil {
+		notes = []note{}
+	}
+	log.Printf("%d notes listed from postgresql", len(notes))
+	writeJSON(w, http.StatusOK, map[string][]note{"notes": notes})
 }
 
 func (s *service) read(w http.ResponseWriter, r *http.Request) {
