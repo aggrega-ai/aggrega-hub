@@ -46,7 +46,7 @@ artifact reuse; both accept Go templates as their only authoring mode. See the
 
 The first path segment after the entity type. Identifies the vendor/author.
 
-- `core` — official Aggrega standard library (maintained by Cognitio S.r.l.)
+- `core` — official Aggrega standard library (maintained by Cognitio s.r.l.)
 - Third-party publishers: use your organization name (e.g., `acme`, `enterprise`)
 
 ### Component Categories
@@ -1316,14 +1316,15 @@ things, the difference is the information.
 
 ```yaml
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2026 Cognitio S.r.l.
+# Copyright 2026 Cognitio s.r.l.
 ```
 
 The header states the terms **this YAML file** is published under, and it is the
 only surface that can: `metadata.license` names the licence of the software the
 entity describes, not of the file describing it. It is stated per file rather
 than inferred from the repository so that a catalog published by anyone else can
-say what its own terms are.
+say what its own terms are. A new version of an entity is written with this
+header, and a version already published keeps the bytes it was published with.
 
 ### Metadata key order
 
