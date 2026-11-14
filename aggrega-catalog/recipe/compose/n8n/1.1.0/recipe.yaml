@@ -1,0 +1,453 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: n8n
+  version: 1.1.0
+  description: >
+    The n8n automation platform for local development via Docker Compose,
+    synthesized from the Workload kind by the compose provider. The data
+    directory is a named volume, the only home of the workflows and the
+    credentials authored in the editor, which survive a restart; state written
+    anywhere else in the container does not.
+
+    A workflow definition, when supplied on `values.flow_definition`, is
+    carried in a compose config and imported by an init service with
+    `n8n import:workflow` before the platform starts, on every start, so it is
+    applied again rather than seeded once; with none, neither is rendered.
+
+    The model wired into the `model` socket arrives as OPENAI_BASE_URL and its
+    key as OPENAI_API_KEY. Each tool and vector store arrives under the
+    variables helm/n8n names, AGGREGA_TOOL_<ALIAS>_URL,
+    AGGREGA_VECTOR_STORE_<ALIAS>_URL, their parts and credentials, each
+    credential written into the file as it was delivered. A connection
+    writing an `inject:` block receives the names it dictates as on helm/n8n,
+    a file as a compose config mounted at the path it names.
+
+    N8N_BLOCK_ENV_ACCESS_IN_NODE is true unless the component's
+    allow_env_access_in_nodes value is true, so a workflow reads these values
+    through $env only then. `infra.external_base_url`, where set, becomes the
+    editor address and the webhook base.
+
+    With `values.metrics_enabled` true, N8N_METRICS turns n8n's metrics on, at
+    /metrics on port 5678, which answers that path without a sign-in and which
+    any peer on the compose network reaches, and provides.metrics_endpoint
+    publishes the address; false, that key is empty.
+
+    With `infra.port` set, the editor is published on that port of the host's
+    loopback address, 127.0.0.1, alone.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/ai-agent/n8n:1.1.0
+  # metrics_endpoint is the address n8n serves its own metrics at while
+  # values.metrics_enabled is true: /metrics on the main port 5678 of the
+  # service, named after the component instance and resolved on the compose
+  # network, where any peer reaches the port with nothing published to the
+  # host. A peer reaches the container's own port by name whatever
+  # infra.port publishes on the host, so the address keeps 5678. It is empty
+  # while the value is false, when the metrics are off.
+  provides:
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.instance_id }}:5678/metrics{{ end }}"
+  # The workflow definition is authored by the developer on .values. When present
+  # it renders a compose config the seeding init container mounts as a file;
+  # presence-guarded so an Aggregate supplying no definition emits no config and
+  # no init service, byte-identical to a bare deploy.
+  #
+  # Docker Compose substitutes $NAME and ${NAME} anywhere in the file's values,
+  # a config's content included, and reads $$ as one literal $. So the
+  # definition is written with every $ doubled, and the import reads it as
+  # authored, its $env and $json expressions intact.
+  #
+  # The config's name is spelled here and again on the `flow` volume below. The
+  # artifact and the workload are separate template strings with no binding either
+  # could dereference, so the repetition is forced rather than chosen — the two
+  # must be edited together.
+  #
+  # How the platform reconciles a re-import against a workflow already present
+  # in its data directory is the platform's own behaviour.
+  artifacts:
+    n8n-flow.compose-fragment.yaml: |
+      {{- if .values.flow_definition }}
+      configs:
+        {{ .context.instance_id }}-flow:
+          content: |
+      {{ .values.flow_definition | replace "$" "$$" | indent 6 }}
+      {{- end }}
+    # The compose configs holding the file entries the connections dictate,
+    # one per file and numbered in path order, the names the workload's
+    # volumes read. A compose config is written as one file at the path it is
+    # mounted at, and Docker Compose substitutes a $ in its content, so each $
+    # is doubled. They are emitted only while a connection dictates a file, so
+    # a build with none renders nothing here.
+    n8n-files.compose-fragment.yaml: |
+      {{- $pipeFiles := optional (default dict .context.inject) "file" dict }}
+      {{- $files := dict }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- range $path, $from := (optional (default dict $edge.inject) "file" dict) }}
+      {{- $_ := set $files $path (optional $pipeFiles $path "") }}
+      {{- end }}
+      {{- end }}
+      {{- if $files }}
+      configs:
+        {{- $i := 0 }}
+        {{- range $path, $v := $files }}
+        {{ $.context.instance_id }}-file-{{ $i }}:
+          content: {{ toJson (replace "$" "$$" $v) }}
+        {{- $i = add $i 1 }}
+        {{- end }}
+      {{- end }}
+  # The variables a connection's provides fill are defaults, as on helm/n8n: a
+  # connection writing an inject block receives exactly the names it dictates
+  # instead of OPENAI_BASE_URL, or of its address, header and part variables,
+  # while the credentials and endpoint secrets attached on it stay.
+  workload: |
+    {{- /*
+      A connection that writes no inject block receives the defaults the
+      comments below name. A connection that writes one receives exactly what
+      it dictates instead, read off the inject pipe as a map: no
+      OPENAI_BASE_URL from a model connection, no AGGREGA_TOOL_<ALIAS>_URL
+      from the endpoint a tool publishes, no _CREDENTIAL_HEADER, no
+      AGGREGA_VECTOR_STORE_<ALIAS>_URL and no part variables. What its
+      attachments deliver stays either way: the model's credential as
+      OPENAI_API_KEY, a tool's or a store's as _CREDENTIAL, and a tool's
+      endpoint secret as AGGREGA_TOOL_<ALIAS>_URL.
+
+      A dictated env entry becomes a service variable under the name it gives,
+      after every variable this recipe names, written as the pipe carries it,
+      so Docker Compose substitutes a $ in it as in every variable; a dictated
+      file entry becomes a compose config mounted as one file at the absolute
+      path it names in the platform's service, its content written with each $
+      doubled so the file holds the value itself, and a path that is not
+      absolute, or one lying beneath another file's path, is refused. An arg
+      entry is refused, because this recipe renders no command line for the
+      platform: the service's command replaces the image's default, which
+      starts the platform. Any other mechanism is refused too. A dictated
+      variable named like one this recipe delivers itself, a platform setting
+      or another connection's, or like the key an attachment's value arrives
+      under on the inject pipe, where the attachment's value would take its
+      place, halts the build, naming both, since the compiler cannot see the
+      names a recipe writes.
+
+      Two tools or two vector_store connections whose aliases differ only in
+      letter case, or in a hyphen against an underscore, are named alike, so
+      the build halts, naming both, wherever the two would deliver one
+      variable: always while both take the defaults, and otherwise wherever
+      what each still delivers meets, such as a credential attached on each.
+    */ -}}
+    {{- $pipe := default dict .context.inject -}}
+    {{- $env := optional $pipe "env" dict -}}
+    {{- $pipeFiles := optional $pipe "file" dict -}}
+    {{- $dictating := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+    {{- if $entries }}{{ $_ := set $dictating $alias true }}{{ end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $taken := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $slot, $attachment := (default dict $edge.features) -}}
+    {{- with optional (default dict $attachment.values) "key" "" -}}
+    {{- $_ := set $taken . (printf "the %s attached on the %s connection %s, whose value arrives on the inject pipe under that key" $slot $edge.socket $alias) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if .infra.external_base_url -}}
+    {{- range $var := list "N8N_EDITOR_BASE_URL" "N8N_WEBHOOK_URL" "WEBHOOK_URL" -}}
+    {{- $_ := set $taken $var "the platform's own setting written from infra.external_base_url" -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $_ := set $taken "N8N_BLOCK_ENV_ACCESS_IN_NODE" "the platform's own setting written from values.allow_env_access_in_nodes" -}}
+    {{- if .values.metrics_enabled -}}
+    {{- $_ := set $taken "N8N_METRICS" "the platform's own setting turning its metrics on" -}}
+    {{- end -}}
+    {{- $connectionVars := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if eq $edge.socket "model" -}}
+    {{- if not (hasKey $dictating $alias) -}}
+    {{- $_ := set $taken "OPENAI_BASE_URL" (printf "the model connection %s, which writes no inject block" $alias) -}}
+    {{- end -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $taken "OPENAI_API_KEY" (printf "the credential attached on the model connection %s" $alias) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if or (eq $edge.socket "tools") (eq $edge.socket "vector_store") -}}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" -}}
+    {{- $byDefault := printf "the %s connection %s, which writes no inject block" $edge.socket $alias -}}
+    {{- $delivers := dict -}}
+    {{- if eq $edge.socket "tools" -}}
+    {{- if hasKey $features "endpoint" -}}
+    {{- $_ := set $delivers (printf "AGGREGA_TOOL_%s_URL" $name) (printf "the endpoint attached on the tools connection %s" $alias) -}}
+    {{- else if not (hasKey $dictating $alias) -}}
+    {{- $_ := set $delivers (printf "AGGREGA_TOOL_%s_URL" $name) $byDefault -}}
+    {{- end -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $delivers (printf "AGGREGA_TOOL_%s_CREDENTIAL" $name) (printf "the credential attached on the tools connection %s" $alias) -}}
+    {{- if and (not (hasKey $dictating $alias)) (optional $edge.provides "credential_header" "") -}}
+    {{- $_ := set $delivers (printf "AGGREGA_TOOL_%s_CREDENTIAL_HEADER" $name) $byDefault -}}
+    {{- end -}}
+    {{- end -}}
+    {{- else -}}
+    {{- if not (hasKey $dictating $alias) -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_URL" $name) $byDefault -}}
+    {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") -}}
+    {{- range $part := list "HOST" "PORT" "DATABASE" "USER" -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_%s" $name $part) $byDefault -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_CREDENTIAL" $name) (printf "the credential attached on the vector_store connection %s" $alias) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- range $var, $by := $delivers -}}
+    {{- with optional $connectionVars $var "" -}}
+    {{- fail (printf "the %s connections %s and %s of %q would both deliver the variable %s, because a connection's variables are named for its alias upper-cased with every character other than a letter or a digit an underscore: rename one of the two" $edge.socket . $alias $.context.instance_id $var) -}}
+    {{- end -}}
+    {{- $_ := set $connectionVars $var $alias -}}
+    {{- $_ := set $taken $var $by -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $files := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+    {{- range $name, $from := $entries -}}
+    {{- if eq $mechanism "env" -}}
+    {{- with optional $taken $name "" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the variable %s, which this realization already delivers from %s: dictate another name in that connection's inject block" $edge.socket $alias $.context.instance_id $name .) -}}
+    {{- end -}}
+    {{- else if eq $mechanism "file" -}}
+    {{- if not (hasPrefix "/" $name) -}}
+    {{- fail (printf "the %s connection %s of %q dictates a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- end -}}
+    {{- $_ := set $files $name (optional $pipeFiles $name "") -}}
+    {{- else if eq $mechanism "arg" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the command-line argument %q, and this realization renders no command line for the platform: a service's command replaces the image's default command, which starts the platform. Dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- else -}}
+    {{- fail (printf "the %s connection %s of %q dictates %q under the delivery mechanism %q, and this realization delivers env and file entries only: dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name $mechanism) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- range $path, $_ := $files -}}
+    {{- range $other, $_ := $files -}}
+    {{- if hasPrefix (printf "%s/" $path) $other -}}
+    {{- fail (printf "the component %q is handed a file at %q and another at %q beneath it, and one path cannot be both a file and a directory: dictate the two files at paths neither of which lies beneath the other" $.context.instance_id $path $other) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $dataPath := "/home/node/.n8n" -}}
+    {{- $seedFile := "/flows/workflow.json" -}}
+    apiVersion: aggrega.ai/v1beta1
+    kind: Workload
+    form: stateless
+    {{- if .values.flow_definition }}
+    # Seed the supplied workflow before the platform starts. The init container
+    # imports the flow from the mounted config into the n8n data directory the
+    # main container serves from (both mount the shared data volume).
+    # $seedFile is the single authored home for the seed file: the import argument
+    # and the mount that puts the file there both read it, so a future move cannot
+    # relocate one and leave the other pointing at the old path. It names a file
+    # rather than a directory because this target delivers a configmap volume as
+    # one file at the mount path, so the mount path is the file the import reads.
+    initContainers:
+      - name: import-flow
+        image: "{{ .infra.image }}"
+        command: ["n8n"]
+        args: ["import:workflow", "--input={{ $seedFile }}"]
+        volumeMounts:
+          - name: data
+            path: "{{ $dataPath }}"
+          - name: flow
+            path: "{{ $seedFile }}"
+    {{- end }}
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        # $dataPath is the single authored home for the platform's data
+        # directory. Both this container's mount and the seeding init container's
+        # mount read the binding — they have to name the same directory for an
+        # imported workflow to be visible to the platform — so a future move
+        # cannot relocate one and leave the other behind.
+        # The model endpoint arrives on the `model` uses-edge; the recipe ranges
+        # the outbound edges and matches on the socket name, then reads the model
+        # recipe's published endpoint. Which model a workflow calls is selected
+        # in the workflow's own node, and the environment carries no model name.
+        # A model API key attached on the `model` connection arrives on the
+        # inject pipe and renders as OPENAI_API_KEY, read under the key its own
+        # attachment delivered it under, values.key, which is value unless the
+        # Aggregate names another; an attachment naming no key is read under
+        # OPENAI_API_KEY.
+        # N8N_BLOCK_ENV_ACCESS_IN_NODE is delivered as on helm/n8n: "true"
+        # while the component's allow_env_access_in_nodes value is false, its
+        # default, and "false" only where an Aggregate sets that value true. A
+        # workflow reads the model, tool and store values through $env only in
+        # the second case, which opens every variable of the platform's
+        # environment, the credentials included, to every workflow.
+        # Each `tools` and `vector_store` connection is delivered as on
+        # helm/n8n, under its alias upper-cased with every hyphen an underscore,
+        # each secret read from the inject pipe under its own attachment's
+        # values.key: a tool's endpoint secret in place of the endpoint the tool
+        # publishes, its credential with the header beside it only where the
+        # tool publishes one, and a store's credential beside the address the
+        # store publishes or the one composed from its protocol, host and port.
+        # A store that also publishes a database and a user is delivered in
+        # parts as well, AGGREGA_VECTOR_STORE_<ALIAS>_HOST, _PORT, _DATABASE and
+        # _USER, for the Postgres credential helm/n8n describes.
+        # Two secrets the Release alone attaches both arrive under the key value
+        # and halt the build naming both; an Aggregate naming values.key on one
+        # of them avoids it.
+        # With infra.external_base_url set, the platform's editor address and
+        # its webhook base are both that address. The webhook base is written
+        # under both names the platform has read it by: N8N_WEBHOOK_URL, which a
+        # build that reads it prefers, and WEBHOOK_URL, the only name an earlier
+        # build reads — the image is the Release's, so either kind may run. A
+        # build that reads the newer name logs a deprecation notice for the
+        # older one at start-up. Unset, none of the three is emitted.
+        # N8N_METRICS is delivered as on helm/n8n, only while
+        # values.metrics_enabled is true.
+        variables:
+    {{- range $alias, $edge := .context.uses }}
+    {{- if and (eq $edge.socket "model") (not (hasKey $dictating $alias)) }}
+          OPENAI_BASE_URL: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- end }}
+    {{- with .infra.external_base_url }}
+          N8N_EDITOR_BASE_URL: "{{ . }}"
+          N8N_WEBHOOK_URL: "{{ . }}"
+          WEBHOOK_URL: "{{ . }}"
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if and (eq $edge.socket "model") (hasKey (default dict $edge.features) "credential") }}
+    {{- $credentialKey := optional $edge.features.credential.values "key" "" }}
+          OPENAI_API_KEY: "{{ if $credentialKey }}{{ index $.context.inject.env $credentialKey | replace "\\" "\\\\" | replace "\"" "\\\"" }}{{ else }}{{ index $.context.inject.env "OPENAI_API_KEY" | replace "\\" "\\\\" | replace "\"" "\\\"" }}{{ end }}"
+    {{- end }}
+    {{- end }}
+    {{- if optional .values "allow_env_access_in_nodes" false }}
+          N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+    {{- else }}
+          N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"
+    {{- end }}
+    {{- if .values.metrics_enabled }}
+          N8N_METRICS: "true"
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "tools" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- $features := default dict $edge.features }}
+    {{- $dictates := hasKey $dictating $alias }}
+    {{- if hasKey $features "endpoint" }}
+          AGGREGA_TOOL_{{ $name }}_URL: "{{ index $.context.inject.env $features.endpoint.values.key | replace "\\" "\\\\" | replace "\"" "\\\"" }}"
+    {{- else if not $dictates }}
+          AGGREGA_TOOL_{{ $name }}_URL: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- if hasKey $features "credential" }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL: "{{ index $.context.inject.env $features.credential.values.key | replace "\\" "\\\\" | replace "\"" "\\\"" }}"
+    {{- if and (not $dictates) (optional $edge.provides "credential_header" "") }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL_HEADER: "{{ $edge.provides.credential_header }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "vector_store" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- $features := default dict $edge.features }}
+    {{- if not (hasKey $dictating $alias) }}
+    {{- $url := optional $edge.provides "endpoint" "" }}
+    {{- if not $url }}
+    {{- $url = printf "%v://%v:%v" $edge.provides.protocol $edge.provides.host $edge.provides.port }}
+    {{- end }}
+          AGGREGA_VECTOR_STORE_{{ $name }}_URL: "{{ $url }}"
+    {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") }}
+          AGGREGA_VECTOR_STORE_{{ $name }}_HOST: "{{ $edge.provides.host }}"
+          AGGREGA_VECTOR_STORE_{{ $name }}_PORT: "{{ $edge.provides.port }}"
+          AGGREGA_VECTOR_STORE_{{ $name }}_DATABASE: "{{ $edge.provides.database }}"
+          AGGREGA_VECTOR_STORE_{{ $name }}_USER: "{{ $edge.provides.user }}"
+    {{- end }}
+    {{- end }}
+    {{- if hasKey $features "credential" }}
+          AGGREGA_VECTOR_STORE_{{ $name }}_CREDENTIAL: "{{ index $.context.inject.env $features.credential.values.key | replace "\\" "\\\\" | replace "\"" "\\\"" }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- /* The variables connections dictate, after every variable this recipe names, in alias order. */}}
+    {{- range $alias, $edge := .context.uses }}
+    {{- range $name, $from := (optional (default dict $edge.inject) "env" dict) }}
+          {{ toJson $name }}: {{ toJson (optional $env $name "") }}
+    {{- end }}
+    {{- end }}
+        ports:
+          http: 5678
+        # The platform documents GET /healthz/readiness, which answers once its
+        # database is connected and migrated. The check runs inside the image the
+        # Release names; the platform's own published image carries busybox wget
+        # and no curl, so the probe runs wget directly. The timing is the
+        # platform's own Helm chart's readiness probe. A service keeps one
+        # healthcheck, so one probe is declared.
+        health:
+          ready:
+            exec:
+              - wget
+              - -q
+              - --spider
+              - "http://127.0.0.1:5678/healthz/readiness"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+        volumeMounts:
+          - name: data
+            path: "{{ $dataPath }}"
+    {{- $i := 0 }}
+    {{- range $path, $_ := $files }}
+          - name: inject-file-{{ $i }}
+            path: {{ toJson $path }}
+    {{- $i = add $i 1 }}
+    {{- end }}
+    volumes:
+      data:
+        # The data directory holds the workflows and credentials authored in the
+        # editor. The seeding step re-imports only the supplied definition, so
+        # everything else authored here has no other home and the volume must
+        # outlive the container.
+        # The size is a literal: the component's infra.storage.size is read by
+        # the n8n-chart Recipe alone, and this Recipe reads nothing there.
+        persistent:
+          size: 2Gi
+    {{- if .values.flow_definition }}
+      flow:
+        configmap:
+          source: "{{ .context.instance_id }}-flow"
+    {{- end }}
+    {{- $i = 0 }}
+    {{- range $path, $_ := $files }}
+      inject-file-{{ $i }}:
+        configmap:
+          source: "{{ $.context.instance_id }}-file-{{ $i }}"
+    {{- $i = add $i 1 }}
+    {{- end }}
+    # With infra.port set, a Loopback entry publishes the container port http
+    # on the host's loopback address alone: the entry's number, infra.port, is
+    # the host side and http's own number, 5678, the container side, so compose
+    # renders "127.0.0.1:<infra.port>:5678", and a browser on the same machine
+    # opens the editor and the webhook endpoint at http://127.0.0.1:<infra.port>.
+    # Unset, the ClusterIP entry publishes nothing, and the service is reached
+    # on the compose network only.
+    services:
+      default:
+    {{- with optional .infra "port" 0 }}
+        type: Loopback
+        ports:
+          http: {{ . }}
+    {{- else }}
+        type: ClusterIP
+        ports:
+          http: 5678
+    {{- end }}
