@@ -8,8 +8,7 @@ metadata:
   version: 1.1.0
   description: >
     The Langflow visual flow-builder on Kubernetes, synthesized by the helm
-    provider: a Deployment serving the editor on a ClusterIP Service, on port
-    7860 or the port `infra.port` sets, with a
+    provider: a Deployment serving the editor on a ClusterIP Service, with a
     persistent volume holding the flow database and its encryption key;
     nothing else survives a restart. A supplied flow definition is carried in
     a ConfigMap Langflow loads at each start, even with signing in required,
@@ -37,6 +36,7 @@ metadata:
     Reach for this realization where the build must complete with nothing
     fetched or the metrics are wanted; reach for `langflow-chart`, rendering
     Langflow's own chart, where a chart repository is reachable at build time.
+    A set `infra.published_port`, a Docker Compose setting, halts the build.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -77,10 +77,20 @@ spec:
   # of authored YAML, rather than at start-up in a cluster. It halts only on
   # that ambiguity: an Aggregate that sets the lever
   # has made its choice and renders exactly what it asked for.
+  #
+  # infra.published_port publishes the editor on the host's loopback address
+  # with Docker Compose. A cluster has no such host port, and a NodePort or a
+  # LoadBalancer would expose the editor to the network rather than to this
+  # machine, so a Release setting it is refused by name here rather than
+  # accepted and ignored.
   assertions:
     admin_credential_prerequisite: >-
       {{- if and .values.require_authentication (not (hasKey (default dict .features) "admin_password")) -}}
       {{- fail "the Langflow editor needs an administrator password to sign in with and none is attached: attach a secret credential to the admin_password slot to set that password, or set values.require_authentication to false to run the editor with no sign-in required at all" -}}
+      {{- end -}}
+    published_port_not_on_kubernetes: >-
+      {{- if optional .infra "published_port" 0 -}}
+      {{- fail (printf "the component %q sets infra.published_port: publishing a port on the host is a Docker Compose setting; on Kubernetes reach it with `kubectl port-forward`, or attach `core/public-ingress` to expose it" .metadata.instance_id) -}}
       {{- end -}}
   # When a flow definition is supplied, the LangflowFlow bundle imported below
   # emits a ConfigMap carrying it, which the Workload mounts as the directory
@@ -243,15 +253,19 @@ spec:
   # model's and the tools' variables are the platform's own reading, so those
   # sockets admit no inject block.
   #
-  # The image serves the editor on 7860, and nothing here moves that listener,
-  # so the container port and both probes stay on 7860 whatever port the
-  # Release sets. infra.port is the port of the Service's http entry, which
-  # targets the container port by its name, http; unset, the Service serves
-  # the editor on 7860 as well. The metrics keep their own port, 9090, on the
-  # container and the Service, so metrics_endpoint does not move with it.
+  # infra.port is the port Langflow listens on inside its container and the
+  # port of the Service's http entry; $port binds it once, and the container
+  # port http, which both probes are sent to, the Service entry, which targets
+  # it by name, and LANGFLOW_PORT, which moves the platform's listener, all
+  # read the binding. The image listens on 7860 unless told otherwise, so
+  # LANGFLOW_PORT is rendered only for another port, and a Release leaving
+  # infra.port at its default renders no variable for it. The metrics keep
+  # their own port, 9090, on the container and the Service, so
+  # metrics_endpoint does not move with it.
   workload: |
     {{- $configDir := "/app/langflow" -}}
     {{- $flowsPath := "/app/flows" -}}
+    {{- $port := .infra.port -}}
     {{- $requireAuth := .values.require_authentication -}}
     {{- $adminCredential := and $requireAuth (hasKey (default dict .features) "admin_password") -}}
     {{- /* The alias of the `model` connection carrying a credential, or empty. */ -}}
@@ -362,6 +376,9 @@ spec:
     {{- end -}}
     {{- if .values.metrics_enabled -}}
     {{- $_ := set $taken "LANGFLOW_PROMETHEUS_PORT" "the platform's own setting turning its metrics on" -}}
+    {{- end -}}
+    {{- if ne (int $port) 7860 -}}
+    {{- $_ := set $taken "LANGFLOW_PORT" "the platform's own setting naming the port it listens on" -}}
     {{- end -}}
     {{- if $toolVariables -}}
     {{- $_ := set $taken "LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT" "the platform's own setting listing the tool credentials' variables" -}}
@@ -499,6 +516,10 @@ spec:
     {{- if .values.metrics_enabled }}
           LANGFLOW_PROMETHEUS_PORT: "9090"
     {{- end }}
+    {{- if ne (int $port) 7860 }}
+          # The port the platform listens on, when it is not the image's own.
+          LANGFLOW_PORT: "{{ $port }}"
+    {{- end }}
     {{- range $alias, $edge := .context.uses }}
     {{- if and (eq $edge.socket "vector_store") (not (hasKey $dictating $alias)) }}
     {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
@@ -567,7 +588,7 @@ spec:
     {{- end }}
     {{- end }}
         ports:
-          http: 7860
+          http: {{ $port }}
     {{- if .values.metrics_enabled }}
           metrics: 9090
     {{- end }}
@@ -619,13 +640,12 @@ spec:
         configmap:
           source: "{{ .context.rendered_name }}-files"
     {{- end }}
-    # The editor's port is infra.port where the Release sets it: see the
-    # comment above the workload.
+    # The editor's port is infra.port: see the comment above the workload.
     services:
       default:
         type: ClusterIP
         ports:
-          http: {{ optional .infra "port" 7860 }}
+          http: {{ $port }}
     {{- if .values.metrics_enabled }}
           metrics: 9090
     {{- end }}

@@ -32,27 +32,33 @@ metadata:
     editor address and the webhook base.
 
     With `values.metrics_enabled` true, N8N_METRICS turns n8n's metrics on, at
-    /metrics on port 5678, which answers that path without a sign-in and which
-    any peer on the compose network reaches, and provides.metrics_endpoint
-    publishes the address; false, that key is empty.
+    /metrics on `infra.port`, which answers that path without a sign-in and
+    which any peer on the compose network reaches, and
+    provides.metrics_endpoint publishes the address; false, that key is empty.
 
-    With `infra.port` set, the editor is published on that port of the host's
-    loopback address, 127.0.0.1, alone.
+    With `infra.published_port` set, the editor is published on that port of
+    the host's loopback address, 127.0.0.1, alone.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
 spec:
   capability: compose
   implements: core/ai-agent/n8n:1.1.0
+  # listen_port is the port n8n listens on inside its container: infra.port,
+  # 5678 unless the Release sets another. It is the one home of that number,
+  # which the listener, the container port, the healthcheck and the metrics
+  # address all read, so none can move without the others.
+  locals:
+    listen_port: '{{ optional .infra "port" 5678 }}'
   # metrics_endpoint is the address n8n serves its own metrics at while
-  # values.metrics_enabled is true: /metrics on the main port 5678 of the
-  # service, named after the component instance and resolved on the compose
-  # network, where any peer reaches the port with nothing published to the
-  # host. A peer reaches the container's own port by name whatever
-  # infra.port publishes on the host, so the address keeps 5678. It is empty
-  # while the value is false, when the metrics are off.
+  # values.metrics_enabled is true: /metrics on the main port, listen_port, of
+  # the service, named after the component instance and resolved on the
+  # compose network, where any peer reaches the port with nothing published
+  # to the host. A peer reaches the container's own port whatever
+  # infra.published_port publishes on the host. It is empty while the value
+  # is false, when the metrics are off.
   provides:
-    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.instance_id }}:5678/metrics{{ end }}"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.instance_id }}:{{ .locals.listen_port }}/metrics{{ end }}"
   # The workflow definition is authored by the developer on .values. When present
   # it renders a compose config the seeding init container mounts as a file;
   # presence-guarded so an Aggregate supplying no definition emits no config and
@@ -164,6 +170,9 @@ spec:
     {{- $_ := set $taken "N8N_BLOCK_ENV_ACCESS_IN_NODE" "the platform's own setting written from values.allow_env_access_in_nodes" -}}
     {{- if .values.metrics_enabled -}}
     {{- $_ := set $taken "N8N_METRICS" "the platform's own setting turning its metrics on" -}}
+    {{- end -}}
+    {{- if ne (toString .locals.listen_port) "5678" -}}
+    {{- $_ := set $taken "N8N_PORT" "the platform's own setting written from infra.port" -}}
     {{- end -}}
     {{- $connectionVars := dict -}}
     {{- range $alias, $edge := .context.uses -}}
@@ -312,6 +321,9 @@ spec:
         # older one at start-up. Unset, none of the three is emitted.
         # N8N_METRICS is delivered as on helm/n8n, only while
         # values.metrics_enabled is true.
+        # N8N_PORT, the port n8n listens on, is delivered only where infra.port
+        # is not 5678, n8n's own default, so a Release keeping 5678 renders
+        # exactly as one written before the key existed.
         variables:
     {{- range $alias, $edge := .context.uses }}
     {{- if and (eq $edge.socket "model") (not (hasKey $dictating $alias)) }}
@@ -336,6 +348,9 @@ spec:
     {{- end }}
     {{- if .values.metrics_enabled }}
           N8N_METRICS: "true"
+    {{- end }}
+    {{- if ne (toString .locals.listen_port) "5678" }}
+          N8N_PORT: "{{ .locals.listen_port }}"
     {{- end }}
     {{- range $alias, $edge := .context.uses }}
     {{- if eq $edge.socket "tools" }}
@@ -384,7 +399,7 @@ spec:
     {{- end }}
     {{- end }}
         ports:
-          http: 5678
+          http: {{ .locals.listen_port }}
         # The platform documents GET /healthz/readiness, which answers once its
         # database is connected and migrated. The check runs inside the image the
         # Release names; the platform's own published image carries busybox wget
@@ -397,7 +412,7 @@ spec:
               - wget
               - -q
               - --spider
-              - "http://127.0.0.1:5678/healthz/readiness"
+              - "http://127.0.0.1:{{ .locals.listen_port }}/healthz/readiness"
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 3
@@ -433,21 +448,24 @@ spec:
           source: "{{ $.context.instance_id }}-file-{{ $i }}"
     {{- $i = add $i 1 }}
     {{- end }}
-    # With infra.port set, a Loopback entry publishes the container port http
-    # on the host's loopback address alone: the entry's number, infra.port, is
-    # the host side and http's own number, 5678, the container side, so compose
-    # renders "127.0.0.1:<infra.port>:5678", and a browser on the same machine
-    # opens the editor and the webhook endpoint at http://127.0.0.1:<infra.port>.
-    # Unset, the ClusterIP entry publishes nothing, and the service is reached
-    # on the compose network only.
+    # With infra.published_port set, a Loopback entry publishes the container
+    # port http on the host's loopback address alone: the entry's number,
+    # published_port, is the host side and http's own number, infra.port, the
+    # container side, so compose renders
+    # "127.0.0.1:<published_port>:<infra.port>", and a browser on the same
+    # machine opens the editor and the webhook endpoint at
+    # http://127.0.0.1:<published_port>. n8n names its own addresses after
+    # infra.port, so where the two differ infra.external_base_url carries the
+    # published one. Unset, the ClusterIP entry publishes nothing, and the
+    # service is reached on the compose network only.
     services:
       default:
-    {{- with optional .infra "port" 0 }}
+    {{- with optional .infra "published_port" 0 }}
         type: Loopback
         ports:
           http: {{ . }}
     {{- else }}
         type: ClusterIP
         ports:
-          http: 5678
+          http: {{ $.locals.listen_port }}
     {{- end }}

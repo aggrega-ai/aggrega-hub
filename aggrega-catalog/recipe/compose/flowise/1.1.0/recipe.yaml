@@ -13,7 +13,7 @@ metadata:
     data volume, mounted at the platform's home directory, and survive a
     restart; nothing outside that directory does.
 
-    Setting infra.port publishes the editor on 127.0.0.1 at that port.
+    infra.published_port publishes the editor on 127.0.0.1.
 
     The model endpoint wired into the `model` socket is rendered as
     OPENAI_BASE_URL and a key attached on that connection as OPENAI_API_KEY,
@@ -59,14 +59,15 @@ spec:
     flow_seed_directory: /seed
   # metrics_endpoint is the address Flowise serves its metrics at while
   # values.metrics_enabled is true, when the Workload below delivers
-  # ENABLE_METRICS and METRICS_PROVIDER: /api/v1/metrics on port 3000 of the
-  # service name, which every peer on the compose network reaches. A peer
-  # connects to the container's own port whatever infra.port publishes on the
-  # host, so the address carries 3000 either way. Empty while the value is
-  # false. metrics_credential_required follows it, true exactly while there is
-  # an address to scrape, since Flowise answers its metrics only to an API key.
+  # ENABLE_METRICS and METRICS_PROVIDER: /api/v1/metrics on the port the
+  # platform listens on, infra.port, of the service name, which every peer on
+  # the compose network reaches. A peer connects to that container port
+  # whatever infra.published_port publishes on the host. Empty while the value
+  # is false. metrics_credential_required follows it, true exactly while there
+  # is an address to scrape, since Flowise answers its metrics only to an API
+  # key.
   provides:
-    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.instance_id }}:3000/api/v1/metrics{{ end }}"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.instance_id }}:{{ .infra.port }}/api/v1/metrics{{ end }}"
     metrics_credential_required: "{{ if .values.metrics_enabled }}true{{ else }}false{{ end }}"
   # When values.flow_definition is set, a compose fragment adds a service that
   # runs once and seeds the definition, and the FlowiseFlowSeed bundle adds two
@@ -90,8 +91,8 @@ spec:
   # GET /api/v1/ping becomes, and carries restart "no", so it runs once at each
   # start of the stack and its exit status is what a reader inspects. It shares
   # the main service's network namespace, the way a sidecar does, so it reaches
-  # the platform at 127.0.0.1 on the port the Workload serves, 3000, whatever
-  # network the boundary is given. It runs the platform's own image, whose
+  # the platform at 127.0.0.1 on the port the Workload serves, infra.port,
+  # whatever network the boundary is given. It runs the platform's own image, whose
   # Node.js runtime carries the HTTP client the script uses, with the image's
   # entrypoint replaced so it does not start a second platform. Its name
   # carries -flow-seed after the instance, apart from the names the Workload's
@@ -121,7 +122,7 @@ spec:
           image: "{{ .infra.image }}"
           entrypoint: ["node", "{{ .locals.flow_seed_directory }}/seed.js"]
           environment:
-            FLOWISE_URL: "http://127.0.0.1:3000"
+            FLOWISE_URL: "http://127.0.0.1:{{ .infra.port }}"
             OWNER_EMAIL: "{{ .infra.owner_email }}"
             OWNER_PASSWORD: "{{ if $passwordKey }}{{ index .context.inject.env $passwordKey | replace "\\" "\\\\" | replace "\"" "\\\"" }}{{ else }}{{ index .context.inject.env "OWNER_PASSWORD" | replace "\\" "\\\\" | replace "\"" "\\\"" }}{{ end }}"
             CHATFLOW_ID: "{{ .values.chatflow_id }}"
@@ -273,6 +274,9 @@ spec:
     {{- end -}}
     {{- $_ := set $taken "DATABASE_PATH" "the platform's own setting naming its data directory" -}}
     {{- $_ := set $taken "SECRETKEY_PATH" "the platform's own setting naming where it keeps its encryption key" -}}
+    {{- if ne (toString .infra.port) "3000" -}}
+    {{- $_ := set $taken "PORT" "the platform's own setting naming the port it listens on, infra.port" -}}
+    {{- end -}}
     {{- if .values.metrics_enabled -}}
     {{- $_ := set $taken "ENABLE_METRICS" "the platform's own setting turning its metrics on" -}}
     {{- $_ := set $taken "METRICS_PROVIDER" "the platform's own setting naming its metrics format" -}}
@@ -377,9 +381,15 @@ spec:
         # metrics, in the Prometheus format, while values.metrics_enabled is
         # true; it serves them on its own port behind its API-key check, which
         # every peer on the compose network already reaches.
+        # PORT moves the platform's listener, which is 3000 when PORT is unset,
+        # to infra.port. It is rendered only where infra.port is not 3000, so a
+        # Release keeping the default renders the variables it always did.
         variables:
           DATABASE_PATH: "{{ $dataPath }}"
           SECRETKEY_PATH: "{{ $dataPath }}"
+    {{- if ne (toString .infra.port) "3000" }}
+          PORT: "{{ .infra.port }}"
+    {{- end }}
     {{- if .values.metrics_enabled }}
           ENABLE_METRICS: "true"
           METRICS_PROVIDER: "prometheus"
@@ -446,7 +456,7 @@ spec:
     {{- end }}
     {{- end }}
         ports:
-          http: 3000
+          http: {{ .infra.port }}
         # The platform answers GET /api/v1/ping without authentication, and its
         # own Compose file checks that route with curl, every 10 s after a 30 s
         # start period and allowing five retries. The check runs inside the
@@ -479,16 +489,17 @@ spec:
           source: "{{ $.context.instance_id }}-file-{{ $i }}"
     {{- $i = add $i 1 }}
     {{- end }}
-    # With infra.port set, a Loopback entry publishes the editor on the host's
-    # loopback address alone, so it opens in a browser on the machine running
-    # the stack and on no other: the entry's number, infra.port, is the host
-    # side and the container port it names, http on 3000, the container side,
-    # so compose renders "127.0.0.1:<infra.port>:3000". Unset, the ClusterIP
-    # entry publishes nothing, and the platform is reached on the compose
-    # network only. Containers on that network reach port 3000 either way.
+    # With infra.published_port set, a Loopback entry publishes the editor on
+    # the host's loopback address alone, where any process on this machine
+    # reaches it and no other machine does: the entry's number,
+    # infra.published_port, is the host side and the container port it names,
+    # http on infra.port, the container side, so compose renders
+    # "127.0.0.1:<published_port>:<infra.port>". Unset, the ClusterIP entry
+    # publishes nothing, and the platform is reached on the compose network
+    # only, where containers reach infra.port either way.
     services:
       default:
-    {{- with optional .infra "port" 0 }}
+    {{- with optional .infra "published_port" 0 }}
         type: Loopback
         ports:
           http: {{ . }}

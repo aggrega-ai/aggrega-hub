@@ -14,7 +14,7 @@ metadata:
     encrypting the editor's credentials, so both survive a restart; nothing
     outside that directory does.
 
-    The Service serves the editor on infra.port when it is set, else on 3000.
+    infra.published_port is refused; reach the Service with kubectl port-forward.
 
     The model endpoint wired into the `model` socket is injected as
     OPENAI_BASE_URL and a key attached on that connection as OPENAI_API_KEY,
@@ -54,17 +54,16 @@ spec:
   # flow_seed_directory is where the Job mounts that ConfigMap and runs the
   # script, and where the script reads the definition.
   #
-  # service_port is the port the Workload's Service serves the platform on:
-  # infra.port when the Release sets it, and otherwise 3000, the port Flowise
-  # serves inside its container, which the Service targets by name either way.
-  # It is the one home of that number, which the Service, the metrics address
-  # and the seeding Job's address all read, so none can move without the
-  # others.
+  # service_port is infra.port, 3000 unless the Release sets another: the port
+  # the platform listens on inside its container and the port its Service
+  # serves it on. It is the one home of that number in this Recipe, which the
+  # container port, the listener, the Service, the metrics address and the
+  # seeding Job's address all read, so none can move without the others.
   locals:
     flow_seed_delivery: config_map
     flow_seed_config_map_suffix: "-flow"
     flow_seed_directory: /seed
-    service_port: '{{ optional .infra "port" 3000 }}'
+    service_port: "{{ .infra.port }}"
   # metrics_endpoint is the address Flowise serves its metrics at while
   # values.metrics_enabled is true, when the Workload below delivers
   # ENABLE_METRICS and METRICS_PROVIDER: /api/v1/metrics on the Service the
@@ -75,6 +74,16 @@ spec:
   provides:
     metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-default:{{ .locals.service_port }}/api/v1/metrics{{ end }}"
     metrics_credential_required: "{{ if .values.metrics_enabled }}true{{ else }}false{{ end }}"
+  # infra.published_port publishes a port on the host, which only the Docker
+  # Compose realization does. A LoadBalancer or NodePort Service would expose
+  # the editor to the network rather than to one machine, so it is no
+  # equivalent; a Release setting the key halts the build naming it rather than
+  # having it ignored.
+  assertions:
+    published_port_not_on_kubernetes: >-
+      {{- if optional .infra "published_port" 0 -}}
+      {{- fail (printf "the component %q sets infra.published_port: publishing a port on the host is a Docker Compose setting; on Kubernetes reach it with `kubectl port-forward`, or attach `core/public-ingress` to expose it" .metadata.instance_id) -}}
+      {{- end -}}
   # When values.flow_definition is set, the FlowiseFlowSeed bundle emits a
   # ConfigMap carrying the definition verbatim beside the script that seeds
   # it, and a one-shot Job runs that script once the platform answers. With no
@@ -312,6 +321,9 @@ spec:
     {{- $taken := dict -}}
     {{- $_ := set $taken "DATABASE_PATH" "the platform's own setting naming its data directory" -}}
     {{- $_ := set $taken "SECRETKEY_PATH" "the platform's own setting naming where it keeps its encryption key" -}}
+    {{- if ne .locals.service_port "3000" -}}
+    {{- $_ := set $taken "PORT" "the platform's own setting naming the port it listens on, infra.port" -}}
+    {{- end -}}
     {{- if .values.metrics_enabled -}}
     {{- $_ := set $taken "ENABLE_METRICS" "the platform's own setting turning its metrics on" -}}
     {{- $_ := set $taken "METRICS_PROVIDER" "the platform's own setting naming its metrics format" -}}
@@ -437,9 +449,15 @@ spec:
         # metrics, in the Prometheus format, while values.metrics_enabled is
         # true; it serves them on its own port behind its API-key check, so no
         # port is added.
+        # PORT moves the platform's listener, which is 3000 when PORT is unset,
+        # to service_port. It is rendered only where that is not 3000, so a
+        # Release keeping the default renders the variables it always did.
         variables:
           DATABASE_PATH: "{{ $dataPath }}"
           SECRETKEY_PATH: "{{ $dataPath }}"
+    {{- if ne .locals.service_port "3000" }}
+          PORT: "{{ .locals.service_port }}"
+    {{- end }}
     {{- if .values.metrics_enabled }}
           ENABLE_METRICS: "true"
           METRICS_PROVIDER: "prometheus"
@@ -521,7 +539,7 @@ spec:
     {{- end }}
     {{- end }}
         ports:
-          http: 3000
+          http: {{ .locals.service_port }}
         # The platform answers GET /api/v1/ping without authentication, and its
         # own Compose file checks that route every 10 s after a 30 s start period,
         # allowing five retries — the timing the liveness probe below uses.
@@ -556,9 +574,10 @@ spec:
         configmap:
           source: "{{ .context.rendered_name }}-files"
     {{- end }}
-    # The Service's port is service_port, infra.port when the Release sets it;
-    # it names the container port http, so it targets 3000 whichever port it
-    # serves on.
+    # The Service's port is service_port, and it names the container port http,
+    # which listens on the same port. It stays a ClusterIP Service whatever the
+    # Release sets: infra.published_port, the host port Docker Compose
+    # publishes, is refused by the assertion above.
     services:
       default:
         type: ClusterIP

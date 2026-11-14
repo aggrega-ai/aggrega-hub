@@ -34,7 +34,7 @@ metadata:
     /metrics on the Service's port, which answers without a sign-in, and
     provides.metrics_endpoint publishes the address.
 
-    `infra.port`, where set, is the Service's port, forwarding to 5678.
+    `infra.published_port` is a Docker Compose setting and halts the build.
 
     Reach for this realization where the build must complete with nothing
     fetched; reach for `n8n-chart`, rendering n8n's own chart, where a chart
@@ -46,13 +46,21 @@ metadata:
 spec:
   capability: helm
   implements: core/ai-agent/n8n:1.1.0
-  # service_port is the port the Workload's Service serves the platform on:
-  # infra.port when the Release sets it, and otherwise 5678, the port n8n
-  # serves inside its container, which the Service targets by name either way.
-  # It is the one home of that number, which the Service and the metrics
-  # address both read, so neither can move without the other.
+  # service_port is infra.port, 5678 unless the Release sets another: the port
+  # n8n listens on inside its container, the container port http, and the
+  # port of the Service, which targets http by name. It is the one home of
+  # that number, which the listener, the container port, the Service and the
+  # metrics address all read, so none can move without the others.
   locals:
     service_port: '{{ optional .infra "port" 5678 }}'
+  # Publishing a port on the host has no Kubernetes counterpart that stays on
+  # this machine — a LoadBalancer or a NodePort reaches the network — so a
+  # Release setting infra.published_port halts rather than having it ignored.
+  assertions:
+    published_port_not_on_kubernetes: >-
+      {{- if optional .infra "published_port" 0 -}}
+      {{- fail (printf "the component %q sets infra.published_port: publishing a port on the host is a Docker Compose setting; on Kubernetes reach it with `kubectl port-forward`, or attach `core/public-ingress` to expose it" .metadata.instance_id) -}}
+      {{- end -}}
   # metrics_endpoint is the address n8n serves its own metrics at while
   # values.metrics_enabled is true: /metrics on the synthesized ClusterIP
   # Service, "<rendered_name>-default", at its port, service_port, with no
@@ -217,6 +225,9 @@ spec:
     {{- if .values.metrics_enabled -}}
     {{- $_ := set $taken "N8N_METRICS" "the platform's own setting turning its metrics on" -}}
     {{- end -}}
+    {{- if ne (toString .locals.service_port) "5678" -}}
+    {{- $_ := set $taken "N8N_PORT" "the platform's own setting written from infra.port" -}}
+    {{- end -}}
     {{- $connectionVars := dict -}}
     {{- range $alias, $edge := .context.uses -}}
     {{- $features := default dict $edge.features -}}
@@ -354,6 +365,9 @@ spec:
         # metrics, which it serves at /metrics on its main port with no
         # sign-in; with the value false it is not emitted and the metrics stay
         # off, n8n's own default.
+        # N8N_PORT, the port n8n listens on, is delivered only where
+        # service_port is not 5678, n8n's own default, so a Release keeping
+        # 5678 renders exactly as one written before the key existed.
         variables:
     {{- range $alias, $edge := .context.uses }}
     {{- if and (eq $edge.socket "model") (not (hasKey $dictating $alias)) }}
@@ -372,6 +386,9 @@ spec:
     {{- end }}
     {{- if .values.metrics_enabled }}
           N8N_METRICS: "true"
+    {{- end }}
+    {{- if ne (toString .locals.service_port) "5678" }}
+          N8N_PORT: "{{ .locals.service_port }}"
     {{- end }}
     {{- range $alias, $edge := .context.uses }}
     {{- if and (eq $edge.socket "tools") (not (hasKey $dictating $alias)) }}
@@ -447,7 +464,7 @@ spec:
     {{- end }}
     {{- end }}
         ports:
-          http: 5678
+          http: {{ .locals.service_port }}
         # The platform documents GET /healthz, which answers once the instance is
         # reachable, and GET /healthz/readiness, which answers once its database
         # is connected and migrated, and keeps both enabled on its main server.
@@ -500,8 +517,8 @@ spec:
           source: "{{ .context.rendered_name }}-files"
     {{- end }}
     # The Service's port is service_port; it names the container port http,
-    # so its targetPort is 5678, the port n8n serves in its container,
-    # whichever port the Service carries.
+    # so its targetPort is the port n8n serves in its container, service_port
+    # too.
     services:
       default:
         type: ClusterIP
