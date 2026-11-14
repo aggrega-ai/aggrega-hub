@@ -3979,10 +3979,16 @@ Consequences for a Recipe author:
   - **Which Components carry it**: a Component whose Docker Compose realization
     serves a port a user opens or calls from the machine declares
     `infra.published_port` beside `infra.port`, as `core/ai-agent/langflow` does from
-    its `1.1.0`.
+    its `1.1.0`. A Component whose container runs the Release's own program
+    declares `infra.port` too, naming the port that program listens on: where the
+    framework reads a port setting of its own, its Recipes deliver the key there,
+    as `core/ai-agent/google-adk`'s deliver `PORT`, and where it reads none, they
+    deliver it to nothing, as `core/ai-agent/crewai`'s do from its `1.1.0`.
   - **On Kubernetes their Recipes refuse it by name**: publishing a port on the
     host is a Docker Compose setting; on Kubernetes the Service is reached with
-    `kubectl port-forward`, or exposed by attaching `core/public-ingress`. A
+    `kubectl port-forward`, or exposed by attaching `core/public-ingress`, and for
+    a Component `core/public-ingress` cannot take — a worker — the refusal stops at
+    `kubectl port-forward`. A
     `NodePort` or `LoadBalancer` Service is no equivalent, since it opens the port
     to the network rather than to one machine. A realization on another target
     refuses it by name as well, and one that runs no server, as an MCP remote's,
@@ -3990,6 +3996,9 @@ Consequences for a Recipe author:
   - **`infra.port` keeps its meaning on every target**: the port the product
     listens on, and on Kubernetes the port of its Service. A synthesized
     realization declares both its container port and its Service port from it,
+    except where it renders neither, as the Kubernetes realizations of a worker
+    running the Release's own program do, `helm/crewai` from its `1.1.0` among
+    them, so that `kubectl port-forward` reaches the program on its own port,
     and a realization rendering the product's own chart writes it, from one local,
     into the chart's Service-port value — which Langflow's chart also passes to the
     command line that starts the product — and, where the product's listener reads
