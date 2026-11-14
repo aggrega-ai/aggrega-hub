@@ -1,0 +1,244 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: librechat
+  version: 1.1.0
+  license: MIT
+  description: >
+    A self-hosted LibreChat installation for local development via Docker
+    Compose, synthesized from the Workload kind by the compose provider: one
+    service and a named volume for the files people upload. The accounts,
+    conversations, agents and stored per-user credentials live in the document
+    store wired on the `backend` edge.
+
+    The model edge's endpoint becomes the platform's OpenAI-compatible base URL
+    and its model name the one model offered; the backend edge's host and port
+    compose the document-store connection string, with the sign-in attached on
+    that connection as its user part.
+
+    With infra.published_port set, the interface is published on the host's
+    loopback address and opens at http://127.0.0.1:<published_port>; unset,
+    nothing is published and only peers on the compose network reach it.
+
+    The four required secrets, an optional model API key and an optional store
+    sign-in arrive as literal environment values in the Compose file, as every
+    credential does on this target, unless the attached value is a Compose
+    variable reference. With no model API key attached, each person enters
+    their own key in the interface.
+
+    With values.metrics_enabled true, the secret attached to metrics_secret
+    turns the platform's metrics on at /metrics on the listen port, and
+    provides.metrics_endpoint publishes the address; the build halts when that
+    slot is unfilled.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/ai-agent/librechat:1.2.0
+  # This Recipe reads no infra.overrides keys, and not infra.source_version,
+  # which names a chart version where no chart is read. infra.storage.size is
+  # carried onto the uploads volume, where this target gives a volume no size.
+  #
+  # provides.host is the bare service name, named after the component instance
+  # and resolved on the compose network, where a peer reaches the port whether
+  # or not it is published on the host. provides.port is the listen port, never
+  # infra.published_port, which only a process on the host reaches.
+  #
+  # metrics_endpoint is where the platform serves its Prometheus metrics while
+  # values.metrics_enabled is true, when the workload below delivers
+  # METRICS_SECRET: /metrics on the listen port of the same service, spelling
+  # the service name out again because a provides entry cannot read another
+  # provides entry. Empty while the value is false. metrics_credential_required
+  # follows it, true exactly while there is an address to scrape, since the
+  # platform answers its metrics only to a bearer token equal to that secret.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.instance_id }}:{{ .infra.port }}/metrics{{ end }}"
+    metrics_credential_required: "{{ if .values.metrics_enabled }}true{{ else }}false{{ end }}"
+  # The platform answers /metrics only to a bearer token equal to
+  # METRICS_SECRET, and to every request with 401 while that variable is unset,
+  # so turning its metrics on without a secret would publish an address no
+  # scrape could read. The build halts here instead, naming the slot and the
+  # value, so the fix is one line of authored YAML. With the value false
+  # nothing is read and nothing halts. DELIBERATE NEAR-DUPLICATE of the same
+  # assertion on helm/librechat: each Recipe holds the rule for the settings it
+  # renders, and no catalog kind holds one assertion for several Recipes to
+  # share.
+  assertions:
+    metrics_need_a_secret: >-
+      {{- if and (optional .values "metrics_enabled" false) (not (hasKey (default dict .features) "metrics_secret")) -}}
+      {{- fail (printf "the LibreChat platform %q has values.metrics_enabled true but nothing fills its metrics_secret slot, and the platform answers its metrics only to a bearer token equal to that secret: attach a secret credential to metrics_secret, the token a scrape presents on its connection's credential slot, or set metrics_enabled to false" .metadata.instance_id) -}}
+      {{- end -}}
+  # Two edges are translated rather than passed through, because the variables
+  # the platform reads are not the names the targets publish. The model edge
+  # carries a published endpoint and a published model name: the endpoint
+  # becomes the platform's OpenAI-compatible base URL, OPENAI_REVERSE_PROXY,
+  # and the model name the single-entry model list it offers, OPENAI_MODELS, so
+  # the name a person picks in the interface is the name the wired component
+  # serves under. The backend edge carries a host and a port, which compose the
+  # document-store connection string, MONGO_URI, together with the logical
+  # database name the developer declared. Both are read by socket name rather
+  # than by the alias the topology chose, so neither depends on that alias.
+  #
+  # The bind address is set to accept traffic on every interface: the
+  # platform's own default binds the loopback address only, which in a
+  # container means nothing outside it, the published port included, reaches
+  # it. The listen port is emitted because the process reads its port from the
+  # environment.
+  #
+  # Every credential arrives on the inject pipe and is written into the file as
+  # a literal environment value, read under the key its own attachment
+  # delivered it under, values.key, which is value unless the Aggregate names
+  # another. Two attachments left on that default would both arrive under it,
+  # so an Aggregate filling several slots names a key on each. A model API key
+  # attached on the `model` connection becomes OPENAI_API_KEY; with none
+  # attached the platform runs in its per-user mode, where each person enters
+  # their own key in the interface and no key is rendered. A sign-in attached
+  # on the `backend` connection becomes the user part of MONGO_URI, written
+  # between mongodb:// and the store's host exactly as delivered, so its value
+  # is <user>:<password>, percent-encoded where a part holds a reserved
+  # character; with none attached the string carries no user part. The
+  # session secret becomes JWT_SECRET, the refresh secret JWT_REFRESH_SECRET,
+  # and the credential-encryption pair CREDS_KEY and CREDS_IV; the Component requires
+  # those four slots, so no value every reader of this catalog holds is
+  # rendered by this Recipe. The metrics secret becomes METRICS_SECRET only
+  # while values.metrics_enabled is true: setting that variable is what turns
+  # the platform's metrics on.
+  workload: |
+    {{- $uploadsPath := "/app/uploads" -}}
+    {{- /*
+      The image digest each tag was checked against. A tag listed here is
+      pulled by that digest as well, so the platform that starts is the one
+      this Recipe was proven with however the tag moves; a tag the Release
+      names that is not listed is pulled by its tag alone.
+    */ -}}
+    {{- $digests := dict "v0.8.7" "sha256:c5db3331b845e1f289f8d04c0c77936c4bbe372f76730a804abc1c37e44d23a9" -}}
+    {{- $features := default dict .features -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- /* The alias of the `model` connection carrying a credential, or empty. */ -}}
+    {{- $modelCredential := "" -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- if and (eq $edge.socket "model") (hasKey (default dict $edge.features) "credential") -}}
+    {{- $modelCredential = $alias -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /* Each component slot beside the variable the platform reads it from. */ -}}
+    {{- $slots := list (list "session_secret" "JWT_SECRET") (list "session_refresh_secret" "JWT_REFRESH_SECRET") (list "credential_encryption_key" "CREDS_KEY") (list "credential_encryption_iv" "CREDS_IV") -}}
+    {{- if .values.metrics_enabled }}{{ $slots = append $slots (list "metrics_secret" "METRICS_SECRET") }}{{ end -}}
+    apiVersion: aggrega.ai/v1beta1
+    kind: Workload
+    form: stateless
+    containers:
+      main:
+        image: "ghcr.io/danny-avila/librechat:{{ .infra.engine_version }}{{ with get $digests .infra.engine_version }}@{{ . }}{{ end }}"
+        variables:
+          HOST: 0.0.0.0
+          PORT: "{{ .infra.port }}"
+          # Quoted because a title is free text: unquoted, a title spelled like
+          # a number or a boolean is read as one, and the variables map, which
+          # takes strings, then refuses the build.
+          APP_TITLE: "{{ .values.app_title }}"
+          ALLOW_REGISTRATION: "{{ .values.allow_registration }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "model" }}
+          OPENAI_REVERSE_PROXY: "{{ $edge.provides.endpoint }}"
+          OPENAI_MODELS: "{{ $edge.provides.model }}"
+    {{- end }}
+    {{- if eq $edge.socket "backend" }}
+    {{- $userinfo := "" }}
+    {{- if hasKey (default dict $edge.features) "credential" }}
+    {{- $key := optional (default dict $edge.features.credential.values) "key" "" | default "value" }}
+    {{- $userinfo = printf "%s@" (index $env $key | replace "\\" "\\\\" | replace "\"" "\\\"") }}
+    {{- end }}
+          MONGO_URI: "mongodb://{{ $userinfo }}{{ $edge.provides.host }}:{{ $edge.provides.port }}/{{ $.values.database_name }}"
+    {{- end }}
+    {{- end }}
+          # The browser-facing base URL: the operator's external URL when one
+          # was supplied, and otherwise localhost on the listen port, which
+          # names the published address where infra.published_port equals
+          # infra.port; a Release publishing another port sets
+          # infra.external_base_url to http://127.0.0.1:<published_port>.
+    {{- with .infra.external_base_url }}
+          DOMAIN_CLIENT: "{{ . }}"
+          DOMAIN_SERVER: "{{ . }}"
+    {{- else }}
+          DOMAIN_CLIENT: "http://localhost:{{ .infra.port }}"
+          DOMAIN_SERVER: "http://localhost:{{ .infra.port }}"
+    {{- end }}
+    {{- with $modelCredential }}
+    {{- $key := optional (index $.context.uses . "features" "credential" "values") "key" "" | default "value" }}
+          OPENAI_API_KEY: "{{ index $env $key | replace "\\" "\\\\" | replace "\"" "\\\"" }}"
+    {{- else }}
+          OPENAI_API_KEY: user_provided
+    {{- end }}
+    {{- /* The four required slots are always attached in a build; the guard lets a
+      single-entity validate, which attaches nothing, still render the rest. */}}
+    {{- range $slot := $slots }}
+    {{- $name := index $slot 0 }}
+    {{- if hasKey $features $name }}
+    {{- $key := optional (default dict (index $features $name).values) "key" "" | default "value" }}
+          {{ index $slot 1 }}: "{{ index $env $key | replace "\\" "\\\\" | replace "\"" "\\\"" }}"
+    {{- end }}
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The platform's own Helm chart probes GET /health on this port and
+        # gives no timing. The image carries busybox wget and no curl, so the
+        # check runs wget directly. The server connects to its document store
+        # before it listens, so failures in the first 30 s do not count, and six
+        # misses 10 s apart mark it unhealthy. A service keeps one healthcheck,
+        # so one probe is declared.
+        health:
+          ready:
+            exec:
+              - wget
+              - -q
+              - --spider
+              - "http://127.0.0.1:{{ .infra.port }}/health"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+        volumeMounts:
+          - name: uploads
+            path: "{{ $uploadsPath }}"
+        # The resource quantities are quoted so the rendered value stays a string
+        # whatever the Release supplies: a whole-core quantity such as 1
+        # re-parses as a YAML integer and fails workload validation.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    volumes:
+      uploads:
+        persistent:
+          size: "{{ .infra.storage.size }}"
+    services:
+      default:
+    {{- with optional .infra "published_port" 0 }}
+        # The Release asked for the interface on the host, so it opens in a
+        # browser on the developer's own machine. Loopback publishes the port on
+        # 127.0.0.1 only, so no other machine reaches the sign-in page, while
+        # every process on this one does. The entry's number is the host side;
+        # the container port `http` is the listen port, infra.port, so compose
+        # writes 127.0.0.1:<published_port>:<port>.
+        type: Loopback
+        ports:
+          http: {{ . }}
+    {{- else }}
+        # infra.published_port is unset, so nothing is published on the host;
+        # containers on the compose network reach the listen port by the
+        # service name.
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
+    {{- end }}
