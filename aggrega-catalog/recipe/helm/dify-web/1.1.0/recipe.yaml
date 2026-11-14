@@ -1,0 +1,151 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: dify-web
+  version: 1.1.0
+  # metadata.license is deliberately absent. The front end this Recipe realizes
+  # is published under a modified Apache License 2.0 carrying additional
+  # conditions — among them a condition on altering the branding this image
+  # serves — and no single SPDX identifier names those terms; the licensing
+  # class sits on the Component's upstream-licensing label. The SPDX header at
+  # the top of this file states the terms of the file itself.
+  description: >
+    The Dify front end on Kubernetes via the helm provider's Workload synthesis
+    (a stateless Deployment plus a ClusterIP Service on the HTTP port). The
+    front end holds no state and owns no datastore, so it renders stateless.
+
+    The API server's identity resolved from the `api` uses-edge arrives on
+    .context.inject.env and becomes SERVER_CONSOLE_API_URL, the in-cluster base
+    URL the server-side rendering path calls. That is a different address from
+    the one the browser uses: a page rendered in the cluster reaches the API
+    server by its Service name, while the browser reaches it through the
+    ingress tier. So where the operator supplied an external base URL, it is
+    emitted separately as CONSOLE_API_URL and APP_API_URL, which is what the
+    browser reads; left empty, the browser derives the address from the page it
+    was served on.
+
+    provides.host is the bare, self-contained in-cluster service name of the
+    synthesized Service — it carries no namespace, so the recipe is independent
+    of where it is deployed. A consumer in another namespace qualifies the host
+    with the target namespace on its own side (caller-side routing).
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/dify-web:1.1.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare Service name "<rendered_name>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<rendered_name>-default"
+  # with no namespace segment. A same-namespace consumer reaches it under this
+  # name directly; a cross-namespace consumer qualifies it caller-side.
+  provides:
+    host: "{{ .context.rendered_name }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  # infra.published_port publishes the front end on the host's loopback address
+  # on Docker Compose. A cluster has no single host to publish on, and a
+  # NodePort or LoadBalancer Service would expose the front end to the network
+  # rather than to one machine, so this Recipe refuses the key by name instead
+  # of ignoring it.
+  assertions:
+    published_port_not_on_kubernetes: >-
+      {{- if optional .infra "published_port" 0 -}}
+      {{- fail (printf "the component %q sets infra.published_port: publishing a port on the host is a Docker Compose setting; on Kubernetes reach it with `kubectl port-forward`, or attach `core/public-ingress` to expose it" .metadata.instance_id) -}}
+      {{- end -}}
+  workload: |
+    {{- /*
+      The connection variables this Recipe reads off the inject pipe, under the
+      socket whose edge delivers them, each beside the provides key the edge's
+      inject block names it from. The pipe is read as a map, and every read of
+      these variables below goes through it, so a variable nothing delivered is
+      told apart from one delivered empty: an edge on one of these sockets
+      leaving any of its variables missing halts the build, naming the edge, the
+      variables and the inject block to write, rather than rendering a
+      connection setting with an empty value. A socket in $required is read
+      whether or not anything is wired to it, so leaving it empty halts too.
+    */ -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $reads := dict "api" (dict "API_HOST" "host" "API_PORT" "port") -}}
+    {{- $required := list "api" -}}
+    {{- $gaps := list }}{{ $wired := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ with get $reads $edge.socket -}}
+    {{- $wired = append $wired $edge.socket }}{{ $missing := list }}{{ $shape := list -}}
+    {{- range $var, $from := . }}{{ if not (hasKey $env $var) }}{{ $missing = append $missing $var }}{{ end }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- if $missing }}{{ $gaps = append $gaps (printf "the edge %q on its %s socket delivers no %s, so give that edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $alias $edge.socket (join " or " $missing) (join ", " $shape)) }}{{ end -}}
+    {{- end }}{{ end -}}
+    {{- range $socket := $required }}{{ if not (has $socket $wired) -}}
+    {{- $vars := list }}{{ $shape := list }}{{ range $var, $from := get $reads $socket }}{{ $vars = append $vars $var }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
+    {{- end }}{{ end -}}
+    {{- if $gaps }}{{ fail (printf "core/ai-agent/dify-web %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    apiVersion: aggrega.ai/v1beta1
+    kind: Workload
+    # The front end holds no durable state, so the default stateless form (a
+    # Deployment on the helm provider) is correct.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "langgenius/dify-web:{{ .infra.engine_version }}"
+        variables:
+          # The port the front-end server binds. The image reads the standard
+          # Node port variable.
+          PORT: "{{ .infra.port }}"
+          # The address the front-end server binds. The image binds the one
+          # HOSTNAME names, and Kubernetes sets HOSTNAME to the pod's name, which
+          # resolves to the pod's own address alone; kubectl port-forward
+          # connects on the pod's loopback, where nothing would answer. 0.0.0.0
+          # binds every address the pod has.
+          HOSTNAME: "0.0.0.0"
+          # The in-cluster address of the API server, resolved from the `api`
+          # edge. The server-side rendering path calls this; the browser does
+          # not, and cannot, because the Service name does not resolve outside
+          # the cluster.
+          SERVER_CONSOLE_API_URL: "http://{{ $env.API_HOST }}:{{ $env.API_PORT }}"
+          # Stated rather than left to the image, because the front end's own
+          # build and its published Compose definition disagree about the
+          # default. A standard-library entity chooses the quieter one.
+          NEXT_TELEMETRY_DISABLED: "1"
+          ALLOW_EMBED: "{{ .values.allow_embed }}"
+          TEXT_GENERATION_TIMEOUT_MS: "{{ .values.text_generation_timeout_ms }}"
+          TOP_K_MAX_VALUE: "{{ .values.top_k_max }}"
+          MAX_PARALLEL_LIMIT: "{{ .values.max_parallel_limit }}"
+          MAX_ITERATIONS_NUM: "{{ .values.max_iterations }}"
+          MAX_TOOLS_NUM: "{{ .values.max_tools }}"
+    {{- with .infra.external_base_url }}
+          # The externally reachable base URL, when the operator supplied one.
+          # These are the addresses the browser calls, so they are the ingress
+          # tier's address rather than the API server's Service name.
+          CONSOLE_API_URL: "{{ . }}"
+          APP_API_URL: "{{ . }}"
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The front end documents no health endpoint and the platform's own
+        # Compose file gives it no healthcheck, so both probes open a TCP
+        # connection to the port it binds.
+        health:
+          ready:
+            tcp: {{ .infra.port }}
+          live:
+            tcp: {{ .infra.port }}
+            initialDelaySeconds: 10
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the Release supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}

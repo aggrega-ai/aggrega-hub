@@ -1,0 +1,661 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: dify
+  version: 1.1.0
+  # metadata.license is deliberately absent. The Dify platform this Recipe
+  # realizes is published under a modified Apache License 2.0 carrying
+  # additional conditions, and no single SPDX identifier names those terms; the
+  # licensing class sits on the Component's upstream-licensing label. The
+  # SPDX header at the top of this file states the terms of the file itself.
+  description: >
+    The Dify API and console server on Kubernetes via the helm provider's
+    Workload synthesis: a stateless Deployment and a ClusterIP Service on the
+    API port. It holds no local state: the PostgreSQL backend, the
+    Redis-compatible cache and the vector datastore are the systems of record.
+    The identities its uses-edges resolve compose its connection settings and
+    the in-cluster URLs of its siblings, and its outbound requests to a
+    user-supplied address leave through the proxy. A cache publishing
+    valkey-tls or redis-tls is reached over TLS; another TLS protocol halts the
+    build. A vector-store connection halts it when its target is not a vector
+    engine or publishes a protocol other than http: both drivers are vector
+    engines dialled over http.
+
+    Its application secret comes from the credential attached to secret_key,
+    which has no default: the Component requires the slot, and the build halts
+    when nothing fills it. Each of its other four credentials comes from a
+    credential when one is attached and otherwise from a pinned development
+    literal; the three it presents to the backend, the sandbox and the plugin
+    runtime are held on those connections. Those defaults are for evaluation
+    and local development. The two keys the server shares with the task worker
+    and the plugin runtime are attached on all three or on none.
+
+    An app_definition, when set, is carried in a ConfigMap and imported by a
+    one-shot Job running the server's image: it performs Dify's first-time
+    setup if needed as infra.owner_email, with the owner_password credential
+    read by secretKeyRef, signs in, and imports the application unless one of
+    that name is present. With no definition, neither is rendered.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/dify:1.1.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare Service name "<rendered_name>-default" — the helm
+  # provider names the synthesized ClusterIP Service "<rendered_name>-default"
+  # with no namespace segment, so the recipe is independent of where it is
+  # deployed. A same-namespace consumer reaches it under this name directly; a
+  # cross-namespace consumer qualifies it with the target namespace on its own
+  # side (caller-side routing).
+  provides:
+    host: "{{ .context.rendered_name }}-default"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  # Importing values.app_definition needs an account to import it as. On a fresh
+  # installation every console call is refused until Dify's first-time setup has
+  # run, and that setup creates the owner account, so the import step performs
+  # it as infra.owner_email with the password attached to owner_password, then
+  # signs in as that account. Neither has a default: both name who owns the
+  # installation. So a definition with either one missing halts here, where the
+  # fix is one line of authored YAML, rather than as a step that fails in the
+  # cluster. With no definition nothing is read and nothing halts.
+  #
+  # infra.published_port publishes the server on the host's loopback address on
+  # Docker Compose. A cluster has no single host to publish on, and a NodePort or
+  # LoadBalancer Service would expose the server to the network rather than to
+  # one machine, so this Recipe refuses the key by name instead of ignoring it.
+  assertions:
+    published_port_not_on_kubernetes: >-
+      {{- if optional .infra "published_port" 0 -}}
+      {{- fail (printf "the component %q sets infra.published_port: publishing a port on the host is a Docker Compose setting; on Kubernetes reach it with `kubectl port-forward`, or attach `core/public-ingress` to expose it" .metadata.instance_id) -}}
+      {{- end -}}
+    app_definition_needs_an_owner: >-
+      {{- if optional .values "app_definition" "" -}}
+      {{- if not (optional .infra "owner_email" "") -}}
+      {{- fail (printf "the Dify server %q is given values.app_definition to import but no infra.owner_email: set infra.owner_email in the Release to the email address of the account that owns the installation, or remove app_definition" .metadata.instance_id) -}}
+      {{- end -}}
+      {{- if not (hasKey (default dict .features) "owner_password") -}}
+      {{- fail (printf "the Dify server %q is given values.app_definition to import but nothing fills its owner_password slot: attach a secret credential to owner_password holding the password of the account infra.owner_email names, or remove app_definition" .metadata.instance_id) -}}
+      {{- end -}}
+      {{- end -}}
+  # When values.app_definition is set, a ConfigMap carries the definition
+  # verbatim beside the script that imports it, and a one-shot Job runs that
+  # script once the server answers. With no definition both render empty and
+  # neither is emitted, so the output is what it is without the value.
+  #
+  # The step, in order: it waits for GET /console/api/setup to answer; if setup
+  # has not run, it posts the owner account to /console/api/setup; it signs in
+  # at /console/api/login, which takes the password Base64-encoded; it lists the
+  # applications named like the definition's app.name and stops, leaving it as
+  # it is, when one carries exactly that name; otherwise it posts the definition
+  # to /console/api/apps/imports and, when Dify holds the import for
+  # confirmation, as it does for a DSL version newer than the installation's,
+  # confirms it. Every call after
+  # signing in carries the session cookies the sign-in set, in an explicit
+  # Cookie header and under the names the server gave them, with the CSRF token
+  # repeated in X-CSRF-Token: the server marks those cookies secure when its
+  # external address is https, and a client would then withhold them from the
+  # in-cluster http address. A refused call prints its step and HTTP status
+  # beside the message Dify's reply carries, and the details where they differ;
+  # a 422, Dify's refusal of a request it finds invalid, prints the message
+  # alone. Dify refuses an owner account it finds invalid, a password too weak
+  # say, with a generic message rather than the rule the account broke, so that
+  # refusal prints the generic message. Nothing the step prints repeats the
+  # password: a text from Dify's reply holding the password, as given or
+  # Base64-encoded, or carrying input_value, the marker a validation error
+  # writes before the value it refused, is left out.
+  #
+  # The Job runs the server's own image, whose Python environment carries the
+  # HTTP and YAML libraries the script uses, so the step adds no image. It has
+  # the form the provider gives a run-to-completion workload, restartPolicy
+  # Never, and sets no deadline and no retry count, so a failure a retry can
+  # fix is retried as often as the cluster's default allows, six times; each
+  # attempt stops waiting for the server after about ten minutes, and a reply
+  # of the server's own failure, a 5xx, is retried too. A refusal no retry can
+  # fix — Dify refusing the setup, the sign-in, the listing, the import or its
+  # confirmation with a 4xx other than 408 or 429, Dify reporting the import
+  # failed, or a definition naming no application — exits with status 2, and
+  # the Job's podFailurePolicy fails the Job at that attempt, so it reports
+  # Failed at once rather than at the retry limit. The address is the Service the Workload below is served on,
+  # <rendered_name>-default, on infra.port. That bare name resolves only inside
+  # the Service's own namespace, and the Secret the password is read from must
+  # sit beside the Job too, so the ConfigMap and the Job carry the namespace the
+  # Release, or else the Aggregate, declares for the component through the aggrega.ai/namespace
+  # annotation, as the Workload's own resources do, and none where it declares
+  # none, where the applying tool places all three. The definition sits in the
+  # ConfigMap rather than in the Job, so editing it leaves the Job's pod
+  # template unchanged. A Job's pod template cannot be changed once
+  # created, so a Release changing anything else the Job's pod carries — the
+  # owner's email, the image tag, the port — deletes the completed Job before
+  # applying. A Job that failed is deleted before applying again too: applied
+  # unchanged, it stays failed and runs no further attempt.
+  #
+  # The owner password reaches the step by reference: OWNER_PASSWORD is a
+  # secretKeyRef to the Secret name and data key the owner_password credential
+  # publishes, so no file this Recipe renders carries the password, and a
+  # credential publishing neither halts the build.
+  artifacts:
+    dify-app.configmap.yaml: |
+      {{- if .values.app_definition -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-app
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" (optional (optional (default dict .context.annotations) "aggregate" dict) "aggrega.ai/namespace" "") }}
+        namespace: "{{ . }}"
+        {{- end }}
+      data:
+        app.yml: |
+      {{ .values.app_definition | indent 4 }}
+        import.py: |
+          import base64
+          import os
+          import sys
+          import time
+
+          import httpx
+          import yaml
+
+          API = os.environ["DIFY_API_URL"].rstrip("/") + "/console/api"
+          EMAIL = os.environ["OWNER_EMAIL"]
+          PASSWORD = os.environ["OWNER_PASSWORD"]
+          ENCODED = base64.b64encode(PASSWORD.encode("utf-8")).decode("ascii")
+          FINAL = 2
+
+
+          def fail(message, code=1):
+              print(message, file=sys.stderr)
+              sys.exit(code)
+
+
+          def read_json(response):
+              try:
+                  return response.json()
+              except ValueError:
+                  return {}
+
+
+          def said(text):
+              if not isinstance(text, str) or "input_value" in text:
+                  return ""
+              if PASSWORD and (PASSWORD in text or ENCODED in text):
+                  return ""
+              return text.strip()
+
+
+          def refused(step, response):
+              body = read_json(response)
+              error = body.get("error") if isinstance(body, dict) else None
+              fields = error if isinstance(error, dict) else body if isinstance(body, dict) else {}
+              status = response.status_code
+              reasons = []
+              for key in ("message",) if status == 422 else ("message", "details"):
+                  text = said(fields.get(key))
+                  if text and text not in reasons:
+                      reasons.append(text)
+              message = f"{step} was refused with HTTP {status}"
+              if reasons:
+                  message += ": " + "; ".join(reasons)
+              fail(message, FINAL if 400 <= status < 500 and status not in (408, 429) else 1)
+
+
+          def setup_step(client):
+              deadline = time.monotonic() + 600
+              while time.monotonic() < deadline:
+                  try:
+                      response = client.get(API + "/setup")
+                      if response.status_code == 200:
+                          return read_json(response).get("step")
+                  except httpx.HTTPError:
+                      pass
+                  time.sleep(5)
+              fail("the Dify API server did not answer within ten minutes")
+
+
+          def main():
+              with open("/seed/app.yml", encoding="utf-8") as handle:
+                  definition = handle.read()
+              app = (yaml.safe_load(definition) or {}).get("app") or {}
+              name = app.get("name") or ""
+              if not name:
+                  fail("the definition names no application under app.name", FINAL)
+              with httpx.Client(timeout=60) as client:
+                  if setup_step(client) != "finished":
+                      owner = {"email": EMAIL, "name": EMAIL.split("@")[0][:30], "password": PASSWORD}
+                      response = client.post(API + "/setup", json=owner)
+                      if response.status_code != 201:
+                          refused("first-time setup", response)
+                      print(f"first-time setup done: owner account {EMAIL}")
+                  response = client.post(API + "/login", json={"email": EMAIL, "password": ENCODED})
+                  if response.status_code != 200 or read_json(response).get("result") != "success":
+                      refused(f"signing in as {EMAIL}", response)
+                  session = {cookie.name: cookie.value for cookie in response.cookies.jar}
+                  client.cookies.clear()
+                  csrf = next((value for key, value in session.items() if key.endswith("csrf_token")), "")
+                  headers = {
+                      "Cookie": "; ".join(f"{key}={value}" for key, value in session.items()),
+                      "X-CSRF-Token": csrf,
+                  }
+                  page = 1
+                  while True:
+                      query = {"page": page, "limit": 100, "name": name}
+                      response = client.get(API + "/apps", params=query, headers=headers)
+                      if response.status_code != 200:
+                          refused("listing the applications", response)
+                      listing = read_json(response)
+                      if any(item.get("name") == name for item in listing.get("data", [])):
+                          print(f"an application named {name!r} is already present; leaving it as it is")
+                          return
+                      if not listing.get("has_more"):
+                          break
+                      page += 1
+                  body = {"mode": "yaml-content", "yaml_content": definition}
+                  response = client.post(API + "/apps/imports", json=body, headers=headers)
+                  result = read_json(response)
+                  if result.get("status") == "pending":
+                      response = client.post(API + "/apps/imports/" + result.get("id", "") + "/confirm", headers=headers)
+                      result = read_json(response)
+                  if result.get("status") not in ("completed", "completed-with-warnings"):
+                      if result.get("status") != "failed":
+                          refused(f"importing {name!r}", response)
+                      reason = said(result.get("error")) or f"HTTP {response.status_code}"
+                      fail(f"importing {name!r} failed: {reason}", FINAL)
+                  print(f"imported {name!r} as application {result.get('app_id')}")
+
+
+          main()
+      {{- end }}
+    dify-app-import.job.yaml: |
+      {{- if .values.app_definition }}
+      {{- $locator := optional (optional (default dict .features) "owner_password" dict) "provides" dict }}
+      {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) }}
+      {{- fail (printf "the owner_password credential of the Dify server %q publishes no Secret name and data key, so the step importing values.app_definition could not be given a reference to read it from: attach an owner_password credential publishing both, such as core/referenced-secret" .context.instance_id) }}
+      {{- end -}}
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ .context.rendered_name }}-app-import
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" (optional (optional (default dict .context.annotations) "aggregate" dict) "aggrega.ai/namespace" "") }}
+        namespace: "{{ . }}"
+        {{- end }}
+      spec:
+        podFailurePolicy:
+          rules:
+            - action: FailJob
+              onExitCodes:
+                containerName: import
+                operator: In
+                values: [2]
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: import
+                image: "langgenius/dify-api:{{ .infra.engine_version }}"
+                command: ["python", "/seed/import.py"]
+                env:
+                  - name: DIFY_API_URL
+                    value: "http://{{ .context.rendered_name }}-default:{{ .infra.port }}"
+                  - name: OWNER_EMAIL
+                    value: "{{ .infra.owner_email }}"
+                  - name: OWNER_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: "{{ .features.owner_password.provides.name }}"
+                        key: "{{ .features.owner_password.provides.key }}"
+                volumeMounts:
+                  - name: seed
+                    mountPath: /seed
+                    readOnly: true
+            volumes:
+              - name: seed
+                configMap:
+                  name: {{ .context.rendered_name }}-app
+      {{- end }}
+  # The backend identity resolved from the backend uses-edge (host, port,
+  # username, database) and the cache, vector-store, sandbox, plugin-runtime
+  # and proxy identities resolved from their edges arrive on
+  # .context.inject.env and compose the server's connection settings and the
+  # in-cluster URLs of its siblings.
+  #
+  # Four of those edges are translated rather than passed through, because the
+  # variable the server reads is not the one the target publishes. The
+  # vector-store edge publishes a host, a port and a gRPC port, and the driver
+  # named on that edge decides which variables carry them: a Weaviate
+  # connection composes WEAVIATE_ENDPOINT and WEAVIATE_GRPC_ENDPOINT, and a
+  # Qdrant connection composes QDRANT_URL and QDRANT_GRPC_PORT. The sandbox
+  # edge composes CODE_EXECUTION_ENDPOINT, and the plugin-runtime edge composes
+  # PLUGIN_DAEMON_URL. The proxy edge composes SSRF_PROXY_HTTP_URL and
+  # SSRF_PROXY_HTTPS_URL, which is how a request to a user-supplied address
+  # leaves through the proxy rather than directly.
+  #
+  # The backend password is rendered password-free where possible: with no
+  # credential on the backend connection the Recipe uses an inline development
+  # default matching the standard-library PostgreSQL Recipe's own default, and
+  # with one attached the password is supplied on DB_PASSWORD via the
+  # credential subsystem. The same holds for the application secret, the
+  # sandbox execution key, and the two keys the server and the plugin runtime
+  # present to each other, the runtime's server key and the key the runtime
+  # presents on the internal API. The three the server presents — the backend
+  # password, the sandbox key and the runtime's server key — are held on the
+  # backend, sandbox and plugin_daemon connections; the application secret and
+  # the internal-API key the server verifies are slots of its own. Each falls
+  # back to a pinned development literal when nothing is attached, so the stack
+  # runs with no external secret. The two handshake keys are read by the
+  # server, the task worker and the plugin runtime alike, so a credential for
+  # either is attached on all three or on none of them.
+  workload: |
+    {{- /*
+      The alias of each connection carrying a credential, or empty: the
+      backend's password, the sandbox's execution key and the plugin runtime's
+      server key.
+    */ -}}
+    {{- $backendCredential := "" -}}
+    {{- $sandboxCredential := "" -}}
+    {{- $pluginDaemonCredential := "" -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- if hasKey (default dict $edge.features) "credential" -}}
+    {{- if eq $edge.socket "backend" -}}{{- $backendCredential = $alias -}}{{- end -}}
+    {{- if eq $edge.socket "sandbox" -}}{{- $sandboxCredential = $alias -}}{{- end -}}
+    {{- if eq $edge.socket "plugin_daemon" -}}{{- $pluginDaemonCredential = $alias -}}{{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /*
+      The connection variables this Recipe reads off the inject pipe, under the
+      socket whose edge delivers them, each beside the provides key the edge's
+      inject block names it from. The pipe is read as a map, and every read of
+      these variables below goes through it, so a variable nothing delivered is
+      told apart from one delivered empty: an edge on one of these sockets
+      leaving any of its variables missing halts the build, naming the edge, the
+      variables and the inject block to write, rather than rendering a
+      connection setting with an empty value. A socket in $required is read
+      whether or not anything is wired to it, so leaving it empty halts too.
+    */ -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $reads := dict "backend" (dict "DB_HOST" "host" "DB_PORT" "port" "DB_USERNAME" "user" "DB_DATABASE" "database") "cache" (dict "REDIS_HOST" "host" "REDIS_PORT" "port") "vector_store" (dict "VDB_HOST" "host" "VDB_PORT" "port" "VDB_GRPC_PORT" "grpc_port") "sandbox" (dict "SANDBOX_HOST" "host" "SANDBOX_PORT" "port") "plugin_daemon" (dict "PLUGIN_DAEMON_HOST" "host" "PLUGIN_DAEMON_PORT" "port") "ssrf_proxy" (dict "SSRF_PROXY_HOST" "host" "SSRF_PROXY_PORT" "port") -}}
+    {{- $required := list "backend" "cache" "sandbox" "plugin_daemon" "ssrf_proxy" -}}
+    {{- $gaps := list }}{{ $wired := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ with get $reads $edge.socket -}}
+    {{- $wired = append $wired $edge.socket }}{{ $missing := list }}{{ $shape := list -}}
+    {{- range $var, $from := . }}{{ if not (hasKey $env $var) }}{{ $missing = append $missing $var }}{{ end }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- if $missing }}{{ $gaps = append $gaps (printf "the edge %q on its %s socket delivers no %s, so give that edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $alias $edge.socket (join " or " $missing) (join ", " $shape)) }}{{ end -}}
+    {{- end }}{{ end -}}
+    {{- range $socket := $required }}{{ if not (has $socket $wired) -}}
+    {{- $vars := list }}{{ $shape := list }}{{ range $var, $from := get $reads $socket }}{{ $vars = append $vars $var }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
+    {{- end }}{{ end -}}
+    {{- if $gaps }}{{ fail (printf "core/ai-agent/dify %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    {{- /*
+      The cache connection over TLS. A cache publishing valkey-tls or redis-tls accepts TLS
+      connections alone, so the server reaches it over TLS; any other value
+      ending in -tls names a cache served over TLS that this server is not
+      taught to reach, and halts rather than connecting in plaintext. A
+      server_ca on the connection is the authority the server checks the
+      cache's certificate against; it is mounted, so its attachment must name a
+      Secret, and it is refused on a cache served without TLS, where no
+      handshake takes place to check a certificate in. DELIBERATE
+      NEAR-DUPLICATE: the worker's and the scheduler's Recipes repeat this block
+      inside templates of their own, and no catalog kind holds a template
+      fragment for several Recipes to share; change all three together.
+    */ -}}
+    {{- $cacheTLS := false }}{{ $cacheCA := "" -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "cache" -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- $edgeTLS := has $proto (list "valkey-tls" "redis-tls") -}}
+    {{- if $edgeTLS }}{{ $cacheTLS = true }}{{ else if hasSuffix "-tls" $proto -}}
+    {{- fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a cache served over TLS that the Dify server does not reach: it speaks the Redis protocol, over TLS to a cache publishing valkey-tls or redis-tls; wire a Redis-protocol cache to the cache socket" $alias $.context.instance_id $edge.target $proto) -}}
+    {{- end -}}
+    {{- if hasKey (default dict $edge.features) "server_ca" -}}
+    {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) -}}
+    {{- fail (printf "the server_ca on the cache connection %s of %q publishes no Secret name, so no Secret could be mounted into the server's container: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if not $edgeTLS -}}
+    {{- fail (printf "the cache connection %s of %q holds a server_ca, but the cache it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that cache, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $proto)) -}}
+    {{- end -}}
+    {{- $cacheCA = $alias -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
+    {{- /*
+      The vector-store connection. The two drivers the socket names, Weaviate
+      and Qdrant, are both vector engines, and the server dials either at an
+      address composed http://. So a connection whose target's
+      datastore.aggrega.ai/engine label is anything but vector halts, since
+      neither driver speaks a search or semantic-memory engine, and so does one
+      whose target publishes a protocol other than http, which the server would
+      reach in plaintext or not at all. Among vector stores the build cannot
+      tell Weaviate or Qdrant from Chroma, Milvus or pgvector by label, so the
+      driver named on the edge stays the author's statement. DELIBERATE
+      NEAR-DUPLICATE: the worker's Recipe repeats this block inside a template
+      of its own, and no catalog kind holds a template fragment for two
+      Recipes to share; change both together.
+    */ -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "vector_store" -}}
+    {{- $engine := toString (optional (default dict $edge.labels) "datastore.aggrega.ai/engine" "") -}}
+    {{- if ne $engine "vector" -}}
+    {{- fail (printf "the vector_store connection %s of %q reaches %q, whose datastore.aggrega.ai/engine label is %s, not vector: the Dify server's two drivers, Weaviate and Qdrant, speak to a vector engine alone; wire a vector store, such as core/datastore/weaviate or core/datastore/qdrant, to the vector_store socket" $alias $.context.instance_id $edge.target (default "absent" $engine)) -}}
+    {{- end -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- if and $proto (ne $proto "http") -}}
+    {{- fail (printf "the vector_store connection %s of %q reaches %q, which publishes protocol %s, and the Dify server dials its %s driver at an http:// address, so it would reach that store in plaintext or not at all: wire a store publishing protocol http to the vector_store socket" $alias $.context.instance_id $edge.target $proto (toString $edge.values.engine)) -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
+    apiVersion: aggrega.ai/v1beta1
+    kind: Workload
+    # The server holds no durable state — the backend, the cache and the vector
+    # datastore are the systems of record — so the default stateless form (a
+    # Deployment on the helm provider) is correct: no form: stateful, no
+    # persistentTemplate volume, no PVC.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "langgenius/dify-api:{{ .infra.engine_version }}"
+        # MODE selects which of the three roles this image runs. The API image
+        # also runs the task worker and the scheduler, each under its own MODE,
+        # which is why all three components pin the same engine_version.
+        variables:
+          MODE: api
+          LOG_LEVEL: "{{ .infra.log_level }}"
+          # The listen port the server binds. It is emitted as well as published
+          # on the container port and the Service, because the server reads its
+          # bind port from here: without it, moving infra.port would move the
+          # Service and the container port while the process kept binding its
+          # own default.
+          DIFY_PORT: "{{ .infra.port }}"
+          # The server applies outstanding schema migrations at startup, so a
+          # fresh backend becomes usable without a separate migration step. This
+          # is the one workload in the stack where the flag is true: the worker
+          # and the scheduler set it false so they cannot run the same upgrade
+          # concurrently with this one.
+          MIGRATION_ENABLED: "true"
+          # The backend identity arrives on the inject pipe under the names the
+          # server itself reads, so these pass through untranslated. DB_TYPE is
+          # fixed because the backend socket is wired to a PostgreSQL component.
+          DB_TYPE: postgresql
+          DB_HOST: "{{ $env.DB_HOST }}"
+          DB_PORT: "{{ $env.DB_PORT }}"
+          DB_USERNAME: "{{ $env.DB_USERNAME }}"
+          DB_DATABASE: "{{ $env.DB_DATABASE }}"
+          # The cache identity likewise passes through under the server's own
+          # names. The two logical-database indices come from the cache edge's
+          # own values block, read by socket name rather than by the alias the
+          # topology chose, so the Recipe does not depend on that alias. The
+          # broker URL carries no password because the standard-library Redis
+          # Recipe leaves authentication off unless a credential is attached to
+          # it; attaching one means supplying the broker URL through an
+          # override.
+          REDIS_HOST: "{{ $env.REDIS_HOST }}"
+          REDIS_PORT: "{{ $env.REDIS_PORT }}"
+          CELERY_BACKEND: redis
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "cache" }}
+          REDIS_DB: "{{ $edge.values.db_index }}"
+          CELERY_BROKER_URL: "{{ if $cacheTLS }}rediss{{ else }}redis{{ end }}://{{ $env.REDIS_HOST }}:{{ $env.REDIS_PORT }}/{{ $edge.values.broker_db_index }}"
+    {{- end }}
+    {{- end }}
+          # Over TLS the cache client and the Celery broker, whose rediss:// URL
+          # turns TLS on for it, both verify the cache's certificate and the
+          # name dialed: REDIS_SSL_CERT_REQS defaults to CERT_NONE, which checks
+          # nothing, so it is set. They check it against the authority in the
+          # connection's server_ca where one is attached, and otherwise against
+          # the image's default trust store, which a publicly trusted
+          # certificate chains to.
+    {{- if $cacheTLS }}
+          REDIS_USE_SSL: "true"
+          REDIS_SSL_CERT_REQS: CERT_REQUIRED
+    {{- if $cacheCA }}
+          REDIS_SSL_CA_CERTS: /etc/dify/cache-server-ca/ca.crt
+    {{- end }}
+    {{- end }}
+          # The vector-store edge is translated: the driver named on the edge
+          # decides which variables carry the store's address, because the two
+          # drivers the socket admits read different ones. VECTOR_STORE is the
+          # variable the server dispatches on.
+          VECTOR_INDEX_NAME_PREFIX: "{{ .values.vector_index_prefix }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "vector_store" }}
+          VECTOR_STORE: "{{ $edge.values.engine }}"
+    {{- if eq $edge.values.engine "weaviate" }}
+          WEAVIATE_ENDPOINT: "http://{{ $env.VDB_HOST }}:{{ $env.VDB_PORT }}"
+          WEAVIATE_GRPC_ENDPOINT: "grpc://{{ $env.VDB_HOST }}:{{ $env.VDB_GRPC_PORT }}"
+    {{- end }}
+    {{- if eq $edge.values.engine "qdrant" }}
+          QDRANT_URL: "http://{{ $env.VDB_HOST }}:{{ $env.VDB_PORT }}"
+          QDRANT_GRPC_PORT: "{{ $env.VDB_GRPC_PORT }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+          # The sibling edges are translated into the single URL each subsystem
+          # is addressed by. The sandbox and the plugin runtime are reached
+          # directly in-cluster; the proxy is reached as a forward proxy, which
+          # is what the two SSRF_PROXY variables mean.
+          CODE_EXECUTION_ENDPOINT: "http://{{ $env.SANDBOX_HOST }}:{{ $env.SANDBOX_PORT }}"
+          PLUGIN_DAEMON_URL: "http://{{ $env.PLUGIN_DAEMON_HOST }}:{{ $env.PLUGIN_DAEMON_PORT }}"
+          PLUGIN_DIFY_INNER_API_URL: "http://{{ .context.rendered_name }}-default:{{ .infra.port }}"
+          SSRF_PROXY_HTTP_URL: "http://{{ $env.SSRF_PROXY_HOST }}:{{ $env.SSRF_PROXY_PORT }}"
+          SSRF_PROXY_HTTPS_URL: "http://{{ $env.SSRF_PROXY_HOST }}:{{ $env.SSRF_PROXY_PORT }}"
+          # The two keys the server and the plugin runtime present to each
+          # other: the one the server presents, held on its plugin_daemon
+          # connection, and the one it verifies, behind its own credential slot.
+          # Unattached, the Recipe emits the pinned development literal below —
+          # the same literal the worker and the plugin-runtime Recipes emit — so
+          # the stack runs self-contained with no external secret. Attached, the
+          # literal is not emitted and the credential subsystem delivers the
+          # value on the same variable through the attachments block further
+          # down. The server, the worker and the plugin runtime all read these
+          # two keys, so a credential is attached on all three or on none of
+          # them: attaching it to some of them leaves the rest carrying a
+          # different value, which renders cleanly and is refused when the call
+          # between them is made.
+    {{- if not $pluginDaemonCredential }}
+          PLUGIN_DAEMON_KEY: dify-plugin-daemon-server-key
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "inner_api_key") }}
+          INNER_API_KEY_FOR_PLUGIN: dify-plugin-inner-api-key
+    {{- end }}
+          # Application limits the developer declared.
+          TOP_K_MAX_VALUE: "{{ .values.top_k_max }}"
+          MAX_PARALLEL_LIMIT: "{{ .values.max_parallel_limit }}"
+          MAX_ITERATIONS_NUM: "{{ .values.max_iterations }}"
+          MAX_TOOLS_NUM: "{{ .values.max_tools }}"
+          INDEXING_MAX_SEGMENTATION_TOKENS_LENGTH: "{{ .values.indexing_max_segmentation_tokens }}"
+    {{- with .infra.external_base_url }}
+          # The externally reachable base URL, when the operator supplied one.
+          # The server composes the console, application, service-API and file
+          # URLs from it, which is what makes a shared link resolve from
+          # outside the cluster. Left empty, none of these is emitted and the
+          # server derives each address from the incoming request.
+          CONSOLE_API_URL: "{{ . }}"
+          CONSOLE_WEB_URL: "{{ . }}"
+          SERVICE_API_URL: "{{ . }}"
+          APP_API_URL: "{{ . }}"
+          APP_WEB_URL: "{{ . }}"
+          FILES_URL: "{{ . }}"
+    {{- end }}
+    {{- if not $backendCredential }}
+          DB_PASSWORD: apppass
+    {{- end }}
+    {{- if not $sandboxCredential }}
+          CODE_EXECUTION_API_KEY: dify-sandbox
+    {{- end }}
+    {{- if or $backendCredential (hasKey (default dict .features) "secret_key") $sandboxCredential $pluginDaemonCredential (hasKey (default dict .features) "inner_api_key") $cacheCA }}
+        attachments:
+    {{- with $backendCredential }}
+          DB_PASSWORD:
+            connection: "{{ . }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "secret_key" }}
+          SECRET_KEY:
+            from: secret_key
+            as: env
+    {{- end }}
+    {{- with $sandboxCredential }}
+          CODE_EXECUTION_API_KEY:
+            connection: "{{ . }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- with $pluginDaemonCredential }}
+          PLUGIN_DAEMON_KEY:
+            connection: "{{ . }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "inner_api_key" }}
+          INNER_API_KEY_FOR_PLUGIN:
+            from: inner_api_key
+            as: env
+    {{- end }}
+    {{- with $cacheCA }}
+          # The cache connection's server_ca Secret mounts whole, read-only, one
+          # file per data key, so the server reads ca.crt from this directory.
+          cache-server-ca:
+            connection: "{{ . }}"
+            from: server_ca
+            as: file
+            path: /etc/dify/cache-server-ca
+    {{- end }}
+    {{- end }}
+        ports:
+          http: {{ .infra.port }}
+        # The server answers GET /health, and the platform's own Compose file
+        # checks that route with the timing the liveness probe below uses. No
+        # start-up probe is documented. The server applies outstanding schema
+        # migrations before it binds its port, so the liveness probe first
+        # checks after that file's 30 s start period and allows three misses
+        # 30 s apart.
+        health:
+          ready:
+            http: /health
+            periodSeconds: 10
+            timeoutSeconds: 5
+          live:
+            http: /health
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the Release supplies: a whole-core quantity such as
+        # 1 re-parses as a YAML integer and fails workload validation, while a
+        # milli quantity happens not to.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
