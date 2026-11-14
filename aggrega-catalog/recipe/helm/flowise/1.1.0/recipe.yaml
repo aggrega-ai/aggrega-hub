@@ -1,0 +1,566 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: flowise
+  version: 1.1.0
+  description: >
+    The Flowise visual agent-builder on Kubernetes, rendered offline as plain
+    manifests by the helm provider's Workload synthesis: a Deployment serving
+    the editor on a ClusterIP Service, backed by a persistent volume at the
+    platform's home directory holding the chatflow database and the key
+    encrypting the editor's credentials, so both survive a restart; nothing
+    outside that directory does.
+
+    The Service serves the editor on infra.port when it is set, else on 3000.
+
+    The model endpoint wired into the `model` socket is injected as
+    OPENAI_BASE_URL and a key attached on that connection as OPENAI_API_KEY,
+    which a chatflow's OpenAI node reads only while its Connect Credential and
+    Base Path fields are empty, through the client library's environment
+    fallback; a credential on the node wins.
+
+    Each `tools` and `vector_store` connection reaches the platform under
+    variables named for its alias, as the comments above the workload set
+    out: AGGREGA_TOOL_<ALIAS>_URL, AGGREGA_VECTOR_STORE_<ALIAS>_URL and their
+    parts, each credential by a secretKeyRef. A chatflow reads each through a
+    Runtime variable of the same name. A connection writing an `inject:`
+    block receives the names it dictates instead of its address and part
+    variables, as variables or as files mounted at the paths it names; its
+    credentials stay.
+
+    A flow_definition, when set, is carried in a ConfigMap and seeded by a
+    one-shot Job in the platform's image: it registers infra.owner_email as
+    the owner on a fresh instance, the owner_password credential read by
+    secretKeyRef, signs in, and updates the chatflow at chatflow_id or imports
+    it there. With none, neither is rendered. The contract is authored against
+    Flowise 3.1.3.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/flowise:1.1.0
+  # The entries below are the values the seeding Job shares with the
+  # FlowiseFlowSeed bundle imported for the definition and the script that
+  # seeds it. Each has its home in the bundle, which stops the build naming the
+  # local when one is missing or differs from its own; the Job reads them
+  # here, because an artifact of this Recipe cannot read the bundle.
+  # flow_seed_delivery has the bundle emit one ConfigMap, named after the
+  # rendered name followed by flow_seed_config_map_suffix; a locals entry
+  # cannot read the rendered name, so the Job composes the two.
+  # flow_seed_directory is where the Job mounts that ConfigMap and runs the
+  # script, and where the script reads the definition.
+  #
+  # service_port is the port the Workload's Service serves the platform on:
+  # infra.port when the Release sets it, and otherwise 3000, the port Flowise
+  # serves inside its container, which the Service targets by name either way.
+  # It is the one home of that number, which the Service, the metrics address
+  # and the seeding Job's address all read, so none can move without the
+  # others.
+  locals:
+    flow_seed_delivery: config_map
+    flow_seed_config_map_suffix: "-flow"
+    flow_seed_directory: /seed
+    service_port: '{{ optional .infra "port" 3000 }}'
+  # metrics_endpoint is the address Flowise serves its metrics at while
+  # values.metrics_enabled is true, when the Workload below delivers
+  # ENABLE_METRICS and METRICS_PROVIDER: /api/v1/metrics on the Service the
+  # Workload is served on, <rendered_name>-default, at its port, service_port.
+  # Empty while the value is false. metrics_credential_required follows it,
+  # true exactly while there is an address to scrape, since Flowise answers its
+  # metrics only to an API key.
+  provides:
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-default:{{ .locals.service_port }}/api/v1/metrics{{ end }}"
+    metrics_credential_required: "{{ if .values.metrics_enabled }}true{{ else }}false{{ end }}"
+  # When values.flow_definition is set, the FlowiseFlowSeed bundle emits a
+  # ConfigMap carrying the definition verbatim beside the script that seeds
+  # it, and a one-shot Job runs that script once the platform answers. With no
+  # definition neither renders, so the output is what it is without the
+  # value. The Component's assertions have already halted a definition with no
+  # infra.owner_email, no owner_password credential or a chatflow_id that is
+  # not a UUID.
+  #
+  # The script is the bundle's, the one compose/flowise imports too, so both
+  # targets run one text; the bundle says what it does, in order. In short, it
+  # registers infra.owner_email as the owner on a fresh instance, signs in,
+  # and updates the chatflow at chatflow_id or imports the definition at that
+  # id, named after values.display_name or the id, halting with the
+  # platform's own status and message when a call is refused; running it
+  # again updates the same chatflow, so a retried or repeated run converges.
+  #
+  # The Job runs the platform's own image, whose Node.js runtime carries the
+  # HTTP client the script uses, so the step adds no image; the command
+  # replaces the image's own entrypoint, which would start a second platform.
+  # It has the form the provider gives a run-to-completion workload —
+  # restartPolicy Never, and no deadline or retry count, so the cluster's
+  # defaults apply — and each attempt stops waiting for the platform after
+  # about ten minutes. The address is the Service the Workload below is
+  # served on, <rendered_name>-default, on the port it serves, service_port.
+  # That bare name resolves only inside the Service's own namespace, and the
+  # Secret the password is read from must sit beside the Job too, so the
+  # ConfigMap and the Job carry the namespace the Release, or else the Aggregate, declares for the component through the
+  # aggrega.ai/namespace annotation, as the Workload's own resources do, and
+  # none where it declares none, where the applying tool places all three. The
+  # definition sits in the ConfigMap rather than in the Job, so editing it
+  # leaves the Job's pod template unchanged; a Job runs when it is created,
+  # so seeding an edited definition into a running platform means deleting the
+  # completed Job and applying again. A Job's pod template cannot be changed
+  # once created, so a Release changing anything else the Job's pod carries —
+  # the owner's email, the image, the chatflow's id or name, the Service's
+  # port — deletes the completed Job before applying.
+  #
+  # The owner password reaches the step by reference: OWNER_PASSWORD is a
+  # secretKeyRef to the Secret name and data key the owner_password credential
+  # publishes, so no file this Recipe renders carries the password, and a
+  # credential publishing neither halts the build.
+  artifacts:
+    flowise-flow:
+      $import: FlowiseFlowSeed#/artifacts/SeedScript
+    flowise-flow-seed.job.yaml: |
+      {{- if .values.flow_definition }}
+      {{- $locator := optional (optional (default dict .features) "owner_password" dict) "provides" dict }}
+      {{- if not (and (optional $locator "name" "") (optional $locator "key" "")) }}
+      {{- fail (printf "the owner_password credential of the Flowise platform %q publishes no Secret name and data key, so the step seeding values.flow_definition could not be given a reference to read it from: attach an owner_password credential publishing both, such as core/referenced-secret" .context.instance_id) }}
+      {{- end -}}
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: {{ .context.rendered_name }}-flow-seed
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" (optional (optional (default dict .context.annotations) "aggregate" dict) "aggrega.ai/namespace" "") }}
+        namespace: "{{ . }}"
+        {{- end }}
+      spec:
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: seed
+                image: "{{ .infra.image }}"
+                command: ["node", "{{ .locals.flow_seed_directory }}/seed.js"]
+                env:
+                  - name: FLOWISE_URL
+                    value: "http://{{ .context.rendered_name }}-default:{{ .locals.service_port }}"
+                  - name: OWNER_EMAIL
+                    value: "{{ .infra.owner_email }}"
+                  - name: OWNER_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: "{{ .features.owner_password.provides.name }}"
+                        key: "{{ .features.owner_password.provides.key }}"
+                  - name: CHATFLOW_ID
+                    value: "{{ .values.chatflow_id }}"
+                  - name: CHATFLOW_NAME
+                    value: {{ optional .values "display_name" "" | default .values.chatflow_id | toJson }}
+                volumeMounts:
+                  - name: seed
+                    mountPath: {{ .locals.flow_seed_directory }}
+                    readOnly: true
+            volumes:
+              - name: seed
+                configMap:
+                  name: {{ .context.rendered_name }}{{ .locals.flow_seed_config_map_suffix }}
+      {{- end }}
+    # The ConfigMap holding the file entries the connections dictate, keyed
+    # file-0, file-1 and so on in path order, the keys the workload's mounts
+    # read. It is emitted only while a connection dictates a file, so a build
+    # with none renders nothing here, and it carries the namespace the Release, or else the Aggregate,
+    # declares for the component, as the seeding Job does.
+    flowise-files.configmap.yaml: |
+      {{- $pipeFiles := optional (default dict .context.inject) "file" dict }}
+      {{- $files := dict }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- range $path, $from := (optional (default dict $edge.inject) "file" dict) }}
+      {{- $_ := set $files $path (optional $pipeFiles $path "") }}
+      {{- end }}
+      {{- end }}
+      {{- if $files -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-files
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" (optional (optional (default dict .context.annotations) "aggregate" dict) "aggrega.ai/namespace" "") }}
+        namespace: "{{ . }}"
+        {{- end }}
+      data:
+        {{- $i := 0 }}
+        {{- range $path, $v := $files }}
+        file-{{ $i }}: {{ toJson $v }}
+        {{- $i = add $i 1 }}
+        {{- end }}
+      {{- end }}
+  # The Workload becomes a Deployment serving the Flowise editor on a ClusterIP
+  # Service, backed by a persistent volume. Two pieces of durable state land on
+  # that volume and survive a restart: the chatflow database, and the
+  # encryption key that protects the credentials created in the editor. The
+  # platform generates that key on first start and writes it under the data
+  # path, so the key and the database whose rows it protects stay together.
+  # The volume is mounted at /home/node, the home directory of the user the
+  # platform's image runs as, and the data path is /home/node/.flowise, the
+  # platform's own documented data directory; whatever else the platform writes
+  # under its home directory survives with them, and state written anywhere
+  # else in the container does not.
+  #
+  # The platform's image runs as `node`, uid 1000, from Flowise 3.1.4, and as
+  # root before it. A volume the cluster's storage creates is commonly owned by
+  # root, which `node` cannot write, so the pod carries fsGroup 1000: Kubernetes
+  # then gives the volume to group 1000, the group of `node`, writable by it.
+  # An image running as root writes it either way.
+  #
+  # The model endpoint wired into the `model` socket is injected as
+  # OPENAI_BASE_URL and a model API key attached on that connection as
+  # OPENAI_API_KEY, through a secretKeyRef naming the connection. A chatflow
+  # resolves its model credential per node from Flowise's own encrypted
+  # credential store: the OpenAI node selects a credential, and Flowise looks it
+  # up and decrypts it — so a credential selected on the node takes precedence
+  # over the delivered key, and an operator who wants a chatflow to work the way
+  # Flowise intends creates that credential in the editor after deploying. The
+  # delivered variables are read by the underlying OpenAI client library when
+  # the node's Connect Credential and Base Path fields are left empty. That is
+  # the client library's environment fallback rather than a documented Flowise
+  # feature, so a future Flowise release that changes how it validates a
+  # credential-less node would end it. Which model a chatflow calls is selected
+  # inside the chatflow's own OpenAI node, whose model-name field carries the
+  # platform's default; the environment carries no model name.
+  #
+  # Chatflows are authored in the Flowise editor, or seeded from
+  # values.flow_definition by the one-shot Job the artifacts above describe:
+  # Flowise loads no chatflow from a file or a variable at start-up, so the
+  # Workload itself carries nothing for it.
+  #
+  # Each `tools` and `vector_store` connection's variables are named for its
+  # alias, upper-cased, with every character other than a letter or a digit an
+  # underscore; the alias grammar admits only a hyphen and an underscore
+  # besides, so a hyphen becomes an underscore. A chatflow reads none of them
+  # until a Runtime variable of the same name exists on Flowise's Variables
+  # page: Flowise resolves a Runtime variable from the environment variable of
+  # its name, and a chatflow reads it as $vars.<name>.
+  #
+  # AGGREGA_TOOL_<ALIAS>_URL is the endpoint the tool publishes, unless the
+  # connection carries an endpoint secret: then it is that secret, referenced
+  # by connection and slot, and the published address is not delivered. The
+  # credential is delivered only where the connection carries one, and the
+  # header beside it only where the tool publishes one; a tool behind a bridge
+  # publishes none, because the bridge checks no caller's credential.
+  #
+  # AGGREGA_VECTOR_STORE_<ALIAS>_URL is the endpoint the store publishes, or,
+  # for a store publishing none, the address composed from the protocol, host
+  # and port it publishes. Its credential is delivered only where the
+  # connection carries one.
+  #
+  # A store that also publishes a database and a user, as
+  # core/datastore/pgvector does, is delivered in parts as well:
+  # AGGREGA_VECTOR_STORE_<ALIAS>_HOST, _PORT, _DATABASE and _USER, its
+  # published host, port, database and user. Flowise's Postgres node takes the
+  # host and the database in text fields, which a Runtime variable fills, the
+  # port in a number field, and the user and the password from its Postgres
+  # API credential, which Flowise stores and no Runtime variable fills, so
+  # those two are typed into that credential. A store publishing no database
+  # or no user gets no parts: its connection delivers the address and the
+  # credential alone.
+  #
+  # Every secret on every connection sits under one attachments key, so the
+  # block is opened once, and only where one connection carries a secret.
+  #
+  # The tools and vector_store variables above are defaults, because a
+  # chatflow reads them under whatever names its Runtime variables carry: a
+  # connection writing an inject block receives exactly the names it dictates
+  # instead of its address, header and part variables, while its credential
+  # and endpoint secrets stay. The model connection's variables are the client
+  # library's own names, which the platform reads itself, so its socket admits
+  # no inject block.
+  workload: |
+    {{- /*
+      A connection that writes no inject block receives the defaults above. A
+      tools or vector_store connection that writes one receives exactly what
+      it dictates instead, read off the inject pipe as a map: no
+      AGGREGA_TOOL_<ALIAS>_URL from the endpoint the tool publishes, no
+      _CREDENTIAL_HEADER, no AGGREGA_VECTOR_STORE_<ALIAS>_URL and no part
+      variables. What its attachments deliver stays either way: the credential
+      as _CREDENTIAL, and a tool's endpoint secret as AGGREGA_TOOL_<ALIAS>_URL.
+
+      A dictated env entry becomes a container variable under the name it
+      gives, after every variable this recipe names, which a chatflow reads
+      through a Runtime variable of that name; a dictated file entry a
+      read-only file at the absolute path it names, held in one ConfigMap and
+      mounted by subPath, so a path that is not absolute, or one lying beneath
+      another file's path, is refused. An arg entry is refused, because this
+      recipe renders no command line: Kubernetes takes a container's arguments
+      in place of the image's default command, which starts the platform. Any
+      other mechanism is refused too. A dictated variable named like one this
+      recipe delivers itself, a platform setting, the model's variables or
+      another connection's, halts the build, naming both, since the compiler
+      cannot see the names a recipe writes.
+
+      Two tools or two vector_store connections whose aliases differ only in
+      letter case, or in a hyphen against an underscore, are named alike, so
+      the build halts, naming both, wherever the two would deliver one
+      variable: always while both take the defaults, and otherwise wherever
+      what each still delivers meets, such as a credential attached on each.
+    */ -}}
+    {{- $pipe := default dict .context.inject -}}
+    {{- $env := optional $pipe "env" dict -}}
+    {{- $pipeFiles := optional $pipe "file" dict -}}
+    {{- $dictating := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+    {{- if $entries }}{{ $_ := set $dictating $alias true }}{{ end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $taken := dict -}}
+    {{- $_ := set $taken "DATABASE_PATH" "the platform's own setting naming its data directory" -}}
+    {{- $_ := set $taken "SECRETKEY_PATH" "the platform's own setting naming where it keeps its encryption key" -}}
+    {{- if .values.metrics_enabled -}}
+    {{- $_ := set $taken "ENABLE_METRICS" "the platform's own setting turning its metrics on" -}}
+    {{- $_ := set $taken "METRICS_PROVIDER" "the platform's own setting naming its metrics format" -}}
+    {{- end -}}
+    {{- $connectionVars := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if eq $edge.socket "model" -}}
+    {{- $_ := set $taken "OPENAI_BASE_URL" (printf "the model connection %s, whose endpoint the OpenAI client library reads under that name" $alias) -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $taken "OPENAI_API_KEY" (printf "the credential attached on the model connection %s" $alias) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if or (eq $edge.socket "tools") (eq $edge.socket "vector_store") -}}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" -}}
+    {{- $byDefault := printf "the %s connection %s, which writes no inject block" $edge.socket $alias -}}
+    {{- $delivers := dict -}}
+    {{- if eq $edge.socket "tools" -}}
+    {{- if hasKey $features "endpoint" -}}
+    {{- $_ := set $delivers (printf "AGGREGA_TOOL_%s_URL" $name) (printf "the endpoint attached on the tools connection %s" $alias) -}}
+    {{- else if not (hasKey $dictating $alias) -}}
+    {{- $_ := set $delivers (printf "AGGREGA_TOOL_%s_URL" $name) $byDefault -}}
+    {{- end -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $delivers (printf "AGGREGA_TOOL_%s_CREDENTIAL" $name) (printf "the credential attached on the tools connection %s" $alias) -}}
+    {{- if and (not (hasKey $dictating $alias)) (optional $edge.provides "credential_header" "") -}}
+    {{- $_ := set $delivers (printf "AGGREGA_TOOL_%s_CREDENTIAL_HEADER" $name) $byDefault -}}
+    {{- end -}}
+    {{- end -}}
+    {{- else -}}
+    {{- if not (hasKey $dictating $alias) -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_URL" $name) $byDefault -}}
+    {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") -}}
+    {{- range $part := list "HOST" "PORT" "DATABASE" "USER" -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_%s" $name $part) $byDefault -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_CREDENTIAL" $name) (printf "the credential attached on the vector_store connection %s" $alias) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- range $var, $by := $delivers -}}
+    {{- with optional $connectionVars $var "" -}}
+    {{- fail (printf "the %s connections %s and %s of %q would both deliver the variable %s, because a connection's variables are named for its alias upper-cased with every character other than a letter or a digit an underscore: rename one of the two" $edge.socket . $alias $.context.instance_id $var) -}}
+    {{- end -}}
+    {{- $_ := set $connectionVars $var $alias -}}
+    {{- $_ := set $taken $var $by -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $files := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+    {{- range $name, $from := $entries -}}
+    {{- if eq $mechanism "env" -}}
+    {{- with optional $taken $name "" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the variable %s, which this realization already delivers from %s: dictate another name in that connection's inject block" $edge.socket $alias $.context.instance_id $name .) -}}
+    {{- end -}}
+    {{- else if eq $mechanism "file" -}}
+    {{- if not (hasPrefix "/" $name) -}}
+    {{- fail (printf "the %s connection %s of %q dictates a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- end -}}
+    {{- $_ := set $files $name (optional $pipeFiles $name "") -}}
+    {{- else if eq $mechanism "arg" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the command-line argument %q, and this realization renders no command line: Kubernetes takes a container's arguments in place of the image's default command, which starts the platform. Dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- else -}}
+    {{- fail (printf "the %s connection %s of %q dictates %q under the delivery mechanism %q, and this realization delivers env and file entries only: dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name $mechanism) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- range $path, $_ := $files -}}
+    {{- range $other, $_ := $files -}}
+    {{- if hasPrefix (printf "%s/" $path) $other -}}
+    {{- fail (printf "the component %q is handed a file at %q and another at %q beneath it, and one path cannot be both a file and a directory: dictate the two files at paths neither of which lies beneath the other" $.context.instance_id $path $other) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $homeDir := "/home/node" -}}
+    {{- $dataPath := printf "%s/.flowise" $homeDir -}}
+    {{- $secrets := false -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if and (eq $edge.socket "model") (hasKey $features "credential") -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- if and (eq $edge.socket "tools") (or (hasKey $features "credential") (hasKey $features "endpoint")) -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- if and (eq $edge.socket "vector_store") (hasKey $features "credential") -}}
+    {{- $secrets = true -}}
+    {{- end -}}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1beta1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    # Group 1000 owns the data volume, so the `node` user the platform's image
+    # runs as can write it whatever owner the storage gives the volume.
+    podSecurityContext:
+      fsGroup: 1000
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        # $homeDir is the single authored home for where the data volume is
+        # mounted, the home directory of the platform's user, and $dataPath, the
+        # platform's data directory inside it, is derived from it. The database
+        # path and the credential-key path read $dataPath and the volume mount
+        # reads $homeDir, so a future move cannot relocate one and leave the
+        # others behind.
+        # DATABASE_PATH and SECRETKEY_PATH are load-bearing rather than
+        # decorative: without them the platform keeps the database and the
+        # credential encryption key it generates on first start under its own
+        # user's home directory, which is the mounted volume only for an image
+        # running as `node`. An image running as root would write both outside
+        # the volume, and each restart would then mint a new key, leaving every
+        # credential created in the editor undecryptable.
+        # The model endpoint arrives on the `model` uses-edge; the recipe ranges
+        # the outbound edges and matches on the socket name to read the published
+        # endpoint.
+        # ENABLE_METRICS and METRICS_PROVIDER turn on the platform's own
+        # metrics, in the Prometheus format, while values.metrics_enabled is
+        # true; it serves them on its own port behind its API-key check, so no
+        # port is added.
+        variables:
+          DATABASE_PATH: "{{ $dataPath }}"
+          SECRETKEY_PATH: "{{ $dataPath }}"
+    {{- if .values.metrics_enabled }}
+          ENABLE_METRICS: "true"
+          METRICS_PROVIDER: "prometheus"
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "model" }}
+          OPENAI_BASE_URL: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if and (eq $edge.socket "tools") (not (hasKey $dictating $alias)) }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- $features := default dict $edge.features }}
+    {{- if not (hasKey $features "endpoint") }}
+          AGGREGA_TOOL_{{ $name }}_URL: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- if and (hasKey $features "credential") (optional $edge.provides "credential_header" "") }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL_HEADER: "{{ $edge.provides.credential_header }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if and (eq $edge.socket "vector_store") (not (hasKey $dictating $alias)) }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- $url := optional $edge.provides "endpoint" "" }}
+    {{- if not $url }}
+    {{- $url = printf "%v://%v:%v" $edge.provides.protocol $edge.provides.host $edge.provides.port }}
+    {{- end }}
+          AGGREGA_VECTOR_STORE_{{ $name }}_URL: "{{ $url }}"
+    {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") }}
+          AGGREGA_VECTOR_STORE_{{ $name }}_HOST: "{{ $edge.provides.host }}"
+          AGGREGA_VECTOR_STORE_{{ $name }}_PORT: "{{ $edge.provides.port }}"
+          AGGREGA_VECTOR_STORE_{{ $name }}_DATABASE: "{{ $edge.provides.database }}"
+          AGGREGA_VECTOR_STORE_{{ $name }}_USER: "{{ $edge.provides.user }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- /* The variables connections dictate, after every variable this recipe names, in alias order. */}}
+    {{- range $alias, $edge := .context.uses }}
+    {{- range $name, $from := (optional (default dict $edge.inject) "env" dict) }}
+          {{ toJson $name }}: {{ toJson (optional $env $name "") }}
+    {{- end }}
+    {{- end }}
+        # Fallback for the no-credential authoring state: the client library
+        # reads this only when the node's Connect Credential is left empty. A
+        # chatflow node with its own credential attached uses that instead — so
+        # this delivery is not how the key is supplied.
+    {{- if $secrets }}
+        attachments:
+    {{- range $alias, $edge := .context.uses }}
+    {{- $features := default dict $edge.features }}
+    {{- if and (eq $edge.socket "model") (hasKey $features "credential") }}
+          OPENAI_API_KEY:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- if eq $edge.socket "tools" }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+    {{- if hasKey $features "endpoint" }}
+          AGGREGA_TOOL_{{ $name }}_URL:
+            connection: "{{ $alias }}"
+            from: endpoint
+            as: env
+    {{- end }}
+    {{- if hasKey $features "credential" }}
+          AGGREGA_TOOL_{{ $name }}_CREDENTIAL:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- end }}
+    {{- if and (eq $edge.socket "vector_store") (hasKey $features "credential") }}
+          AGGREGA_VECTOR_STORE_{{ regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}_CREDENTIAL:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- end }}
+    {{- end }}
+        ports:
+          http: 3000
+        # The platform answers GET /api/v1/ping without authentication, and its
+        # own Compose file checks that route every 10 s after a 30 s start period,
+        # allowing five retries — the timing the liveness probe below uses.
+        health:
+          ready:
+            http: /api/v1/ping
+            periodSeconds: 10
+            timeoutSeconds: 5
+          live:
+            http: /api/v1/ping
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+        volumeMounts:
+          - name: data
+            path: "{{ $homeDir }}"
+    {{- $i := 0 }}
+    {{- range $path, $_ := $files }}
+          - name: inject-files
+            path: {{ toJson $path }}
+            subPath: "file-{{ $i }}"
+            readonly: true
+    {{- $i = add $i 1 }}
+    {{- end }}
+    volumes:
+      data:
+        persistent:
+          size: "{{ .infra.storage.size }}"
+    {{- if $files }}
+      inject-files:
+        configmap:
+          source: "{{ .context.rendered_name }}-files"
+    {{- end }}
+    # The Service's port is service_port, infra.port when the Release sets it;
+    # it names the container port http, so it targets 3000 whichever port it
+    # serves on.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .locals.service_port }}

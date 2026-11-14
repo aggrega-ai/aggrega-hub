@@ -1,0 +1,631 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: langflow
+  version: 1.1.0
+  description: >
+    The Langflow visual flow-builder on Kubernetes, synthesized by the helm
+    provider: a Deployment serving the editor on a ClusterIP Service, on port
+    7860 or the port `infra.port` sets, with a
+    persistent volume holding the flow database and its encryption key;
+    nothing else survives a restart. A supplied flow definition is carried in
+    a ConfigMap Langflow loads at each start, even with signing in required,
+    which an image at Langflow 1.5.1 or older does not do.
+
+    Signing in is required, as an administrator seeded from values.admin_user
+    and the password attached to admin_password; values.require_authentication
+    false leaves the editor open to anyone reaching it, and doing neither
+    halts the build.
+
+    The `model` socket's endpoint arrives as OPENAI_BASE_URL and a key
+    attached on that connection as OPENAI_API_KEY. Each `vector_store` and
+    `tools` connection arrives as the Component describes, every credential
+    by a secretKeyRef, and LANGFLOW_SSRF_ALLOWED_HOSTS admits the hosts of
+    both. A `vector_store` connection writing an `inject:` block receives the
+    names it dictates in place of its address and connection-string
+    variables, as variables a flow reads as global variables or as files
+    mounted at the paths it names; its credential stays.
+
+    With `values.metrics_enabled` true, LANGFLOW_PROMETHEUS_PORT turns on
+    Langflow's metrics at port 9090, which checks no caller and joins the
+    Service, and provides.metrics_endpoint publishes their address; false, it
+    is empty.
+
+    Reach for this realization where the build must complete with nothing
+    fetched or the metrics are wanted; reach for `langflow-chart`, rendering
+    Langflow's own chart, where a chart repository is reachable at build time.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/langflow:1.1.0
+  # The entries below are the values the Workload shares with the LangflowFlow
+  # bundle imported for the flow. Each has its home in the bundle, which stops
+  # the build naming the local when one is missing or differs from its own;
+  # the Workload reads them here, because a workload cannot read the bundle.
+  # flow_file_delivery has the bundle emit one ConfigMap, named after the
+  # rendered name followed by flow_file_config_map_suffix; a locals entry
+  # cannot read the rendered name, so the Workload's volume composes the two.
+  locals:
+    flow_file_delivery: config_map
+    flow_file_config_map_suffix: "-flow"
+  # metrics_endpoint is the address Langflow serves its own metrics at while
+  # values.metrics_enabled is true: /metrics on port 9090 of the synthesized
+  # ClusterIP Service, "<rendered_name>-default", which carries that port only
+  # then, with no namespace segment, so a consumer in another namespace
+  # qualifies the host on its own side. It is empty while the value is false,
+  # when the metrics are off.
+  provides:
+    metrics_endpoint: "{{ if .values.metrics_enabled }}http://{{ .context.rendered_name }}-default:9090/metrics{{ end }}"
+  # Reaching the editor requires signing in: the recipe switches the platform's
+  # built-in sign-in bypass off and seeds an administrator account from
+  # values.admin_user and the password attached to the admin_password slot, so
+  # that password is the only way in. An Aggregate that wants the editor open to
+  # anyone who can reach the service sets values.require_authentication to false
+  # instead, which leaves the bypass on and needs no credential. Doing neither
+  # halts the build, so an editor nobody can sign in to is never deployed.
+  #
+  # With the sign-in bypass switched off, the seeded administrator account is the
+  # only way into the editor, and its password comes from the attached
+  # credential — there is no fallback the platform can invent. So leaving
+  # require_authentication at its default and attaching nothing asks for an
+  # editor nobody could reach. The build halts here, where the fix is one line
+  # of authored YAML, rather than at start-up in a cluster. It halts only on
+  # that ambiguity: an Aggregate that sets the lever
+  # has made its choice and renders exactly what it asked for.
+  assertions:
+    admin_credential_prerequisite: >-
+      {{- if and .values.require_authentication (not (hasKey (default dict .features) "admin_password")) -}}
+      {{- fail "the Langflow editor needs an administrator password to sign in with and none is attached: attach a secret credential to the admin_password slot to set that password, or set values.require_authentication to false to run the editor with no sign-in required at all" -}}
+      {{- end -}}
+  # When a flow definition is supplied, the LangflowFlow bundle imported below
+  # emits a ConfigMap carrying it, which the Workload mounts as the directory
+  # the platform loads on startup; with no definition the platform deploys
+  # empty and no ConfigMap is rendered. Langflow loads every .json file in
+  # that directory into the administrator's flows at each start, after seeding
+  # the administrator, so the flow loads whether or not signing in is
+  # required. Where the definition carries the id of a flow already loaded,
+  # that flow is updated in place, so an edit made to it in the editor is
+  # replaced at the next start. An image at Langflow 1.5.1 or older loads the
+  # directory only while the sign-in bypass is on, which
+  # values.require_authentication false turns on.
+  #
+  # The bundle is the one compose/langflow imports too, so both targets write
+  # the flow with one text; the bundle says what it writes and why. In short,
+  # each `tools` connection is written into the flow, because Langflow's MCP
+  # Tools component reads a server's address from the flow and from no
+  # variable: the MCP Tools node whose server is named for the connection's
+  # alias gets the address the tool publishes and, for a connection carrying
+  # a credential, the name of the variable the Workload below delivers for it
+  # under the header the tool publishes, and the flow is written back as JSON
+  # with its keys sorted; with no tools connection it is written as authored.
+  # The component's assertion has already held the flow and the connections
+  # to each other. The ConfigMap carries the namespace the Release, or else the Aggregate, declares for
+  # the component through the aggrega.ai/namespace annotation, because the pod
+  # mounts it by name, which resolves only in the pod's own namespace.
+  artifacts:
+    langflow-flow:
+      $import: LangflowFlow#/artifacts/FlowFile
+    # The ConfigMap holding the file entries the connections dictate, keyed
+    # file-0, file-1 and so on in path order, the keys the workload's mounts
+    # read. It is emitted only while a connection dictates a file, so a build
+    # with none renders nothing here, and it carries the namespace the Release, or else the Aggregate,
+    # declares for the component, as the flow's ConfigMap does.
+    langflow-files.configmap.yaml: |
+      {{- $pipeFiles := optional (default dict .context.inject) "file" dict }}
+      {{- $files := dict }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- range $path, $from := (optional (default dict $edge.inject) "file" dict) }}
+      {{- $_ := set $files $path (optional $pipeFiles $path "") }}
+      {{- end }}
+      {{- end }}
+      {{- if $files -}}
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ .context.rendered_name }}-files
+        {{- with optional (optional (default dict .context.annotations) "release" dict) "aggrega.ai/namespace" (optional (optional (default dict .context.annotations) "aggregate" dict) "aggrega.ai/namespace" "") }}
+        namespace: "{{ . }}"
+        {{- end }}
+      data:
+        {{- $i := 0 }}
+        {{- range $path, $v := $files }}
+        file-{{ $i }}: {{ toJson $v }}
+        {{- $i = add $i 1 }}
+        {{- end }}
+      {{- end }}
+  # The Workload becomes a Deployment serving the Langflow editor on a ClusterIP
+  # Service, backed by a persistent volume mounted at the platform's config
+  # directory. The recipe directs the flow database into that config directory,
+  # so the flows authored in the editor survive a restart together with the
+  # encryption key the platform generates there; the platform's default location
+  # for the database is inside the image, which would not survive, so the recipe
+  # sets the flag that moves it. State written anywhere else in the container
+  # does not survive.
+  #
+  # The platform's image runs as uid 1000, group 0, and a volume the cluster's
+  # storage creates is commonly owned by root, which that user cannot write; the
+  # platform then fails to start. So the pod carries fsGroup 1000, as the
+  # platform's own Helm chart does: Kubernetes gives the volume to group 1000
+  # and adds that group to the platform's process, which can then write it.
+  #
+  # The environment-variable contract below is authored against
+  # langflow-base 0.11.0.
+  #
+  # The model endpoint wired into the `model` socket is injected as
+  # OPENAI_BASE_URL and a model API key attached on that connection as
+  # OPENAI_API_KEY; the key is delivered as an env secret, through a
+  # secretKeyRef naming the connection, and is never written into a flow
+  # artifact. Which
+  # model a flow calls is selected in the flow's own model component field, whose
+  # model-name list carries the platform's default; the environment carries no
+  # model name.
+  #
+  # Each `vector_store` connection's variables are named for its alias,
+  # upper-cased, with every character other than a letter or a digit an
+  # underscore; the alias grammar admits only a hyphen and an underscore
+  # besides, so a hyphen becomes an underscore. AGGREGA_VECTOR_STORE_<ALIAS>_URL
+  # is the endpoint the store publishes, or, for a store publishing none, the
+  # address composed from the protocol, host and port it publishes. Its
+  # credential is delivered only where the connection carries one, through a
+  # secretKeyRef naming the connection. A flow reads either through a field
+  # that names a global variable of the same name: where no stored global
+  # variable carries that name, Langflow reads the environment variable.
+  #
+  # A store that also publishes a database and a user, as
+  # core/datastore/pgvector does, is delivered as well as
+  # AGGREGA_VECTOR_STORE_<ALIAS>_CONNECTION_STRING,
+  # postgresql://<user>:<password>@<host>:<port>/<database>, the one string
+  # Langflow's PGVector component takes. Its password is the reference
+  # $(AGGREGA_VECTOR_STORE_<ALIAS>_CREDENTIAL), which Kubernetes expands when
+  # the container starts from the credential entry the provider lists ahead
+  # of the plain variables, so no rendered file carries the password; a
+  # connection carrying no credential gets the string without one. The
+  # password goes in as the Secret holds it, unencoded: Langflow
+  # percent-encodes the text between the string's last colon and its last @
+  # before it connects, so a password encoded beforehand would be encoded
+  # twice. A store publishing no database or no user gets no string.
+  #
+  # A `tools` connection's address reaches the platform in the flow the
+  # bundle above writes, never as a variable. Its credential, where the
+  # connection carries one, is delivered as AGGREGA_TOOL_<ALIAS>_CREDENTIAL,
+  # named as the vector stores' variables are, through a secretKeyRef naming
+  # the connection. Langflow fills a header from a stored global variable
+  # only when the header's whole value is that variable's name, so the node's
+  # header names a variable holding exactly what the header presents. Under
+  # any header but Authorization that is AGGREGA_TOOL_<ALIAS>_CREDENTIAL
+  # itself. Under Authorization, compared in any letter case, a server reads
+  # Bearer and the credential, so the header names
+  # AGGREGA_TOOL_<ALIAS>_AUTHORIZATION, a plain variable holding Bearer and
+  # the reference $(AGGREGA_TOOL_<ALIAS>_CREDENTIAL), which Kubernetes
+  # expands when the container starts from the credential entry the provider
+  # lists ahead of the plain variables, so no rendered file carries the
+  # credential. The name each header carries is listed, comma-separated, in
+  # LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT. Langflow adds that list to the
+  # names it already reads, and stores each listed variable the environment
+  # holds as a global variable of the administrator's: at each sign-in, or,
+  # with the sign-in bypass on, once when it creates the administrator. Until
+  # the variable is stored the header carries its name rather than the
+  # credential. The build halts on a credential for a tool publishing no
+  # credential_header, such as one behind a bridge, which checks no caller's
+  # credential. An attachment on the connection's endpoint slot, a whole
+  # address carrying its key, halts the build too: the address could reach
+  # Langflow only written into the flow file, its key with it.
+  #
+  # Langflow refuses an MCP server or a vector store whose host resolves to a
+  # private network address, which an in-cluster Service name normally does,
+  # unless LANGFLOW_SSRF_ALLOWED_HOSTS lists the host. So the variable lists,
+  # comma-separated, the host of every `tools` and `vector_store` connection's
+  # address, once each, lower-cased as Langflow compares it; with neither
+  # socket wired it is not rendered, and Langflow's guard stays as shipped.
+  # Set here, it replaces a list given through Langflow's own settings.
+  #
+  # With values.metrics_enabled true, LANGFLOW_PROMETHEUS_PORT switches on the
+  # platform's own metrics and names their port, 9090, where Langflow starts a
+  # listener of its own on every interface, apart from the editor's port, that
+  # serves the metrics and nothing else, checking no caller; the port is
+  # declared on the container and the Service so the published address
+  # reaches it. With the value false none of the three is rendered and the
+  # metrics stay off, Langflow's own default. The probes keep the editor's
+  # port: an http probe goes to the container port whose name sorts first, and
+  # `http` sorts before `metrics`.
+  #
+  # A vector_store connection's variables are defaults, because a flow reads
+  # them under whatever names its fields give: a connection writing an inject
+  # block receives exactly the names it dictates instead of
+  # AGGREGA_VECTOR_STORE_<ALIAS>_URL and _CONNECTION_STRING, read by a flow the
+  # same way, through a field naming a global variable of that name, while its
+  # credential stays and its host stays in LANGFLOW_SSRF_ALLOWED_HOSTS. The
+  # model's and the tools' variables are the platform's own reading, so those
+  # sockets admit no inject block.
+  #
+  # The image serves the editor on 7860, and nothing here moves that listener,
+  # so the container port and both probes stay on 7860 whatever port the
+  # Release sets. infra.port is the port of the Service's http entry, which
+  # targets the container port by its name, http; unset, the Service serves
+  # the editor on 7860 as well. The metrics keep their own port, 9090, on the
+  # container and the Service, so metrics_endpoint does not move with it.
+  workload: |
+    {{- $configDir := "/app/langflow" -}}
+    {{- $flowsPath := "/app/flows" -}}
+    {{- $requireAuth := .values.require_authentication -}}
+    {{- $adminCredential := and $requireAuth (hasKey (default dict .features) "admin_password") -}}
+    {{- /* The alias of the `model` connection carrying a credential, or empty. */ -}}
+    {{- $modelCredential := "" -}}
+    {{- /* Whether a `vector_store` connection carries a credential. */ -}}
+    {{- $storeCredential := false -}}
+    {{- /* The aliases of the `tools` connections carrying a credential. */ -}}
+    {{- $toolCredentials := list -}}
+    {{- /* The aliases among them whose tool reads the credential from the Authorization header. */ -}}
+    {{- $toolAuthorizations := list -}}
+    {{- /* The name of the variable the flow's header carries for each of those connections, in alias order. */ -}}
+    {{- $toolVariables := list -}}
+    {{- /* The address each `tools` and `vector_store` connection is delivered at, by alias. */ -}}
+    {{- $addresses := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if and (eq $edge.socket "model") (hasKey $features "credential") -}}
+    {{- $modelCredential = $alias -}}
+    {{- end -}}
+    {{- if and (eq $edge.socket "vector_store") (hasKey $features "credential") -}}
+    {{- $storeCredential = true -}}
+    {{- end -}}
+    {{- if eq $edge.socket "vector_store" -}}
+    {{- $url := optional $edge.provides "endpoint" "" -}}
+    {{- if not $url -}}
+    {{- $url = printf "%v://%v:%v" $edge.provides.protocol $edge.provides.host $edge.provides.port -}}
+    {{- end -}}
+    {{- $_ := set $addresses $alias $url -}}
+    {{- end -}}
+    {{- if eq $edge.socket "tools" -}}
+    {{- if hasKey $features "endpoint" -}}
+    {{- fail (printf "the tools connection %s of the Langflow platform %q carries an endpoint attachment, a whole address carrying its key: Langflow reads an MCP server's address only from the flow file it loads, so the address and its key would be written into that file as a literal; remove the attachment and reach the tool at the address it publishes, with its key on the connection's credential slot" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- $_ := set $addresses $alias $edge.provides.endpoint -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $header := optional $edge.provides "credential_header" "" -}}
+    {{- if not $header -}}
+    {{- fail (printf "the tools connection %s of the Langflow platform %q carries a credential, but the tool it reaches publishes no credential_header to present it under, as a tool behind a bridge, which checks no caller's credential, does not: remove the credential from the connection" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" -}}
+    {{- if eq (lower $header) "authorization" -}}
+    {{- $toolAuthorizations = append $toolAuthorizations $alias -}}
+    {{- $toolVariables = append $toolVariables (printf "AGGREGA_TOOL_%s_AUTHORIZATION" $name) -}}
+    {{- else -}}
+    {{- $toolVariables = append $toolVariables (printf "AGGREGA_TOOL_%s_CREDENTIAL" $name) -}}
+    {{- end -}}
+    {{- $toolCredentials = append $toolCredentials $alias -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /* The host of every delivered address, once each, as Langflow's private-address guard compares it. */ -}}
+    {{- $allowedHosts := list -}}
+    {{- range $alias, $url := $addresses -}}
+    {{- $host := lower (urlParse $url).hostname -}}
+    {{- if and $host (not (has $host $allowedHosts)) -}}
+    {{- $allowedHosts = append $allowedHosts $host -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /*
+      A connection that writes no inject block receives the defaults above. A
+      vector_store connection that writes one receives exactly what it
+      dictates instead, read off the inject pipe as a map: no
+      AGGREGA_VECTOR_STORE_<ALIAS>_URL and no _CONNECTION_STRING. Its
+      credential stays as _CREDENTIAL, and its host stays in
+      LANGFLOW_SSRF_ALLOWED_HOSTS, which the platform reads itself.
+
+      A dictated env entry becomes a container variable under the name it
+      gives, after every variable this recipe names, which a flow reads
+      through a field naming a global variable of that name; a dictated file
+      entry a read-only file at the absolute path it names, held in one
+      ConfigMap and mounted by subPath, so a path that is not absolute, or one
+      lying beneath another file's path, is refused. An arg entry is refused,
+      because this recipe renders no command line: Kubernetes takes a
+      container's arguments in place of the image's default command, which
+      starts the platform. Any other mechanism is refused too. A dictated
+      variable named like one this recipe delivers itself, a platform setting,
+      the model's or a tool's variables or another connection's, halts the
+      build, naming both, since the compiler cannot see the names a recipe
+      writes.
+
+      Two vector_store connections whose aliases differ only in letter case,
+      or in a hyphen against an underscore, are named alike, so the build
+      halts, naming both, wherever the two would deliver one variable: always
+      while both take the defaults, and otherwise wherever what each still
+      delivers meets, such as a credential attached on each.
+    */ -}}
+    {{- $pipe := default dict .context.inject -}}
+    {{- $env := optional $pipe "env" dict -}}
+    {{- $pipeFiles := optional $pipe "file" dict -}}
+    {{- $dictating := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+    {{- if $entries }}{{ $_ := set $dictating $alias true }}{{ end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $taken := dict -}}
+    {{- range $var := list "LANGFLOW_CONFIG_DIR" "LANGFLOW_SAVE_DB_IN_CONFIG_DIR" "LANGFLOW_AUTO_LOGIN" -}}
+    {{- $_ := set $taken $var "the platform's own setting" -}}
+    {{- end -}}
+    {{- if $requireAuth -}}
+    {{- $_ := set $taken "LANGFLOW_SUPERUSER" "the platform's own setting naming its administrator" -}}
+    {{- end -}}
+    {{- if $adminCredential -}}
+    {{- $_ := set $taken "LANGFLOW_SUPERUSER_PASSWORD" "the admin_password attached on the platform" -}}
+    {{- end -}}
+    {{- if .values.flow_definition -}}
+    {{- $_ := set $taken "LANGFLOW_LOAD_FLOWS_PATH" "the platform's own setting naming the flows it loads" -}}
+    {{- end -}}
+    {{- if .values.metrics_enabled -}}
+    {{- $_ := set $taken "LANGFLOW_PROMETHEUS_PORT" "the platform's own setting turning its metrics on" -}}
+    {{- end -}}
+    {{- if $toolVariables -}}
+    {{- $_ := set $taken "LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT" "the platform's own setting listing the tool credentials' variables" -}}
+    {{- end -}}
+    {{- if $allowedHosts -}}
+    {{- $_ := set $taken "LANGFLOW_SSRF_ALLOWED_HOSTS" "the platform's own setting listing the hosts of the wired tools and stores" -}}
+    {{- end -}}
+    {{- range $alias := $toolCredentials -}}
+    {{- $_ := set $taken (printf "AGGREGA_TOOL_%s_CREDENTIAL" (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_")) (printf "the credential attached on the tools connection %s" $alias) -}}
+    {{- end -}}
+    {{- range $alias := $toolAuthorizations -}}
+    {{- $_ := set $taken (printf "AGGREGA_TOOL_%s_AUTHORIZATION" (regexReplaceAll "[^A-Z0-9]" (upper $alias) "_")) (printf "the credential attached on the tools connection %s, presented under Authorization" $alias) -}}
+    {{- end -}}
+    {{- $storeVars := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- $features := default dict $edge.features -}}
+    {{- if eq $edge.socket "model" -}}
+    {{- $_ := set $taken "OPENAI_BASE_URL" (printf "the model connection %s, whose endpoint the platform reads under that name" $alias) -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $taken "OPENAI_API_KEY" (printf "the credential attached on the model connection %s" $alias) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if eq $edge.socket "vector_store" -}}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" -}}
+    {{- $byDefault := printf "the vector_store connection %s, which writes no inject block" $alias -}}
+    {{- $delivers := dict -}}
+    {{- if not (hasKey $dictating $alias) -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_URL" $name) $byDefault -}}
+    {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_CONNECTION_STRING" $name) $byDefault -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if hasKey $features "credential" -}}
+    {{- $_ := set $delivers (printf "AGGREGA_VECTOR_STORE_%s_CREDENTIAL" $name) (printf "the credential attached on the vector_store connection %s" $alias) -}}
+    {{- end -}}
+    {{- range $var, $by := $delivers -}}
+    {{- with optional $storeVars $var "" -}}
+    {{- fail (printf "the vector_store connections %s and %s of %q would both deliver the variable %s, because a connection's variables are named for its alias upper-cased with every character other than a letter or a digit an underscore: rename one of the two" . $alias $.context.instance_id $var) -}}
+    {{- end -}}
+    {{- $_ := set $storeVars $var $alias -}}
+    {{- $_ := set $taken $var $by -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $files := dict -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- range $mechanism, $entries := (default dict $edge.inject) -}}
+    {{- range $name, $from := $entries -}}
+    {{- if eq $mechanism "env" -}}
+    {{- with optional $taken $name "" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the variable %s, which this realization already delivers from %s: dictate another name in that connection's inject block" $edge.socket $alias $.context.instance_id $name .) -}}
+    {{- end -}}
+    {{- else if eq $mechanism "file" -}}
+    {{- if not (hasPrefix "/" $name) -}}
+    {{- fail (printf "the %s connection %s of %q dictates a file at %q, and a file is written at an absolute path inside the container: write that path in the connection's inject block starting with /" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- end -}}
+    {{- $_ := set $files $name (optional $pipeFiles $name "") -}}
+    {{- else if eq $mechanism "arg" -}}
+    {{- fail (printf "the %s connection %s of %q dictates the command-line argument %q, and this realization renders no command line: Kubernetes takes a container's arguments in place of the image's default command, which starts the platform. Dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name) -}}
+    {{- else -}}
+    {{- fail (printf "the %s connection %s of %q dictates %q under the delivery mechanism %q, and this realization delivers env and file entries only: dictate the value as an env or a file entry in that inject block instead" $edge.socket $alias $.context.instance_id $name $mechanism) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- range $path, $_ := $files -}}
+    {{- range $other, $_ := $files -}}
+    {{- if hasPrefix (printf "%s/" $path) $other -}}
+    {{- fail (printf "the component %q is handed a file at %q and another at %q beneath it, and one path cannot be both a file and a directory: dictate the two files at paths neither of which lies beneath the other" $.context.instance_id $path $other) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1beta1
+    kind: Workload
+    form: stateless
+    replicas: 1
+    # Group 1000 owns the data volume, so the platform's user can write it
+    # whatever owner the storage gives the volume.
+    podSecurityContext:
+      fsGroup: 1000
+    containers:
+      main:
+        image: "{{ .infra.image }}"
+        # $configDir is the single authored home for the platform's config
+        # directory, and $flowsPath for the seeded-flow directory. Every key that
+        # has to agree on one of them reads the binding rather than repeating the
+        # literal, so a future move cannot relocate one and leave the others
+        # behind. The config directory is /app/langflow, the one the platform's
+        # own image creates for it and its own documentation mounts a volume at;
+        # the seeded-flow directory is /app/flows, the one its documentation
+        # names for flows loaded at start.
+        # The save-database-in-config-directory flag is load-bearing rather than
+        # decorative: the platform's own default puts the flow database inside the
+        # installed package directory in the image, which the mounted volume does
+        # not cover, so without the flag the flows authored in the editor are lost
+        # at the first restart.
+        # The model endpoint arrives on the `model` uses-edge; the recipe ranges
+        # the outbound edges and matches on the socket name to read the published
+        # endpoint.
+        # values.require_authentication is the single authored home for whether
+        # the editor asks for a sign-in; $requireAuth binds it once and the
+        # variables, the mounted credential and the build-time assertion all read
+        # that binding, so the sign-in posture cannot be decided twice and
+        # disagree. The platform's own bypass flag is its inverse, which is why
+        # each arm writes the opposite word rather than piping the value through
+        # — piping it would make the two spellings look interchangeable, and they
+        # are not.
+        # The two arms are the only two coherent states, and they are kept whole
+        # deliberately: bypass off means the account name and its password travel
+        # with it, and bypass on means neither is authored, so no half-configured
+        # account is ever emitted.
+        variables:
+          LANGFLOW_CONFIG_DIR: "{{ $configDir }}"
+          LANGFLOW_SAVE_DB_IN_CONFIG_DIR: "true"
+    {{- if $requireAuth }}
+          LANGFLOW_AUTO_LOGIN: "false"
+          # Quoted because a login name is free text. Unquoted, a name spelled
+          # like a number or a boolean is read as one — `007` arrives as the
+          # number 7 and `true` as a boolean — and the variables map, which
+          # takes strings, then refuses the build over a name that was perfectly
+          # legal to choose.
+          LANGFLOW_SUPERUSER: "{{ .values.admin_user }}"
+    {{- else }}
+          LANGFLOW_AUTO_LOGIN: "true"
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "model" }}
+          OPENAI_BASE_URL: "{{ $edge.provides.endpoint }}"
+    {{- end }}
+    {{- end }}
+    {{- if .values.flow_definition }}
+          # Load the seeded flow directory on startup.
+          LANGFLOW_LOAD_FLOWS_PATH: "{{ $flowsPath }}"
+    {{- end }}
+    {{- if .values.metrics_enabled }}
+          LANGFLOW_PROMETHEUS_PORT: "9090"
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if and (eq $edge.socket "vector_store") (not (hasKey $dictating $alias)) }}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+          AGGREGA_VECTOR_STORE_{{ $name }}_URL: "{{ index $addresses $alias }}"
+    {{- if and (optional $edge.provides "database" "") (optional $edge.provides "user" "") }}
+    {{- /* The password is the credential entry the attachments block below
+           writes for this connection, referenced as $(NAME): the provider
+           writes that Secret-read entry ahead of the plain variables, so the
+           runtime expands the reference when the container starts. With no
+           credential on the connection there is no such entry, and the string
+           carries no password rather than an unexpanded reference. */}}
+    {{- $password := "" }}
+    {{- if hasKey (default dict $edge.features) "credential" }}
+    {{- $password = printf ":$(AGGREGA_VECTOR_STORE_%s_CREDENTIAL)" $name }}
+    {{- end }}
+          AGGREGA_VECTOR_STORE_{{ $name }}_CONNECTION_STRING: "postgresql://{{ $edge.provides.user }}{{ $password }}@{{ $edge.provides.host }}:{{ $edge.provides.port }}/{{ $edge.provides.database }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- range $alias := $toolAuthorizations }}
+    {{- /* Bearer and the credential, the reference expanded, as the vector
+           store's password is, from the Secret-read entry the attachments
+           block below writes for this connection, which the provider lists
+           ahead of the plain variables. */}}
+    {{- $name := regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}
+          AGGREGA_TOOL_{{ $name }}_AUTHORIZATION: "Bearer $(AGGREGA_TOOL_{{ $name }}_CREDENTIAL)"
+    {{- end }}
+    {{- with $toolVariables }}
+          LANGFLOW_VARIABLES_TO_GET_FROM_ENVIRONMENT: "{{ join "," . }}"
+    {{- end }}
+    {{- with $allowedHosts }}
+          LANGFLOW_SSRF_ALLOWED_HOSTS: "{{ join "," . }}"
+    {{- end }}
+    {{- /* The variables connections dictate, after every variable this recipe names, in alias order. */}}
+    {{- range $alias, $edge := .context.uses }}
+    {{- range $name, $from := (optional (default dict $edge.inject) "env" dict) }}
+          {{ toJson $name }}: {{ toJson (optional $env $name "") }}
+    {{- end }}
+    {{- end }}
+    {{- if or $modelCredential $adminCredential $storeCredential $toolCredentials }}
+        attachments:
+    {{- with $modelCredential }}
+          OPENAI_API_KEY:
+            connection: "{{ . }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- if $adminCredential }}
+          LANGFLOW_SUPERUSER_PASSWORD:
+            from: admin_password
+            as: env
+    {{- end }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if and (eq $edge.socket "vector_store") (hasKey (default dict $edge.features) "credential") }}
+          AGGREGA_VECTOR_STORE_{{ regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}_CREDENTIAL:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- end }}
+    {{- range $alias := $toolCredentials }}
+          AGGREGA_TOOL_{{ regexReplaceAll "[^A-Z0-9]" (upper $alias) "_" }}_CREDENTIAL:
+            connection: "{{ $alias }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- end }}
+        ports:
+          http: 7860
+    {{- if .values.metrics_enabled }}
+          metrics: 9090
+    {{- end }}
+        # The platform documents GET /health_check, which answers once its
+        # database and chat service respond, as its health check, and says GET
+        # /health is served before it has finished starting. So readiness asks
+        # /health_check, and liveness asks /health, which answers as soon as the
+        # process serves and so does not restart a slow start. The timing is the
+        # platform's own Helm chart's.
+        health:
+          ready:
+            http: /health_check
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          live:
+            http: /health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+        volumeMounts:
+          - name: data
+            path: "{{ $configDir }}"
+    {{- if .values.flow_definition }}
+          - name: flow
+            path: "{{ $flowsPath }}"
+    {{- end }}
+    {{- $i := 0 }}
+    {{- range $path, $_ := $files }}
+          - name: inject-files
+            path: {{ toJson $path }}
+            subPath: "file-{{ $i }}"
+            readonly: true
+    {{- $i = add $i 1 }}
+    {{- end }}
+    volumes:
+      data:
+        persistent:
+          size: "{{ .infra.storage.size }}"
+    {{- if .values.flow_definition }}
+      flow:
+        configmap:
+          source: "{{ .context.rendered_name }}{{ .locals.flow_file_config_map_suffix }}"
+    {{- end }}
+    {{- if $files }}
+      inject-files:
+        configmap:
+          source: "{{ .context.rendered_name }}-files"
+    {{- end }}
+    # The editor's port is infra.port where the Release sets it: see the
+    # comment above the workload.
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ optional .infra "port" 7860 }}
+    {{- if .values.metrics_enabled }}
+          metrics: 9090
+    {{- end }}
