@@ -1,0 +1,182 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: nginx
+  version: 1.0.1
+  description: >
+    NGINX reverse-proxy gateway for local development via Docker Compose.
+    Synthesized-mode Workload — the compose provider translates the Workload
+    into a service entry. The upstream host and port arrive on
+    .context.inject.env under the two variables the locals name, which the
+    `upstream` edge's inject block names, and are written into a minimal NGINX
+    server configuration whose proxy_pass forwards matching requests to that
+    upstream. With an edge wired on any socket but guard and either variable
+    missing from the pipe, the build halts naming the edge and its socket; with
+    neither on the pipe and no such edge, the location answers 503. A
+    core/prompt-injection-shield attachment's realization
+    (prompt-injection-shield-nginx) writes the two variables with the address
+    of the guard wired to the guard socket. provides.host is the bare service
+    name, resolved on the compose network. Each core/traffic-shadowing
+    attachment on the component adds a mirror to that location, sending a copy
+    of every forwarded request, with its original URI, to the service the
+    attachment's infra names, whose response NGINX discards. NGINX cannot copy
+    a share of the requests, so the FeatureRecipe realizing the attachment
+    (traffic-shadowing-nginx) halts on a share below 100, and this Recipe
+    halts on an attachment to a gateway that forwards nothing. With no such
+    attachment the configuration carries no mirror. Each
+    core/concurrency-limit attachment adds a cap, one total across NGINX's
+    worker processes, and a request past it is answered 503;
+    concurrency-limit-nginx refuses scope model.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: compose
+  implements: core/gateway/nginx:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # The two inject-pipe variables the server configuration reads its proxy_pass
+  # target from: the Aggregate names them on the upstream edge's inject block,
+  # and a core/prompt-injection-shield attachment's realization writes them,
+  # pointing the target at the guard wired to the guard socket. Each is read
+  # from here by the workload below and by that realization, so the two cannot
+  # name different variables.
+  locals:
+    upstream_host_variable: NGINX_UPSTREAM_HOST
+    upstream_port_variable: NGINX_UPSTREAM_PORT
+
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+
+  workload: |
+    {{- /*
+      One mirror per core/traffic-shadowing attachment, in attachment-name
+      order, which is the order a template ranges over a map in. An
+      attachment is found by its type with any version it was authored with
+      set aside, so core/traffic-shadowing and core/traffic-shadowing:1.0.0
+      are both read. Each mirror names an upstream group for the copy's
+      destination, so the internal location can pass the original request URI
+      ($request_uri) without NGINX needing a resolver at runtime: a proxy_pass
+      carrying a variable looks its host up among the server groups first. No
+      attachment, no mirror: the range is empty and the server block is
+      exactly the one written without it.
+    */ -}}
+    {{- $mirrors := list -}}
+    {{- range $name, $f := (default dict .features) -}}
+    {{- if eq (first (splitList ":" $f.type)) "core/traffic-shadowing" -}}
+    {{- $mirrors = append $mirrors (dict "name" $name "group" (printf "mirror_%s" $name) "location" (printf "/__mirror_%s" $name) "server" (printf "%s:%v" $f.infra.service_name $f.infra.service_port)) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /*
+      One cap per core/concurrency-limit attachment, in attachment-name order,
+      found by its type with any version it was authored with set aside. Each
+      is a limit_conn zone keyed on one fixed word, the same for every request,
+      so NGINX counts every request the server is processing against one key,
+      and it keeps that count in shared memory every worker process reads: one
+      total across everything the gateway forwards. The zone is declared ahead
+      of the server block, which the image includes inside its http block, and
+      the limit inside the server block, where it reaches the forwarding
+      location and every location beside it; the copy a mirror sends is part
+      of the request it copies and is not counted again. The zone is one
+      megabyte, above the eight memory pages NGINX requires at the least, and
+      the one key it holds takes a few dozen bytes. The key is a word with no
+      $ in it, so Compose reads nothing in it as a variable of its own. A
+      request past the cap is answered 503, NGINX's default. The attachment's
+      max_in_flight is read as the Feature declares it; its realization,
+      concurrency-limit-nginx, refuses a scope other than gateway and a cap
+      NGINX cannot hold. No attachment, no cap: the range is empty and the
+      configuration is exactly the one written without it.
+    */ -}}
+    {{- $caps := list -}}
+    {{- range $name, $f := (default dict .features) -}}
+    {{- if eq (first (splitList ":" $f.type)) "core/concurrency-limit" -}}
+    {{- $caps = append $caps (dict "zone" (printf "concurrency_%s" $name) "max" (int64 $f.infra.max_in_flight)) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /*
+      The proxy_pass target: the host and port under the two variables the
+      locals name, read off the inject pipe as a map so that a variable nothing
+      delivered is told apart from one delivered empty. An edge wired on any
+      socket but guard is where they come from: the upstream socket, or one a
+      Component extending core/gateway/nginx adds. So an edge there delivering
+      only one of the two, or neither, halts the build naming the edge and its
+      socket, unless an attachment's realization has written both, as
+      core/prompt-injection-shield's does. The guard socket is the one set
+      aside, because that realization reads the guard's edge itself. With no
+      such edge, one variable without the other halts as well, since whatever
+      delivered one meant the gateway to forward. With neither and no such
+      edge there is nowhere to forward to: the location keeps its path and
+      answers 503, and a mirror, which copies a forwarded request, has nothing
+      to copy and halts the build.
+    */ -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $hostVar := .locals.upstream_host_variable -}}
+    {{- $portVar := .locals.upstream_port_variable -}}
+    {{- $missing := list -}}
+    {{- range (list $hostVar $portVar) }}{{ if not (hasKey $env .) }}{{ $missing = append $missing . }}{{ end }}{{ end -}}
+    {{- $edges := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ if ne $edge.socket "guard" }}{{ $edges = append $edges (printf "the edge %q on its %s socket" $alias $edge.socket) }}{{ end }}{{ end -}}
+    {{- if and $missing $edges -}}
+    {{- $verb := "delivers" }}{{ $which := "that edge" }}{{ if gt (len $edges) 1 }}{{ $verb = "deliver" }}{{ $which = "the edge it should forward through" }}{{ end -}}
+    {{- $halt := printf "core/gateway/nginx %q forwards each request to the host and port under %s and %s on its inject pipe, but %s %s no %s; give %s an inject block naming %s from the upstream's host and %s from its port — inject: { env: [ { in: %s, from: host }, { in: %s, from: port } ] }" .context.instance_id $hostVar $portVar (join " and " $edges) $verb (join " or " $missing) $which $hostVar $portVar $hostVar $portVar -}}
+    {{- fail $halt -}}
+    {{- end -}}
+    {{- if eq (len $missing) 1 -}}
+    {{- $halt := printf "core/gateway/nginx %q finds %s on its inject pipe but no %s, and forwards only to a host and port delivered together; whatever delivers one of the two delivers both — %s as the upstream's host and %s as its port" .context.instance_id (first (without (list $hostVar $portVar) (first $missing))) (first $missing) $hostVar $portVar -}}
+    {{- fail $halt -}}
+    {{- end -}}
+    {{- if and $missing $mirrors -}}
+    {{- $mirrorNames := list }}{{ range $mirrors }}{{ $mirrorNames = append $mirrorNames .name }}{{ end -}}
+    {{- $halt := printf "core/traffic-shadowing attachment %q on %q copies each request the gateway forwards, but %q forwards none: no edge delivers %s and %s on its inject pipe and no core/prompt-injection-shield attachment writes them, so its location answers 503 and there is no forwarded request to copy; wire an upstream whose edge names both, or remove the attachment" (join ", " $mirrorNames) .context.instance_id .context.instance_id $hostVar $portVar -}}
+    {{- fail $halt -}}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1beta1
+    kind: Workload
+    containers:
+      main:
+        image: "nginx:{{ .infra.engine_version }}"
+        # The upstream target resolved from the `upstream` uses-edge arrives on
+        # the inject pipe (.context.inject.env). It is written into the NGINX
+        # server config at start-up and forwarded via proxy_pass. With no target
+        # on the pipe the location carries no proxy_pass and answers 503. Each
+        # mirror adds its upstream group ahead of the server block, a mirror
+        # directive in the forwarded location, and the internal location the
+        # copy is sent from. The NGINX variable is written $$request_uri because
+        # Compose reads $ in the file it is given as the start of a variable of
+        # its own, and $$ is how that file spells a literal $. Each cap adds its
+        # zone ahead of the server block and its limit at the head of it.
+        command:
+          - /bin/sh
+          - -c
+          - "echo '{{ range $caps }}limit_conn_zone gateway zone={{ .zone }}:1m; {{ end }}{{ range $mirrors }}upstream {{ .group }} { server {{ .server }}; } {{ end }}server { listen {{ .infra.port }}; {{ range $caps }}limit_conn {{ .zone }} {{ .max }}; {{ end }}location {{ .values.upstream_path }} { {{ range $mirrors }}mirror {{ .location }}; {{ end }}{{ if $missing }}return 503;{{ else }}proxy_pass http://{{ index $env $hostVar }}:{{ index $env $portVar }};{{ end }} }{{ range $mirrors }} location = {{ .location }} { internal; proxy_pass http://{{ .group }}$$request_uri; }{{ end }} }' > /etc/nginx/conf.d/default.conf && exec nginx -g 'daemon off;'"
+        ports:
+          http: {{ .infra.port }}
+        # NGINX documents no health endpoint, and the one location this server
+        # configures forwards to the upstream, or answers 503 with none to
+        # forward to, so the service's healthcheck opens a TCP connection to the
+        # port the server listens on, with the nc the image's busybox provides.
+        # It is an exec probe naming 127.0.0.1 rather than a tcp probe: a tcp
+        # probe on this target connects to localhost, which this image resolves
+        # to ::1 first, and busybox nc tries that address alone, while the server
+        # configuration above listens on IPv4 alone, so the check would fail for
+        # ever on a server that answers. A service keeps one healthcheck, so one
+        # probe is declared.
+        health:
+          ready:
+            exec:
+              - nc
+              - "-z"
+              - 127.0.0.1
+              - "{{ .infra.port }}"
+            periodSeconds: 10
+            timeoutSeconds: 5
+    services:
+      default:
+        type: NodePort
+        ports:
+          http: {{ .infra.port }}
