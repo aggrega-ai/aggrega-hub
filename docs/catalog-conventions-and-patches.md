@@ -964,7 +964,10 @@ must agree on it; an importer supplying its own declares a parameter of its own
 and passes it down through its `aggregates` entry. What the parameter means
 follows the realization the importer's Manifest binds: the credential itself under
 `k8s-secret-from-parameter`, the name of a Secret that already exists under
-`k8s-existing-secret`. So the default is a valid Kubernetes object name that also
+`k8s-existing-secret`, and on `compose` the credential itself under
+`dotenv-referenced-secret`, which delivers it on the inject pipe — written as a
+Compose variable reference such as `${DIFY_DB_PASSWORD}`, it stays out of the
+emitted file. So the default is a valid Kubernetes object name that also
 meets what the product requires of the credential — a length, the characters it
 refuses — and the parameter's description says what the value is under each.
 Every Manifest whose Aggregate imports the module maps `core/referenced-secret`,
@@ -976,11 +979,12 @@ fulfills it, or the build halts. `core/harbor` does the same for its three keys,
 `core/livekit` for its API secret, `core/agenta` for its signing and encryption
 keys and `core/dify` for its application secret (see "A key with no development
 default"). The shape stops where
-the Feature cannot follow. A
-module that also builds on `compose` attaches nothing, because that target has no
-realization of a Feature holding a credential by reference; its description says
-its components run on their Recipes' development credentials and that a reader
-needing real ones composes the components directly. And a slot no consumer can
+the Feature cannot follow. On `compose` it follows only as far as each
+component's compose Recipe reads the slot's value off its inject pipe, under the
+attachment's `key`; a module whose components' compose Recipes do not attaches
+nothing, its description saying its components run on their Recipes' development
+credentials and that a reader needing real ones composes the components directly.
+And a slot no consumer can
 present stays unattached, because filling it switches authentication on for
 clients with no way to authenticate — the store's password in `core/livekit`,
 which neither the media server nor the bridge declares a slot to present. So
@@ -989,7 +993,8 @@ because one parameter would then be a Secret's name on one side and the literal
 credential on the other. `core/keycloak`, `core/harbor`, `core/thanos`,
 `core/apisix`, `core/livekit`, `core/agenta` and `core/dify` are the shipped
 shape, the last two leaving credentials unattached for those reasons;
-`core/kong` and `core/ferretdb` show the `compose` limit.
+`core/kong` and `core/ferretdb` attach nothing, so their components run on their
+Recipes' development credentials.
 
 ### Recipe/FeatureRecipe Provider Segment
 
@@ -2125,7 +2130,11 @@ into the product's own configuration, under names the product defines.
   variable on Kubernetes, as in an Amazon ECS task definition. A secret that must
   stay out of rendered output takes `core/referenced-secret` or
   `core/random-password`, which publish only the secret resource's locator — its
-  name and data key — so no value of theirs reaches the pipe.
+  name and data key — so no value of theirs reaches the pipe. Docker Compose has
+  no secret resource: there `core/referenced-secret` is realized by
+  `compose/dotenv-referenced-secret`, which delivers its value on the pipe as
+  `core/secret-value`'s realization does, and a Compose variable reference as its
+  origin is what keeps the material out of the emitted file.
 
 The generic compute primitives — `core/compute/server`, `worker`, `task` and
 `function` — are the worked example. They declare no socket, so every
@@ -3455,11 +3464,12 @@ the Release. On helm, `k8s-existing-secret` points at a Secret that already
 exists and `k8s-external-secret` has a secret-store operator fetch the
 credential into one, so neither writes the material into the rendered output;
 `k8s-secret-from-parameter` writes it in, which suits evaluation only.
-`core/referenced-secret` has no compose realization, because the target has no
-secret-reference primitive (see "What the `compose` target expresses" below):
-there the credential arrives on the inject pipe, and a `core/secret-value`
-attachment bound to `dotenv-secret` keeps the material out of the emitted file
-when its origin is a Compose variable reference such as `${DB_PASSWORD}`. An
+The compose target has no secret-reference primitive (see "What the `compose`
+target expresses" below): there the credential arrives on the inject pipe, and
+`core/referenced-secret` bound to `dotenv-referenced-secret`, or a
+`core/secret-value` attachment bound to `dotenv-secret`, keeps the material out
+of the emitted file when its origin is a Compose variable reference such as
+`${DB_PASSWORD}`. An
 optional governance Feature can ride the same edge to carry policy context for
 the referenced resource without coupling it to provisioning.
 
@@ -3506,8 +3516,11 @@ strings, and checks none of what follows.
   `core/referenced-secret-set` mapped to `compose/dotenv-secret-set` delivers
   one variable per entry, so an entry whose value is a Compose variable
   reference, `value: "${GITHUB_TOKEN}"`, keeps the credential out of the
-  emitted file, and Docker Compose substitutes it when the stack starts. Both
-  compose Recipes halt the build on an attachment whose realization publishes
+  emitted file, and Docker Compose substitutes it when the stack starts.
+  `core/referenced-secret` mapped to `compose/dotenv-referenced-secret`
+  delivers one variable, named by the attachment's `values.key` and carrying
+  its origin, and publishes an empty name, so both compose Recipes accept it.
+  Both compose Recipes halt the build on an attachment whose realization publishes
   the name of a secret resource, which this target cannot read, and on one
   that delivers no variable under a name no inject block dictates. `helm/mcp`
   halts on an attachment here, as it
@@ -3930,11 +3943,11 @@ account reads exactly as authoritative as a right one.
 | Several named files mounted as a **directory** | **Not expressible.** One config is one file, and the target performs no key expansion: pointing the mount at a directory path writes a single file at that path. A value shaped as a map of filename to content — bootstrap scripts, a drop-in directory — has no `compose` realization. |
 | `volumes.<n>.persistent` | The volume is **created and named**; the declared `size` reaches no emitted byte, and nothing reports it. The target has no volume-size concept. |
 | `containers.<n>.resources` | **Realized** as `deploy.resources` — `cpu` as fractional cores, `memory` as an exact byte count, and an `nvidia.com/gpu` count as a reservation of that many NVIDIA GPUs, which the Docker host must be able to hand to containers. An operator's sizing is honored here, not dropped. Every other extended resource key is dropped, with a warning naming it. |
-| `containers.<n>.health` | **One healthcheck per service.** Of the probes a container declares, `live` is translated, else `ready`, else `startup`, and a warning names the ones dropped. The check runs **inside the image**: an `http` probe becomes `curl -f` against the port whose name sorts first and a `tcp` probe becomes `nc -z`, both through the image's shell, while an `exec` probe runs its command directly. A `depends_on` entry derived from a `uses` edge has `service_started` semantics, so it orders start-up and does not wait for the target to report healthy. |
+| `containers.<n>.health` | **One healthcheck per service.** Of the probes a container declares, `live` is translated, else `ready`, else `startup`, and a warning names the ones dropped. The check runs **inside the image**: an `http` probe becomes `curl -f` against the port whose name sorts first and a `tcp` probe becomes `nc -z`, both through the image's shell and both against `localhost`, while an `exec` probe runs its command directly. An image whose `localhost` resolves to `::1` first, with an `nc` that tries that address alone — the Alpine base of `langgenius/dify-web` is one — fails a `tcp` probe for ever against a server listening on IPv4 only, so its Recipe declares an `exec` probe running `nc -z 127.0.0.1 <port>`, as `compose/dify-web` does. A `depends_on` entry derived from a `uses` edge has `service_started` semantics, so it orders start-up and does not wait for the target to report healthy. |
 | `initContainers` | **Realized** as a companion service the main service waits on, through `depends_on` with `service_completed_successfully`. |
 | `services.<n>` | A `NodePort` or `LoadBalancer` entry publishes its ports on every host interface, and a `Loopback` entry on the host's loopback address, 127.0.0.1, only. A `ClusterIP` or `Headless` entry publishes nothing, so a port an operator sets reaches no emitted byte. |
 | `replicas` | **Dropped, with a warning** naming it. |
-| An attached credential | Arrives on the inject pipe and is delivered as a **literal environment value** in the emitted file, written as the credential delivered it — so the material sits in the artifact, unless the delivered value is itself a Compose variable reference such as `${DB_PASSWORD}`, which Docker Compose substitutes from the shell environment or a `.env` file when the stack starts. The target has no secret-reference primitive for a `secretKeyRef`-style pointer to resolve, so `core/referenced-secret`, which publishes only a locator, has no `compose` realization, and attaching it with the Manifest leaving it unmapped halts the build. `core/referenced-secret-set`'s `compose` realization, `compose/dotenv-secret-set`, delivers each entry on the inject pipe as a value under its key and publishes an empty locator, since it emits no resource. |
+| An attached credential | Arrives on the inject pipe and is delivered as a **literal environment value** in the emitted file, written as the credential delivered it — so the material sits in the artifact, unless the delivered value is itself a Compose variable reference such as `${DB_PASSWORD}`, which Docker Compose substitutes from the shell environment or a `.env` file when the stack starts. The target has no secret-reference primitive for a `secretKeyRef`-style pointer to resolve, so a realization that publishes only a locator gives a `compose` Recipe nothing to write; the `compose` Recipes refusing such an attachment name the locator it published. `core/referenced-secret`'s `compose` realization, `compose/dotenv-referenced-secret`, delivers its origin on the inject pipe as a value under its `values.key`, and `core/referenced-secret-set`'s, `compose/dotenv-secret-set`, delivers each entry as a value under its key; both publish an empty locator, since they emit no resource, and a Recipe reads the value off the pipe under that key. |
 | `containers.<n>.lifecycle`, `containers.<n>.envFrom` | **The build halts.** The target has neither primitive, and dropping either silently would change what the Release means. |
 | A top-level `models` entry — not a Workload construct; an `artifacts:` fragment or a sourced compose file writes it, with a service's `models:` reference | **Carried as written**, in Compose's own spelling. Docker Compose 2.38 or later, with Docker Model Runner on the host, pulls and configures each model before it starts any container, and the build checks neither. **A model no service is granted is left out**: `docker compose up` drops it unless run with `--all-resources`. So a Recipe that writes a model also writes a service granted it, as `compose/docker-model-runner` does. |
 | A run that ends, or one held until someone starts it — the `task` form, or a Feature asking for a run started by hand | **Written whole as a service in an `artifacts:` fragment, with `restart: "no"`.** Workload synthesis on this target maps the `stateless` and `stateful` forms only and halts on `task`, `scheduled` and `daemon`, and it writes no `profiles`; nor can a fragment add a key to a service the workload synthesizes, since two definitions of one service name within a component do not combine, one replaces the other whole. With `restart: "no"` Compose does not start the service again when it exits, so it runs once at each `docker compose up`. To hold it until someone starts it, the service also carries a profile, `profiles: ["manual"]`: `docker compose up` leaves it stopped, and `docker compose run --rm <service>` starts one run. `compose/task` is the pattern. The quantity conversion in the `resources` row runs only for a synthesized service, so such a Recipe sizes the service itself, refusing by name a quantity it does not read. Nothing on this target starts a service on a schedule, so a scheduled run is refused by name. |

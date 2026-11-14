@@ -1,0 +1,220 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: dify-ssrf-proxy
+  version: 1.0.0
+  license: GPL-2.0-or-later
+  description: >
+    The Dify egress proxy on Docker Compose via the compose provider's
+    Workload synthesis: one service running Squid, reached on the compose
+    network under its service name and published on no host port. It keeps
+    nothing across a restart, so it declares no volume.
+
+    It renders the same Squid configuration as helm/dify-ssrf-proxy, resolved
+    when the stack is compiled, with the same access rules in the same order:
+    any destination in private, loopback, link-local, shared-CGN or multicast
+    address space is refused before the named domains and the calling services
+    are permitted, so a supplied address reaches the public internet and cannot
+    reach the stack's own services. A private range becomes reachable only by
+    being named in allowed_private_networks. The configuration is a compose
+    config mounted as the one file Squid reads, where the helm Recipe mounts a
+    ConfigMap directory.
+
+    Its health check opens a TCP connection to the proxy port with the image's
+    own bash, since the image carries no nc. It reads every value, infra key
+    and sizing the helm Recipe reads, and refuses nothing beyond the
+    Component's schema.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/ai-agent/dify-ssrf-proxy:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare service name, the component's instance name, which
+  # every service on the compose network resolves.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  # The resolved Squid configuration, written as a compose config the workload
+  # mounts as /etc/squid/squid.conf. It is the configuration helm/dify-ssrf-proxy
+  # emits as a ConfigMap, line for line: the ACL definitions name the client
+  # ranges the proxy accepts calls from and the destination ranges it refuses,
+  # and the access rules below them are evaluated in order, and the order is the
+  # security property rather than a style choice. The client ranges are the
+  # private address space, which is where a compose network's addresses come
+  # from, as a cluster's do. DELIBERATE NEAR-DUPLICATE of helm/dify-ssrf-proxy's
+  # configuration: each provider wraps the file in its own resource — a
+  # ConfigMap there, a compose config here — inside an artifact the Recipe owns,
+  # and no catalog kind holds part of an artifact for two Recipes to share; a
+  # change to the rules is made to both.
+  #
+  # Docker Compose substitutes a variable reference in a config's content when
+  # the stack starts, so every value the Aggregate supplies is written with each
+  # $ doubled, which Compose reads as one literal $, and reaches Squid as
+  # authored.
+  #
+  # The config's name is spelled here and again on the volume that mounts it
+  # below. The artifact and the workload are separate template strings with no
+  # binding either could dereference, so the repetition is forced rather than
+  # chosen — the two must be edited together.
+  artifacts:
+    dify-ssrf-proxy-config.compose-fragment.yaml: |
+      configs:
+        {{ .context.instance_id }}-config:
+          content: |
+            # Client ranges the proxy accepts calls from — the private address
+            # space, which is where the calling services sit.
+            acl client_localnet src 10.0.0.0/8
+            acl client_localnet src 100.64.0.0/10
+            acl client_localnet src 169.254.0.0/16
+            acl client_localnet src 172.16.0.0/12
+            acl client_localnet src 192.168.0.0/16
+            acl client_localnet src fc00::/7
+            acl client_localnet src fe80::/10
+
+            # Destination ranges the proxy refuses. A supplied address resolving
+            # into any of these is denied, which is what stops a workflow reaching
+            # the stack's own services or a host's metadata endpoint.
+            acl to_private_networks dst 0.0.0.0/8
+            acl to_private_networks dst 10.0.0.0/8
+            acl to_private_networks dst 100.64.0.0/10
+            acl to_private_networks dst 127.0.0.0/8
+            acl to_private_networks dst 169.254.0.0/16
+            acl to_private_networks dst 172.16.0.0/12
+            acl to_private_networks dst 192.168.0.0/16
+            acl to_private_networks dst 224.0.0.0/4
+            acl to_private_networks dst 240.0.0.0/4
+            acl to_private_networks dst ::/128
+            acl to_private_networks dst ::1/128
+            acl to_private_networks dst ::ffff:0:0/96
+            acl to_private_networks dst fc00::/7
+            acl to_private_networks dst fe80::/10
+            acl to_private_networks dst ff00::/8
+
+            acl SSL_ports port 443
+            acl Safe_ports port 80
+            acl Safe_ports port 21
+            acl Safe_ports port 443
+            acl Safe_ports port 1025-65535
+            acl CONNECT method CONNECT
+
+            # Domains permitted by name regardless of the address they resolve to.
+            # The plugin marketplace the platform installs from is always named;
+            # anything else is named by the Aggregate.
+            acl allowed_domains dstdomain .marketplace.dify.ai
+      {{- range .values.allowed_domains }}
+            acl allowed_domains dstdomain {{ replace "$" "$$" . }}
+      {{- end }}
+      {{- if .values.allowed_private_networks }}
+
+            # Private destinations the Aggregate named. They are permitted ahead
+            # of the private-network refusal below, which is the only way a
+            # private address becomes reachable through the proxy.
+            acl allowed_private_networks dst
+      {{- range .values.allowed_private_networks }} {{ replace "$" "$$" . }}
+      {{- end }}
+      {{- end }}
+
+            http_port {{ .infra.port }}
+            coredump_dir /var/spool/squid
+            client_request_buffer_max_size {{ replace "$" "$$" .values.max_request_body_size }}
+            cache_mem 256 MB
+            memory_cache_mode disk
+            max_filedescriptors 65536
+            connect_timeout 30 seconds
+            request_timeout 2 minutes
+            read_timeout 2 minutes
+            # Both logs are files in the image's own log directory. Squid opens
+            # them after it has dropped from root to its proxy user, which can
+            # write that directory but cannot reopen the container's standard
+            # streams, since those belong to root. The cache log's messages reach
+            # docker compose logs all the same, through the -d 1 the service
+            # starts squid with; the access log is read inside the container, at
+            # /var/log/squid/access.log. Nothing rotates either file, so each
+            # grows for as long as the container runs. access_log names a module
+            # and a destination; cache_log names a destination only.
+            access_log stdio:/var/log/squid/access.log
+            cache_log /var/log/squid/cache.log
+            logfile_rotate 0
+
+            # Access rules, evaluated in order. The refusals come first, then the
+            # named private destinations, then the named domains, then the calling
+            # services, then a final deny.
+            http_access deny !Safe_ports
+            http_access deny CONNECT !SSL_ports
+            http_access allow localhost manager
+            http_access deny manager
+      {{- if .values.allowed_private_networks }}
+            http_access allow client_localnet allowed_private_networks
+      {{- end }}
+            http_access deny to_private_networks
+            http_access allow allowed_domains
+            http_access allow client_localnet
+            http_access allow localhost
+            http_access deny all
+  workload: |
+    apiVersion: aggrega.ai/v1beta1
+    kind: Workload
+    # The proxy caches in memory only and keeps nothing across a restart, so the
+    # stateless form, with no volume beyond its configuration, is correct.
+    form: stateless
+    containers:
+      main:
+        image: "ubuntu/squid:{{ .infra.engine_version }}"
+        # The container runs squid itself against the resolved configuration,
+        # rather than the image's entrypoint script: -N stays in the
+        # foreground, -Y defers optional work during startup, -C leaves
+        # fatal-signal handling to the runtime, and -d 1 copies the cache
+        # log's messages onto squid's standard error, which docker compose logs
+        # reads.
+        command: ["/usr/sbin/squid", "-f", "/etc/squid/squid.conf", "-NYC", "-d", "1"]
+        ports:
+          proxy: {{ .infra.port }}
+        # The proxy documents no health endpoint, so the check opens a TCP
+        # connection to the port it listens on, as helm/dify-ssrf-proxy's probes
+        # do. A tcp probe runs nc on this target, and the image carries no nc,
+        # curl or wget; it carries bash, whose /dev/tcp redirection opens the
+        # connection and fails while nothing listens. Squid logs each check as a
+        # connection from 127.0.0.1 that ended before a request, as it logs a
+        # Kubernetes TCP probe. A service keeps one healthcheck, so one probe is
+        # declared; failures in the first 10 s do not count, the delay
+        # helm/dify-ssrf-proxy gives its liveness probe.
+        health:
+          ready:
+            exec:
+              - bash
+              - "-c"
+              - "exec 3<>/dev/tcp/127.0.0.1/{{ .infra.port }}"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the Release supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+        # The configuration is one file, so it is mounted at the file's own
+        # path: this target delivers a configmap volume as one file at the
+        # mount path.
+        volumeMounts:
+          - name: config
+            path: /etc/squid/squid.conf
+    volumes:
+      config:
+        configmap:
+          source: "{{ .context.instance_id }}-config"
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          proxy: {{ .infra.port }}

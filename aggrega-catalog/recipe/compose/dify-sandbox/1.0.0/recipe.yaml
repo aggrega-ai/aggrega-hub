@@ -1,0 +1,191 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: dify-sandbox
+  version: 1.0.0
+  license: Apache-2.0
+  description: >
+    The Dify code sandbox on Docker Compose via the compose provider's Workload
+    synthesis: one service on the execution port, reached on the compose
+    network under its service name and published on no host port. Each
+    execution is independent, so it declares no volume.
+
+    Its outbound client is pointed at the proxy wired on the ssrf_proxy
+    connection, as with helm/dify-sandbox, and it shares the stack's one
+    network rather than sitting on an isolated one as in Dify's own Compose
+    file. The execution key is the value attached to code_execution_key,
+    written into the emitted file as delivered, so an origin written as a
+    Compose variable reference keeps the key out of the file; unattached, the
+    pinned development literal is written. Declared Python requirements are
+    one compose config mounted as the requirements file.
+
+    It halts the build where the ssrf_proxy connection leaves SSRF_PROXY_HOST
+    or SSRF_PROXY_PORT undelivered, and where the attached key's realization
+    publishes the name of a secret resource or delivers no value.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: compose
+  implements: core/ai-agent/dify-sandbox:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # provides.host is the bare service name, the component's instance name, which
+  # every service on the compose network resolves.
+  provides:
+    host: "{{ .context.instance_id }}"
+    port: "{{ .infra.port }}"
+    protocol: "http"
+  # The declared Python requirements become one requirements file, a compose
+  # config the workload mounts at the file the sandbox reads on startup,
+  # /dependencies/python-requirements.txt, in place of the empty one the image
+  # carries. helm/dify-sandbox mounts a ConfigMap holding the same file over the
+  # whole directory; this target delivers a config as one file at the mount
+  # path. The entry renders empty — and so emits no config — when the developer
+  # declared none, and the workload then carries no mount either. Each line is
+  # written with every $ doubled, which Docker Compose reads as one literal $,
+  # so it reaches the file as authored.
+  #
+  # The config's name is spelled here and again on the volume that mounts it
+  # below. The artifact and the workload are separate template strings with no
+  # binding either could dereference, so the repetition is forced rather than
+  # chosen — the two must be edited together.
+  artifacts:
+    dify-sandbox-dependencies.compose-fragment.yaml: |
+      {{- if .values.python_packages }}
+      configs:
+        {{ .context.instance_id }}-dependencies:
+          content: |
+      {{- range .values.python_packages }}
+            {{ replace "$" "$$" . }}
+      {{- end }}
+      {{- end }}
+  # The proxy identity resolved from the ssrf_proxy connection arrives on the
+  # inject pipe and is composed into HTTP_PROXY and HTTPS_PROXY, the variables
+  # the sandbox's own outbound client reads, as helm/dify-sandbox composes them:
+  # code the sandbox runs was supplied by an application author, so its
+  # requests leave through the proxy, which refuses private destinations. Dify's
+  # own Compose file also places the sandbox on a network of its own shared with
+  # the proxy alone; this realization, like the helm one, renders no network
+  # isolation, so the proxy is the route for every client that honours those
+  # variables.
+  #
+  # The execution key. Docker Compose has no secret reference, so the key
+  # reaches the service only as a value written into the compose file. The
+  # code_execution_key attachment delivers it on the inject pipe under the key
+  # the attachment names in values.key — compose/dotenv-referenced-secret for a
+  # core/referenced-secret, compose/dotenv-secret for a core/secret-value — and
+  # it is written as API_KEY as delivered, so an origin written as a Compose
+  # variable reference, ${NAME}, keeps the key out of the file and Docker
+  # Compose substitutes it when the stack starts. An attachment naming no key is
+  # read under API_KEY. Two refusals keep an attachment from being dropped: one
+  # whose realization publishes a non-empty name, the locator of a secret
+  # resource, halts the build naming it, since this target cannot read a
+  # resource by name — core/referenced-secret's Kubernetes realizations publish
+  # one, and a Manifest may map either on this target; and one under which no
+  # value reaches the pipe halts it too, rather than starting the sandbox with
+  # an empty key. Unattached, the key is the pinned development literal the
+  # API-server and worker Recipes present when their connection carries none,
+  # as on helm/dify-sandbox.
+  workload: |
+    {{- /*
+      The connection variables this Recipe reads off the inject pipe, under the
+      socket whose edge delivers them, each beside the provides key the edge's
+      inject block names it from. The pipe is read as a map, and every read of
+      these variables below goes through it, so a variable nothing delivered is
+      told apart from one delivered empty: an edge on one of these sockets
+      leaving any of its variables missing halts the build, naming the edge, the
+      variables and the inject block to write, rather than rendering a
+      connection setting with an empty value. A socket in $required is read
+      whether or not anything is wired to it, so leaving it empty halts too.
+      DELIBERATE NEAR-DUPLICATE of the same block in helm/dify-sandbox, and of
+      the block every Dify Recipe declares with its own sockets and names: it is
+      part of a workload template, and no catalog kind holds part of one for
+      several Recipes to share; a change to it is made to all.
+    */ -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $reads := dict "ssrf_proxy" (dict "SSRF_PROXY_HOST" "host" "SSRF_PROXY_PORT" "port") -}}
+    {{- $required := list "ssrf_proxy" -}}
+    {{- $gaps := list }}{{ $wired := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ with get $reads $edge.socket -}}
+    {{- $wired = append $wired $edge.socket }}{{ $missing := list }}{{ $shape := list -}}
+    {{- range $var, $from := . }}{{ if not (hasKey $env $var) }}{{ $missing = append $missing $var }}{{ end }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- if $missing }}{{ $gaps = append $gaps (printf "the edge %q on its %s socket delivers no %s, so give that edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $alias $edge.socket (join " or " $missing) (join ", " $shape)) }}{{ end -}}
+    {{- end }}{{ end -}}
+    {{- range $socket := $required }}{{ if not (has $socket $wired) -}}
+    {{- $vars := list }}{{ $shape := list }}{{ range $var, $from := get $reads $socket }}{{ $vars = append $vars $var }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
+    {{- end }}{{ end -}}
+    {{- if $gaps }}{{ fail (printf "core/ai-agent/dify-sandbox %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    {{- $apiKey := "dify-sandbox" -}}
+    {{- with optional (default dict .features) "code_execution_key" dict -}}
+    {{- with optional (optional . "provides" dict) "name" "" -}}
+    {{- fail (printf "the code_execution_key slot of %q carries an attachment whose realization publishes %q, the name of a secret resource the key is to be read from, and Docker Compose has no secret reference to read it through: map core/referenced-secret to compose/dotenv-referenced-secret in the Manifest, writing its origin as the key or as a Compose variable reference such as ${DIFY_CODE_EXECUTION_KEY}" $.context.instance_id .) -}}
+    {{- end -}}
+    {{- $keyName := default "API_KEY" (optional (optional . "values" dict) "key" "") -}}
+    {{- if not (hasKey $env $keyName) -}}
+    {{- fail (printf "the code_execution_key slot of %q is attached, but no value reaches this Recipe under %s, the key the attachment names, so the sandbox would start with no execution key: map core/referenced-secret to compose/dotenv-referenced-secret, or core/secret-value to compose/dotenv-secret, in the Manifest" $.context.instance_id $keyName) -}}
+    {{- end -}}
+    {{- $apiKey = index $env $keyName -}}
+    {{- end -}}
+    apiVersion: aggrega.ai/v1beta1
+    kind: Workload
+    # Each execution is independent and leaves nothing behind, so the stateless
+    # form is correct.
+    form: stateless
+    containers:
+      main:
+        image: "langgenius/dify-sandbox:{{ .infra.engine_version }}"
+        variables:
+          SANDBOX_PORT: "{{ .infra.port }}"
+          GIN_MODE: release
+          WORKER_TIMEOUT: "{{ .values.worker_timeout }}"
+          ENABLE_NETWORK: "{{ .values.enable_network }}"
+          # The proxy identity arrives on the inject pipe and is composed into
+          # the two variables the sandbox's outbound client reads, so executed
+          # code reaches the network only through the proxy.
+          HTTP_PROXY: "http://{{ $env.SSRF_PROXY_HOST }}:{{ $env.SSRF_PROXY_PORT }}"
+          HTTPS_PROXY: "http://{{ $env.SSRF_PROXY_HOST }}:{{ $env.SSRF_PROXY_PORT }}"
+          # The execution key as delivered, or the development literal. It is
+          # written through toJson, so a quote or a backslash in it reaches the
+          # file as delivered.
+          API_KEY: {{ $apiKey | toJson }}
+        ports:
+          http: {{ .infra.port }}
+        # The sandbox answers GET /health without the execution key, and Dify's
+        # own Compose file checks that route with curl, which the image carries;
+        # an http probe on this target is that curl, sent to the execution port.
+        # No timing is documented, so the check repeats every 10 s, as
+        # helm/dify-sandbox's probes do. A service keeps one healthcheck, so one
+        # probe is declared.
+        health:
+          ready:
+            http: /health
+            periodSeconds: 10
+            timeoutSeconds: 5
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the Release supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+    {{- if .values.python_packages }}
+        volumeMounts:
+          - name: dependencies
+            path: /dependencies/python-requirements.txt
+    volumes:
+      dependencies:
+        configmap:
+          source: "{{ .context.instance_id }}-dependencies"
+    {{- end }}
+    services:
+      default:
+        type: ClusterIP
+        ports:
+          http: {{ .infra.port }}
