@@ -3476,30 +3476,43 @@ adopted resource becomes Release-managed.
 ### Model Context Protocol servers: their credentials and the tool socket
 
 `core/ai-tool/mcp` stands for a Model Context Protocol server whose software is
-the Release's, and the Manifest chooses how it is realized: `helm/mcp` runs an
-image serving the protocol over HTTP; `helm/mcp-stdio-bridge` and
-`compose/mcp-stdio-bridge` run a package that speaks only stdio behind a pinned
-bridge serving it over HTTP; `helm/mcp-remote` and `compose/mcp-remote` reach a
-server someone else runs, as reference realizations. Every one publishes
-`host`, `port`, `endpoint`, `protocol` and `credential_header`, so a consumer
-wires to the tool the same way whichever answers it. Two kinds of credential
+the Release's, and the Manifest chooses how it is realized: `helm/mcp` and
+`compose/mcp` run an image serving the protocol over HTTP;
+`helm/mcp-stdio-bridge` and `compose/mcp-stdio-bridge` run a package that speaks
+only stdio behind a pinned bridge serving it over HTTP; `helm/mcp-remote` and
+`compose/mcp-remote` reach a server someone else runs, as reference
+realizations. Every one publishes `host`, `port`, `endpoint`, `protocol` and
+`credential_header`, so a consumer wires to the tool the same way whichever
+answers it. Two kinds of credential
 meet at such a server, and each has its own holder. This is a catalog
 convention: the compiler pipes the slots, the attachments and the published
 strings, and checks none of what follows.
 
-- **A bridged server's credentials are environment variables the server
-  reads.** They are held in the Component's `server_env` slot as one Secret
-  with one data key per variable, each key named as the variable.
-  `helm/mcp-stdio-bridge` imports every data key of the Secret the attachment
-  names into the bridge's environment by reference, and the bridge starts the
-  server with that environment, so the server inherits each variable. Attach
-  `core/referenced-secret`, mapped to `helm/k8s-existing-secret`, to name a
-  Secret that already exists, and the credential stays out of every rendered
-  file; `core/referenced-secret-set`'s realization writes the values into a
-  Secret the build renders, which suits evaluation. `compose/mcp-stdio-bridge`
-  halts the build on an attachment here, because the compose target has no
-  secret reference to deliver one through, and the realizations that start no
-  server behind the bridge halt on one too.
+- **A server's own credentials are environment variables the server reads.**
+  They are held in the Component's `server_env` slot, one variable per key,
+  each key named as the variable. On Kubernetes the slot names one Secret with
+  one data key per variable: `helm/mcp-stdio-bridge` imports every data key of
+  the Secret the attachment names into the bridge's environment by reference,
+  and the bridge starts the server with that environment, so the server
+  inherits each variable. Attach `core/referenced-secret`, mapped to
+  `helm/k8s-existing-secret`, to name a Secret that already exists, and the
+  credential stays out of every rendered file; `core/referenced-secret-set`
+  mapped to `helm/k8s-secret-set` writes the values into a Secret the build
+  renders, which suits evaluation. On Docker Compose, which has no secret
+  reference, the attachment delivers each variable on the inject pipe and the
+  Recipe writes it into the service's environment as a value:
+  `compose/mcp-stdio-bridge` from 1.1.0 into the bridge's environment, which
+  the server inherits, and `compose/mcp` into the server's own.
+  `core/referenced-secret-set` mapped to `compose/dotenv-secret-set` delivers
+  one variable per entry, so an entry whose value is a Compose variable
+  reference, `value: "${GITHUB_TOKEN}"`, keeps the credential out of the
+  emitted file, and Docker Compose substitutes it when the stack starts. Both
+  compose Recipes halt the build on an attachment whose realization publishes
+  the name of a secret resource, which this target cannot read, and on one
+  that delivers no variable under a name no inject block dictates. `helm/mcp`
+  halts on an attachment here, as it
+  delivers nothing from the slot to the image it runs, and the realizations
+  that start no server halt on one too.
 - **A remote server's credential is held by its consumer**, on the consumer's
   connection to the tool, in the `credential` slot its socket declares (see "A
   key both ends of a connection hold"), and presented under the request header
@@ -3921,7 +3934,7 @@ account reads exactly as authoritative as a right one.
 | `initContainers` | **Realized** as a companion service the main service waits on, through `depends_on` with `service_completed_successfully`. |
 | `services.<n>` | A `NodePort` or `LoadBalancer` entry publishes its ports on every host interface, and a `Loopback` entry on the host's loopback address, 127.0.0.1, only. A `ClusterIP` or `Headless` entry publishes nothing, so a port an operator sets reaches no emitted byte. |
 | `replicas` | **Dropped, with a warning** naming it. |
-| An attached credential | Arrives on the inject pipe and is delivered as a **literal environment value** in the emitted file, written as the credential delivered it — so the material sits in the artifact, unless the delivered value is itself a Compose variable reference such as `${DB_PASSWORD}`, which Docker Compose substitutes from the shell environment or a `.env` file when the stack starts. The target has no secret-reference primitive for a `secretKeyRef`-style pointer to resolve, so neither credential Feature that publishes only a locator — `core/referenced-secret`, `core/referenced-secret-set` — has a `compose` realization, and attaching one the Manifest leaves unmapped halts the build. |
+| An attached credential | Arrives on the inject pipe and is delivered as a **literal environment value** in the emitted file, written as the credential delivered it — so the material sits in the artifact, unless the delivered value is itself a Compose variable reference such as `${DB_PASSWORD}`, which Docker Compose substitutes from the shell environment or a `.env` file when the stack starts. The target has no secret-reference primitive for a `secretKeyRef`-style pointer to resolve, so `core/referenced-secret`, which publishes only a locator, has no `compose` realization, and attaching it with the Manifest leaving it unmapped halts the build. `core/referenced-secret-set`'s `compose` realization, `compose/dotenv-secret-set`, delivers each entry on the inject pipe as a value under its key and publishes an empty locator, since it emits no resource. |
 | `containers.<n>.lifecycle`, `containers.<n>.envFrom` | **The build halts.** The target has neither primitive, and dropping either silently would change what the Release means. |
 | A top-level `models` entry — not a Workload construct; an `artifacts:` fragment or a sourced compose file writes it, with a service's `models:` reference | **Carried as written**, in Compose's own spelling. Docker Compose 2.38 or later, with Docker Model Runner on the host, pulls and configures each model before it starts any container, and the build checks neither. **A model no service is granted is left out**: `docker compose up` drops it unless run with `--all-resources`. So a Recipe that writes a model also writes a service granted it, as `compose/docker-model-runner` does. |
 | A run that ends, or one held until someone starts it — the `task` form, or a Feature asking for a run started by hand | **Written whole as a service in an `artifacts:` fragment, with `restart: "no"`.** Workload synthesis on this target maps the `stateless` and `stateful` forms only and halts on `task`, `scheduled` and `daemon`, and it writes no `profiles`; nor can a fragment add a key to a service the workload synthesizes, since two definitions of one service name within a component do not combine, one replaces the other whole. With `restart: "no"` Compose does not start the service again when it exits, so it runs once at each `docker compose up`. To hold it until someone starts it, the service also carries a profile, `profiles: ["manual"]`: `docker compose up` leaves it stopped, and `docker compose run --rm <service>` starts one run. `compose/task` is the pattern. The quantity conversion in the `resources` row runs only for a synthesized service, so such a Recipe sizes the service itself, refusing by name a quantity it does not read. Nothing on this target starts a service on a schedule, so a scheduled run is refused by name. |
