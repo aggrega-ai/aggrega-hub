@@ -3985,7 +3985,8 @@ Consequences for a Recipe author:
     `kubectl port-forward`, or exposed by attaching `core/public-ingress`. A
     `NodePort` or `LoadBalancer` Service is no equivalent, since it opens the port
     to the network rather than to one machine. A realization on another target
-    refuses it by name as well.
+    refuses it by name as well, and one that runs no server, as an MCP remote's,
+    refuses it on every target, pointing at the remote server's own address.
   - **`infra.port` keeps its meaning on every target**: the port the product
     listens on, and on Kubernetes the port of its Service. A synthesized
     realization declares both its container port and its Service port from it,
