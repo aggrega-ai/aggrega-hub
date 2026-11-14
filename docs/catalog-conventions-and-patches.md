@@ -3946,14 +3946,14 @@ account reads exactly as authoritative as a right one.
 | `containers.<n>.resources` | **Realized** as `deploy.resources` — `cpu` as fractional cores, `memory` as an exact byte count, and an `nvidia.com/gpu` count as a reservation of that many NVIDIA GPUs, which the Docker host must be able to hand to containers. An operator's sizing is honored here, not dropped. Every other extended resource key is dropped, with a warning naming it. |
 | `containers.<n>.health` | **One healthcheck per service.** Of the probes a container declares, `live` is translated, else `ready`, else `startup`, and a warning names the ones dropped. The check runs **inside the image**: an `http` probe becomes `curl -f` against the port whose name sorts first and a `tcp` probe becomes `nc -z`, both through the image's shell and both against `localhost`, while an `exec` probe runs its command directly. An image whose `localhost` resolves to `::1` first, with an `nc` that tries that address alone — the Alpine base of `langgenius/dify-web` is one — fails a `tcp` probe for ever against a server listening on IPv4 only, so its Recipe declares an `exec` probe running `nc -z 127.0.0.1 <port>`, as `compose/dify-web` does. A `depends_on` entry derived from a `uses` edge has `service_started` semantics, so it orders start-up and does not wait for the target to report healthy. |
 | `initContainers` | **Realized** as a companion service the main service waits on, through `depends_on` with `service_completed_successfully`. A synthesized main service carries a `restart` key only where its container declares a `restartPolicy` — `Always` becomes `unless-stopped`, `OnFailure` `on-failure`, `Never` `no` — so without one Docker Compose does not start its process again once it has exited: a process that opens a datastore as it starts, and exits when the datastore does not yet accept connections, stays down. Its Recipe declares an init container that waits until the datastore's address accepts a TCP connection, as `compose/dify` and `compose/langgraph` do. |
-| `services.<n>` | A `NodePort` or `LoadBalancer` entry publishes its ports on every host interface, and a `Loopback` entry on the host's loopback address, 127.0.0.1, only. A `ClusterIP` or `Headless` entry publishes nothing, so a port an operator sets reaches no emitted byte. |
+| `services.<n>` | A `NodePort` or `LoadBalancer` entry publishes its ports on every host interface, and a `Loopback` entry on the host's loopback address, 127.0.0.1, only. Each port an entry names is published with the entry's number on the host side and the number of the container port of that name on the container side, as a Kubernetes Service maps its port onto a target port; an entry naming no declared container port publishes its own number on both sides. A `ClusterIP` or `Headless` entry publishes nothing, so a port an operator sets reaches no emitted byte. |
 | `replicas` | **Dropped, with a warning** naming it. |
 | An attached credential | Arrives on the inject pipe and is delivered as a **literal environment value** in the emitted file, written as the credential delivered it — so the material sits in the artifact, unless the delivered value is itself a Compose variable reference such as `${DB_PASSWORD}`, which Docker Compose substitutes from the shell environment or a `.env` file when the stack starts. The target has no secret-reference primitive for a `secretKeyRef`-style pointer to resolve, so a realization that publishes only a locator gives a `compose` Recipe nothing to write; the `compose` Recipes refusing such an attachment name the locator it published. `core/referenced-secret`'s `compose` realization, `compose/dotenv-referenced-secret`, delivers its origin on the inject pipe as a value under its `values.key`, and `core/referenced-secret-set`'s, `compose/dotenv-secret-set`, delivers each entry as a value under its key; both publish an empty locator, since they emit no resource, and a Recipe reads the value off the pipe under that key. |
 | `containers.<n>.lifecycle`, `containers.<n>.envFrom` | **The build halts.** The target has neither primitive, and dropping either silently would change what the Release means. |
 | A top-level `models` entry — not a Workload construct; an `artifacts:` fragment or a sourced compose file writes it, with a service's `models:` reference | **Carried as written**, in Compose's own spelling. Docker Compose 2.38 or later, with Docker Model Runner on the host, pulls and configures each model before it starts any container, and the build checks neither. **A model no service is granted is left out**: `docker compose up` drops it unless run with `--all-resources`. So a Recipe that writes a model also writes a service granted it, as `compose/docker-model-runner` does. |
 | A run that ends, or one held until someone starts it — the `task` form, or a Feature asking for a run started by hand | **Written whole as a service in an `artifacts:` fragment, with `restart: "no"`.** Workload synthesis on this target maps the `stateless` and `stateful` forms only and halts on `task`, `scheduled` and `daemon`, and it writes no `profiles`; nor can a fragment add a key to a service the workload synthesizes, since two definitions of one service name within a component do not combine, one replaces the other whole. With `restart: "no"` Compose does not start the service again when it exits, so it runs once at each `docker compose up`. To hold it until someone starts it, the service also carries a profile, `profiles: ["manual"]`: `docker compose up` leaves it stopped, and `docker compose run --rm <service>` starts one run. `compose/task` is the pattern, and `compose/dify`'s application import is one such run. A run executing a script in an image whose own entrypoint starts a server names the script as the service's `entrypoint`: `command` replaces only the image's arguments, and the image would start the server instead. The quantity conversion in the `resources` row runs only for a synthesized service, so such a Recipe sizes the service itself, refusing by name a quantity it does not read. Nothing on this target starts a service on a schedule, so a scheduled run is refused by name. |
 
-Two consequences for a Recipe author:
+Consequences for a Recipe author:
 
 - **A single configuration file is realizable on this target; a directory of them is
   not.** Where a component exposes both — a raw configuration block and a map of
@@ -3962,6 +3962,35 @@ Two consequences for a Recipe author:
   reads it, rather than in a Recipe comment.
 - **The volume-size row is the knob rule's standing exception**, and it is named
   rather than silent: see the datastore family template below.
+- **A port meant for the machine running the stack alone — a UI a user opens in a
+  browser there, an API a client there calls — is published with a `Loopback`
+  entry**, so it answers at 127.0.0.1 and on none of the host's other interfaces.
+  Which number sits on each side follows the Component's `infra.port`:
+  - **Where `infra.port` carries a default and is the port the container itself
+    listens on** — `core/compute/server`, `core/ai-agent/dify`,
+    `core/ai-agent/dify-web`, `core/ai-agent/google-adk` and `core/ai-tool/mcp` —
+    the compose Recipe that publishes it (`compose/server`, `compose/dify`,
+    `compose/dify-web`, `compose/google-adk` from `1.1.0`, `compose/mcp`, and
+    `compose/mcp-stdio-bridge` from `1.1.0`) reads `infra.port` for both the
+    container port and the entry, so it is the number on both sides. The default
+    fills `infra.port` before any Recipe reads it, so a Recipe cannot tell a
+    Release that leaves it unset from one that sets the default, and such a Recipe
+    publishes the port on every build. Two such components on one machine
+    therefore take distinct values, and a Release sets another value where the
+    default is already taken there.
+  - **Where `infra.port` carries no default and the container listens on the
+    product's own port** — `core/ai-agent/langflow` on 7860, `core/ai-agent/flowise`
+    on 3000 and `core/ai-agent/n8n` on 5678, from their `1.1.0` versions — the
+    container port is the product's own number and the entry reads `infra.port`, so
+    the host side is `infra.port` and the container side the product's port. Nothing
+    is published until the Release sets `infra.port`. On Kubernetes the same key is
+    the port of the product's Service: a synthesized realization points it at the
+    product's own container port, as `core/devtool/adminer`'s does, and a
+    realization rendering the product's own chart writes it, from one local, into
+    the chart's Service-port value — which Langflow's chart also passes to the
+    command line that starts the product — and, where the product's listener reads
+    a setting of its own, into that too, as `N8N_PORT` in n8n's chart Secret, so
+    the Service, the container port, the probes and the listener move together.
 
 ### Health checks on server workloads
 
