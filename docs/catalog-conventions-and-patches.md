@@ -3963,31 +3963,34 @@ Consequences for a Recipe author:
 - **The volume-size row is the knob rule's standing exception**, and it is named
   rather than silent: see the datastore family template below.
 - **A port meant for the machine running the stack alone — a UI a user opens in a
-  browser there, an API a client there calls — is published with a `Loopback`
-  entry**, so it answers at 127.0.0.1 and on none of the host's other interfaces.
-  Which number sits on each side follows the Component's `infra.port`:
-  - **Where `infra.port` carries a default and is the port the container itself
-    listens on** — `core/compute/server`, `core/ai-agent/dify`,
-    `core/ai-agent/dify-web`, `core/ai-agent/google-adk` and `core/ai-tool/mcp` —
-    the compose Recipe that publishes it (`compose/server`, `compose/dify`,
-    `compose/dify-web`, `compose/google-adk` from `1.1.0`, `compose/mcp`, and
-    `compose/mcp-stdio-bridge` from `1.1.0`) reads `infra.port` for both the
-    container port and the entry, so it is the number on both sides. The default
-    fills `infra.port` before any Recipe reads it, so a Recipe cannot tell a
-    Release that leaves it unset from one that sets the default, and such a Recipe
-    publishes the port on every build. Two such components on one machine
-    therefore take distinct values, and a Release sets another value where the
-    default is already taken there.
-  - **Where `infra.port` carries no default and the container listens on the
-    product's own port** — `core/ai-agent/langflow` on 7860, `core/ai-agent/flowise`
-    on 3000 and `core/ai-agent/n8n` on 5678, from their `1.1.0` versions — the
-    container port is the product's own number and the entry reads `infra.port`, so
-    the host side is `infra.port` and the container side the product's port. Nothing
-    is published until the Release sets `infra.port`. On Kubernetes the same key is
-    the port of the product's Service: a synthesized realization points it at the
-    product's own container port, as `core/devtool/adminer`'s does, and a
-    realization rendering the product's own chart writes it, from one local, into
-    the chart's Service-port value — which Langflow's chart also passes to the
+  browser there, an API a client there calls — is published only when the Release
+  sets `infra.published_port`**, through a `Loopback` entry, so it answers at
+  127.0.0.1 and on none of the host's other interfaces. The entry names the
+  container port declared for `infra.port`, the port the product listens on, and
+  carries `infra.published_port` as its number, so the host side is
+  `infra.published_port` and the container side `infra.port`. Unset, the Recipe
+  writes no publishing entry and nothing is published on the host.
+  - **Why a key of its own, with no default.** A Component's `infra.port` default
+    fills that key before any Recipe reads it, so a Recipe cannot tell a Release
+    that asked for a port from one that left the default, and publishing on
+    `infra.port` would publish on every build. Any process on the machine reaches a
+    published port, and two components publishing on one machine take distinct
+    values.
+  - **Which Components carry it**: a Component whose Docker Compose realization
+    serves a port a user opens or calls from the machine declares
+    `infra.published_port` beside `infra.port`, as `core/ai-agent/langflow` does from
+    its `1.1.0`.
+  - **On Kubernetes their Recipes refuse it by name**: publishing a port on the
+    host is a Docker Compose setting; on Kubernetes the Service is reached with
+    `kubectl port-forward`, or exposed by attaching `core/public-ingress`. A
+    `NodePort` or `LoadBalancer` Service is no equivalent, since it opens the port
+    to the network rather than to one machine. A realization on another target
+    refuses it by name as well.
+  - **`infra.port` keeps its meaning on every target**: the port the product
+    listens on, and on Kubernetes the port of its Service. A synthesized
+    realization declares both its container port and its Service port from it,
+    and a realization rendering the product's own chart writes it, from one local,
+    into the chart's Service-port value — which Langflow's chart also passes to the
     command line that starts the product — and, where the product's listener reads
     a setting of its own, into that too, as `N8N_PORT` in n8n's chart Secret, so
     the Service, the container port, the probes and the listener move together.
