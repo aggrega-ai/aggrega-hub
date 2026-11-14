@@ -1,0 +1,173 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Component
+metadata:
+  name: core/ai-agent/dify-worker-beat
+  version: 1.1.0
+  # metadata.license is deliberately absent. This service runs the Dify API
+  # image, published under a modified Apache License 2.0 carrying additional
+  # conditions that no single SPDX identifier names. The licensing class is
+  # stated on the component.aggrega.ai/upstream-licensing label instead.
+  description: >
+    The Dify task scheduler — the Celery beat process that puts the platform's
+    periodic work on the queue at its due time: dataset re-indexing sweeps,
+    expired-file and orphaned-document cleanup, workspace usage rollups, and
+    scheduled application runs. It reads the schedule from the platform's
+    relational model in the PostgreSQL backend wired through the `backend`
+    uses-socket and enqueues onto the Redis-compatible broker wired through
+    `cache`, where the task worker picks the work up; it never runs a task
+    itself. Exactly one instance runs — two schedulers on one queue would
+    enqueue every periodic task twice — so it renders as a single-replica
+    stateless worker. It serves no port and nothing connects to it, so it
+    publishes no provides contract.
+
+    By default it schedules nothing that reaches Dify's vendor:
+    infra.telemetry_enabled turns on the daily usage event, and
+    infra.marketplace_enabled the daily plugin upgrade check.
+  labels:
+    component.aggrega.ai/type: worker
+    component.aggrega.ai/category: ai-agent
+    # Every Recipe of this component runs the scheduler as containers in the
+    # Release's own cluster, so a single posture is its identity.
+    # Selector-only: never stamped onto rendered output.
+    component.aggrega.ai/hosting: self-hosted
+    # The platform's source is published under terms that are not OSI-approved:
+    # a modified Apache License 2.0 whose additional conditions attach to
+    # operating a multi-tenant environment and to altering the front end's
+    # branding. Any reader may obtain and run the pinned image on those terms.
+    component.aggrega.ai/upstream-licensing: source-available
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  # Self-inject allowlist: the component may inject resolved uses-edge values
+  # into the env delivery mechanism.
+  inject: [env]
+
+  usesSchema:
+    # The PostgreSQL backend the scheduler reads the periodic-task schedule
+    # from.
+    backend:
+      selector: "component.aggrega.ai/category=datastore"
+      inject: [env]
+      required: true
+      # A statement about this connection's target, authored on the connection:
+      # the backend it reaches takes no credential. It changes nothing this
+      # component renders.
+      valueSchema:
+        unauthenticated:
+          type: boolean
+          default: false
+          description: Declares that the backend this connection reaches takes no credential, so a connection carrying none is intended rather than an omission. It changes nothing this component renders.
+      # Optional backend password, held on the connection it is presented on and
+      # shared with the backend and the API server. When attached, supplies the
+      # PostgreSQL password via the credential subsystem; when unattached, the
+      # Recipe falls back to its inline development default.
+      # To replace the Recipe's development default, attach core/random-password
+      # on the connection: the cluster generates it, and the backend takes the
+      # same credential by core/referenced-secret.
+      featuresSchema:
+        credential:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [env]
+          description: "Optional password the scheduler presents to the backend this connection reaches, shared with that backend. When attached, supplies the backend password via the credential subsystem; unattached, the Recipe uses the development literal `apppass`, which this catalog publishes, so every Release that leaves the slot unattached shares that password."
+    # The Redis-compatible cache the scheduler enqueues onto. A cache publishing
+    # protocol valkey-tls or redis-tls is reached over TLS, the scheduler checking its
+    # certificate and the name dialed against the authority in server_ca where
+    # one is attached, and against the image's default trust store where not; a
+    # cache publishing another value served over TLS halts the build, naming the
+    # connection.
+    cache:
+      selector: "component.aggrega.ai/category=datastore"
+      inject: [env]
+      required: true
+      # The authority the scheduler checks the cache's certificate against, for
+      # a cache whose certificate an authority the image does not already trust
+      # signs; secret-kind-pinned and sensitive as every secret-kind slot is,
+      # delivered as a file.
+      featuresSchema:
+        server_ca:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [file]
+          description: "Optional authority the scheduler checks the cache's certificate against while the cache publishes protocol valkey-tls or redis-tls, where the image does not already trust the authority that signs it. Its Secret holds ca.crt. The Recipe mounts the whole Secret read-only and points the cache client and the task broker at the file. The build halts on a server_ca publishing no Secret name, and on one wired to a cache served without TLS. Fill it with core/referenced-secret."
+      valueSchema:
+        # Redis logical-database indices this connection uses. They match the
+        # worker's indices on the same cache, because the scheduler enqueues
+        # what the worker consumes.
+        db_index:
+          type: integer
+          min: 0
+          max: 15
+          default: 0
+          description: Redis logical-database index the application cache uses on this connection.
+        broker_db_index:
+          type: integer
+          min: 0
+          max: 15
+          default: 1
+          description: Redis logical-database index the Celery broker uses on this connection.
+
+  schema:
+    # The scheduler reads no developer values: what it enqueues and when is
+    # fixed by the platform, and the schedule itself lives in the backend.
+    values: {}
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      engine_version:
+        type: string
+        default: "1.17.0"
+        description: Dify API container image tag. The API server, the task worker and this scheduler run the same image, so a Release moves all three together.
+      log_level:
+        type: string
+        enum: [DEBUG, INFO, WARNING, ERROR, CRITICAL]
+        default: INFO
+        description: Log verbosity the scheduler emits.
+      # The same two switches core/ai-agent/dify and the task worker declare,
+      # each defaulting to false; a Release sets each on all three components,
+      # since each process reads its own settings.
+      telemetry_enabled:
+        type: boolean
+        default: false
+        description: "Lets the scheduler put Dify's anonymous daily usage event on the queue, which the task worker then sends to otel.dify.ai, falling back to otel.dify.cn. Unset or false, the event is never scheduled. Set it on the server and the task worker too."
+      marketplace_enabled:
+        type: boolean
+        default: false
+        description: "Lets the scheduler put Dify's plugin upgrade check on the queue every fifteen minutes; the task worker then fetches the plugin list from marketplace.dify.ai once a day for each workspace. Unset or false, the check is never scheduled. Set it on the server and the task worker too."
+      compute:
+        cpu:
+          type: string
+          default: 100m
+        memory:
+          type: string
+          # The scheduler runs in the API server's image, and at the default
+          # image tag its memory settles near 500Mi once it has started; the
+          # default leaves about half as much again above that.
+          default: 768Mi
+      overrides:
+        type: object
+        additionalProperties: true
+        description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+
+  # A connection to a target its catalog labels a managed service
+  # (component.aggrega.ai/hosting: managed) carries a credential, or says on the
+  # connection that its target takes none. The rule reads the target's labels,
+  # the connection's unauthenticated value and its credential slot, all known
+  # before a Recipe binds, so it holds whichever Recipe renders this component;
+  # a self-hosted target draws nothing. The list names every socket of this
+  # component that declares unauthenticated.
+  assertions:
+    managed_target_needs_a_credential: >-
+      {{- range $socket := list "backend" -}}
+      {{- range $alias, $connection := (optional $.uses $socket dict) -}}
+      {{- $managed := eq (optional $connection.labels "component.aggrega.ai/hosting" "") "managed" -}}
+      {{- $optedOut := optional $connection.values "unauthenticated" false -}}
+      {{- if and $managed (not (hasKey $connection.features "credential")) (not $optedOut) -}}
+      {{- fail (printf "the %s connection %s of %q reaches %q, whose component.aggrega.ai/hosting label is managed, with no credential: attach one under credential on that connection, or set unauthenticated: true in its values" $socket $alias $.metadata.instance_id $connection.target) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}

@@ -1,0 +1,296 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Component
+metadata:
+  name: core/ai-agent/dify-worker
+  version: 1.1.0
+  # metadata.license is deliberately absent. This service runs the Dify API
+  # image, published under a modified Apache License 2.0 carrying additional
+  # conditions that no single SPDX identifier names. The licensing class is
+  # stated on the component.aggrega.ai/upstream-licensing label instead.
+  description: >
+    The Dify task worker — the Celery consumer that runs everything a Dify
+    installation does off the request path: indexing uploaded documents into the
+    vector datastore, executing scheduled and queued workflow runs, generating
+    dataset segments, and delivering mail and webhooks. It takes work from the
+    Redis-compatible broker wired through the `cache` uses-socket, reads and
+    writes the platform's relational model in the PostgreSQL backend wired
+    through `backend`, and writes embeddings into the vector datastore wired
+    through `vector_store`. Workflow code nodes it executes run in the sandbox
+    wired through `sandbox`, and outbound requests to addresses a user supplied
+    are routed through the forward proxy wired through `ssrf_proxy`. It serves
+    no port and nothing connects to it — work reaches it through the broker — so
+    it publishes no provides contract and renders as a stateless worker tier.
+
+    By default nothing reaches Dify's vendor: infra.telemetry_enabled turns on
+    its daily usage event, and infra.marketplace_enabled its daily plugin
+    upgrade check against the plugin marketplace.
+  labels:
+    component.aggrega.ai/type: worker
+    component.aggrega.ai/category: ai-agent
+    # Every Recipe of this component runs the worker as containers in the
+    # Release's own cluster, so a single posture is its identity.
+    # Selector-only: never stamped onto rendered output.
+    component.aggrega.ai/hosting: self-hosted
+    # The platform's source is published under terms that are not OSI-approved:
+    # a modified Apache License 2.0 whose additional conditions attach to
+    # operating a multi-tenant environment and to altering the front end's
+    # branding. Any reader may obtain and run the pinned image on those terms.
+    component.aggrega.ai/upstream-licensing: source-available
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  # Self-inject allowlist: the component may inject resolved uses-edge values
+  # into the env delivery mechanism.
+  inject: [env]
+
+  usesSchema:
+    # The PostgreSQL backend holding the platform's relational model.
+    backend:
+      selector: "component.aggrega.ai/category=datastore"
+      inject: [env]
+      required: true
+      # A statement about this connection's target, authored on the connection:
+      # the backend it reaches takes no credential. It changes nothing this
+      # component renders.
+      valueSchema:
+        unauthenticated:
+          type: boolean
+          default: false
+          description: Declares that the backend this connection reaches takes no credential, so a connection carrying none is intended rather than an omission. It changes nothing this component renders.
+      # Optional backend password, held on the connection it is presented on and
+      # shared with the backend and the API server. When attached, supplies the
+      # PostgreSQL password via the credential subsystem; when unattached, the
+      # Recipe falls back to its inline development default.
+      # To replace the Recipe's development default, attach core/random-password
+      # on the connection: the cluster generates it, and the backend takes the
+      # same credential by core/referenced-secret.
+      featuresSchema:
+        credential:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [env]
+          description: "Optional password the worker presents to the backend this connection reaches, shared with that backend. When attached, supplies the backend password via the credential subsystem; unattached, the Recipe uses the development literal `apppass`, which this catalog publishes, so every Release that leaves the slot unattached shares that password."
+    # The Redis-compatible cache the worker takes its queue from. A cache
+    # publishing protocol valkey-tls or redis-tls is reached over TLS, the worker checking
+    # its certificate and the name dialed against the authority in server_ca
+    # where one is attached, and against the image's default trust store where
+    # not; a cache publishing another value served over TLS halts the build,
+    # naming the connection.
+    cache:
+      selector: "component.aggrega.ai/category=datastore"
+      inject: [env]
+      required: true
+      # The authority the worker checks the cache's certificate against, for a
+      # cache whose certificate an authority the image does not already trust
+      # signs; secret-kind-pinned and sensitive as every secret-kind slot is,
+      # delivered as a file.
+      featuresSchema:
+        server_ca:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [file]
+          description: "Optional authority the worker checks the cache's certificate against while the cache publishes protocol valkey-tls or redis-tls, where the image does not already trust the authority that signs it. Its Secret holds ca.crt. The Recipe mounts the whole Secret read-only and points the cache client and the task broker at the file. The build halts on a server_ca publishing no Secret name, and on one wired to a cache served without TLS. Fill it with core/referenced-secret."
+      valueSchema:
+        # Redis logical-database indices this connection uses. They match the
+        # API server's indices on the same cache, because the two exchange work
+        # through it.
+        db_index:
+          type: integer
+          min: 0
+          max: 15
+          default: 0
+          description: Redis logical-database index the application cache uses on this connection.
+        broker_db_index:
+          type: integer
+          min: 0
+          max: 15
+          default: 1
+          description: Redis logical-database index the Celery broker uses on this connection.
+    # The vector datastore the worker writes dataset embeddings into. The helm
+    # Recipe narrows the selector to what the worker's drivers reach: a target
+    # whose datastore.aggrega.ai/engine label is not vector, or which publishes
+    # a protocol other than http, halts the build, naming the connection.
+    vector_store:
+      selector: "datastore.aggrega.ai/engine in (vector, semantic-memory, search)"
+      inject: [env]
+      required: true
+      valueSchema:
+        # Which client driver the worker speaks on this connection. It names the
+        # same driver as the API server's own vector-store edge, because both
+        # read and write the same collections. The compiler neither infers the
+        # target's engine nor checks the name against it, and every vector store
+        # carries the same engine label, so among the targets the Recipe admits,
+        # Weaviate and Qdrant cannot be told from Chroma or Milvus, and the
+        # driver named here stays the author's statement.
+        engine:
+          type: string
+          enum: [weaviate, qdrant]
+          default: weaviate
+          description: "Vector-store client driver the worker uses on this connection, Weaviate's or Qdrant's, each dialled at an http:// address. The helm Recipe halts the build on a target whose datastore.aggrega.ai/engine label is not vector, since both drivers speak to a vector engine alone, and on one publishing a protocol other than http. Every vector store carries the same label, so the build cannot tell Weaviate or Qdrant from another vector engine such as Chroma or Milvus: name the driver of the store the connection reaches."
+    # The sandbox that executes the code nodes of workflows the worker runs.
+    sandbox:
+      selector: "component.aggrega.ai/category=ai-agent"
+      inject: [env]
+      required: true
+      # A statement about this connection's target, authored on the connection:
+      # the sandbox it reaches takes no credential. It changes nothing this
+      # component renders.
+      valueSchema:
+        unauthenticated:
+          type: boolean
+          default: false
+          description: Declares that the sandbox this connection reaches takes no credential, so a connection carrying none is intended rather than an omission. It changes nothing this component renders.
+      # Optional execution key, held on the connection it is presented on. The
+      # worker presents this key on every code-execution request, so the same
+      # credential is attached to the code_execution_key slot on the sandbox.
+      # Unattached, the Recipe uses a pinned development literal.
+      # To replace the Recipe's development default, attach core/random-password
+      # on the connection: the cluster generates it, and the sandbox takes the
+      # same credential by core/referenced-secret.
+      featuresSchema:
+        credential:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [env]
+          description: "Optional execution-key credential the worker presents on every request to the sandbox this connection reaches. The same credential is attached to the code_execution_key slot on the sandbox, so both ends hold the same value. Unattached, the Recipe uses the pinned development literal `dify-sandbox`, suitable for evaluation only and published in this catalog, so every Release that leaves the slot unattached shares it."
+    # The plugin runtime the worker dispatches model calls through. Indexing a
+    # document means embedding it, and an embedding model is delivered as a
+    # plugin, so the worker reaches the runtime for the same reason the API
+    # server does.
+    plugin_daemon:
+      selector: "component.aggrega.ai/category=ai-agent"
+      inject: [env]
+      required: true
+      # A statement about this connection's target, authored on the connection:
+      # the plugin runtime it reaches takes no credential. It changes nothing
+      # this component renders.
+      valueSchema:
+        unauthenticated:
+          type: boolean
+          default: false
+          description: Declares that the plugin runtime this connection reaches takes no credential, so a connection carrying none is intended rather than an omission. It changes nothing this component renders.
+      # Optional plugin-runtime key, held on the connection it is presented on.
+      # The worker presents this key on every call it makes to the plugin
+      # runtime, and the runtime admits the call only when the value matches its
+      # own plugin_daemon_key slot. The API server presents the same key on its
+      # own connection to the runtime, so the same credential is attached on the
+      # runtime and on both connections, or on none of them. Unattached, the
+      # Recipe uses a pinned development literal.
+      # To replace the Recipe's development default, attach core/random-password
+      # on the runtime: the cluster generates it, and each connection takes the
+      # same credential by core/referenced-secret.
+      featuresSchema:
+        credential:
+          selector: "feature.aggrega.ai/kind=secret"
+          sensitive: true
+          inject: [env]
+          description: "Optional credential the worker presents on every call it makes to the plugin runtime this connection reaches. The runtime holds the same key in its plugin_daemon_key slot and the API server presents it on its own connection, so the credential is attached to all three or to none: attaching it to some of them leaves the rest carrying a different value, which renders cleanly and is refused when the call is made. Unattached, the Recipe uses the pinned development literal `dify-plugin-daemon-server-key`, suitable for evaluation only and published in this catalog, so every Release that leaves the slot unattached shares it."
+    # The forward proxy that outbound requests to user-supplied addresses are
+    # routed through.
+    ssrf_proxy:
+      selector: "component.aggrega.ai/category=ai-agent"
+      inject: [env]
+      required: true
+
+  featuresSchema:
+    # Required application-secret slot, with no default. The worker decrypts
+    # stored model-provider credentials under this value, so it must carry the
+    # same secret as the API server. A pinned default would be a key every
+    # reader of this catalog holds. A key the cluster generates is attached
+    # through core/random-password, and slots sharing it take it by
+    # core/referenced-secret.
+    secret_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      required: true
+      description: "Required application-secret credential. The worker decrypts stored model-provider credentials under it, so it carries the same secret as the API server. There is no default: the build halts when nothing fills this slot."
+    # Optional internal-API key slot. The plugin runtime presents this key on
+    # every call back into the internal API, and the worker admits the call only
+    # when the value matches its own. The worker and the API server each declare
+    # this slot under the same name, and the plugin runtime presents the key on
+    # its connection to the API server, so the same credential is attached to
+    # all three or to none of them. Unattached, the Recipe uses a pinned
+    # development literal.
+    # To replace the Recipe's development default, attach core/random-password: the
+    # cluster generates it, and slots sharing it take it by core/referenced-secret.
+    inner_api_key:
+      selector: "feature.aggrega.ai/kind=secret"
+      sensitive: true
+      inject: [env]
+      description: "Optional credential the plugin runtime presents on every call back into the internal API, which the worker compares against its own. The worker and the API server declare this slot under the same name and the plugin runtime presents it on its connection to the API server, so the credential is attached to all three or to none: attaching it to some of them leaves the rest carrying a different value, which renders cleanly and is refused when the call is made. Unattached, the Recipe uses the pinned development literal `dify-plugin-inner-api-key`, suitable for evaluation only and published in this catalog, so every Release that leaves the slot unattached shares it."
+
+  schema:
+    values:
+      # Developer Intent — filled by the Developer in the Aggregate.
+      vector_index_prefix:
+        type: string
+        default: "Vector_index"
+        description: Name prefix the worker gives the collections it creates in the wired vector datastore. It matches the API server's prefix, because the two write the same collections.
+      indexing_max_segmentation_tokens:
+        type: integer
+        min: 1
+        default: 4000
+        description: Longest segment, in tokens, the dataset indexer produces when it splits a document.
+    infra:
+      # Operational Sizing — filled by the Operator in the Release. Developer
+      # never sees this.
+      engine_version:
+        type: string
+        default: "1.17.0"
+        description: Dify API container image tag. The API server, the scheduler and this worker run the same image, so a Release moves all three together.
+      log_level:
+        type: string
+        enum: [DEBUG, INFO, WARNING, ERROR, CRITICAL]
+        default: INFO
+        description: Log verbosity the worker emits.
+      concurrency:
+        type: integer
+        min: 1
+        default: 4
+        description: Number of task slots one worker process runs in parallel. Raising it raises throughput and the worker's memory ceiling together, so it is sized with compute.memory.
+      # The same two switches core/ai-agent/dify and the scheduler declare, each
+      # defaulting to false; a Release sets each on all three components, since
+      # each process reads its own settings.
+      telemetry_enabled:
+        type: boolean
+        default: false
+        description: "Lets the worker send Dify's anonymous daily usage event, and the install event when the server's own was not delivered, to otel.dify.ai, falling back to otel.dify.cn. Unset or false, nothing reaches those hosts. Set it on the server and the scheduler too."
+      marketplace_enabled:
+        type: boolean
+        default: false
+        description: "Lets the worker reach Dify's plugin marketplace (marketplace.dify.ai): the daily plugin upgrade check the scheduler enqueues, and installing the plugins a new workspace is configured with. Model-provider plugins such as OpenAI's install from the marketplace, so a Release whose applications use one sets it. Unset or false, nothing reaches that host. Set it on the server and the scheduler too."
+      compute:
+        cpu:
+          type: string
+          default: 500m
+        memory:
+          type: string
+          default: 1Gi
+      overrides:
+        type: object
+        additionalProperties: true
+        description: Provider-specific overrides. Accepts any nested structure. Each Recipe documents which keys it reads.
+
+  # A connection to a target its catalog labels a managed service
+  # (component.aggrega.ai/hosting: managed) carries a credential, or says on the
+  # connection that its target takes none. The rule reads the target's labels,
+  # the connection's unauthenticated value and its credential slot, all known
+  # before a Recipe binds, so it holds whichever Recipe renders this component;
+  # a self-hosted target draws nothing. The list names every socket of this
+  # component that declares unauthenticated.
+  assertions:
+    managed_target_needs_a_credential: >-
+      {{- range $socket := list "backend" "sandbox" "plugin_daemon" -}}
+      {{- range $alias, $connection := (optional $.uses $socket dict) -}}
+      {{- $managed := eq (optional $connection.labels "component.aggrega.ai/hosting" "") "managed" -}}
+      {{- $optedOut := optional $connection.values "unauthenticated" false -}}
+      {{- if and $managed (not (hasKey $connection.features "credential")) (not $optedOut) -}}
+      {{- fail (printf "the %s connection %s of %q reaches %q, whose component.aggrega.ai/hosting label is managed, with no credential: attach one under credential on that connection, or set unauthenticated: true in its values" $socket $alias $.metadata.instance_id $connection.target) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
