@@ -1,0 +1,301 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: dify-worker
+  version: 2.0.0
+  # metadata.license is deliberately absent. The Dify platform this Recipe
+  # realizes is published under a modified Apache License 2.0 carrying
+  # additional conditions, and no single SPDX identifier names those terms; the
+  # licensing class sits on the Component's upstream-licensing label. The
+  # SPDX header at the top of this file states the terms of the file itself.
+  #
+  # The worker's vector-store driver and index prefix match the API server's,
+  # because the two write the same collections. A vector-store connection halts
+  # the build when its target is not a vector engine or publishes a protocol
+  # other than http, because both drivers are vector engines dialled over http.
+  description: >
+    The Dify task worker on Kubernetes via the helm provider's Workload
+    synthesis. The worker runs the same image as the API server under a
+    different MODE, takes its work from the Celery broker rather than from a
+    listening socket, and therefore renders as a stateless Deployment with no
+    ports and no Service — nothing connects to it, so it publishes nothing. By
+    default it sends Dify's vendor no heartbeat or install event; the plugin
+    marketplace is reached as Dify ships it.
+
+    The identities its uses-edges resolve compose its connection settings and
+    the single URL each sibling subsystem is addressed by. A cache publishing
+    valkey-tls or redis-tls is reached over TLS; another TLS protocol halts the
+    build, and so does a vector-store connection whose target is not a vector
+    engine served over http.
+
+    The application secret comes from the credential attached to secret_key,
+    which has no default: the Component requires the slot, and the build halts
+    when nothing fills it. The backend password, the sandbox execution key and
+    the two keys the worker and the plugin runtime present to each other each
+    come from a credential when one is attached and from an inline development
+    default otherwise, matching the defaults the other Recipes in this stack
+    emit; the three the worker presents to the backend, the sandbox and the
+    plugin runtime are held on those connections. These defaults are for
+    evaluation and local development. The two handshake keys are read by the
+    worker, the API server and the plugin runtime alike, so a credential for
+    either is attached on all three or on none of them.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/dify-worker:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # The worker publishes no provides contract: it is reached through the broker
+  # rather than over the network, so there is no address for a consumer to read.
+  #
+  # The backend, cache, vector-store, sandbox, plugin-runtime and proxy
+  # identities resolved from the component's uses-edges arrive on
+  # .context.inject.env. The backend and cache identities pass through under
+  # the names the worker itself reads; the vector-store edge is translated
+  # according to the driver named on that edge, and the sandbox, plugin-runtime
+  # and proxy edges are composed into the single URL each subsystem is
+  # addressed by.
+  workload: |
+    {{- /*
+      The alias of each connection carrying a credential, or empty: the
+      backend's password, the sandbox's execution key and the plugin runtime's
+      server key.
+    */ -}}
+    {{- $backendCredential := "" -}}
+    {{- $sandboxCredential := "" -}}
+    {{- $pluginDaemonCredential := "" -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- if hasKey (default dict $edge.features) "credential" -}}
+    {{- if eq $edge.socket "backend" -}}{{- $backendCredential = $alias -}}{{- end -}}
+    {{- if eq $edge.socket "sandbox" -}}{{- $sandboxCredential = $alias -}}{{- end -}}
+    {{- if eq $edge.socket "plugin_daemon" -}}{{- $pluginDaemonCredential = $alias -}}{{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /*
+      The connection variables this Recipe reads off the inject pipe, under the
+      socket whose edge delivers them, each beside the provides key the edge's
+      inject block names it from. The pipe is read as a map, and every read of
+      these variables below goes through it, so a variable nothing delivered is
+      told apart from one delivered empty: an edge on one of these sockets
+      leaving any of its variables missing halts the build, naming the edge, the
+      variables and the inject block to write, rather than rendering a
+      connection setting with an empty value. A socket in $required is read
+      whether or not anything is wired to it, so leaving it empty halts too.
+    */ -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $reads := dict "backend" (dict "DB_HOST" "host" "DB_PORT" "port" "DB_USERNAME" "user" "DB_DATABASE" "database") "cache" (dict "REDIS_HOST" "host" "REDIS_PORT" "port") "vector_store" (dict "VDB_HOST" "host" "VDB_PORT" "port" "VDB_GRPC_PORT" "grpc_port") "sandbox" (dict "SANDBOX_HOST" "host" "SANDBOX_PORT" "port") "plugin_daemon" (dict "PLUGIN_DAEMON_HOST" "host" "PLUGIN_DAEMON_PORT" "port") "ssrf_proxy" (dict "SSRF_PROXY_HOST" "host" "SSRF_PROXY_PORT" "port") -}}
+    {{- $required := list "backend" "cache" "sandbox" "plugin_daemon" "ssrf_proxy" -}}
+    {{- $gaps := list }}{{ $wired := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ with get $reads $edge.socket -}}
+    {{- $wired = append $wired $edge.socket }}{{ $missing := list }}{{ $shape := list -}}
+    {{- range $var, $from := . }}{{ if not (hasKey $env $var) }}{{ $missing = append $missing $var }}{{ end }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- if $missing }}{{ $gaps = append $gaps (printf "the edge %q on its %s socket delivers no %s, so give that edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $alias $edge.socket (join " or " $missing) (join ", " $shape)) }}{{ end -}}
+    {{- end }}{{ end -}}
+    {{- range $socket := $required }}{{ if not (has $socket $wired) -}}
+    {{- $vars := list }}{{ $shape := list }}{{ range $var, $from := get $reads $socket }}{{ $vars = append $vars $var }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
+    {{- end }}{{ end -}}
+    {{- if $gaps }}{{ fail (printf "core/ai-agent/dify-worker %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    {{- /*
+      The cache connection over TLS, read exactly as the API server's Recipe
+      reads it (DELIBERATE NEAR-DUPLICATE: each Dify Recipe repeats this block
+      inside a template of its own, and no catalog kind holds a template
+      fragment for several Recipes to share; change all three together). A
+      cache publishing valkey-tls or redis-tls is reached over TLS; any other value ending
+      in -tls halts rather than connecting in plaintext. A server_ca must name
+      a Secret, and is refused on a cache served without TLS.
+    */ -}}
+    {{- $cacheTLS := false }}{{ $cacheCA := "" -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "cache" -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- $edgeTLS := has $proto (list "valkey-tls" "redis-tls") -}}
+    {{- if $edgeTLS }}{{ $cacheTLS = true }}{{ else if hasSuffix "-tls" $proto -}}
+    {{- fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a cache served over TLS that the Dify worker does not reach: it speaks the Redis protocol, over TLS to a cache publishing valkey-tls or redis-tls; wire a Redis-protocol cache to the cache socket" $alias $.context.instance_id $edge.target $proto) -}}
+    {{- end -}}
+    {{- if hasKey (default dict $edge.features) "server_ca" -}}
+    {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) -}}
+    {{- fail (printf "the server_ca on the cache connection %s of %q publishes no Secret name, so no Secret could be mounted into the worker's container: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if not $edgeTLS -}}
+    {{- fail (printf "the cache connection %s of %q holds a server_ca, but the cache it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that cache, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $proto)) -}}
+    {{- end -}}
+    {{- $cacheCA = $alias -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
+    {{- /*
+      The vector-store connection, read exactly as the API server's Recipe
+      reads it (DELIBERATE NEAR-DUPLICATE: each of the two Recipes repeats this
+      block inside a template of its own, and no catalog kind holds a template
+      fragment for two Recipes to share; change both together). Weaviate and
+      Qdrant are both vector engines, and the worker dials either at an address
+      composed http://, so a target whose datastore.aggrega.ai/engine label is
+      anything but vector halts, and so does one publishing a protocol other
+      than http, which the worker would reach in plaintext or not at all. The
+      build cannot tell one vector engine from another, so the driver named on
+      the edge stays the author's statement.
+    */ -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "vector_store" -}}
+    {{- $engine := toString (optional (default dict $edge.labels) "datastore.aggrega.ai/engine" "") -}}
+    {{- if ne $engine "vector" -}}
+    {{- fail (printf "the vector_store connection %s of %q reaches %q, whose datastore.aggrega.ai/engine label is %s, not vector: the Dify worker's two drivers, Weaviate and Qdrant, speak to a vector engine alone; wire a vector store, such as core/datastore/weaviate or core/datastore/qdrant, to the vector_store socket" $alias $.context.instance_id $edge.target (default "absent" $engine)) -}}
+    {{- end -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- if and $proto (ne $proto "http") -}}
+    {{- fail (printf "the vector_store connection %s of %q reaches %q, which publishes protocol %s, and the Dify worker dials its %s driver at an http:// address, so it would reach that store in plaintext or not at all: wire a store publishing protocol http to the vector_store socket" $alias $.context.instance_id $edge.target $proto (toString $edge.values.engine)) -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
+    apiVersion: aggrega.ai/v1beta1
+    kind: Workload
+    # The worker holds no durable state — its queue lives in the cache and its
+    # results in the backend and the vector datastore — so the stateless form (a
+    # Deployment on the helm provider) is correct. No ports and no services: the
+    # worker opens no listening socket.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "langgenius/dify-api:{{ .infra.engine_version }}"
+        # MODE selects the worker role of the shared API image.
+        variables:
+          MODE: worker
+          LOG_LEVEL: "{{ .infra.log_level }}"
+          # The migration flag is read ahead of the mode, so it would apply to
+          # the worker exactly as it does to the API server. It is false here
+          # because the API server is the single place that applies the schema
+          # upgrade: a worker with it set true would run the same upgrade at the
+          # same time.
+          MIGRATION_ENABLED: "false"
+          CELERY_WORKER_AMOUNT: "{{ .infra.concurrency }}"
+          # The backend identity arrives on the inject pipe under the names the
+          # worker itself reads, so these pass through untranslated.
+          DB_TYPE: postgresql
+          DB_HOST: "{{ $env.DB_HOST }}"
+          DB_PORT: "{{ $env.DB_PORT }}"
+          DB_USERNAME: "{{ $env.DB_USERNAME }}"
+          DB_DATABASE: "{{ $env.DB_DATABASE }}"
+          REDIS_HOST: "{{ $env.REDIS_HOST }}"
+          REDIS_PORT: "{{ $env.REDIS_PORT }}"
+          CELERY_BACKEND: redis
+          # Nothing reaches Dify's vendor by default: the worker sends no
+          # heartbeat or install event to otel.dify.ai, or otel.dify.cn; Dify
+          # reads the flag in api/services/telemetry_service.py.
+          DISABLE_TELEMETRY: "true"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "cache" }}
+          REDIS_DB: "{{ $edge.values.db_index }}"
+          CELERY_BROKER_URL: "{{ if $cacheTLS }}rediss{{ else }}redis{{ end }}://{{ $env.REDIS_HOST }}:{{ $env.REDIS_PORT }}/{{ $edge.values.broker_db_index }}"
+    {{- end }}
+    {{- end }}
+          # Over TLS the cache client and the Celery broker verify the cache's
+          # certificate and the name dialed, against the connection's server_ca
+          # where one is attached and the image's default trust store where
+          # not; REDIS_SSL_CERT_REQS defaults to CERT_NONE, which checks nothing,
+          # so it is set.
+    {{- if $cacheTLS }}
+          REDIS_USE_SSL: "true"
+          REDIS_SSL_CERT_REQS: CERT_REQUIRED
+    {{- if $cacheCA }}
+          REDIS_SSL_CA_CERTS: /etc/dify/cache-server-ca/ca.crt
+    {{- end }}
+    {{- end }}
+          # The vector-store edge is translated: the driver named on the edge
+          # decides which variables carry the store's address.
+          VECTOR_INDEX_NAME_PREFIX: "{{ .values.vector_index_prefix }}"
+          INDEXING_MAX_SEGMENTATION_TOKENS_LENGTH: "{{ .values.indexing_max_segmentation_tokens }}"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "vector_store" }}
+          VECTOR_STORE: "{{ $edge.values.engine }}"
+    {{- if eq $edge.values.engine "weaviate" }}
+          WEAVIATE_ENDPOINT: "http://{{ $env.VDB_HOST }}:{{ $env.VDB_PORT }}"
+          WEAVIATE_GRPC_ENDPOINT: "grpc://{{ $env.VDB_HOST }}:{{ $env.VDB_GRPC_PORT }}"
+    {{- end }}
+    {{- if eq $edge.values.engine "qdrant" }}
+          QDRANT_URL: "http://{{ $env.VDB_HOST }}:{{ $env.VDB_PORT }}"
+          QDRANT_GRPC_PORT: "{{ $env.VDB_GRPC_PORT }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+          CODE_EXECUTION_ENDPOINT: "http://{{ $env.SANDBOX_HOST }}:{{ $env.SANDBOX_PORT }}"
+          PLUGIN_DAEMON_URL: "http://{{ $env.PLUGIN_DAEMON_HOST }}:{{ $env.PLUGIN_DAEMON_PORT }}"
+          SSRF_PROXY_HTTP_URL: "http://{{ $env.SSRF_PROXY_HOST }}:{{ $env.SSRF_PROXY_PORT }}"
+          SSRF_PROXY_HTTPS_URL: "http://{{ $env.SSRF_PROXY_HOST }}:{{ $env.SSRF_PROXY_PORT }}"
+          # The two keys the worker and the plugin runtime present to each
+          # other: the one the worker presents, held on its plugin_daemon
+          # connection, and the one it verifies, behind its own credential slot.
+          # Unattached, the Recipe emits the pinned development literal below —
+          # the same literal the API-server and plugin-runtime Recipes emit — so
+          # the stack runs self-contained with no external secret. Attached, the
+          # literal is not emitted and the credential subsystem delivers the
+          # value on the same variable through the attachments block further
+          # down. The worker, the API server and the plugin runtime all read
+          # these two keys, so a credential is attached on all three or on none
+          # of them: attaching it to some of them leaves the rest carrying a
+          # different value, which renders cleanly and is refused when the call
+          # between them is made.
+    {{- if not $pluginDaemonCredential }}
+          PLUGIN_DAEMON_KEY: dify-plugin-daemon-server-key
+    {{- end }}
+    {{- if not (hasKey (default dict .features) "inner_api_key") }}
+          INNER_API_KEY_FOR_PLUGIN: dify-plugin-inner-api-key
+    {{- end }}
+    {{- if not $backendCredential }}
+          DB_PASSWORD: apppass
+    {{- end }}
+    {{- if not $sandboxCredential }}
+          CODE_EXECUTION_API_KEY: dify-sandbox
+    {{- end }}
+    {{- if or $backendCredential (hasKey (default dict .features) "secret_key") $sandboxCredential $pluginDaemonCredential (hasKey (default dict .features) "inner_api_key") $cacheCA }}
+        attachments:
+    {{- with $backendCredential }}
+          DB_PASSWORD:
+            connection: "{{ . }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "secret_key" }}
+          SECRET_KEY:
+            from: secret_key
+            as: env
+    {{- end }}
+    {{- with $sandboxCredential }}
+          CODE_EXECUTION_API_KEY:
+            connection: "{{ . }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- with $pluginDaemonCredential }}
+          PLUGIN_DAEMON_KEY:
+            connection: "{{ . }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- if hasKey (default dict .features) "inner_api_key" }}
+          INNER_API_KEY_FOR_PLUGIN:
+            from: inner_api_key
+            as: env
+    {{- end }}
+    {{- with $cacheCA }}
+          # The cache connection's server_ca Secret mounts whole, read-only, so
+          # the worker reads ca.crt from this directory.
+          cache-server-ca:
+            connection: "{{ . }}"
+            from: server_ca
+            as: file
+            path: /etc/dify/cache-server-ca
+    {{- end }}
+    {{- end }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the Release supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"

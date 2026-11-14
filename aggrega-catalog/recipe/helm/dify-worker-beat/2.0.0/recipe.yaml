@@ -1,0 +1,191 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: dify-worker-beat
+  version: 2.0.0
+  # metadata.license is deliberately absent. The Dify platform this Recipe
+  # realizes is published under a modified Apache License 2.0 carrying
+  # additional conditions, and no single SPDX identifier names those terms; the
+  # licensing class sits on the Component's upstream-licensing label. The
+  # SPDX header at the top of this file states the terms of the file itself.
+  description: >
+    The Dify task scheduler on Kubernetes via the helm provider's Workload
+    synthesis. The scheduler runs the same image as the API server under a
+    different MODE and does one thing: read the periodic-task schedule from the
+    backend and enqueue each task onto the Celery broker at its due time. It
+    opens no listening socket, so it renders as a stateless Deployment with no
+    ports and no Service, and it publishes nothing. By default it schedules no
+    heartbeat event to Dify's vendor; the plugin marketplace's upgrade check is
+    scheduled as Dify ships it.
+
+    Exactly one replica is rendered and the count is not a knob. Two schedulers
+    reading one schedule and enqueuing onto one broker would put every periodic
+    task on the queue twice, so scaling this component out multiplies the work
+    rather than sharing it. Throughput is scaled on the task worker, which is
+    what consumes what the scheduler enqueues.
+
+    The backend and cache identities resolved from the component's uses-edges
+    arrive on .context.inject.env under the names the scheduler itself reads.
+    A cache publishing valkey-tls or redis-tls is reached over TLS, its certificate checked
+    against the cache connection's server_ca, mounted, or the image's default
+    trust store; another TLS protocol on the cache halts the build.
+    The backend password comes from a credential when the backend connection
+    carries one and from an inline development default otherwise, matching the
+    standard-library PostgreSQL Recipe's own default.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: helm
+  implements: core/ai-agent/dify-worker-beat:1.0.0
+  # This Recipe reads no infra.overrides keys.
+  #
+  # The scheduler publishes no provides contract: it opens no listening socket,
+  # so there is no address for a consumer to read.
+  workload: |
+    {{- /* The alias of the `backend` connection carrying a credential, or empty. */ -}}
+    {{- $backendCredential := "" -}}
+    {{- range $alias, $edge := .context.uses -}}
+    {{- if and (eq $edge.socket "backend") (hasKey (default dict $edge.features) "credential") -}}
+    {{- $backendCredential = $alias -}}
+    {{- end -}}
+    {{- end -}}
+    {{- /*
+      The connection variables this Recipe reads off the inject pipe, under the
+      socket whose edge delivers them, each beside the provides key the edge's
+      inject block names it from. The pipe is read as a map, and every read of
+      these variables below goes through it, so a variable nothing delivered is
+      told apart from one delivered empty: an edge on one of these sockets
+      leaving any of its variables missing halts the build, naming the edge, the
+      variables and the inject block to write, rather than rendering a
+      connection setting with an empty value. A socket in $required is read
+      whether or not anything is wired to it, so leaving it empty halts too.
+    */ -}}
+    {{- $env := optional (default dict .context.inject) "env" dict -}}
+    {{- $reads := dict "backend" (dict "DB_HOST" "host" "DB_PORT" "port" "DB_USERNAME" "user" "DB_DATABASE" "database") "cache" (dict "REDIS_HOST" "host" "REDIS_PORT" "port") -}}
+    {{- $required := list "backend" "cache" -}}
+    {{- $gaps := list }}{{ $wired := list -}}
+    {{- range $alias, $edge := .context.uses }}{{ with get $reads $edge.socket -}}
+    {{- $wired = append $wired $edge.socket }}{{ $missing := list }}{{ $shape := list -}}
+    {{- range $var, $from := . }}{{ if not (hasKey $env $var) }}{{ $missing = append $missing $var }}{{ end }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- if $missing }}{{ $gaps = append $gaps (printf "the edge %q on its %s socket delivers no %s, so give that edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $alias $edge.socket (join " or " $missing) (join ", " $shape)) }}{{ end -}}
+    {{- end }}{{ end -}}
+    {{- range $socket := $required }}{{ if not (has $socket $wired) -}}
+    {{- $vars := list }}{{ $shape := list }}{{ range $var, $from := get $reads $socket }}{{ $vars = append $vars $var }}{{ $shape = append $shape (printf "{ in: %s, from: %s }" $var $from) }}{{ end -}}
+    {{- $gaps = append $gaps (printf "nothing is wired to its %s socket to deliver %s, so wire one and give its edge an inject block naming each from its target's provides — inject: { env: [ %s ] }" $socket (join " and " $vars) (join ", " $shape)) -}}
+    {{- end }}{{ end -}}
+    {{- if $gaps }}{{ fail (printf "core/ai-agent/dify-worker-beat %q composes its connection settings from variables its edges deliver on its inject pipe, but %s" .context.instance_id (join "; and " $gaps)) }}{{ end -}}
+    {{- /*
+      The cache connection over TLS, read exactly as the API server's Recipe
+      reads it (DELIBERATE NEAR-DUPLICATE: each Dify Recipe repeats this block
+      inside a template of its own, and no catalog kind holds a template
+      fragment for several Recipes to share; change all three together). A
+      cache publishing valkey-tls or redis-tls is reached over TLS; any other value ending
+      in -tls halts rather than connecting in plaintext. A server_ca must name
+      a Secret, and is refused on a cache served without TLS.
+    */ -}}
+    {{- $cacheTLS := false }}{{ $cacheCA := "" -}}
+    {{- range $alias, $edge := .context.uses }}{{ if eq $edge.socket "cache" -}}
+    {{- $proto := toString (optional (default dict $edge.provides) "protocol" "") -}}
+    {{- $edgeTLS := has $proto (list "valkey-tls" "redis-tls") -}}
+    {{- if $edgeTLS }}{{ $cacheTLS = true }}{{ else if hasSuffix "-tls" $proto -}}
+    {{- fail (printf "the cache connection %s of %q reaches %q, which publishes protocol %s, a cache served over TLS that the Dify scheduler does not reach: it speaks the Redis protocol, over TLS to a cache publishing valkey-tls or redis-tls; wire a Redis-protocol cache to the cache socket" $alias $.context.instance_id $edge.target $proto) -}}
+    {{- end -}}
+    {{- if hasKey (default dict $edge.features) "server_ca" -}}
+    {{- $caProvides := optional (optional (default dict $edge.features) "server_ca" dict) "provides" dict -}}
+    {{- if not (and (kindIs "map" $caProvides) (optional $caProvides "name" "")) -}}
+    {{- fail (printf "the server_ca on the cache connection %s of %q publishes no Secret name, so no Secret could be mounted into the scheduler's container: attach a server_ca publishing one, such as core/referenced-secret" $alias $.context.instance_id) -}}
+    {{- end -}}
+    {{- if not $edgeTLS -}}
+    {{- fail (printf "the cache connection %s of %q holds a server_ca, but the cache it reaches, %q, publishes protocol %s, served without TLS, so no TLS handshake takes place to check a certificate in: turn client_tls on for that cache, or remove the server_ca" $alias $.context.instance_id $edge.target (default "none" $proto)) -}}
+    {{- end -}}
+    {{- $cacheCA = $alias -}}
+    {{- end -}}
+    {{- end }}{{ end -}}
+    apiVersion: aggrega.ai/v1beta1
+    kind: Workload
+    # The scheduler holds no durable state — the schedule lives in the backend —
+    # so the stateless form (a Deployment on the helm provider) is correct. No
+    # ports and no services: it opens no listening socket. The replica count is
+    # fixed at one because a second scheduler would double-enqueue every
+    # periodic task.
+    form: stateless
+    replicas: 1
+    containers:
+      main:
+        image: "langgenius/dify-api:{{ .infra.engine_version }}"
+        # MODE selects the scheduler role of the shared API image.
+        variables:
+          MODE: beat
+          LOG_LEVEL: "{{ .infra.log_level }}"
+          # The migration flag is read ahead of the mode, so it would apply to
+          # the scheduler exactly as it does to the API server. It is false here
+          # because the API server is the single place that applies the schema
+          # upgrade.
+          MIGRATION_ENABLED: "false"
+          # The backend and cache identities arrive on the inject pipe under the
+          # names the scheduler itself reads, so these pass through
+          # untranslated.
+          DB_TYPE: postgresql
+          DB_HOST: "{{ $env.DB_HOST }}"
+          DB_PORT: "{{ $env.DB_PORT }}"
+          DB_USERNAME: "{{ $env.DB_USERNAME }}"
+          DB_DATABASE: "{{ $env.DB_DATABASE }}"
+          REDIS_HOST: "{{ $env.REDIS_HOST }}"
+          REDIS_PORT: "{{ $env.REDIS_PORT }}"
+          CELERY_BACKEND: redis
+          # Nothing reaches Dify's vendor by default: the scheduler neither
+          # schedules nor enqueues at start the heartbeat the worker would post
+          # to otel.dify.ai; Dify reads the flag in api/extensions/ext_celery.py.
+          DISABLE_TELEMETRY: "true"
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "cache" }}
+          REDIS_DB: "{{ $edge.values.db_index }}"
+          CELERY_BROKER_URL: "{{ if $cacheTLS }}rediss{{ else }}redis{{ end }}://{{ $env.REDIS_HOST }}:{{ $env.REDIS_PORT }}/{{ $edge.values.broker_db_index }}"
+    {{- end }}
+    {{- end }}
+          # Over TLS the cache client and the Celery broker verify the cache's
+          # certificate and the name dialed, against the connection's server_ca
+          # where one is attached and the image's default trust store where
+          # not; REDIS_SSL_CERT_REQS defaults to CERT_NONE, which checks nothing,
+          # so it is set.
+    {{- if $cacheTLS }}
+          REDIS_USE_SSL: "true"
+          REDIS_SSL_CERT_REQS: CERT_REQUIRED
+    {{- if $cacheCA }}
+          REDIS_SSL_CA_CERTS: /etc/dify/cache-server-ca/ca.crt
+    {{- end }}
+    {{- end }}
+    {{- if not $backendCredential }}
+          DB_PASSWORD: apppass
+    {{- end }}
+    {{- if or $backendCredential $cacheCA }}
+        attachments:
+    {{- end }}
+    {{- with $backendCredential }}
+          DB_PASSWORD:
+            connection: "{{ . }}"
+            from: credential
+            as: env
+    {{- end }}
+    {{- with $cacheCA }}
+          # The cache connection's server_ca Secret mounts whole, read-only, so
+          # the scheduler reads ca.crt from this directory.
+          cache-server-ca:
+            connection: "{{ . }}"
+            from: server_ca
+            as: file
+            path: /etc/dify/cache-server-ca
+    {{- end }}
+        # The resource quantities are quoted so the rendered value stays a
+        # string whatever the Release supplies.
+        resources:
+          requests:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
+          limits:
+            cpu: "{{ .infra.compute.cpu }}"
+            memory: "{{ .infra.compute.memory }}"
