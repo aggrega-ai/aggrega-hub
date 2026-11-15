@@ -5531,6 +5531,35 @@ records it. A pinning entity
 whose own version directory is released takes a new version of its own, chosen
 by the same three rules, rather than an edit in place.
 
+**A Component's new version takes new versions of the Recipes that realize the
+one before it**, in the same change. A Recipe's `implements:` names one
+Component version, so taking `core/datastore/mariadb` to `1.1.0` gives
+`recipe/helm/mariadb`, `recipe/compose/mariadb` and every other Recipe
+implementing `core/datastore/mariadb:1.0.0` a new version whose `implements:`
+names `core/datastore/mariadb:1.1.0`. Without them, `1.1.0` is a version a
+Manifest can map to no Recipe.
+
+`scripts/check-component-recipes.sh` holds the catalog to that. It reads every
+Component and Recipe under `aggrega-catalog/` and refuses a Component version no
+Recipe realizes while the version immediately below it has Recipes, naming the
+Component, the version, the Recipes of the version below it and the file that
+declares the new version.
+
+A Recipe realizes a Component version when its `implements:` names that version,
+or names the Component with no version; a Component version whose `extends:`
+names a realized base is realized by the Recipes of that base. A Component none
+of whose versions has a Recipe is not refused, and neither is a Component's
+lowest version. The check reads the catalog tree and no registry, and it judges
+neither Features nor FeatureRecipes. A value it cannot read — a version range in
+`implements:`, say — stops it with nothing judged, naming the file and the
+value.
+
+The catalog publish workflow runs it on every run, a dry run included, and the
+publish job does not start until it passes, so nothing is selected, published or
+signed past a refusal. Run it by hand from the repository root with
+`scripts/check-component-recipes.sh`, or point it at another tree with
+`--catalog <dir>`; its `--help` says what it reads and what each exit code means.
+
 **When a change fits none of the rules, or more than one, ask rather than
 guess.** Moving the default `infra.engine_version` of `core/datastore/mariadb`
 from `"11.4"` to a later MariaDB release is such a case: it is an upstream minor
