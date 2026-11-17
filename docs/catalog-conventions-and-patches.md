@@ -1897,12 +1897,14 @@ or good, complete and maintained — published module wherever one exists and th
 configuration Terraform loads from it calls no module from a registry. That
 configuration is the module's root and each directory a local `source` (`./`,
 `../`) reaches from it. The Recipe names the module by its git repository with the
-`git-repository` source kind, at the tag the module is published under. It writes
+`git-repository` source kind, at the tag the module is published under, or, when the
+module is published as an OpenTofu module package, by that package with the
+`terraform-module-oci` source kind. It writes
 the body otherwise — as an `artifacts:` body, or as a module kept beside the Recipe
 — and its `description` says which test failed: not official, not complete, not
 maintained, or calling a registry module.
 
-- **The pin is the git commit.** A registry publishes each version of a module as a
+- **For a module sourced from its git repository, the pin is the git commit.** A registry publishes each version of a module as a
   tag of the module's own git repository, and what it answers when asked to download
   a version is a git source at the commit that tag names. Terraform's dependency lock
   file records the providers a configuration selected and no module. So the pin is
