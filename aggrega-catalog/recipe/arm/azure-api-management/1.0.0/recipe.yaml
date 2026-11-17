@@ -1,0 +1,216 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: azure-api-management
+  version: 1.0.0
+  description: >
+    Adds an API serving a model to an Azure API Management instance that
+    already exists, rendered as an Azure Resource Manager template: the API,
+    its chat completions operation, the backend it forwards to and its policy.
+    Reach for it where the instance exists and the Release deploys an Azure
+    Resource Manager template; reach for terraform/azure-api-management where
+    it deploys Terraform, and for the helm or compose reference where the API
+    is configured outside the Release. It creates no instance: the template
+    declares the instance as an existing resource, which ARM reads and never
+    deploys, so a Release without one creates it outside first.
+
+    The policy sends each request to the backend, removes the caller's
+    subscription key from what it forwards, and authenticates as
+    infra.backend_authentication says. With provider_key, a core/referenced-secret
+    bound to arm/key-vault-secret, the key stays in Key Vault: the template
+    writes a named value the instance reads from that secret with its managed
+    identity, which needs read access to it, and the backend sends it, so the
+    template carries no credential.
+
+    No policy control is realized on arm: attaching core/semantic-caching,
+    core/period-budget, core/prompt-injection-shield or core/retry-policy to
+    the gateway halts the build at recipe resolution, because no arm
+    FeatureRecipe writes a policy element for it.
+
+    Deploying it is outside any build: whether the API then behaves as
+    Microsoft documents is not observed by the compiler.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: arm
+  implements: core/gateway/azure-api-management:1.0.0
+
+  # The API's name in the instance, derived once from its path, which the
+  # instance already holds unique: a slash becomes a hyphen. The backend and the
+  # named value are named after it. The gateway's host defaults to the one Azure
+  # gives the instance. The symbols are the component's own, folded from its
+  # instance id, so two gateways in one template never meet on a symbolic name.
+  locals:
+    api_name: '{{ .infra.api_path | replace "/" "-" }}'
+    gateway_url: '{{ default (printf "https://%s.azure-api.net" .infra.api_management_name) (optional .infra "gateway_url" "") }}'
+    symbol: '{{ capitalizedWords .context.instance_id }}'
+
+  # Plain strings composed from values the operator names, so a consumer in the
+  # same template reads them whole.
+  provides:
+    endpoint: "{{ .locals.gateway_url }}/{{ .infra.api_path }}"
+    model: "{{ .values.model }}"
+
+  # Each halts before anything renders, naming what to set.
+  assertions:
+    backend_url_supplied: >-
+      {{- if not (optional .infra "backend_url" "") -}}
+      {{- fail (printf "%q sets no infra.backend_url, but the arm realization of core/gateway/azure-api-management writes the backend the API forwards model requests to from it; set infra.backend_url in the Release to the base address of the model API, such as https://<resource>.openai.azure.com/openai/v1" .metadata.instance_id) -}}
+      {{- end -}}
+    # No default, because a managed identity token sent to the wrong backend
+    # is a token that backend can use; the operator says which it is.
+    backend_authentication_supplied: >-
+      {{- if not (optional .infra "backend_authentication" "") -}}
+      {{- fail (printf "%q sets no infra.backend_authentication, but the arm realization of core/gateway/azure-api-management has to know how the gateway authenticates to the model API at %s: managed_identity for Azure OpenAI or another Microsoft Foundry model the instance's identity holds a role on, provider_key with the provider_key slot attached, or none for a model API taking no credential; set it in the Release" .metadata.instance_id (optional .infra "backend_url" "infra.backend_url")) -}}
+      {{- end -}}
+    provider_key_follows_the_authentication: >-
+      {{- $attached := hasKey (default dict .features) "provider_key" -}}
+      {{- $mode := optional .infra "backend_authentication" "" -}}
+      {{- if and (eq $mode "provider_key") (not $attached) -}}
+      {{- fail (printf "%q sets infra.backend_authentication to provider_key with nothing attached to its provider_key slot, so the gateway would have no key to present; attach core/referenced-secret naming the Key Vault secret holding the key to provider_key, or choose another backend_authentication" .metadata.instance_id) -}}
+      {{- else if and $attached (ne $mode "provider_key") -}}
+      {{- fail (printf "%q carries an attachment on its provider_key slot while infra.backend_authentication is %q, so the key would be written and never sent; set backend_authentication to provider_key, or remove the attachment" .metadata.instance_id $mode) -}}
+      {{- end -}}
+
+  # The fragment declares the instance existing, so ARM reads it and deploys
+  # nothing for it, and the four child resources hang off it by parent. The
+  # instance is in infra.resource_group_name when the Release sets it and in
+  # the resource group the template is deployed to otherwise.
+  #
+  # Every resource is written at Microsoft.ApiManagement's 2024-05-01 API
+  # version.
+  #
+  # provider_key arrives as the Key Vault secret's resource ID the attachment
+  # publishes, read by its exact leaf, provides.name. The vault's name and the
+  # secret's name are taken from it, and the named value's secretIdentifier is
+  # composed from them and the cloud's Key Vault DNS suffix, so the key itself
+  # appears nowhere. The secret holds the header's whole value, as the header
+  # named by infra.provider_key_header carries it: for a bearer token, Bearer
+  # followed by the key. The named value is referenced in the backend's header
+  # as {{name}}, API Management's own notation.
+  #
+  # The policy removes the caller's subscription key from the request it
+  # forwards, in the header and in the query string, so the model API never
+  # receives the key a caller presents to the gateway.
+  #
+  # Every Component value and infra key is honoured, refused by name, or not
+  # read:
+  #   honoured - values.model; infra.api_management_name, api_path,
+  #     gateway_url (the published address), resource_group_name, backend_url,
+  #     backend_authentication, provider_key_header, subscription_required.
+  #   refused - a Feature that writes a policy element (core/semantic-caching,
+  #     core/period-budget, core/prompt-injection-shield, core/retry-policy):
+  #     no arm FeatureRecipe implements one, so the build halts when the
+  #     Manifest resolves its recipe.
+  #   not read - infra.content_safety_backend_id and
+  #     infra.cache_serves_vector_search, which only the policy elements of
+  #     core/prompt-injection-shield and core/semantic-caching read.
+  artifacts:
+    api-management.yaml: |
+      {{- $f := default dict .features }}
+      {{- $nv := printf "%s-provider-key" .locals.api_name }}
+      {{- $sym := .locals.symbol }}
+      {{- $vault := "" }}
+      {{- $secret := "" }}
+      {{- if hasKey $f "provider_key" }}
+      {{- $id := toString .features.provider_key.provides.name }}
+      {{- if not (regexMatch `(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.KeyVault/vaults/[^/]+/secrets/[^/]+$` $id) }}
+      {{- fail (printf "the provider_key slot of %q is filled by an attachment that publishes no Key Vault secret resource ID, and the gateway's key is read from that secret: bind core/referenced-secret to arm/key-vault-secret in the Manifest" .context.instance_id) }}
+      {{- end }}
+      {{- $parts := splitList "/" $id }}
+      {{- $vault = index $parts 8 }}
+      {{- $secret = index $parts 10 }}
+      {{- end }}
+      resources:
+        {{ $sym }}Instance:
+          existing: true
+          type: Microsoft.ApiManagement/service
+          apiVersion: "2024-05-01"
+          name: "{{ .infra.api_management_name }}"
+          {{- with optional .infra "resource_group_name" "" }}
+          resourceGroup: "{{ . }}"
+          {{- end }}
+      {{- if $vault }}
+        {{ $sym }}NamedValue:
+          type: Microsoft.ApiManagement/service/namedValues
+          apiVersion: "2024-05-01"
+          parent: {{ $sym }}Instance
+          name: "{{ $nv }}"
+          properties:
+            displayName: "{{ $nv }}"
+            secret: true
+            keyVault:
+              secretIdentifier: "[format('https://{0}{1}/secrets/{2}', '{{ $vault }}', environment().suffixes.keyvaultDns, '{{ $secret }}')]"
+      {{- end }}
+        {{ $sym }}Backend:
+          type: Microsoft.ApiManagement/service/backends
+          apiVersion: "2024-05-01"
+          parent: {{ $sym }}Instance
+          name: "{{ .locals.api_name }}-backend"
+      {{- if $vault }}
+          dependsOn:
+            - {{ $sym }}NamedValue
+      {{- end }}
+          properties:
+            protocol: http
+            url: "{{ .infra.backend_url }}"
+      {{- if $vault }}
+            credentials:
+              header:
+                "{{ .infra.provider_key_header }}":
+                  - "{{ printf "{{%s}}" $nv }}"
+      {{- end }}
+        {{ $sym }}Api:
+          type: Microsoft.ApiManagement/service/apis
+          apiVersion: "2024-05-01"
+          parent: {{ $sym }}Instance
+          name: "{{ .locals.api_name }}"
+          properties:
+            displayName: "{{ .locals.api_name }}"
+            path: "{{ .infra.api_path }}"
+            protocols:
+              - https
+            subscriptionRequired: {{ .infra.subscription_required }}
+        {{ $sym }}Operation:
+          type: Microsoft.ApiManagement/service/apis/operations
+          apiVersion: "2024-05-01"
+          parent: {{ $sym }}Api
+          name: chat-completions
+          properties:
+            displayName: Chat completions
+            method: POST
+            urlTemplate: /chat/completions
+        {{ $sym }}Policy:
+          type: Microsoft.ApiManagement/service/apis/policies
+          apiVersion: "2024-05-01"
+          parent: {{ $sym }}Api
+          name: policy
+          dependsOn:
+            - {{ $sym }}Backend
+          properties:
+            format: xml
+            value: |
+              <policies>
+                <inbound>
+                  <base />
+                  <set-backend-service backend-id="{{ .locals.api_name }}-backend" />
+                  <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+                  <set-query-parameter name="subscription-key" exists-action="delete" />
+      {{- if eq .infra.backend_authentication "managed_identity" }}
+                  <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+      {{- end }}
+                </inbound>
+                <backend>
+                  <base />
+                </backend>
+                <outbound>
+                  <base />
+                </outbound>
+                <on-error>
+                  <base />
+                </on-error>
+              </policies>
