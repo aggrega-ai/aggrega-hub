@@ -1911,6 +1911,11 @@ maintained, or calling a registry module.
   and every build vendors exactly those bytes. The tag is written out: a `ref:`
   filled in from a template is pinned in each Release's lockfile rather than in the
   Recipe's own, so a module-sourcing Recipe offers no `source_version` knob.
+- **A module published as an OpenTofu module package is sourced from its registry.**
+  It is sourced with the `terraform-module-oci` source kind, not `git-repository`, at the
+  tag it is published under (or a `sha256:` manifest digest). The pin records the manifest
+  digest and the digest of the package layer as it was published, and every build vendors
+  exactly those bytes. The registry-call rule below applies unchanged.
 - **A registry call is refused because `terraform init` would fetch it outside the
   pin.** A `module` block in the loaded configuration whose `source` is a registry
   address, or any other remote one, names a module Terraform downloads when the
@@ -1955,6 +1960,15 @@ Managed Redis module fails the completeness test instead: it calls no module, bu
 it takes no persistence or access-key setting and leaves out eviction policies the
 service offers, so `recipe/terraform/redis-azure-managed` writes its body rather
 than refusing values the service can honour.
+
+#### A published Bicep module
+
+A Bicep module is published to an OCI registry as its compiled ARM template. A Recipe for the
+`arm` capability that wraps one sources that published form with the `bicep-module-oci`
+source kind, naming the module by its registry path and the version as the registry records
+it. The Recipe binds `enableTelemetry: false` in its `valuesMapping:`, as every Recipe that
+wraps an Azure Verified Module does. Which form the cloud catalog prefers, the published
+module or its git repository, is left to that catalog's own entries.
 
 #### A CloudFormation template
 
