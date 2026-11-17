@@ -1968,8 +1968,8 @@ than refusing values the service can honour.
 A Bicep module is published to an OCI registry as its compiled ARM template. A Recipe for the
 `arm` capability that wraps one sources that published form with the `bicep-module-oci`
 source kind, naming the module by its registry path and the version as the registry records
-it. The Recipe binds `enableTelemetry: false` in its `valuesMapping:`, as every Recipe that
-wraps an Azure Verified Module does. Which form the cloud catalog prefers, the published
+it. The Recipe binds `enableTelemetry: false` in its `valuesMapping:`, when the module
+declares that parameter, as Azure Verified Modules do. Which form the cloud catalog prefers, the published
 module or its git repository, is left to that catalog's own entries.
 
 #### A CloudFormation template
