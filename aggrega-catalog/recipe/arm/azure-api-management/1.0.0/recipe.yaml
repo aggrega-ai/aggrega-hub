@@ -15,7 +15,9 @@ metadata:
     it deploys Terraform, and for the helm or compose reference where the API
     is configured outside the Release. It creates no instance: the template
     declares the instance as an existing resource, which ARM reads and never
-    deploys, so a Release without one creates it outside first.
+    deploys, so a Release without one creates it outside first. The API goes
+    into the instance's resource group, the one the template deploys to, so
+    the boundary deploys into that group.
 
     The policy sends each request to the backend, removes the caller's
     subscription key from what it forwards, and authenticates as
@@ -67,6 +69,13 @@ spec:
       {{- if not (optional .infra "backend_authentication" "") -}}
       {{- fail (printf "%q sets no infra.backend_authentication, but the arm realization of core/gateway/azure-api-management has to know how the gateway authenticates to the model API at %s: managed_identity for Azure OpenAI or another Microsoft Foundry model the instance's identity holds a role on, provider_key with the provider_key slot attached, or none for a model API taking no credential; set it in the Release" .metadata.instance_id (optional .infra "backend_url" "infra.backend_url")) -}}
       {{- end -}}
+    # The template's resources deploy into the resource group the template is
+    # deployed to, and the API belongs in the instance's own, so a different
+    # group would need a template deployed there.
+    resource_group_name_unsupported: >-
+      {{- if optional .infra "resource_group_name" "" -}}
+      {{- fail (printf "%q sets infra.resource_group_name, but the arm realization of core/gateway/azure-api-management writes the API into the instance's resource group, the one the template deploys to, and a template cannot place a resource in another group; remove infra.resource_group_name and deploy this boundary's template into the resource group of the API Management instance %s, or use terraform/azure-api-management, which reads the instance in the resource group infra.resource_group_name names" .metadata.instance_id .infra.api_management_name) -}}
+      {{- end -}}
     provider_key_follows_the_authentication: >-
       {{- $attached := hasKey (default dict .features) "provider_key" -}}
       {{- $mode := optional .infra "backend_authentication" "" -}}
@@ -77,12 +86,19 @@ spec:
       {{- end -}}
 
   # The fragment declares the instance existing, so ARM reads it and deploys
-  # nothing for it, and the four child resources hang off it by parent. The
-  # instance is in infra.resource_group_name when the Release sets it and in
-  # the resource group the template is deployed to otherwise.
+  # nothing for it, and the child resources are declared outside it: each
+  # takes its full type and a name with one segment per type level, as a
+  # format() over the instance's name, the API's name and its own, and depends
+  # on the resource above it that the template deploys, as Bicep writes a child
+  # with a parent. The instance is in the resource group the template is
+  # deployed to; resource_group_name_unsupported refuses any other.
   #
   # Every resource is written at Microsoft.ApiManagement's 2024-05-01 API
   # version.
+  #
+  # The slot is read through .features, here and in the assertion above: an
+  # artifact is no valuesMapping, so no sensitive-mapping rule applies to it,
+  # and presence is all the assertion asks.
   #
   # provider_key arrives as the Key Vault secret's resource ID the attachment
   # publishes, read by its exact leaf, provides.name. The vault's name and the
@@ -100,8 +116,9 @@ spec:
   # Every Component value and infra key is honoured, refused by name, or not
   # read:
   #   honoured - values.model; infra.api_management_name, api_path,
-  #     gateway_url (the published address), resource_group_name, backend_url,
+  #     gateway_url (the published address), backend_url,
   #     backend_authentication, provider_key_header, subscription_required.
+  #   refused - infra.resource_group_name (resource_group_name_unsupported).
   #   refused - a Feature that writes a policy element (core/semantic-caching,
   #     core/period-budget, core/prompt-injection-shield, core/retry-policy):
   #     no arm FeatureRecipe implements one, so the build halts when the
@@ -131,15 +148,11 @@ spec:
           type: Microsoft.ApiManagement/service
           apiVersion: "2024-05-01"
           name: "{{ .infra.api_management_name }}"
-          {{- with optional .infra "resource_group_name" "" }}
-          resourceGroup: "{{ . }}"
-          {{- end }}
       {{- if $vault }}
         {{ $sym }}NamedValue:
           type: Microsoft.ApiManagement/service/namedValues
           apiVersion: "2024-05-01"
-          parent: {{ $sym }}Instance
-          name: "{{ $nv }}"
+          name: "[format('{0}/{1}', '{{ .infra.api_management_name }}', '{{ $nv }}')]"
           properties:
             displayName: "{{ $nv }}"
             secret: true
@@ -149,8 +162,7 @@ spec:
         {{ $sym }}Backend:
           type: Microsoft.ApiManagement/service/backends
           apiVersion: "2024-05-01"
-          parent: {{ $sym }}Instance
-          name: "{{ .locals.api_name }}-backend"
+          name: "[format('{0}/{1}', '{{ .infra.api_management_name }}', '{{ .locals.api_name }}-backend')]"
       {{- if $vault }}
           dependsOn:
             - {{ $sym }}NamedValue
@@ -167,8 +179,7 @@ spec:
         {{ $sym }}Api:
           type: Microsoft.ApiManagement/service/apis
           apiVersion: "2024-05-01"
-          parent: {{ $sym }}Instance
-          name: "{{ .locals.api_name }}"
+          name: "[format('{0}/{1}', '{{ .infra.api_management_name }}', '{{ .locals.api_name }}')]"
           properties:
             displayName: "{{ .locals.api_name }}"
             path: "{{ .infra.api_path }}"
@@ -178,8 +189,9 @@ spec:
         {{ $sym }}Operation:
           type: Microsoft.ApiManagement/service/apis/operations
           apiVersion: "2024-05-01"
-          parent: {{ $sym }}Api
-          name: chat-completions
+          name: "[format('{0}/{1}/{2}', '{{ .infra.api_management_name }}', '{{ .locals.api_name }}', 'chat-completions')]"
+          dependsOn:
+            - {{ $sym }}Api
           properties:
             displayName: Chat completions
             method: POST
@@ -187,9 +199,9 @@ spec:
         {{ $sym }}Policy:
           type: Microsoft.ApiManagement/service/apis/policies
           apiVersion: "2024-05-01"
-          parent: {{ $sym }}Api
-          name: policy
+          name: "[format('{0}/{1}/{2}', '{{ .infra.api_management_name }}', '{{ .locals.api_name }}', 'policy')]"
           dependsOn:
+            - {{ $sym }}Api
             - {{ $sym }}Backend
           properties:
             format: xml
