@@ -1,0 +1,322 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: redis-azure-managed
+  version: 1.0.0
+  # The licence of the vendored module, the Azure Verified Modules programme's
+  # Redis Enterprise cache module: the third-party template this Recipe pins and
+  # wraps in the output. The Azure Managed Redis instance it provisions is a
+  # service the reader contracts for directly with Microsoft, under Azure's
+  # terms.
+  license: MIT
+  description: >
+    Redis on Azure Managed Redis, Microsoft's service running Redis Enterprise,
+    offered under Microsoft's terms of service: one instance with its one
+    database, deployed from an Azure Resource Manager template through
+    Microsoft's Azure Verified Modules module avm/res/cache/redis-enterprise
+    at 0.5.2, MIT, fetched from its git repository at that tag; entity.lock
+    pins the tag's commit and archive digest. Its database takes a persistence
+    setting, an access-key setting and all eight eviction policies, so the
+    Recipe wraps it rather than writing the body. The module deploys a telemetry resource by default, reporting to
+    Microsoft; this Recipe turns it off.
+
+    Reach for it where the Release deploys an Azure Resource Manager template
+    and the cache is an Azure Managed Redis instance in the operator's
+    subscription; reach for terraform/redis-azure-managed where it deploys
+    Terraform.
+
+    The instance goes in the resource group the template is deployed to; the
+    Release may name the region in infra.overrides, and the SKU sizes the cache.
+    The service serves port 10000 and authenticates every client, with
+    Microsoft Entra ID or with an access key it generates once access keys are
+    turned on; it takes no password, so an attached one halts. It runs the
+    Redis version it chooses, so infra.engine_version is not read, and
+    vector_search is empty.
+
+    host publishes an expression for the instance's host name, or
+    infra.overrides.host; port is 10000. With infra.client_tls the service
+    serves TLS alone and protocol is redis-tls; off, it serves plaintext, which
+    needs access keys. maxmemory, databases, another port, infra.overrides.image
+    and a server certificate halt naming the key; compute and storage are not
+    read.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: arm
+  implements: core/datastore/redis:1.0.0
+
+  # The module's directory at the tag its registry publishes as version 0.5.2.
+  # `aggrega pin` resolves the git tag to its commit and records that commit
+  # and the archive's digest in entity.lock, and every build vendors exactly
+  # those bytes. module_subdir names the module's directory in a repository
+  # that holds every Azure Verified Modules module; the provider reads its
+  # main.json, the compiled template the module commits, and wraps it as one
+  # nested deployment.
+  source:
+    kind: git-repository
+    url: https://github.com/Azure/bicep-registry-modules.git
+    ref: avm/res/cache/redis-enterprise/0.5.2
+    module_subdir: avm/res/cache/redis-enterprise
+
+  locals:
+    # The SKU, infra.overrides.sku_name or Balanced_B0, the smallest size of the
+    # Balanced tier.
+    sku: '{{ optional (optional .infra "overrides" dict) "sku_name" "Balanced_B0" }}'
+    # Whether high availability is on: infra.overrides.high_availability_enabled
+    # where it is a boolean, otherwise the module's default, true. Another
+    # value is refused below.
+    ha: '{{ $h := optional (optional .infra "overrides" dict) "high_availability_enabled" true }}{{ if kindIs "bool" $h }}{{ $h }}{{ else }}true{{ end }}'
+    # Whether access keys authenticate clients:
+    # infra.overrides.default_database_access_keys_authentication_enabled where
+    # it is a boolean, otherwise the service's default, false.
+    access_keys: '{{ $k := optional (optional .infra "overrides" dict) "default_database_access_keys_authentication_enabled" false }}{{ if kindIs "bool" $k }}{{ $k }}{{ else }}false{{ end }}'
+    # The module's name for values.maxmemory_policy, or empty while it is unset
+    # or names a policy the service does not offer, which the assertion below
+    # refuses. The module's evictionPolicy parameter takes all eight.
+    eviction: '{{ with optional .values "maxmemory_policy" "" }}{{ get (dict "noeviction" "NoEviction" "allkeys-lru" "AllKeysLRU" "allkeys-lfu" "AllKeysLFU" "allkeys-random" "AllKeysRandom" "volatile-lru" "VolatileLRU" "volatile-lfu" "VolatileLFU" "volatile-random" "VolatileRandom" "volatile-ttl" "VolatileTTL") (toString .) }}{{ end }}'
+    # The name the Release gives the cache under infra.overrides.host, or empty
+    # while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   location                  - string (location; the module's default is the resource group's)
+  #   sku_name                  - string (skuName; default "Balanced_B0")
+  #   high_availability_enabled - bool (highAvailability; the module's default is Enabled)
+  #   public_network_access     - string, Enabled or Disabled (publicNetworkAccess; the service's default stands)
+  #   default_database_access_keys_authentication_enabled
+  #                             - bool (database.accessKeysAuthentication)
+  #   tags                      - map[string]string (tags)
+  #   host                      - string (published as provides.host; not passed to the module)
+  #   image                     - refused: no container image runs on this target
+  # resource_group_name and enable_telemetry are not read: the template deploys
+  # into the resource group the template is deployed to, and telemetry is always
+  # off. infra.overrides.enable_telemetry: true halts by name rather than being
+  # ignored.
+  #
+  # Each is named as the terraform Recipe for the same service names it, so a
+  # Release moves between the two with the same keys. sku_name is the tier and
+  # size: Balanced_B, MemoryOptimized_M, ComputeOptimized_X or FlashOptimized_A
+  # followed by one of the sizes the module's skuName parameter lists. The
+  # module also lists the Enterprise and EnterpriseFlash SKUs, which are the
+  # service's older tiers and size a cache by a capacity this Recipe does not
+  # pass; they halt by name. high_availability_enabled false runs the instance
+  # without replication, which the service offers for development and testing.
+  #
+  # public_network_access Disabled turns off access from every network; this
+  # Recipe creates no private endpoint, so an instance without public access is
+  # reached only through one the operator creates, whose clients connect to the
+  # instance's own host name on port 10000.
+  #
+  # default_database_access_keys_authentication_enabled true turns on the two
+  # access keys the service generates for the database. The module returns them
+  # as secure outputs of the nested deployment; this Recipe publishes none and
+  # the template carries none, so a consumer's credential is a key read from
+  # the instance once it exists, attached on the consumer's connection. With it
+  # off every client authenticates with a Microsoft Entra ID token for an
+  # identity granted access to the database outside this Release, which the
+  # service accepts over TLS alone.
+  #
+  # The database's clustering policy is EnterpriseCluster: the service answers
+  # every client on one endpoint, as a cache that is not clustered does, which
+  # is what the Component's one published host and port describe. The module's
+  # own default stands for the rest, including a minimum TLS version of 1.2 and
+  # a Microsoft-managed encryption key.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation:
+  #   honoured — values.maxmemory_policy, as the database's evictionPolicy,
+  #     each of the eight Redis policies under the service's name for it;
+  #     values.appendonly, as AOF persistence, which the service writes once per
+  #     second to a managed disk it keeps; values.persistence.enabled, as that
+  #     AOF persistence with appendonly and otherwise as an RDB snapshot every
+  #     hour, the most frequent the service offers; infra.client_tls, as the
+  #     database's TLS-only clientProtocol; and the overrides above.
+  #   refused — values.maxmemory (the SKU fixes the memory, and the service
+  #     takes no such setting); values.databases (the service takes no such
+  #     setting); a maxmemory_policy the service does not offer; either kind of
+  #     persistence with high_availability_enabled false, since the service
+  #     persists only with high availability on; infra.port other than the
+  #     Component's default; infra.client_tls false while access keys are off;
+  #     infra.overrides.image; and an attachment to password or to
+  #     server_certificate.
+  #   not read — infra.port while it is the Component's default, since the
+  #     service serves port 10000; infra.engine_version, since the service runs
+  #     the Redis version it chooses and moves an instance to a new version
+  #     itself, and a Recipe cannot tell the Component's default from a value
+  #     the Release wrote; infra.compute.cpu, infra.compute.memory,
+  #     infra.storage.size and infra.storage.type, whose Component defaults size
+  #     a container and its volume, while the SKU sizes the instance and the
+  #     service provisions no volume; and infra.image_serves_vector_search,
+  #     which speaks of an image no build on this target runs.
+  #
+  # The service presents its own certificate to TLS clients, so a certificate
+  # attached to server_certificate halts. It generates the database's access
+  # keys itself and authenticates with them or with Microsoft Entra ID tokens,
+  # never with a password a Release supplies, so a password attached to the
+  # password slot halts: the slot has nothing to carry here. Left unattached,
+  # the cache still authenticates every client, as set out above, rather than
+  # running without authentication as the Component's self-hosted realizations
+  # do.
+  assertions:
+    # The instance is named after the component, and its name is the first
+    # label of the host name the service gives it, so the rule the service
+    # checks it against is checked here, where the name is known: 1 to 60
+    # letters and digits in groups separated by single hyphens.
+    instance_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (and (le (len $n) 60) (regexMatch `^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$` $n)) -}}
+      {{- fail (printf "the component %q names its Azure Managed Redis instance, and an instance name holds up to 60 letters, digits and hyphens, beginning and ending with a letter or a digit, with no two hyphens together: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+    # A number written as public_network_access, 0 included, is refused like any
+    # other: an assertion reads a 0 as empty, so the key's presence is tested.
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if eq (toString (optional $o "enable_telemetry" "")) "true" -}}
+      {{- fail "infra.overrides.enable_telemetry is true, and this Recipe turns the module's telemetry off in every template it writes: remove infra.overrides.enable_telemetry from the Release" -}}
+      {{- end -}}
+      {{- if not (has (toString .locals.sku) (list "Balanced_B0" "Balanced_B1" "Balanced_B3" "Balanced_B5" "Balanced_B10" "Balanced_B20" "Balanced_B50" "Balanced_B100" "Balanced_B150" "Balanced_B250" "Balanced_B350" "Balanced_B500" "Balanced_B700" "Balanced_B1000" "ComputeOptimized_X3" "ComputeOptimized_X5" "ComputeOptimized_X10" "ComputeOptimized_X20" "ComputeOptimized_X50" "ComputeOptimized_X100" "ComputeOptimized_X150" "ComputeOptimized_X250" "ComputeOptimized_X350" "ComputeOptimized_X500" "ComputeOptimized_X700" "FlashOptimized_A250" "FlashOptimized_A500" "FlashOptimized_A700" "FlashOptimized_A1000" "FlashOptimized_A1500" "FlashOptimized_A2000" "FlashOptimized_A4500" "MemoryOptimized_M10" "MemoryOptimized_M20" "MemoryOptimized_M50" "MemoryOptimized_M100" "MemoryOptimized_M150" "MemoryOptimized_M250" "MemoryOptimized_M350" "MemoryOptimized_M500" "MemoryOptimized_M700" "MemoryOptimized_M1000" "MemoryOptimized_M1500" "MemoryOptimized_M2000")) -}}
+      {{- fail (printf "infra.overrides.sku_name is %s, and an Azure Managed Redis SKU is its tier and size, Balanced_B, MemoryOptimized_M, ComputeOptimized_X or FlashOptimized_A followed by a size the module lists, such as Balanced_B5; the older Enterprise and EnterpriseFlash SKUs are not passed: set it to one, or remove it for Balanced_B0" (toJson .locals.sku)) -}}
+      {{- end -}}
+      {{- range $k := list "high_availability_enabled" "default_database_access_keys_authentication_enabled" -}}
+      {{- $b := optional $o $k "" -}}
+      {{- if not (or (kindIs "bool" $b) (eq (toString $b) "")) -}}
+      {{- fail (printf "infra.overrides.%s is %s, and it is passed to the instance as a boolean: set it to true or false, unquoted, or remove it for the default" $k (toJson $b)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $pna := optional $o "public_network_access" "" -}}
+      {{- if or $pna (and (hasKey $o "public_network_access") (has (kindOf $pna) (list "int64" "float64"))) -}}
+      {{- if not (has $pna (list "Enabled" "Disabled")) -}}
+      {{- fail (printf "infra.overrides.public_network_access is %s, and the instance takes Enabled or Disabled: set it to Disabled to turn off access from every network, or remove it for the service's default" (toJson $pna)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $t := optional $o "tags" "" -}}
+      {{- if not (eq (toString $t) "") -}}
+      {{- if not (kindIs "map" $t) -}}
+      {{- fail (printf "infra.overrides.tags is %s, and the instance takes its tags as a map of names to strings: write it as {<name>: <value>}" (toJson $t)) -}}
+      {{- end -}}
+      {{- range $k, $v := $t -}}
+      {{- if not (typeIs "string" $v) -}}
+      {{- fail (printf "infra.overrides.tags.%s is %s, and a tag's value is a string: quote it in the Release" $k (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this cache reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the service serves port 10000` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    port_is_the_service_port: >-
+      {{- if ne (int .infra.port) 6379 -}}
+      {{- fail (printf "infra.port is %v, and Azure Managed Redis serves its clients on port 10000 alone, which this Recipe publishes as port; it takes no other: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+    # A number written as the image, 0 included, is refused like any other
+    # value: an assertion reads a 0 as empty, so the key's presence is tested.
+    no_image_runs: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $image := optional $o "image" "" -}}
+      {{- if or $image (and (hasKey $o "image") (has (kindOf $image) (list "int64" "float64"))) -}}
+      {{- fail (printf "infra.overrides.image is %q, and Azure Managed Redis runs Redis Enterprise itself, so no container image runs on this target: remove infra.overrides.image from the Release, or map this component to redis on helm or compose, which run the image it names" (toString $image)) -}}
+      {{- end -}}
+    values_the_service_cannot_apply: >-
+      {{- with optional .values "maxmemory" "" -}}
+      {{- fail (printf "values.maxmemory is %q, and Azure Managed Redis fixes the memory a cache may use by its SKU and takes no maxmemory setting: remove values.maxmemory from the Aggregate and size the cache with infra.overrides.sku_name in the Release" (toString .)) -}}
+      {{- end -}}
+      {{- with optional .values "databases" "" -}}
+      {{- fail (printf "values.databases is %v, and Azure Managed Redis takes no setting for the number of logical databases: remove values.databases from the Aggregate, or map this component to redis on helm or compose, which set it" .) -}}
+      {{- end -}}
+      {{- with optional .values "maxmemory_policy" "" -}}
+      {{- if not $.locals.eviction -}}
+      {{- fail (printf "values.maxmemory_policy is %q, and Azure Managed Redis offers noeviction, allkeys-lru, allkeys-lfu, allkeys-random, volatile-lru, volatile-lfu, volatile-random and volatile-ttl: set values.maxmemory_policy to one of them, or remove it for the service's default, volatile-lru" (toString .)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if and (or .values.appendonly .values.persistence.enabled) (eq .locals.ha "false") -}}
+      {{- fail "values.appendonly or values.persistence.enabled asks for persistence, and Azure Managed Redis persists a cache only with high availability on, but infra.overrides.high_availability_enabled is false: remove it from the Release, or remove the persistence values from the Aggregate" -}}
+      {{- end -}}
+    tls_and_credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "server_certificate" -}}
+      {{- fail "a certificate is attached to the server_certificate slot, and Azure Managed Redis presents its own certificate to clients: remove the attachment; infra.client_tls alone keeps the service's TLS-only connections here" -}}
+      {{- end -}}
+      {{- if hasKey $f "password" -}}
+      {{- fail "a credential is attached to the password slot, and Azure Managed Redis takes no password a Release supplies: it authenticates clients with Microsoft Entra ID tokens, or with access keys it generates itself while infra.overrides.default_database_access_keys_authentication_enabled is true: remove the attachment" -}}
+      {{- end -}}
+      {{- if and (not .infra.client_tls) (eq .locals.access_keys "false") -}}
+      {{- fail "infra.client_tls is false, which serves plaintext, and Azure Managed Redis then authenticates clients with access keys alone, since it accepts Microsoft Entra ID tokens over TLS only, but access keys are off: set infra.client_tls to true, or set infra.overrides.default_database_access_keys_authentication_enabled to true in the Release" -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. host reads
+  # the nested deployment this component becomes, whose symbolic name is the
+  # instance id folded into words, and names the module's hostName output, the
+  # instance's name under <region>.redis.azure.net; Azure Resource Manager
+  # evaluates the expression when the template deploys, so it resolves for a
+  # consumer in the same template and as text on another target.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the expression. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record for it, so the operator points the name at the instance outside
+  # the Release.
+  #
+  # port is 10000, the port the service serves TLS and plaintext clients on
+  # alike, so it is known ahead of time. protocol is redis-tls while
+  # infra.client_tls is on, when the port accepts TLS alone, and redis while it
+  # is off. vector_search is empty: the service serves the Redis query engine
+  # only from the RediSearch module, enabled when an instance is created, and
+  # this Recipe creates the instance with no module, so a gateway wired to this
+  # instance on its cache_store socket halts the build.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}[reference('{{ capitalizedWords .context.instance_id }}').outputs.hostName.value]{{ end }}"
+    port: "10000"
+    protocol: "{{ if .infra.client_tls }}redis-tls{{ else }}redis{{ end }}"
+    vector_search: ""
+
+  # Each key binds the module parameter of the same name, case aside. The
+  # database is the module's one database; its persistence is the module's
+  # discriminated object, written only where the Aggregate asks for it, so the
+  # service's default, none, stands otherwise. The mapping reads no attachment.
+  valuesMapping: |
+    {{- $o := .infra.overrides }}
+    name: "{{ .context.instance_id }}"
+    {{- with optional $o "location" "" }}
+    location: "{{ . }}"
+    {{- end }}
+    skuName: "{{ .locals.sku }}"
+    {{- if eq .locals.ha "false" }}
+    highAvailability: Disabled
+    {{- else }}
+    highAvailability: Enabled
+    {{- end }}
+    {{- with optional $o "public_network_access" "" }}
+    publicNetworkAccess: "{{ . }}"
+    {{- end }}
+    {{- with optional $o "tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}
+    database:
+      clientProtocol: {{ if .infra.client_tls }}Encrypted{{ else }}Plaintext{{ end }}
+      clusteringPolicy: EnterpriseCluster
+      {{- if kindIs "bool" (optional $o "default_database_access_keys_authentication_enabled" "") }}
+      accessKeysAuthentication: {{ if eq .locals.access_keys "true" }}Enabled{{ else }}Disabled{{ end }}
+      {{- end }}
+      {{- with .locals.eviction }}
+      evictionPolicy: "{{ . }}"
+      {{- end }}
+      {{- if .values.appendonly }}
+      persistence:
+        type: aof
+        frequency: 1s
+      {{- else if .values.persistence.enabled }}
+      persistence:
+        type: rdb
+        frequency: 1h
+      {{- end }}
+    enableTelemetry: false
