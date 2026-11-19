@@ -91,14 +91,16 @@ on:
 # short-lived identity token from the Actions runtime and signs against public
 # Sigstore (Fulcio + Rekor); no offline key is stored. The catalog publishes to
 # the public hub, so recording references in the public transparency log is
-# expected, not a leak. id-token:write lets the job mint the OIDC token. The git
-# writes this workflow makes are two, both to its own repository and both with
-# the job's own token: recording what it published on the published branch, and
-# advancing the publish marker tag (the final two steps); nothing else here writes
-# to the repository, hence contents:write.
+# expected, not a leak. Only the publish-sign job asks for more than reading the
+# repository: id-token:write lets it mint the OIDC token, and contents:write lets
+# it make the two git writes this workflow makes, both to its own repository and
+# both with the job's own token: recording what it published on the published
+# branch, and advancing the publish marker tag (the final two steps). Its checkout
+# does not keep that token; each of the two steps is handed it, and git reads it
+# from the environment, so nothing else in the job finds it on disk. Nothing else
+# here writes to the repository.
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 env:
   # Destination registry host. A repository variable the operator sets once;
@@ -121,6 +123,8 @@ jobs:
     steps:
       - name: Check out the catalog
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Refuse a Component version no Recipe realizes
         run: scripts/check-component-recipes.sh
@@ -155,6 +159,8 @@ jobs:
         # The gate script under .github/scripts is all this job reads from the
         # repository.
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Check the stored registry credential
         # One GET /v2/ with the stored credential; anything but 200 fails,
@@ -197,6 +203,9 @@ jobs:
     # catalog diff; point the AGGREGA_RUNNER repository variable at a
     # self-hosted label to move heavy work off metered hosted minutes.
     runs-on: ${{ vars.AGGREGA_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: write
+      id-token: write
 
     # 🔴 NAME THE SHELL RATHER THAN LETTING IT BE CHOSEN. Every `run:` below opens
     # with `set -euo pipefail`, and `pipefail` is a bash option that dash rejects
@@ -238,7 +247,7 @@ jobs:
     # The registry is authenticated even on pull, so the image is pulled with the
     # same registry credentials used to push.
     container:
-      image: ${{ needs.registry.outputs.image }}
+      image: ${{ needs.registry.outputs.image }} # zizmor: ignore[unpinned-images] the tooling image this release publishes, at its exact version, which the registry job waits for before this job starts
       credentials:
         username: ${{ vars.REGISTRY_USERNAME }}
         password: ${{ secrets.REGISTRY_PASSWORD }}
@@ -272,6 +281,7 @@ jobs:
           # marker tag and the history between it and HEAD must be present.
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Trust the checked-out tree
         # 🔴 git REFUSES a repository whose directory is owned by another user —
@@ -402,8 +412,19 @@ jobs:
           GIT_COMMITTER_NAME: github-actions[bot]
           GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
           PUBLISHED_FROM: ${{ github.sha }}
+          GIT_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          probe="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=catalogpublish.probe GIT_CONFIG_VALUE_0=read git config --get catalogpublish.probe || true)"
+          if [ "$probe" != read ]; then
+            echo "this image's $(git --version) does not read configuration from GIT_CONFIG_COUNT, which is how the token reaches git without being written to disk; git 2.31 or later does" >&2
+            exit 1
+          fi
+          auth="$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
           scripts/record-published.sh --rows "$RUNNER_TEMP/published-rows.tsv" \
             --message "chore(catalog): record the catalog versions published from ${PUBLISHED_FROM:0:12}"
 
@@ -418,5 +439,17 @@ jobs:
         if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
         env:
           MARKER: catalog-published
+          GIT_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          probe="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=catalogpublish.probe GIT_CONFIG_VALUE_0=read git config --get catalogpublish.probe || true)"
+          if [ "$probe" != read ]; then
+            echo "this image's $(git --version) does not read configuration from GIT_CONFIG_COUNT, which is how the token reaches git without being written to disk; git 2.31 or later does" >&2
+            exit 1
+          fi
+          auth="$(printf 'x-access-token:%s' "$GIT_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
           git push origin "+refs/tags/${MARKER}"
