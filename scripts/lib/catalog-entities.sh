@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # scripts/lib/catalog-entities.sh — which catalog files are publishable entities,
-# read the one way every script in this repository reads it. Sourced by
-# scripts/publish-diff.sh and scripts/published-version-guard.sh; it defines
+# and which version directory a catalog file lies under, read the one way every
+# script in this repository reads them. Sourced by scripts/publish-diff.sh,
+# scripts/published-version-guard.sh and scripts/vendor-validate.sh; it defines
 # functions and variables and runs nothing.
 #
 # A caller sets AGGREGA (the binary it publishes or judges with) before calling
@@ -104,4 +105,29 @@ is_publishable() {
 # standard input when FILE is "-", or nothing.
 peek_kind() {
   awk -F':[[:space:]]*' '/^kind:[[:space:]]/{print $2; exit}' "$1" | tr -d '\r'
+}
+
+# --- The version directory a catalog file lies under ---------------------------
+# The catalog's directory, relative to the repository's top.
+CATALOG_ROOT="aggrega-catalog"
+
+# version_dir PATH — prints the version directory PATH lies under: the first
+# directory below aggrega-catalog/<kind>/ whose name is a version. Returns 1 when
+# PATH lies under none.
+version_dir() {
+  local rest="${1#"$CATALOG_ROOT"/}" dir="$CATALOG_ROOT" seg
+  local -a segs=()
+  IFS=/ read -r -a segs <<<"$rest"
+  # The last segment is the file itself and the first is the kind; a version
+  # directory is one of the directories between them.
+  [ "${#segs[@]}" -ge 3 ] || return 1
+  dir="$dir/${segs[0]}"
+  for seg in "${segs[@]:1:${#segs[@]}-2}"; do
+    dir="$dir/$seg"
+    if [[ $seg =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  return 1
 }

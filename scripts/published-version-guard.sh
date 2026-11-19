@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR disable=SC1091
 # scripts/published-version-guard.sh — hold every published version of a catalog
 # entity to the digest the registry holds for it, and every path the publish
 # workflows own to what they published.
@@ -237,7 +238,6 @@ cd "$TOP" || exit 2
 export GIT_OPTIONAL_LOCKS=0
 REMOTE="${PUBLISHED_REMOTE:-$(published_remote .)}"
 PUB="refs/remotes/$REMOTE/$PUBLISHED_BRANCH"
-CATALOG_ROOT="aggrega-catalog"
 # A registry name that resolves nowhere: the dry run composes the reference under
 # it and contacts nothing, and the guard compares what follows it.
 GUARD_REGISTRY="guard.invalid"
@@ -285,26 +285,8 @@ if [ "$MODE" = staged ] && [ "$HAVE_PUB" = 1 ]; then
 fi
 
 # --- a released version directory changed ---------------------------------------
-# version_dir PATH — prints the version directory PATH lies under: the first
-# directory below aggrega-catalog/<kind>/ whose name is a version. Returns 1 when
-# PATH lies under none.
-version_dir() {
-  local rest="${1#"$CATALOG_ROOT"/}" dir="$CATALOG_ROOT" seg
-  local -a segs=()
-  IFS=/ read -r -a segs <<<"$rest"
-  # The last segment is the file itself and the first is the kind; a version
-  # directory is one of the directories between them.
-  [ "${#segs[@]}" -ge 3 ] || return 1
-  dir="$dir/${segs[0]}"
-  for seg in "${segs[@]:1:${#segs[@]}-2}"; do
-    dir="$dir/$seg"
-    if [[ $seg =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
-      printf '%s\n' "$dir"
-      return 0
-    fi
-  done
-  return 1
-}
+# A staged path's version directory is read by version_dir
+# (scripts/lib/catalog-entities.sh).
 
 # synced PATH — whether PATH lies under an owned path this commit stages exactly as
 # the published branch holds it.
