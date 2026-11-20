@@ -1,0 +1,376 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: ArtifactLibrary
+metadata:
+  name: EcsFargateModule
+  version: 1.0.0
+  description: >
+    The Terraform bodies every Amazon ECS Recipe runs its container in on
+    Fargate, held once: Service, an ECS service keeping a count of tasks of
+    its task definition running; and Task, a task definition with, when a
+    schedule is given, the EventBridge Scheduler schedule that starts a run
+    of it. A Recipe imports one beside its fixed pass-through module,
+    `artifacts: { service: { $import: EcsFargateModule#/artifacts/Service }
+    }`, and renders the body's one input, config, with the matching
+    EcsFargateArguments entry.
+
+    Each body declares a task definition and its service or its schedule,
+    and nothing else. No cluster, IAM role, VPC, subnet, security group, log
+    group or load balancer is emitted: each belongs to the operator, who
+    names it under infra.overrides. The Recipe reads the body's outputs as
+    module.<instance>.service.<output>.
+spec:
+  artifacts:
+    # The bundles. Each is one file, main.tf, which lands in the importing
+    # component's module directory as service/main.tf, the child module the
+    # fixed pass-through calls with its config input and hands back as its
+    # service output; a Recipe therefore reads an output below as
+    # module.<instance>.service.<output>. The files are static HCL: no
+    # template action runs in them, so every component importing a bundle
+    # gets the same bytes, and everything that differs between components
+    # arrives in config, which the EcsFargateArguments entry of the same name
+    # renders and checks.
+    #
+    # config. One object, typed in each body: the names are those of the
+    # arguments it sets, except subnet_ids and security_groups, which set the
+    # task's network configuration, port, the main container's port,
+    # environment, its variables, and awslogs_group, the log group its output
+    # is written to. A key a component does not need is left out of config
+    # and reads as null, so nothing is emitted for it.
+    #
+    # The container. One essential container, main, runs the image with one
+    # variable per key of environment, in the key order Terraform iterates a
+    # map in, and, where config carries port, maps that port. No health check
+    # is declared: Amazon ECS runs a container health check as a command
+    # inside the container, and an image a body does not name may hold no
+    # tool to run one. Where config names awslogs_group, the container's
+    # output is written to that log group with the awslogs log driver, in the
+    # Region the provider configuration deploys into, under the stream prefix
+    # of the component's name; the log group is the operator's, in that
+    # Region, and the execution role must be allowed to write to it. The task
+    # definition names no runtime platform, so Fargate runs the image as
+    # linux/amd64.
+    #
+    # Files. A body writes no file into the container: the storage a Fargate
+    # task mounts is an Amazon EBS or Amazon EFS volume or a bind mount, as
+    # the Amazon ECS developer guide's "Amazon ECS task definition differences
+    # for Fargate" lists under "Task storage", and none of them is filled by
+    # the task definition. EcsFargateArguments refuses a file entry by name.
+    #
+    # The size. cpu and memory are the task's, in CPU units and MiB, a pair
+    # from Fargate's task-size table, chosen where config is rendered.
+    #
+    # The required_providers block in each file pins hashicorp/aws by the
+    # constraint the catalog conventions' "One AWS provider constraint for
+    # every AWS body" section states, and repeats it because a body is copied
+    # whole into each component's module and imports nothing.
+
+    # An Amazon ECS service on Fargate keeping desired_count tasks of its task
+    # definition running, registering each task's port with the operator's
+    # load balancer target group where config names one. Its outputs are name
+    # and id, the service's ARN.
+    Service:
+      main.tf: |
+        # required_providers pins hashicorp/aws so the engine installs a provider whose
+        # resource schema this module was written against. It is a range rather than an
+        # exact version because every AWS module in one root configuration shares one
+        # installed provider, and two exact pins that differ fail init. The constraint
+        # string is the one the Aggrega catalog conventions' "One AWS provider
+        # constraint for every AWS body" section states; this file repeats it
+        # deliberately, because a vendored module is copied byte for byte and imports
+        # nothing.
+        terraform {
+          required_providers {
+            aws = {
+              source  = "hashicorp/aws"
+              version = "~> 6.69"
+            }
+          }
+        }
+
+        # Everything that differs between components, rendered and checked by
+        # EcsFargateArguments#/mappings/ServiceArguments. A key left out reads as null.
+        variable "config" {
+          type = object({
+            name               = string
+            image              = string
+            port               = optional(number)
+            cpu                = string
+            memory             = string
+            desired_count      = number
+            environment        = map(string)
+            cluster            = string
+            subnet_ids         = list(string)
+            security_groups    = list(string)
+            assign_public_ip   = bool
+            execution_role_arn = string
+            task_role_arn      = optional(string)
+            target_group_arn   = optional(string)
+            awslogs_group      = optional(string)
+          })
+        }
+
+        # The Region the provider configuration deploys into, read when the plan is
+        # made. The awslogs log driver takes the Region of the log group it writes to,
+        # and the log group is the operator's, in the Region the service runs in. A data
+        # source reads; it creates nothing.
+        data "aws_region" "current" {
+          count = var.config.awslogs_group == null ? 0 : 1
+        }
+
+        locals {
+          # The container's port mapping, present only where config carries a port.
+          port_mappings = {
+            for k, v in {
+              portMappings = var.config.port == null ? null : [
+                {
+                  containerPort = var.config.port
+                  protocol      = "tcp"
+                }
+              ]
+            } : k => v if v != null
+          }
+
+          # The container's log configuration, present only where config names a log
+          # group. The stream prefix is the service's name, so each task's stream is
+          # named <service>/main/<task id>.
+          log_configuration = {
+            for k, v in {
+              logConfiguration = var.config.awslogs_group == null ? null : {
+                logDriver = "awslogs"
+                options = {
+                  "awslogs-group"         = var.config.awslogs_group
+                  "awslogs-region"        = data.aws_region.current[0].region
+                  "awslogs-stream-prefix" = var.config.name
+                }
+              }
+            } : k => v if v != null
+          }
+        }
+
+        # One task definition for Fargate, in the awsvpc network mode Fargate requires,
+        # under an execution role that already exists and, where config names one, a
+        # task role that already exists.
+        resource "aws_ecs_task_definition" "this" {
+          family                   = var.config.name
+          requires_compatibilities = ["FARGATE"]
+          network_mode             = "awsvpc"
+          cpu                      = var.config.cpu
+          memory                   = var.config.memory
+          execution_role_arn       = var.config.execution_role_arn
+          task_role_arn            = var.config.task_role_arn
+
+          container_definitions = jsonencode([
+            merge(
+              {
+                name        = "main"
+                image       = var.config.image
+                essential   = true
+                environment = [for k, v in var.config.environment : { name = k, value = v }]
+              },
+              local.port_mappings,
+              local.log_configuration
+            )
+          ])
+        }
+
+        # One Amazon ECS service keeping desired_count tasks of the definition above
+        # running on Fargate, in a cluster, subnets and security groups that already
+        # exist.
+        resource "aws_ecs_service" "this" {
+          name            = var.config.name
+          cluster         = var.config.cluster
+          task_definition = aws_ecs_task_definition.this.arn
+          launch_type     = "FARGATE"
+          desired_count   = var.config.desired_count
+
+          network_configuration {
+            subnets          = var.config.subnet_ids
+            security_groups  = var.config.security_groups
+            assign_public_ip = var.config.assign_public_ip
+          }
+
+          # Registers each task's container port with the operator's target group,
+          # where config names one. The load balancer, its listener and the target
+          # group's own health check are the operator's.
+          dynamic "load_balancer" {
+            for_each = var.config.target_group_arn == null ? [] : [var.config.target_group_arn]
+            content {
+              target_group_arn = load_balancer.value
+              container_name   = "main"
+              container_port   = var.config.port
+            }
+          }
+        }
+
+        output "name" {
+          description = "Name of the service."
+          value       = aws_ecs_service.this.name
+        }
+
+        output "id" {
+          description = "The service's ARN, which the provider gives as its id."
+          value       = aws_ecs_service.this.id
+        }
+
+    # An Amazon ECS task definition for Fargate and, where config carries
+    # schedule_expression, an EventBridge Scheduler schedule starting one task
+    # of it at each time the expression names. With no schedule, the task
+    # definition stands alone for a run someone starts with the Amazon ECS
+    # RunTask operation; the cluster and network keys then set nothing here,
+    # and are the values that run is started with. Its outputs are arn, the
+    # task definition's ARN with its revision, and family.
+    Task:
+      main.tf: |
+        # required_providers pins hashicorp/aws so the engine installs a provider whose
+        # resource schema this module was written against. It is a range rather than an
+        # exact version because every AWS module in one root configuration shares one
+        # installed provider, and two exact pins that differ fail init. The constraint
+        # string is the one the Aggrega catalog conventions' "One AWS provider
+        # constraint for every AWS body" section states; this file repeats it
+        # deliberately, because a vendored module is copied byte for byte and imports
+        # nothing.
+        terraform {
+          required_providers {
+            aws = {
+              source  = "hashicorp/aws"
+              version = "~> 6.69"
+            }
+          }
+        }
+
+        # Everything that differs between components, rendered and checked by
+        # EcsFargateArguments#/mappings/TaskArguments. A key left out reads as null.
+        # schedule_expression_timezone and scheduler_role_arn are given only with
+        # schedule_expression.
+        variable "config" {
+          type = object({
+            name                         = string
+            image                        = string
+            port                         = optional(number)
+            cpu                          = string
+            memory                       = string
+            environment                  = map(string)
+            schedule_expression          = optional(string)
+            schedule_expression_timezone = optional(string)
+            scheduler_role_arn           = optional(string)
+            cluster                      = string
+            subnet_ids                   = list(string)
+            security_groups              = list(string)
+            assign_public_ip             = bool
+            execution_role_arn           = string
+            task_role_arn                = optional(string)
+            awslogs_group                = optional(string)
+          })
+        }
+
+        # The Region the provider configuration deploys into, read when the plan is
+        # made. The awslogs log driver takes the Region of the log group it writes to,
+        # and the log group is the operator's, in the Region the task runs in. A data
+        # source reads; it creates nothing.
+        data "aws_region" "current" {
+          count = var.config.awslogs_group == null ? 0 : 1
+        }
+
+        locals {
+          # The container's port mapping, present only where config carries a port.
+          port_mappings = {
+            for k, v in {
+              portMappings = var.config.port == null ? null : [
+                {
+                  containerPort = var.config.port
+                  protocol      = "tcp"
+                }
+              ]
+            } : k => v if v != null
+          }
+
+          # The container's log configuration, present only where config names a log
+          # group. The stream prefix is the task definition's family, so each run's
+          # stream is named <family>/main/<task id>.
+          log_configuration = {
+            for k, v in {
+              logConfiguration = var.config.awslogs_group == null ? null : {
+                logDriver = "awslogs"
+                options = {
+                  "awslogs-group"         = var.config.awslogs_group
+                  "awslogs-region"        = data.aws_region.current[0].region
+                  "awslogs-stream-prefix" = var.config.name
+                }
+              }
+            } : k => v if v != null
+          }
+        }
+
+        # One task definition for Fargate, in the awsvpc network mode Fargate requires,
+        # under an execution role that already exists and, where config names one, a
+        # task role that already exists. No service runs it, since a run ends.
+        resource "aws_ecs_task_definition" "this" {
+          family                   = var.config.name
+          requires_compatibilities = ["FARGATE"]
+          network_mode             = "awsvpc"
+          cpu                      = var.config.cpu
+          memory                   = var.config.memory
+          execution_role_arn       = var.config.execution_role_arn
+          task_role_arn            = var.config.task_role_arn
+
+          container_definitions = jsonencode([
+            merge(
+              {
+                name        = "main"
+                image       = var.config.image
+                essential   = true
+                environment = [for k, v in var.config.environment : { name = k, value = v }]
+              },
+              local.port_mappings,
+              local.log_configuration
+            )
+          ])
+        }
+
+        # The schedule calls the Amazon ECS RunTask operation on the cluster, named by
+        # its ARN, at each time its expression names, evaluated in its time zone,
+        # starting one task of the definition above on Fargate under the scheduler
+        # role. The flexible time window is off, so a run starts within the minute the
+        # expression names rather than within a window after it. Its retry policy is
+        # the scheduler's own default.
+        resource "aws_scheduler_schedule" "this" {
+          count = var.config.schedule_expression == null ? 0 : 1
+
+          name                         = var.config.name
+          schedule_expression          = var.config.schedule_expression
+          schedule_expression_timezone = var.config.schedule_expression_timezone
+
+          flexible_time_window {
+            mode = "OFF"
+          }
+
+          target {
+            arn      = var.config.cluster
+            role_arn = var.config.scheduler_role_arn
+
+            ecs_parameters {
+              task_definition_arn = aws_ecs_task_definition.this.arn
+              launch_type         = "FARGATE"
+              task_count          = 1
+
+              network_configuration {
+                subnets          = var.config.subnet_ids
+                security_groups  = var.config.security_groups
+                assign_public_ip = var.config.assign_public_ip
+              }
+            }
+          }
+        }
+
+        output "arn" {
+          description = "ARN of the task definition, with its revision."
+          value       = aws_ecs_task_definition.this.arn
+        }
+
+        output "family" {
+          description = "Family of the task definition."
+          value       = aws_ecs_task_definition.this.family
+        }
