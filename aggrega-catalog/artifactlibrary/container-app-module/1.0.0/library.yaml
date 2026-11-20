@@ -1,0 +1,514 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: ArtifactLibrary
+metadata:
+  name: ContainerAppModule
+  version: 1.0.0
+  description: >
+    The Terraform bodies every Azure Container Apps Recipe runs its container
+    in, held once: App, a container app running a fixed count of replicas,
+    with internal ingress where it listens on a port; and Job, a Container
+    Apps job started on a schedule, when one is given, or by the operator. A
+    Recipe imports one beside its fixed pass-through module, `artifacts: {
+    service: { $import: ContainerAppModule#/artifacts/App } }`, and renders
+    the body's one input, config, with the matching ContainerAppArguments
+    entry.
+
+    Each body declares its app or its job, holding each file the component is
+    handed as one of its secrets, and nothing else. No Container Apps
+    environment, resource group, network, managed identity, registry, Key
+    Vault or log workspace is emitted: each belongs to the operator, who
+    names it under infra.overrides. The Recipe reads the body's outputs as
+    module.<instance>.service.<output>.
+spec:
+  artifacts:
+    # The bundles. Each is one file, main.tf, which lands in the importing
+    # component's module directory as service/main.tf, the child module the
+    # fixed pass-through calls with its config input and hands back as its
+    # service output; a Recipe therefore reads an output below as
+    # module.<instance>.service.<output>. The files are static HCL: no
+    # template action runs in them, so every component importing a bundle
+    # gets the same bytes, and everything that differs between components
+    # arrives in config, which the ContainerAppArguments entry of the same
+    # name renders and checks.
+    #
+    # config. One object, typed in each body: the names are those of the
+    # arguments it sets, an argument inside a block by the block's name and
+    # its own joined with an underscore, except port, the port the container
+    # listens on, which an app's ingress targets and the probes request;
+    # replicas, an app's minimum and maximum replica count; environment, the
+    # main container's variables; files, the files mounted into it;
+    # identity_ids, the user-assigned identities of the identity block;
+    # registry_password_secret_id and registry_password_identity, the Key
+    # Vault reference of the secret the registry password is read from;
+    # probe_path, the HTTP path the probes request; and schedule, the cron
+    # expression a job is started on. A key a component does not need is
+    # left out of config and reads as null, or as empty for files and
+    # identity_ids, so nothing is emitted for it.
+    #
+    # The container. One container, main, runs the image with one variable
+    # per key of environment, in the key order Terraform iterates a map in,
+    # at the cpu and memory config carries, a size of the environment's
+    # Consumption workload profile chosen where config is rendered. The app
+    # or job names no workload profile, so Container Apps places it on that
+    # profile, and the operator's environment decides the network its egress
+    # leaves through and where its logs go: Container Apps sets a log
+    # destination on the environment, and an app or a job takes none of its
+    # own.
+    #
+    # Identities and the registry. The app or job is given the user-assigned
+    # identities identity_ids names, and those named for the registry, which
+    # Container Apps takes only from its own identities; each already exists,
+    # and none is created. A private image is pulled from registry_server
+    # with registry_identity, or with registry_username and a password
+    # Container Apps reads from the Key Vault secret
+    # registry_password_secret_id names, with the identity
+    # registry_password_identity names, so the password is never written
+    # into the configuration. With no registry_server the image is pulled as
+    # a public one.
+    #
+    # Files. Each file the component is handed is one secret of the app or
+    # job, file-0, file-1 and so on in the order Terraform iterates the
+    # paths, their lexical order, holding the file's content; one Secret
+    # volume, inject-files, is mounted by sub path at each file's path, so
+    # the file appears alone there and the rest of its directory stays as the
+    # image holds it. Container Apps documents a sub-path mount of a file for
+    # a path the image does not already hold, in a directory it does, and
+    # documents the sub path for an Azure Files mount; that a Secret volume
+    # honours it as well is unverified against a running environment, which
+    # no build reaches. Container Apps makes no new revision when only a
+    # secret changes, so a changed file reaches an app's container when its
+    # replicas next restart. A file's content is held in the secret and in
+    # Terraform state. Which paths can be mounted is checked where config is
+    # rendered.
+    #
+    # The required_providers block in each file pins hashicorp/azurerm by the
+    # constraint the catalog conventions' "One Azure provider constraint for
+    # every Azure body" section states, and repeats it because a body is
+    # copied whole into each component's module and imports nothing. Every
+    # argument here is one azurerm 5.14 takes. The constraint admits no
+    # azurerm 4 release, so a body here does not share a terraform boundary
+    # with a module that admits azurerm 4 alone, such as the one
+    # terraform/postgres-flexible-server sources, or with a body pinning
+    # another azurerm 5 release exactly, such as terraform/azure-api-management
+    # 1.0.0's.
+
+    # A container app with a fixed replica count. Where config carries port,
+    # its ingress is internal: the app's address is reachable only from
+    # inside its environment, by the other apps and jobs there, and is not
+    # published at the environment's inbound address. Without port it has no
+    # ingress, so nothing reaches it. Its outputs are name, id, the app's
+    # resource ID, and fqdn, the address its ingress answers at, empty for an
+    # app with no ingress.
+    App:
+      main.tf: |
+        # required_providers pins hashicorp/azurerm so the engine installs a provider whose
+        # resource schema this module was written against. It is a range rather than an
+        # exact version because every Azure module in one root configuration shares one
+        # installed provider, and two exact pins that differ fail init. The constraint
+        # string is the one the Aggrega catalog conventions' "One Azure provider
+        # constraint for every Azure body" section states; this file repeats it
+        # deliberately, because a vendored module is copied byte for byte and imports
+        # nothing.
+        terraform {
+          required_providers {
+            azurerm = {
+              source  = "hashicorp/azurerm"
+              version = "~> 5.14"
+            }
+          }
+        }
+
+        # Everything that differs between components, rendered and checked by
+        # ContainerAppArguments#/mappings/AppArguments. A key left out reads as null, or as
+        # empty for files and identity_ids.
+        variable "config" {
+          type = object({
+            name                         = string
+            resource_group_name          = string
+            container_app_environment_id = string
+            image                        = string
+            port                         = optional(number)
+            cpu                          = number
+            memory                       = string
+            replicas                     = number
+            environment                  = map(string)
+            files                        = optional(map(string), {})
+            identity_ids                 = optional(list(string), [])
+            registry_server              = optional(string)
+            registry_identity            = optional(string)
+            registry_username            = optional(string)
+            registry_password_secret_id  = optional(string)
+            registry_password_identity   = optional(string)
+            probe_path                   = optional(string)
+          })
+        }
+
+        locals {
+          # The user-assigned identities the app is given: those named for its own code,
+          # and the ones the registry pull and the registry password's Key Vault read are
+          # made with, which Container Apps takes only from the app's own identities.
+          identity_ids = distinct(compact(concat(
+            var.config.identity_ids,
+            [var.config.registry_identity, var.config.registry_password_identity],
+          )))
+
+          # One secret per file, named file-0, file-1 and so on in the order Terraform
+          # iterates a map's keys in, which is the paths' lexical order.
+          files = { for i, path in keys(var.config.files) : path => "file-${i}" }
+        }
+
+        # One container app running the container, in a Container Apps environment and a
+        # resource group that already exist. The module declares the app and nothing
+        # else: no environment, network, identity, registry, Key Vault or log workspace,
+        # each of which belongs to the operator who names it.
+        #
+        # Where port is set, ingress is internal, written here rather than taken from
+        # config: the app's address is reachable only from inside its environment, from
+        # the other apps and jobs there, and is not published at the environment's
+        # inbound address. Without port the app declares no ingress, so nothing reaches
+        # it. The app runs a fixed number of replicas, its minimum and its maximum being
+        # the same count, on the environment's Consumption workload profile, in
+        # single-revision mode; with no scale rule, a minimum of one or more is what keeps
+        # an app without ingress running.
+        resource "azurerm_container_app" "this" {
+          name                         = var.config.name
+          resource_group_name          = var.config.resource_group_name
+          container_app_environment_id = var.config.container_app_environment_id
+          revision_mode                = "Single"
+
+          dynamic "identity" {
+            for_each = length(local.identity_ids) > 0 ? [1] : []
+            content {
+              type         = "UserAssigned"
+              identity_ids = local.identity_ids
+            }
+          }
+
+          # The registry password is read from Key Vault by reference, with the identity
+          # named for it; its value is never written into the configuration.
+          dynamic "secret" {
+            for_each = var.config.registry_password_secret_id == null ? [] : [1]
+            content {
+              name                = "registry-password"
+              key_vault_secret_id = var.config.registry_password_secret_id
+              identity            = var.config.registry_password_identity
+            }
+          }
+
+          dynamic "secret" {
+            for_each = local.files
+            content {
+              name  = secret.value
+              value = var.config.files[secret.key]
+            }
+          }
+
+          dynamic "registry" {
+            for_each = var.config.registry_server == null ? [] : [1]
+            content {
+              server               = var.config.registry_server
+              identity             = var.config.registry_identity
+              username             = var.config.registry_username
+              password_secret_name = var.config.registry_username == null ? null : "registry-password"
+            }
+          }
+
+          dynamic "ingress" {
+            for_each = var.config.port == null ? [] : [var.config.port]
+            content {
+              external_enabled = false
+              target_port      = ingress.value
+
+              traffic_weight {
+                latest_revision = true
+                percentage      = 100
+              }
+            }
+          }
+
+          template {
+            min_replicas = var.config.replicas
+            max_replicas = var.config.replicas
+
+            # One container, main. Its environment is one entry per key of environment,
+            # in the key order Terraform iterates a map in, and each file is mounted alone
+            # at its path from the secret volume below. Where port is set and probe_path
+            # is not, the readiness probe opens a TCP connection to port, and the ingress
+            # sends the replica no traffic until the process accepts one; no liveness
+            # probe is declared, because a start-up time cannot be known for an image
+            # this module does not name. Where probe_path is set, a startup, a readiness
+            # and a liveness probe request it over HTTP on port. Without port, no probe is
+            # declared.
+            container {
+              name   = "main"
+              image  = var.config.image
+              cpu    = var.config.cpu
+              memory = var.config.memory
+
+              dynamic "startup_probe" {
+                for_each = var.config.probe_path == null ? [] : [var.config.probe_path]
+                content {
+                  transport = "HTTP"
+                  port      = var.config.port
+                  path      = startup_probe.value
+                }
+              }
+
+              dynamic "readiness_probe" {
+                for_each = var.config.port == null ? [] : [var.config.port]
+                content {
+                  transport = var.config.probe_path == null ? "TCP" : "HTTP"
+                  port      = readiness_probe.value
+                  path      = var.config.probe_path
+                }
+              }
+
+              dynamic "liveness_probe" {
+                for_each = var.config.probe_path == null ? [] : [var.config.probe_path]
+                content {
+                  transport = "HTTP"
+                  port      = var.config.port
+                  path      = liveness_probe.value
+                }
+              }
+
+              dynamic "env" {
+                for_each = var.config.environment
+                content {
+                  name  = env.key
+                  value = env.value
+                }
+              }
+
+              dynamic "volume_mounts" {
+                for_each = local.files
+                content {
+                  name     = "inject-files"
+                  path     = volume_mounts.key
+                  sub_path = volume_mounts.value
+                }
+              }
+            }
+
+            dynamic "volume" {
+              for_each = length(local.files) > 0 ? [1] : []
+              content {
+                name         = "inject-files"
+                storage_type = "Secret"
+              }
+            }
+          }
+        }
+
+        output "name" {
+          description = "Name of the container app."
+          value       = azurerm_container_app.this.name
+        }
+
+        output "id" {
+          description = "Resource ID of the container app."
+          value       = azurerm_container_app.this.id
+        }
+
+        output "fqdn" {
+          description = "The address the app's internal ingress answers at, reachable from inside its environment; empty for an app with no ingress."
+          value       = length(azurerm_container_app.this.ingress) > 0 ? azurerm_container_app.this.ingress[0].fqdn : ""
+        }
+
+    # A Container Apps job running one replica an execution, started on
+    # schedule, read as a cron expression of five fields in UTC, where config
+    # carries one, and otherwise only when someone starts it. A job has no
+    # ingress. Its outputs are name and id, the job's resource ID.
+    Job:
+      main.tf: |
+        # required_providers pins hashicorp/azurerm so the engine installs a provider whose
+        # resource schema this module was written against. It is a range rather than an
+        # exact version because every Azure module in one root configuration shares one
+        # installed provider, and two exact pins that differ fail init. The constraint
+        # string is the one the Aggrega catalog conventions' "One Azure provider
+        # constraint for every Azure body" section states; this file repeats it
+        # deliberately, because a vendored module is copied byte for byte and imports
+        # nothing.
+        terraform {
+          required_providers {
+            azurerm = {
+              source  = "hashicorp/azurerm"
+              version = "~> 5.14"
+            }
+          }
+        }
+
+        # Everything that differs between components, rendered and checked by
+        # ContainerAppArguments#/mappings/JobArguments. A key left out reads as null, or as
+        # empty for files and identity_ids. port is only the port the startup probe
+        # requests.
+        variable "config" {
+          type = object({
+            name                         = string
+            location                     = string
+            resource_group_name          = string
+            container_app_environment_id = string
+            image                        = string
+            port                         = optional(number)
+            cpu                          = number
+            memory                       = string
+            environment                  = map(string)
+            files                        = optional(map(string), {})
+            identity_ids                 = optional(list(string), [])
+            registry_server              = optional(string)
+            registry_identity            = optional(string)
+            registry_username            = optional(string)
+            registry_password_secret_id  = optional(string)
+            registry_password_identity   = optional(string)
+            probe_path                   = optional(string)
+            schedule                     = optional(string)
+          })
+        }
+
+        locals {
+          # The user-assigned identities the job is given: those named for its own code,
+          # and the ones the registry pull and the registry password's Key Vault read are
+          # made with, which Container Apps takes only from the job's own identities.
+          identity_ids = distinct(compact(concat(
+            var.config.identity_ids,
+            [var.config.registry_identity, var.config.registry_password_identity],
+          )))
+
+          # One secret per file, named file-0, file-1 and so on in the order Terraform
+          # iterates a map's keys in, which is the paths' lexical order.
+          files = { for i, path in keys(var.config.files) : path => "file-${i}" }
+        }
+
+        # One Container Apps job running the container to completion, in a Container Apps
+        # environment and a resource group that already exist, in location, the region the
+        # environment is in. The module declares the job and nothing else: no environment,
+        # network, identity, registry, Key Vault or log workspace, each of which belongs to
+        # the operator who names it.
+        #
+        # Where schedule is set, Container Apps starts an execution on it, reading it as a
+        # cron expression of five fields, minute, hour, day of the month, month and day of
+        # the week, evaluated in UTC; otherwise the job's trigger is manual, and an
+        # execution runs when someone starts one. Each execution runs one replica on the
+        # environment's Consumption workload profile, retried as Container Apps retries a
+        # replica by default. Container Apps requires a replica timeout of every job: here
+        # it is 1800 seconds, the value Microsoft's Container Apps jobs documentation gives
+        # in each of its examples, so a replica still running after 30 minutes is stopped.
+        # A Component's own timeout value, delivered to the container as a variable for
+        # its code to honour, sets no other deadline.
+        resource "azurerm_container_app_job" "this" {
+          name                         = var.config.name
+          location                     = var.config.location
+          resource_group_name          = var.config.resource_group_name
+          container_app_environment_id = var.config.container_app_environment_id
+          replica_timeout_in_seconds   = 1800
+
+          dynamic "schedule_trigger_config" {
+            for_each = var.config.schedule == null ? [] : [var.config.schedule]
+            content {
+              cron_expression = schedule_trigger_config.value
+            }
+          }
+
+          dynamic "manual_trigger_config" {
+            for_each = var.config.schedule == null ? [1] : []
+            content {}
+          }
+
+          dynamic "identity" {
+            for_each = length(local.identity_ids) > 0 ? [1] : []
+            content {
+              type         = "UserAssigned"
+              identity_ids = local.identity_ids
+            }
+          }
+
+          # The registry password is read from Key Vault by reference, with the identity
+          # named for it; its value is never written into the configuration.
+          dynamic "secret" {
+            for_each = var.config.registry_password_secret_id == null ? [] : [1]
+            content {
+              name                = "registry-password"
+              key_vault_secret_id = var.config.registry_password_secret_id
+              identity            = var.config.registry_password_identity
+            }
+          }
+
+          dynamic "secret" {
+            for_each = local.files
+            content {
+              name  = secret.value
+              value = var.config.files[secret.key]
+            }
+          }
+
+          dynamic "registry" {
+            for_each = var.config.registry_server == null ? [] : [1]
+            content {
+              server               = var.config.registry_server
+              identity             = var.config.registry_identity
+              username             = var.config.registry_username
+              password_secret_name = var.config.registry_username == null ? null : "registry-password"
+            }
+          }
+
+          template {
+            # One container, main. Its environment is one entry per key of environment,
+            # in the key order Terraform iterates a map in, and each file is mounted alone
+            # at its path from the secret volume below. Where probe_path is set, a startup
+            # probe requests it over HTTP on port before the replica counts as started;
+            # otherwise no probe is declared.
+            container {
+              name   = "main"
+              image  = var.config.image
+              cpu    = var.config.cpu
+              memory = var.config.memory
+
+              dynamic "startup_probe" {
+                for_each = var.config.probe_path == null ? [] : [var.config.probe_path]
+                content {
+                  transport = "HTTP"
+                  port      = var.config.port
+                  path      = startup_probe.value
+                }
+              }
+
+              dynamic "env" {
+                for_each = var.config.environment
+                content {
+                  name  = env.key
+                  value = env.value
+                }
+              }
+
+              dynamic "volume_mounts" {
+                for_each = local.files
+                content {
+                  name     = "inject-files"
+                  path     = volume_mounts.key
+                  sub_path = volume_mounts.value
+                }
+              }
+            }
+
+            dynamic "volume" {
+              for_each = length(local.files) > 0 ? [1] : []
+              content {
+                name         = "inject-files"
+                storage_type = "Secret"
+              }
+            }
+          }
+        }
+
+        output "name" {
+          description = "Name of the job."
+          value       = azurerm_container_app_job.this.name
+        }
+
+        output "id" {
+          description = "Resource ID of the job."
+          value       = azurerm_container_app_job.this.id
+        }
