@@ -1,0 +1,188 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: task-ecs
+  version: 1.1.0
+  description: >
+    The generic ephemeral compute primitive as an Amazon ECS task on Fargate
+    that an EventBridge Scheduler schedule starts, on the catalog's shared
+    Amazon ECS body. Reach for it where the target is an AWS account with an
+    ECS cluster and a VPC; reach for helm/task on Kubernetes, which also runs
+    a task with no schedule once.
+
+    A task with no schedule carrying core/manual-trigger is deployed without
+    starting, its task definition alone; the operator starts each run with
+    aws ecs run-task, giving the cluster, the task definition and the network
+    configuration from infra.overrides. A scheduled task runs on its
+    schedule, attached or not, and can be started that way too. Any other
+    unscheduled task is refused by name, as nothing on AWS starts it. The
+    cron fields become the scheduler's own expression where the two mean the
+    same times, evaluated in UTC unless the Release names a time zone, and
+    are refused by name where they do not, as for a schedule restricting
+    both the day of the month and the day of the week.
+
+    The cluster, subnets, security groups, execution role and, with a
+    schedule, the scheduler's role come from infra.overrides and are
+    required. Only a task definition and a schedule are emitted: no role,
+    log group or network resource, each of which the operator already runs,
+    and no service, as a run ends.
+
+    Each env entry an edge or the component's own inject block dictates
+    becomes a container variable; timeout arrives by default as TASK_TIMEOUT,
+    which no edge may dictate while it is the default, for the code to
+    honour, as ECS sets no deadline on a run. File, arg and other entries are
+    refused by name. The task runs at the smallest Fargate size meeting
+    infra.compute.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/compute/task:1.0.1
+
+  # The module beside this Recipe is the fixed pass-through every container
+  # Recipe of this catalog carries byte for byte: its one input, config, goes
+  # to the service module the artifacts below import, and that module comes
+  # back out as its service output. entity.lock pins it.
+  #
+  # The terraform-aws-modules project publishes an ECS module,
+  # terraform-aws-modules/ecs/aws, and at v7.6.1 it is not complete for this
+  # component: its root module and its cluster, container-definition,
+  # express-service and service sub-modules declare no scheduled task, so
+  # nothing in it starts a run on a schedule. The catalog's own Task body,
+  # declaring a task definition and a schedule, is what fits.
+  source: ./module
+
+  # This Recipe reads from infra.overrides:
+  #   cluster                      - string (config.cluster), required
+  #   scheduler_role_arn           - string (config.scheduler_role_arn), required with a schedule
+  #   subnet_ids                   - []string (config.subnet_ids), required
+  #   vpc_security_groups          - []string (config.security_groups), required
+  #   execution_role_arn           - string (config.execution_role_arn), required
+  #   task_role_arn                - string (config.task_role_arn)
+  #   assign_public_ip             - bool (config.assign_public_ip; default false)
+  #   awslogs_group                - string (config.awslogs_group)
+  #   schedule_expression_timezone - string (config.schedule_expression_timezone; default UTC)
+  #
+  # Each is passed to the key of the body's config named in brackets, which
+  # EcsFargateModule's Task body documents. Each key of config is named for the
+  # resource argument it sets, the awslogs_group one for the awslogs-group
+  # option of the container's log configuration, except three: subnet_ids
+  # carries its key's name to the schedule's subnets, cluster sets the
+  # schedule target's arn, and scheduler_role_arn its role_arn. Some keys
+  # reuse the spelling terraform/server-ecs and terraform/worker-ecs read for
+  # the same concept, so an operator writes each under one name across the
+  # catalog's terraform Amazon ECS Recipes: cluster, subnet_ids,
+  # vpc_security_groups and execution_role_arn.
+  #
+  # cluster, subnet_ids, vpc_security_groups, execution_role_arn and, with a
+  # schedule, scheduler_role_arn are required and none has a default: the
+  # cluster, the network, the role ECS pulls the image and writes logs with and
+  # the role the scheduler calls ECS with are provisioned outside this Release,
+  # no account-independent value exists for any of them, and this Recipe never
+  # chooses a network or a role for the operator. The cluster is named by its
+  # ARN, since a schedule's target is the ARN of the resource it acts on; the
+  # scheduler role must trust the scheduler and be allowed to run the task
+  # definition and pass the task's roles to ECS. assign_public_ip gives each
+  # run a public IP address, which a task in a public subnet needs to reach the
+  # internet with no NAT gateway; it is off unless the Release turns it on.
+  # awslogs_group names a log group that already exists, in the Region the task
+  # runs in, to which the container's output is written under the stream prefix
+  # of the component's name; the execution role must be allowed to write to it.
+  # schedule_expression_timezone names the IANA time zone the schedule is
+  # evaluated in. The task definition names no runtime platform, so Fargate
+  # runs the image as linux/amd64.
+  #
+  # A task carrying core/manual-trigger with no schedule renders no schedule,
+  # so nothing starts a run under scheduler_role_arn or evaluates a time zone:
+  # both are refused by name there rather than accepted and left unused, and
+  # scheduler_role_arn is required only where a schedule is rendered. The
+  # cluster, subnets, security groups and assign_public_ip stay required and
+  # are passed to the body all the same, which declares nothing with them
+  # then: they are what the operator gives aws ecs run-task, as its --cluster
+  # and its --network-configuration, to start a run of the task definition
+  # family named after the component, and the root configuration names them
+  # beside it.
+  #
+  # Every Component value and infra key is honoured or refused by name, in
+  # EcsFargateArguments#/mappings/TaskArguments and the assertion below:
+  #   honoured — values.schedule as the schedule's expression, values.timeout
+  #     as the locals below say, infra.image (required), infra.compute.cpu and
+  #     infra.compute.memory as the Fargate size that entry chooses, the
+  #     overrides above, and env entries.
+  #   refused — a task with no schedule and no core/manual-trigger
+  #     attachment, by the assertion below; a schedule with no exact
+  #     equivalent, as that entry describes; scheduler_role_arn and
+  #     schedule_expression_timezone on a task rendering no schedule, as
+  #     above; infra.overrides.target_group_arn, since nothing connects to a
+  #     run; a compute quantity that entry cannot read, and a pair larger than
+  #     the largest Fargate task; a component name a schedule or a task
+  #     definition family does not take; an edge or the component's own inject
+  #     block injecting a variable under TASK_TIMEOUT while the timeout is
+  #     delivered under that default name; and an edge's file, arg or
+  #     custom-mechanism entry.
+  assertions:
+    # A run that happens once has nothing on AWS to start it, so it halts
+    # here. A task carrying core/manual-trigger asked for a run nothing starts
+    # until the operator does, so it is not refused for having no schedule.
+    # The attachment is found by its Feature's type, with any version it was
+    # authored with set aside. Nothing else reads it: a scheduled task renders
+    # alike with the attachment or without. A schedule the scheduler cannot
+    # carry exactly halts in EcsFargateArguments#/mappings/TaskArguments.
+    schedule_translates: >-
+      {{- $s := trim (toString (optional .values "schedule" "")) -}}
+      {{- $manual := false -}}
+      {{- range $name, $attachment := optional . "features" dict -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/manual-trigger" }}{{ $manual = true }}{{ end -}}
+      {{- end -}}
+      {{- if and (not $s) (not $manual) -}}
+      {{- fail (printf "the component %q has no schedule and carries no core/manual-trigger attachment, so it runs once, and nothing on AWS starts a run that happens once: neither Terraform nor CloudFormation runs an Amazon ECS task when it applies, so the run would never happen. Give the component a schedule in the Aggregate; attach core/manual-trigger to it there to deploy its task definition alone, for the operator to start each run with aws ecs run-task; or map core/compute/task to helm/task in the Manifest, which runs it once on Kubernetes" .metadata.instance_id) -}}
+      {{- end -}}
+
+  # Target-expected names: the image is the Release's, so no upstream
+  # documentation names a spelling for the developer's timeout value. It is
+  # delivered under the name helm/task delivers it under, and only when the
+  # developer set it, so an unset value renders no variable rather than an
+  # empty one. That name is a default: it is rendered only while no entry of
+  # the component's own inject block, in any mechanism, delivers the timeout,
+  # and an edge or that block delivering that name as well halts, naming
+  # which, rather than one value silently replacing the other. The schedule
+  # is not delivered as a variable: it becomes the schedule's expression. The
+  # component packages no upstream product, so no other local
+  # EcsFargateArguments reads is declared: no default image, so the Release
+  # names the one it runs; no port, so the container maps none; no probe, no
+  # GPU and no socket.
+  locals:
+    value_env: '{"values.timeout": "TASK_TIMEOUT"}'
+
+  artifacts:
+    # The Task body: the task definition and, with a schedule, the schedule.
+    service:
+      $import: EcsFargateModule#/artifacts/Task
+    # A configuration applied with terraform/task-ecs 1.0.1 or 1.0.0 holds the
+    # task definition at aws_ecs_task_definition.this and the schedule, where
+    # one is rendered, at aws_scheduler_schedule.this in this component's
+    # module, the addresses those versions declare them at; this version
+    # declares them in the service module. The blocks move them there, so
+    # Terraform keeps the task definition and the schedule rather than
+    # replacing them.
+    moved.tf: |
+      moved {
+        from = aws_ecs_task_definition.this
+        to   = module.service.aws_ecs_task_definition.this
+      }
+
+      moved {
+        from = aws_scheduler_schedule.this
+        to   = module.service.aws_scheduler_schedule.this
+      }
+
+  # The component publishes nothing across an edge, so nothing is emitted for
+  # one.
+  provides: {}
+
+  valuesMapping:
+    $import: EcsFargateArguments#/mappings/TaskArguments
