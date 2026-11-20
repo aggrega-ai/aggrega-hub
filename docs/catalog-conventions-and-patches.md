@@ -2427,9 +2427,13 @@ provider's current release when the constraint is set, and never lower than the 
 `hashicorp/azurerm` floor declared by a published Azure module a catalog Recipe sources
 whose constraint admits the catalog's major. A floor in another major is not compared: a
 constraint such as `~> 4.12` admits no azurerm 5 release, so the module declaring it
-cannot share a root with a body at `~> 5.14` whatever the numbers say. Where an Azure
-Verified Module brings `Azure/azapi`, `Azure/modtm` or `hashicorp/random`, those
-providers keep the module's ranges and Terraform installs one release of each.
+cannot share a root with a body at `~> 5.14` whatever the numbers say. Nor can an exact
+pin below the catalog's string: `5.9.0`, which `terraform/azure-api-management` 1.0.0
+declares, admits no release at 5.14 or later, so that Recipe and a body at `~> 5.14` go
+in different terraform boundaries too, while a range such as `~> 5.9` admits 5.14 and
+shares one. Where an Azure Verified Module brings `Azure/azapi`, `Azure/modtm` or
+`hashicorp/random`, those providers keep the module's ranges and Terraform installs one
+release of each.
 
 A published module a Recipe sources keeps its publisher's own constraint. The Azure
 Verified Module `recipe/terraform/postgres-flexible-server` vendors declares
@@ -2510,6 +2514,9 @@ over each boundary the build rendered:
   `.cfnlintrc.yaml` as its one configuration, in `us-east-1`;
 - `scripts/vendor-validate-arm.py` over `arm/arm-template.json`.
 
+A Release that is not negative and whose boundaries hold none of these roots is
+refused, naming it, since no validator would judge anything it builds.
+
 The ARM check holds a template to the template syntax Microsoft documents and each
 resource to the vendor's own schema for its type at its `apiVersion`, read with a
 fixed set of reading rules that mend where the vendor's schemas disagree with what
@@ -2530,8 +2537,10 @@ findings each published entity version is known to carry, each with the finding'
 id and the reason naming what in that version causes it. A published version is
 final, so its finding is listed rather than mended; a version not yet published is
 mended, and an entry naming one is refused. An entry whose finding no longer
-appears is refused as stale, so the list only shrinks. A finding is refused unless
-an entry lists it.
+appears is refused as stale, so the list only shrinks. A finding's id carries names
+the fixture gives, an instance's among them, so an entry is judged stale only by a
+run that built every fixture reaching its version: `--all`, or a commit reaching each
+of them. A finding is refused unless an entry lists it.
 
 **The cfn-lint configuration.** `.cfnlintrc.yaml` ignores `W3005`, which reports a
 `DependsOn` that a `GetAtt` or `Ref` in the same resource already enforces. A
@@ -2540,10 +2549,13 @@ earlier waves of its directory, whatever it references, so a Component reading a
 earlier wave's value through a `GetAtt` always repeats an ordering the `DependsOn`
 gives. The rule is ignored for the whole catalog, because the gate takes an ignore by rule
 in this one file and sets aside any a template names for one resource, so it also
-passes a redundant `DependsOn` an author writes; no catalog Recipe writes one. Each ignored rule is a line of its own with
-its reason beside it, and `vendor-validate.sh` refuses an entry with no reason. A
-template's own `Metadata` cannot add an ignore: the gate lints a copy with every
-`cfn-lint` key set aside.
+passes a redundant `DependsOn` an author writes; no catalog Recipe writes one.
+`ignore_checks` is the one key the file holds, and `vendor-validate.sh` refuses any
+other, such as `ignore_templates`, `configure_rules` or `append_rules`, each of which
+would change which templates cfn-lint reads or how it judges with no reason beside
+it. Each ignored rule is a line of its own with its reason beside it, and the gate
+refuses an entry with no reason. A template's own `Metadata` cannot add an ignore:
+the gate lints a copy with every `cfn-lint` key set aside.
 
 **Vendor text.** Vendor text is not committed to the catalog. The resource-schema
 importers write a marker before every text taken from a vendor schema, and
@@ -2560,8 +2572,10 @@ its pinned version, or an `aggrega` binary older than the pin file's
 `aggrega_min_version` gives no verdict (exit 3), naming the one command that
 supplies what is missing; it never falls back to a tool on `PATH`. A Recipe version
 the commit changes that no fixture builds is refused, since no validator would
-judge it: build it in a fixture. A commit that reaches no fixture costs the
-rules alone; `--all` builds every fixture and is a heavy command, and the script's
+judge it: build it in a fixture. A commit is judged by the gate it carries: the
+ARM check runs from the copy of the index, and `--staged` refuses while a file of
+the gate itself, the script, the ARM check or a library it sources, differs from
+the index, naming it. A commit that reaches no fixture costs the rules alone; `--all` builds every fixture and is a heavy command, and the script's
 header holds the measured cost.
 
 **What the gate does not check.**
@@ -2595,7 +2609,7 @@ import the same body, so a fix to the body reaches both.
 |---|---|---|---|---|
 | Terraform, Google Cloud Run | ArtifactLibrary `CloudRunModule` | MappingLibrary `CloudRunArguments` | `Service`, `WorkerPool`, `Job` | the fixed pass-through module, `artifacts.service` importing the body, the arguments entry as `valuesMapping`, its locals and its `provides` |
 | Terraform, Amazon ECS on Fargate | ArtifactLibrary `EcsFargateModule` | MappingLibrary `EcsFargateArguments` | `Service`, `Task` | the same |
-| Terraform, Azure Container Apps | ArtifactLibrary `ContainerAppModule` | MappingLibrary `ContainerAppArguments` | `App`, `Job` | the same |
+| Terraform, Azure Container Apps | ArtifactLibrary `ContainerAppModule` | MappingLibrary `ContainerAppArguments` | `App`, `Job` | the same, and the boundary artifact `provider-azurerm.tf`, `provider "azurerm" { features {} }`, since no body declares a provider block and the azurerm provider refuses to plan without its features block |
 | CloudFormation, Amazon ECS on Fargate | ArtifactLibrary `EcsFargateFragment` | none: the fragment renders in the importing Recipe's context | `Service`, `Task` | `artifacts.service` importing the fragment, its locals and its `provides` |
 | Azure Resource Manager, Azure Container Apps | none: the Recipe sources the Azure Verified Modules module `avm/res/app/container-app` or `avm/res/app/job` | MappingLibrary `ContainerAppParameters` | `AppParameters`, `JobParameters` | `source` naming the module, the parameters entry as `valuesMapping`, its locals and its `provides` |
 
@@ -2605,7 +2619,9 @@ with `valuesMapping: { $import: <Library>#/mappings/<Entry> }`; the import repla
 the whole `valuesMapping`. The arguments entry renders one key, `config`, the one
 argument of the component's module block, and the body is the module `service`
 that `config` reaches. The Recipe reads the body's outputs as
-`module.<instance>.service.<output>`. The catalog's Recipes that use the shape are
+`module.<instance>.service.<output>`. A Recipe uses the shape when its
+`artifacts.service` imports one of these bodies or fragments, or its `valuesMapping`
+imports one of these entries. Those the catalog holds include the generic
 `recipe/terraform/{server,worker}-cloud-run`, `{server,worker}-ecs`, `task-ecs` and
 `{server,worker}-container-apps`, `recipe/cloudformation/{server,worker,task}-ecs`
 and `recipe/arm/{server,worker}-container-apps`.
@@ -2620,7 +2636,7 @@ does not declare reads as empty rather than stopping the build:
 | `container_port` | the port the container listens on; while it is undeclared, `infra.port` where the Component declares one |
 | `value_env` | a JSON object mapping each own value the Recipe delivers by default, `values.<key>`, to the variable it is delivered as |
 | `socket_env` | a JSON object mapping each socket whose connections the Recipe delivers by default to an object mapping each variable to the key of the target's `provides` it carries; locals cannot read connections, so the names travel as this table |
-| `probe_path` | the HTTP path the container's probes request; where it is undeclared no probe is rendered |
+| `probe_path` | the HTTP path the container's probes request; where it is undeclared no HTTP probe is rendered, and a target's own probe stays: a Container Apps app listening on a port keeps a TCP readiness probe on it, and a Cloud Run service keeps Cloud Run's default startup probe |
 | `gpu` | `{"count": 1, "type": <accelerator>}`, read on Cloud Run alone |
 
 A local holds a string, so `value_env`, `socket_env` and `gpu` are written as JSON
@@ -2651,16 +2667,22 @@ Manager Recipe keeps the name of its nested template resource, so a redeploy upd
 app.
 
 **Library versioning.** A published library version is final, and a Release's lock
-records the version each library resolved to.
+records the version each library resolved to. A Recipe imports a library by its bare
+name, which reads the highest version the catalog holds when a Release is pulled, and
+a Recipe's `entity.lock` pins its own source alone, not the libraries it imports: a
+later library version reaches every published Recipe that imports it, at the next
+`aggrega pull` of each Release. On a workspace's catalog folders, a build of a Release
+whose lock records an earlier version halts with `E0130` until that pull.
 
-- A compatible fix, one that leaves every input and output of the body and every
-  local of the arguments as they are, is a later version of the library, and a Release
-  adopts it at its next `aggrega pull`.
-- A change to the contract between the arguments and a Recipe, such as a local
-  added or read differently, means a version of every Recipe that relies on it,
-  since a Recipe at a published version is final and cannot be mended.
-- An incompatible change takes a library name of its own, and the library it
-  departs from stays as published.
+- A compatible fix, one that leaves every input and output of the body and the reading
+  of every local as they are, is a later version of the library.
+- A local added is compatible, since a local a Recipe does not declare reads as empty.
+  A Recipe that is to declare it takes a version of its own, since a Recipe at a
+  published version is final and cannot be mended.
+- A local read differently, or an input or output of a body removed or of another
+  type, is incompatible: it would reach published Recipes that rely on the old
+  reading. It takes a library name of its own, and the library it departs from stays
+  as published.
 
 **Files on each container service.** A file entry on the inject pipe reaches the
 container differently on each target, and each target states its behaviour in its
@@ -2692,19 +2714,39 @@ An `arg` entry and any custom mechanism are refused on every target.
 - A Container Apps job runs with a deadline of 30 minutes on each execution, this
   realization's choice, because Container Apps requires a replica timeout of every
   job.
+- A failed replica of a job is retried as each target leaves it: the Terraform `Job`
+  body sets no retry limit, so whether it is retried is left to Container Apps, while
+  on Azure Resource Manager the module's default retry limit, 0, stands, so it is not
+  retried.
 
 The Container Apps bodies on Terraform declare the constraint of "One Azure provider
 constraint for every Azure body", so a boundary holding one cannot also hold a
-Recipe that requires azurerm 4; that section names which.
+Recipe whose constraint admits no azurerm release at 5.14 or later:
+`terraform/postgres-flexible-server` 1.0.0 (azurerm 4) and
+`terraform/azure-api-management` 1.0.0 (exactly 5.9.0).
+
+**A job's schedule.** The Cloud Run and Container Apps `Job` entries, on Terraform and on
+Azure Resource Manager, pass `values.schedule` to the service as it is written: they
+check nothing in the cron expression, and Cloud Scheduler or Container Apps judges it
+when the configuration is applied or the template deployed. The Amazon ECS entries
+translate it into an EventBridge Scheduler expression, and refuse by name a form they
+cannot translate.
 
 **Deliberate near-duplicates.** Every target holds its own environment assembly,
 and the reading of `.context.self_inject` is repeated in each Recipe that reads it:
-the same steps, differing in the variables each target reserves and the mechanisms
-it delivers. The Fargate size table and the schedule translation are held in both
-`EcsFargateArguments` and `EcsFargateFragment`. A values mapping and a
-CloudFormation template are different kinds, and no catalog kind composes a part of
-a template into another, so each copy says it is deliberate in place and a change
-to one is made to all of them.
+the same steps, differing in the variables each target reserves, the mechanisms it
+delivers and how an own value is escaped for the engine that reads it. An own value is
+text, never a reference: the Terraform arguments, `CloudRunArguments`,
+`EcsFargateArguments` and `ContainerAppArguments`, write a `${` in it as `$${`, which
+Terraform reads as a literal `${`, since the terraform provider escapes a `%{` itself and
+leaves `${` as written for the references neighbours publish; and
+`ContainerAppParameters` writes a value opening with `[` and closing with `]` opening
+with `[[`, which Azure Resource Manager reads as a literal `[`. The lines doing so are
+identical in the Terraform arguments. The Fargate size table and the schedule
+translation are held in both `EcsFargateArguments` and `EcsFargateFragment`. A values
+mapping and a CloudFormation template are different kinds, and no catalog kind composes
+a part of a template into another, so each copy says it is deliberate in place and a
+change to one is made to all of them.
 
 **Proving a product Recipe.** A product Recipe on the shared shape is built in the
 `container-service` fixture of its target, whose own `catalog/` holds a placeholder
