@@ -115,8 +115,8 @@
 #     remedy: write one of those, or move the arm_schemas pin.
 #
 # THE READING RULES. Read as written, the vendor's schemas refuse templates
-# Resource Manager deploys, and pass misspelt properties it refuses. Four rules
-# read them as Resource Manager does:
+# Resource Manager deploys, and pass misspelt properties it refuses. These
+# rules read them as Resource Manager does:
 #   1. Enum strings compare without case. The schemas and the compilers write
 #      enum values in different cases: the schemas write Inner where Bicep
 #      writes inner, which Resource Manager deploys.
@@ -142,6 +142,45 @@
 #      additionalProperties false the vendor writes is read as written. ARM's
 #      property iteration, copy, is allowed in any object, and the properties a
 #      copy names count as present.
+#   5. A property a resource provider takes and its specification omits is
+#      listed. The schemas are generated from each provider's OpenAPI
+#      specification, and a provider can take a property before its
+#      specification lists it, which rule 4 would refuse. DOCUMENTED_PROPERTIES
+#      names each such property by its type, its apiVersion and its path in the
+#      resource, beside the provider's documentation of it. There, and only
+#      there, the property is not refused as unlisted, and its value is not
+#      checked. An apiVersion is listed once a template carries the property at
+#      it. Listed:
+#        Microsoft.CognitiveServices/accounts/deployments@2026-05-01,
+#        properties.modelProviderData: the model-provider attestation the
+#        provider takes for a partner model, set out under "Terms of use" on
+#        Microsoft Learn's page "Deploy and use Claude on Microsoft Foundry
+#        using Bicep or Terraform via Azure Developer CLI"
+#        (https://learn.microsoft.com/azure/developer/ai/how-to/deploy-claude-foundry#terms-of-use),
+#        and missing from the specification
+#        (https://github.com/Azure/azure-rest-api-specs/issues/43610). The
+#        Azure Verified Modules module avm/res/cognitive-services/account writes
+#        it on every model deployment from version 0.19.0, as an expression
+#        over a parameter of its own. Measured: the pinned schemas list it at
+#        no apiVersion of the type and leave the object holding it open, so
+#        without this entry rule 4 alone refuses it.
+#
+# LIMITS. What the check passes that Resource Manager refuses, and where it is
+# stricter than Resource Manager:
+#   - A nested deployment's parameters are not held to the parameters its
+#     template declares: one the template does not declare, one it requires
+#     and is not passed, and a value outside its allowedValues all pass here,
+#     and fail when the template deploys.
+#   - A child resource listed under a resource's own resources is read by its
+#     parent's schema alone: its keys are not held to the resource elements,
+#     and a nested deployment among them is not read as a template.
+#   - Stricter: where the vendor writes additionalProperties false on the base
+#     of a discriminated union inside allOf, a property only a subtype lists is
+#     refused, as in Microsoft.EventGrid/topics/eventSubscriptions' destination.
+#   - Stricter: a child resource declared outside its parent with a literal
+#     name, parent/child, fails the type's name pattern, which matches the
+#     child's name alone; written as an expression, as Bicep and the catalog's
+#     arm Recipes write it, format('{0}/{1}', ...), it passes by rule 3.
 #
 # OFFLINE. Every schema is read from SCHEMAS: a $ref names
 # https://schema.management.azure.com/schemas/<path>, which is read from
@@ -173,6 +212,16 @@ REFERENCE_KEYS = ("existing", "resourceGroup", "subscriptionId")
 TEMPLATE_LANGUAGE_KEYS = ("condition", "comments", "dependsOn", "copy", "scope", "existing", "resourceGroup",
                           "subscriptionId", "metadata")
 DEPLOYMENTS = "microsoft.resources/deployments"
+
+# Rule 5: each property a resource provider takes and its specification omits,
+# keyed by the type and apiVersion it is taken at, in lower case, then by its
+# path in the resource, with the provider's documentation of it.
+DOCUMENTED_PROPERTIES = {
+    ("microsoft.cognitiveservices/accounts/deployments", "2026-05-01"): {
+        ("properties", "modelProviderData"):
+            "https://learn.microsoft.com/azure/developer/ai/how-to/deploy-claude-foundry#terms-of-use",
+    },
+}
 
 # The *resourceDefinitions key a template's $schema names, by the file it names.
 SCOPE_BY_SCHEMA = {
@@ -414,7 +463,7 @@ def accepts_any_object(schema):
 
 
 def arm_validator(schemas):
-    """A draft 4 validator reading the vendor's schemas by the four rules."""
+    """A draft 4 validator reading the vendor's schemas by the reading rules."""
     base = Draft4Validator.VALIDATORS
 
     def unlisted(instance, schema, path):
@@ -583,7 +632,8 @@ class Check:
                               f"the reference form {', '.join(REFERENCE_KEYS)}, metadata{declared} ({LEARN_PAGE}).")
         if ref is None:
             return
-        self.body(resource, address, ref, f"{type_}@{api_version}")
+        documented = DOCUMENTED_PROPERTIES.get((type_.lower(), api_version.lower()), {})
+        self.body(resource, address, ref, f"{type_}@{api_version}", documented)
         properties = resource.get("properties")
         if type_.lower() == DEPLOYMENTS and isinstance(properties, dict) \
                 and isinstance(properties.get("template"), dict):
@@ -603,12 +653,17 @@ class Check:
                   f"apiVersion {api_version} ({newest}). Write an apiVersion they cover, or move the arm_schemas "
                   f"pin in scripts/vendor-validators.json to a commit that covers this one.")
 
-    def body(self, resource, address, ref, label):
+    def body(self, resource, address, ref, label, documented):
+        """Validates RESOURCE against its type's definition at REF. DOCUMENTED
+        holds the paths of the properties rule 5 lists for its type and
+        apiVersion: none of them is refused as unlisted."""
         schema = self.schemas.lookup(ref)
         body = resource_body(resource, self.schemas.shape(schema)[0])
         validator = self.validator_class({"$ref": ref}, registry=self.schemas.registry)
         errors = list(validator.iter_errors(body)) + list(self.unlisted(body, schema, ()))
         for error in errors:
+            if error.validator == "additionalProperties" and tuple(error.absolute_path) in documented:
+                continue
             at = at_address(address, error)
             message = brief(error)
             if error.validator == "anyOf" and error.context:

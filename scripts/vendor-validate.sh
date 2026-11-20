@@ -2121,6 +2121,9 @@ ST_CASES=(
   st_arm_api_version_uncovered
   st_arm_property_misspelt
   st_arm_composed_clean
+  st_arm_documented_clean
+  st_arm_documented_other_api_version
+  st_arm_documented_misspelt
   st_arm_schemas_missing
   st_arm_template_absolute
   st_arm_template_escaping
@@ -2834,6 +2837,46 @@ st_arm_composed_template() {
 END_OF_TEMPLATE
 }
 
+# st_arm_documented_template FILE — a clean template holding one model
+# deployment, Microsoft.CognitiveServices/accounts/deployments at 2026-05-01,
+# whose properties carry modelProviderData, a property the resource provider
+# takes and its specification omits, as an expression over a parameter, as the
+# Azure Verified Modules account module writes it.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_arm_documented_template() {
+  cat >"$1" <<'END_OF_TEMPLATE'
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "languageVersion": "2.0",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "modelProviderData": {
+      "type": "object",
+      "nullable": true
+    }
+  },
+  "resources": {
+    "chat": {
+      "type": "Microsoft.CognitiveServices/accounts/deployments",
+      "apiVersion": "2026-05-01",
+      "name": "[format('{0}/{1}', 'example-account', 'example-chat')]",
+      "sku": {
+        "name": "Standard",
+        "capacity": 1
+      },
+      "properties": {
+        "model": {
+          "format": "OpenAI",
+          "name": "gpt-4o-mini"
+        },
+        "modelProviderData": "[parameters('modelProviderData')]"
+      }
+    }
+  }
+}
+END_OF_TEMPLATE
+}
+
 # st_arm_run WRITER [SED_SCRIPT] — writes a template with WRITER into a
 # directory of its own, applies SED_SCRIPT to it, and runs the check on it
 # there; ST_RC and ST_OUT get its exit status and everything it printed.
@@ -2906,6 +2949,29 @@ st_arm_property_misspelt() {
 st_arm_composed_clean() {
   st_arm_run st_arm_composed_template || { st_broken "write a template"; return; }
   st_passed "a type composed from several schemas through allOf, its properties listed across them"
+}
+
+# Rule 5 lists modelProviderData on a model deployment at 2026-05-01 alone.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_documented_clean() {
+  st_arm_run st_arm_documented_template || { st_broken "write a template"; return; }
+  st_passed "a property the resource provider takes and its specification omits, where the reading rules list it (modelProviderData on a model deployment at 2026-05-01)"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_documented_other_api_version() {
+  st_arm_run st_arm_documented_template 's/"apiVersion": "2026-05-01"/"apiVersion": "2026-07-01"/' ||
+    { st_broken "write a template"; return; }
+  st_arm_caught "a property the reading rules list at one apiVersion, written at another (modelProviderData at 2026-07-01)" \
+    "arm|additionalProperties|$ST_ARM_TEMPLATE/chat/properties/modelProviderData"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_documented_misspelt() {
+  st_arm_run st_arm_documented_template 's/"modelProviderData": "\[/"modelProviderDta": "[/' ||
+    { st_broken "write a template"; return; }
+  st_arm_caught "a misspelling of a property the reading rules list (modelProviderDta)" \
+    "arm|additionalProperties|$ST_ARM_TEMPLATE/chat/properties/modelProviderDta"
 }
 
 # shellcheck disable=SC2329 # a case, run by name from ST_CASES
