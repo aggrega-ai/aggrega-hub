@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck source-path=SCRIPTDIR disable=SC1091
 # scripts/vendor-validate.sh — hold the catalog's cloud Recipes to what the
-# vendors' own validators accept, offline, and every commit to the two rules that
+# vendors' own validators accept, offline, and every commit to the rules that
 # need no validator.
 #
 # --help is the contract: the forms, what each judges, the cache, and every exit
@@ -15,11 +15,12 @@
 # its two parts when the script runs, so no file in this repository carries it and
 # the rule needs no exemption for this script.
 #
-# TWO RULES BEFORE ANY VALIDATOR. The vendor-text rule and the pass-through rule
-# read blobs with git and match text with grep and awk, and they run before any
-# validator is looked for, so they hold on a machine where nothing is primed. A
-# container Recipe is recognised by its text rather than by a YAML parser for the
-# same reason: the rule depends on no tool the machine may lack.
+# RULES BEFORE ANY VALIDATOR. The vendor-text rule, the pass-through rule and the
+# cfn-lint configuration rule read blobs with git and match text with grep and
+# awk, and they run before any validator is looked for, so they hold on a machine
+# where nothing is primed. A container Recipe, and a rule .cfnlintrc.yaml
+# ignores, are recognised by their text rather than by a YAML parser for the same
+# reason: a rule depends on no tool the machine may lack.
 #
 # ONE PIN FILE, ONE CACHE PER PIN FILE. Every version and checksum lives in
 # scripts/vendor-validators.json. The cache directory is named by the SHA-256 of
@@ -82,7 +83,7 @@ usage() {
   local text
   text="$(cat <<'END_OF_HELP'
 vendor-validate.sh — hold the catalog's cloud Recipes to what the vendors' own
-validators accept, offline, and every commit to the two rules that need no
+validators accept, offline, and every commit to the rules that need no
 validator.
 
 USAGE
@@ -95,8 +96,9 @@ USAGE
   --staged     judge the commit being made, as the index holds it, by VENDOR
                TEXT and THE CANONICAL PASS-THROUGH: the form for a pre-commit
                hook.
-  --all        judge everything the index holds by VENDOR TEXT and THE
-               CANONICAL PASS-THROUGH, then require THE VALIDATORS.
+  --all        judge everything the index holds by VENDOR TEXT, THE
+               CANONICAL PASS-THROUGH and THE CFN-LINT CONFIGURATION, then
+               require THE VALIDATORS.
   --prime      fetch every validator the pin file names into the cache, verify
                each checksum, and run --self-test against the result. The one
                form that uses the network.
@@ -109,7 +111,9 @@ USAGE
                clean template, and that tofu, cfn-lint and that check, run
                over a rendered boundary, each name a fault planted there by
                its finding id and the entity version it belongs to, the id
-               holding across runs and line moves. Needs the primed cache.
+               holding across runs and line moves, cfn-lint's even where the
+               template tells cfn-lint to ignore its rule. Needs the primed
+               cache.
 
   It judges the repository it belongs to, wherever it is run from. AGGREGA_BIN
   names the aggrega binary (default: aggrega on PATH). PUBLISHED_REMOTE names
@@ -146,6 +150,17 @@ THE CANONICAL PASS-THROUGH (--staged, --all)
   file itself; --all judges every one. A version the record holds as published
   (.ci-published-digests on <remote>/published, as last fetched) is final and
   keeps the file it was published with, so it is not judged.
+
+THE CFN-LINT CONFIGURATION (--all)
+  .cfnlintrc.yaml, at the top of this repository, is the one configuration
+  cfn-lint reads. Each rule it ignores is a line of its own under
+  ignore_checks, - <rule>, with its reason in a comment beside it or on the
+  line directly above: what the rule reports, and why a template this catalog
+  renders is right to carry it anyway. An entry with no reason, or rules
+  written in brackets on the ignore_checks line itself (an empty list, [],
+  aside), is refused, naming the line and the rule; so is the file's absence
+  from the index. The file is read from the index, as a text, with no YAML
+  parser.
 
 THE VALIDATORS
   scripts/vendor-validators.json pins each validator: OpenTofu by version and
@@ -190,12 +205,12 @@ THE VALIDATORS
     cfn-lint  <boundary>/cloudformation/cloudformation-stack.json, with
               --config-file .cfnlintrc.yaml --non-zero-exit-code warning
               --regions us-east-1. Every error and warning is a finding.
-              cfn-lint reads no configuration file but .cfnlintrc.yaml, at
-              the top of this repository, where each rule ignored carries
-              its reason in a comment. It also reads rules to ignore from a
-              template's own Metadata, under the key cfn-lint, which no
-              Recipe in this catalog renders; this script does not refuse a
-              template carrying it.
+              cfn-lint reads no configuration file but .cfnlintrc.yaml (THE
+              CFN-LINT CONFIGURATION above). It would also take rules to
+              ignore, and more, from a template's own Metadata, under the
+              key cfn-lint, at the top and on each resource: it lints a copy
+              of the template with every such key set aside, each named on
+              standard error, so that configuration takes no effect.
     arm       <boundary>/arm/arm-template.json, by the check above.
 
   A form that requires the validators requires, before it runs any: the cache
@@ -295,6 +310,7 @@ export GIT_OPTIONAL_LOCKS=0
 
 PIN_FILE="$HERE/vendor-validators.json"
 CANONICAL="scripts/container-pass-through/main.tf"
+CFNLINTRC=".cfnlintrc.yaml"
 TF_RECIPES="$CATALOG_ROOT/recipe/terraform"
 PRIME_CMD="$HERE/vendor-validate.sh --prime"
 TMP="$(mktemp -d)" || exit 3
@@ -475,6 +491,50 @@ pass_through_drift() {
   else
     printf 'differs from %s' "$CANONICAL"
   fi
+}
+
+# --- the cfn-lint configuration ---------------------------------------------------
+# Each rule .cfnlintrc.yaml ignores, under ignore_checks, is a line of its own,
+# - <rule>, with its reason in a comment beside it or on the line directly above;
+# awk prints, for each that breaks this, its line number, a tab and what to write.
+# A list written in brackets, empty or not, gives no rule a line of its own, so
+# only the empty one, [], passes.
+# shellcheck disable=SC2016 # awk's own $, not the shell's
+CFNLINTRC_AWK='
+  function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+  function uncomment(s) { sub(/^#.*$/, "", s); sub(/[ \t]+#.*$/, "", s); return trim(s) }
+  function unquote(s) { if (s ~ /^".*"$/ || s ~ /^\047.*\047$/) s = substr(s, 2, length(s) - 2); return s }
+  { sub(/\r$/, "") }
+  in_list && $0 ~ /^[^ \t#-]/ { in_list = 0 }
+  in_list && $0 ~ /^[ \t]*-/ {
+    entry = $0
+    sub(/^[ \t]*-[ \t]*/, "", entry)
+    rule = unquote(uncomment(entry))
+    if (entry !~ /[ \t]#[ \t]*[^ \t]/ && previous !~ /^[ \t]*#[ \t]*[^ \t]/)
+      printf "%d\tignores the cfn-lint rule %s with no reason beside it or on the line above: write, in a comment there, what the rule reports and why a template this catalog renders is right to carry it anyway, or remove the entry\n", NR, rule
+  }
+  !in_list && $0 ~ /^ignore_checks[ \t]*:/ {
+    rest = $0
+    sub(/^ignore_checks[ \t]*:/, "", rest)
+    rest = uncomment(rest)
+    if (rest == "") in_list = 1
+    else if (rest !~ /^\[[ \t]*\]$/)
+      printf "%d\twrites the rules cfn-lint ignores inside the line itself (%s), where no rule has a line of its own for its reason: write each as a line - <rule> under ignore_checks, with its reason in a comment beside it or on the line above\n", NR, rest
+  }
+  { previous = $0 }'
+
+# cfnlintrc_rule — refuses each rule .cfnlintrc.yaml, as the index holds it,
+# ignores without its reason, naming the line and the rule; and the file's
+# absence from the index, since cfn-lint takes its configuration from it alone.
+cfnlintrc_rule() {
+  local line why
+  if ! staged_blob "$CFNLINTRC" "$TMP/cfnlintrc.yaml"; then
+    refuse "$CFNLINTRC: not in the index. cfn-lint takes its configuration from it alone, each rule it ignores with its reason: restore it from git and stage it (git add -- $CFNLINTRC)."
+    return
+  fi
+  while IFS=$'\t' read -r line why; do
+    refuse "$CFNLINTRC:$line: $why."
+  done < <(awk "$CFNLINTRC_AWK" "$TMP/cfnlintrc.yaml")
 }
 
 # --- the pin file and the cache --------------------------------------------------
@@ -688,7 +748,9 @@ require_validators() {
 #             copy of the root (WORK/terraform), init.json, init.err and, when
 #             init succeeded, validate.json and validate.err; VALIDATE_STATUS is
 #             - when validate did not run
-#   cfn-lint  BOUNDARY TEMPLATE OUTPUT STATUS
+#   cfn-lint  BOUNDARY TEMPLATE OUTPUT STATUS LINES — LINES is 0 when cfn-lint
+#             read a rewritten copy of the template, whose line numbers are not
+#             the template's, so no message names one
 #   arm       BOUNDARY TEMPLATE OUTPUT STATUS
 PY_FINDINGS="$(cat <<'END_OF_PYTHON'
 import json, os, re, sys
@@ -844,7 +906,15 @@ def tofu():
         context = one_line(context) if isinstance(context, str) else ""
         m = re.search(r'"([^"]+)"', detail) or re.search(
             r"\bprovider ([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)", detail)
-        name = one_line(m.group(1)) if m else ""
+        name = m.group(1) if m else ""
+        # A name that is a path of this machine is named relative to the
+        # boundary when it lies in the root, and left out otherwise.
+        if os.path.isabs(name):
+            named = os.path.relpath(name, root)
+            name = "" if named == os.pardir or named.startswith(os.pardir + os.sep) else "terraform/" + named
+        elif work in name:
+            name = ""
+        name = one_line(name)
         shown = (rel if outside else "terraform/" + rel) if rel else ""
         address = "/".join(p for p in (one_line(shown), context, name) if p)
         ident = f"tofu|{summary}|{address}"
@@ -861,7 +931,7 @@ def tofu():
     return findings
 
 def cfn_lint():
-    template, output, status = sys.argv[3], sys.argv[4], sys.argv[5]
+    template, output, status, lines = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
     matches = read_json(output, f"cfn-lint's reading of {template} (exit {status})")
     if not isinstance(matches, list):
         no_verdict(f"cfn-lint's reading of {template} (exit {status}) is not a list of findings")
@@ -882,7 +952,7 @@ def cfn_lint():
         if isinstance(path, list) and len(path) >= 2 and path[0] == "Resources":
             prov = uri(get(get(doc, "Resources", str(path[1])), "Metadata", *PROVENANCE))
         line = get(m, "Location", "Start", "LineNumber")
-        where = f" ({template}:{line})" if isinstance(line, int) else ""
+        where = f" ({template}:{line})" if isinstance(line, int) and lines == "1" else ""
         message = one_line(f"cfn-lint {level.lower()}: {get(m, 'Message')}{where}")
         findings.add((f"cfn-lint|{one_line(rule)}|{address}", prov or "-", message))
     if status != str(levels):
@@ -929,6 +999,69 @@ def arm():
 findings = {"tofu": tofu, "cfn-lint": cfn_lint, "arm": arm}[mode]()
 for finding in sorted(findings):
     print("\t".join(finding))
+END_OF_PYTHON
+)"
+
+# The copy cfn-lint reads: it copies the stack template SOURCE to COPY and prints
+# the path of each cfn-lint key it set aside, one a line. cfn-lint takes rules to
+# ignore, regions and more from a template's own Metadata, under the key cfn-lint,
+# at the top and on each resource; the copy carries none of them, so cfn-lint is
+# configured by .cfnlintrc.yaml alone. A template with no such key, or one that
+# is not JSON, is copied byte for byte; otherwise the copy is the template
+# written again, every key in its order, a key written twice kept twice and every
+# number as written, less those keys.
+PY_CFN_LINT_COPY="$(cat <<'END_OF_PYTHON'
+import json, sys
+
+source, copy = sys.argv[1], sys.argv[2]
+KEY = "cfn-lint"
+
+class Members(list):
+    """An object's members, as (key, value) pairs in their order."""
+
+class Number(str):
+    """A number, as written."""
+
+def set_aside(obj, path, found):
+    if isinstance(obj, Members) and any(k == KEY for k, _ in obj):
+        obj[:] = [(k, v) for k, v in obj if k != KEY]
+        found.append(f"{path}/{KEY}")
+
+def dump(value, depth=0):
+    pad, end = "  " * (depth + 1), "  " * depth
+    if isinstance(value, Members):
+        if not value:
+            return "{}"
+        return "{\n" + ",\n".join(f"{pad}{json.dumps(k)}: {dump(v, depth + 1)}" for k, v in value) + f"\n{end}}}"
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        return "[\n" + ",\n".join(pad + dump(v, depth + 1) for v in value) + f"\n{end}]"
+    if isinstance(value, Number):
+        return str(value)
+    return json.dumps(value)
+
+with open(source, "rb") as f:
+    raw = f.read()
+found = []
+try:
+    doc = json.loads(raw.decode("utf-8"), object_pairs_hook=Members, parse_float=Number, parse_int=Number,
+                     parse_constant=Number)
+except ValueError:
+    doc = None
+if isinstance(doc, Members):
+    for key, value in doc:
+        if key == "Metadata":
+            set_aside(value, "Metadata", found)
+        elif key == "Resources" and isinstance(value, Members):
+            for name, resource in value:
+                for rkey, rvalue in resource if isinstance(resource, Members) else ():
+                    if rkey == "Metadata":
+                        set_aside(rvalue, f"Resources/{name}/Metadata", found)
+with open(copy, "wb") as f:
+    f.write(dump(doc).encode("utf-8") + b"\n" if found else raw)
+for path in found:
+    print(path)
 END_OF_PYTHON
 )"
 
@@ -1041,11 +1174,12 @@ tofu_findings() {
 }
 
 # cfn_lint_findings TREE BOUNDARY — cfn-lint, configured by TREE's .cfnlintrc.yaml
-# alone, on the stack template BOUNDARY holds; prints its findings attributed
-# through TREE's catalog.
+# alone, on a copy of the stack template BOUNDARY holds with the template's own
+# cfn-lint configuration set aside (PY_CFN_LINT_COPY), each key set aside named on
+# standard error; prints its findings attributed through TREE's catalog.
 # shellcheck disable=SC2329 # called by name, as a fixture's check calls it
 cfn_lint_findings() {
-  local tree="$1" boundary="$2" template="cloudformation/cloudformation-stack.json" work rc=0
+  local tree="$1" boundary="$2" template="cloudformation/cloudformation-stack.json" work set_aside key rc=0 lines=1
   [ -d "$boundary/cloudformation" ] || return 0
   [ -f "$boundary/$template" ] ||
     no_verdict "$boundary/cloudformation holds no cloudformation-stack.json, the stack template the cloudformation provider renders, so cfn-lint has no template to lint"
@@ -1053,12 +1187,21 @@ cfn_lint_findings() {
   [ -f "$tree/.cfnlintrc.yaml" ] ||
     no_verdict "$tree/.cfnlintrc.yaml is missing, and cfn-lint reads its rules from it; restore it from git"
   work="$(mktemp -d "$TMP/cfn-lint.XXXXXX")" || no_verdict "cannot make a directory in $TMP"
-  (cd -- "$boundary" && env -i PATH="$PATH" HOME="$work" LANG=C.UTF-8 PYTHONUTF8=1 \
+  mkdir -p "$work/cloudformation" || no_verdict "cannot make a directory in $work"
+  set_aside="$(python3 -I -c "$PY_CFN_LINT_COPY" "$boundary/$template" "$work/$template")" ||
+    no_verdict "cannot copy $boundary/$template to $work for cfn-lint"
+  if [ -n "$set_aside" ]; then
+    lines=0
+    while IFS= read -r key; do
+      printf '  set aside  %s\t%s\n' "$key" "cfn-lint's own configuration, written in $boundary/$template: cfn-lint takes its rules from .cfnlintrc.yaml alone, so the copy it reads carries none of it" >&2
+    done <<<"$set_aside"
+  fi
+  (cd -- "$work" && env -i PATH="$PATH" HOME="$work" LANG=C.UTF-8 PYTHONUTF8=1 \
     "$CACHE_DIR/venv/bin/cfn-lint" --config-file "$tree/.cfnlintrc.yaml" --non-zero-exit-code warning \
     --regions us-east-1 --format json -- "$template") >"$work/cfn-lint.json" 2>"$work/cfn-lint.err" || rc=$?
   [ -s "$work/cfn-lint.json" ] ||
     no_verdict "cfn-lint gave no reading of $boundary/$template (exit $rc): $(tail -n 3 "$work/cfn-lint.err" | tr '\n' ' ')"
-  read_findings "$tree" cloudformation cfn-lint "$boundary" "$template" "$work/cfn-lint.json" "$rc"
+  read_findings "$tree" cloudformation cfn-lint "$boundary" "$template" "$work/cfn-lint.json" "$rc" "$lines"
 }
 
 # arm_findings TREE BOUNDARY — the Azure Resource Manager check on the template
@@ -1200,6 +1343,9 @@ ST_CASES=(
   st_canonical_changed
   st_canonical_changed_published_kept
   st_clean_commit
+  st_cfnlintrc_reason_missing
+  st_cfnlintrc_flow_list
+  st_cfnlintrc_reasons_given
   st_unprimed
   st_primed_for_another_pin_file
   st_cached_tofu_other_version
@@ -1229,6 +1375,8 @@ ST_CASES=(
   st_cfn_lint_unattributed
   st_cfn_lint_ambiguous
   st_cfn_lint_id_stable
+  st_cfn_lint_resource_ignore
+  st_cfn_lint_template_ignore
   st_arm_boundary_attributed
 )
 # The container Recipe every scratch repository carries.
@@ -1269,8 +1417,8 @@ st_broken() {
 }
 
 # st_repo — makes ST_REPO, a scratch repository holding a copy of this script's
-# directory and a terraform container Recipe carrying the canonical pass-through,
-# all committed.
+# directory, this repository's .cfnlintrc.yaml and a terraform container Recipe
+# carrying the canonical pass-through, all committed.
 # shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
 st_repo() {
   ST_N=$((ST_N + 1))
@@ -1278,6 +1426,7 @@ st_repo() {
   local recipe="$ST_REPO/$ST_RECIPE"
   mkdir -p "$recipe/module" &&
     cp -R "$HERE" "$ST_REPO/scripts" &&
+    cp "$TOP/.cfnlintrc.yaml" "$ST_REPO/.cfnlintrc.yaml" &&
     cp "$HERE/container-pass-through/main.tf" "$recipe/module/main.tf" &&
     st_recipe_yaml probe-service >"$recipe/recipe.yaml" &&
     printf 'A scratch repository the self-test judges.\n' >"$ST_REPO/README.md" &&
@@ -1502,6 +1651,39 @@ st_clean_commit() {
     git -C "$ST_REPO" add -- "$next" README.md; } || { st_broken "stage a clean change"; return; }
   st_run --staged
   st_passed "a clean commit"
+}
+
+# st_cfnlintrc LINE... — writes .cfnlintrc.yaml in ST_REPO from the lines given,
+# and stages it.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_cfnlintrc() {
+  printf '%s\n' "$@" >"$ST_REPO/.cfnlintrc.yaml" && git -C "$ST_REPO" add -- .cfnlintrc.yaml
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfnlintrc_reason_missing() {
+  { st_repo && st_cfnlintrc "# cfn-lint's configuration." "ignore_checks:" "  - E3012"; } ||
+    { st_broken "stage .cfnlintrc.yaml"; return; }
+  st_run --all
+  st_caught "a rule ignored in .cfnlintrc.yaml with no reason beside it" 1 ".cfnlintrc.yaml:3:" "E3012"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfnlintrc_flow_list() {
+  { st_repo && st_cfnlintrc "ignore_checks: [E3012]"; } || { st_broken "stage .cfnlintrc.yaml"; return; }
+  st_run --all
+  st_caught "rules ignored in .cfnlintrc.yaml as a list on one line, with no line for a reason" 1 \
+    ".cfnlintrc.yaml:1:" "E3012"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfnlintrc_reasons_given() {
+  local home="$ST_ROOT/home-$((ST_N + 1))"
+  { st_repo && st_cache "$home" "$PIN_TOFU_VERSION" "${PIN_PYTHON[cfn-lint]}" &&
+    st_cfnlintrc "ignore_checks:" "  # The reason W3011 is ignored, on the line above." "  - W3011" \
+      "  - E3012  # The reason E3012 is ignored, beside it."; } || { st_broken "stage .cfnlintrc.yaml"; return; }
+  st_run --all HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-at-minimum"
+  st_passed "rules ignored in .cfnlintrc.yaml, each with its reason on the line above or beside it"
 }
 
 # shellcheck disable=SC2329 # a case, run by name from ST_CASES
@@ -2234,6 +2416,30 @@ st_cfn_lint_id_stable() {
   st_found "$label" "cfn-lint|E3012|Resources/Queue/Properties/VisibilityTimeout" "recipe/cloudformation/probe-queue@1.0.0"
 }
 
+# The resource's own Metadata asks cfn-lint to ignore the rule its fault breaks.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfn_lint_resource_ignore() {
+  { st_tree && st_boundary && st_cfn_stack "$ST_BOUNDARY" &&
+    sed -i -e 's/"VisibilityTimeout": 30/"VisibilityTimeout": "thirty"/' \
+      -e 's/^      "Metadata": {$/&\n        "cfn-lint": {\n          "config": {\n            "ignore_checks": ["E3012"]\n          }\n        },/' \
+      "$ST_BOUNDARY/cloudformation/cloudformation-stack.json"; } || { st_broken "write a stack template"; return; }
+  st_findings cfn_lint_findings
+  st_found "a fault whose resource's own Metadata tells cfn-lint to ignore its rule, caught all the same" \
+    "cfn-lint|E3012|Resources/Queue/Properties/VisibilityTimeout" "recipe/cloudformation/probe-queue@1.0.0"
+}
+
+# The template's own Metadata asks cfn-lint to ignore the rule its fault breaks.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfn_lint_template_ignore() {
+  { st_tree && st_boundary && st_cfn_stack "$ST_BOUNDARY" &&
+    sed -i -e 's/"VisibilityTimeout": 30/"VisibilityTimeout": "thirty"/' \
+      -e 's/^  "AWSTemplateFormatVersion": "2010-09-09",$/&\n  "Metadata": {\n    "cfn-lint": {\n      "config": {\n        "ignore_checks": ["E3012"]\n      }\n    }\n  },/' \
+      "$ST_BOUNDARY/cloudformation/cloudformation-stack.json"; } || { st_broken "write a stack template"; return; }
+  st_findings cfn_lint_findings
+  st_found "a fault whose template's own Metadata tells cfn-lint to ignore its rule, caught all the same" \
+    "cfn-lint|E3012|Resources/Queue/Properties/VisibilityTimeout" "recipe/cloudformation/probe-queue@1.0.0"
+}
+
 # The fault lies inside the nested deployment, whose metadata carries the
 # provenance.
 # shellcheck disable=SC2329 # a case, run by name from ST_CASES
@@ -2252,10 +2458,11 @@ case "$MODE" in
   staged | all)
     vendor_text_rule
     pass_through_rule
+    [ "$MODE" != all ] || cfnlintrc_rule
     [ "$REFUSED" -eq 0 ] || exit 1
     if [ "$MODE" = all ]; then
       require_validators
-      echo "$ME: passed — no vendor text, every container Recipe carries the canonical pass-through, and the validators are primed ($CACHE_DIR)"
+      echo "$ME: passed — no vendor text, every container Recipe carries the canonical pass-through, every rule $CFNLINTRC ignores carries its reason, and the validators are primed ($CACHE_DIR)"
     else
       echo "$ME: passed — no vendor text staged, and every container Recipe the commit reaches carries the canonical pass-through"
     fi
