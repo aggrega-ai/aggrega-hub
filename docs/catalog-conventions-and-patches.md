@@ -2412,6 +2412,42 @@ ranges. Moving the range is one change made to every Google body at once, and wh
 the major moves to 9 each vendored module's `< 9` ceiling has to move with it. This
 is a catalog convention: the compiler pipes the block as text and reads nothing in it.
 
+Google bodies keep to the Terraform 1.5 language: Infrastructure Manager's free tier
+applies Terraform 1.5.7, so a body that uses a later language feature does not apply
+there. This is a convention whose enforcement is not implemented, because
+`tofu validate` accepts constructs Terraform 1.5.7 rejects and cannot stand in for it.
+
+### One Azure provider constraint for every Azure body
+
+The same rule holds for Azure, with its own string. Every Terraform body the catalog
+authors for Azure declares `hashicorp/azurerm` in its `required_providers` block as
+**`~> 5.14`**, one string in every such body, carried by each body with a comment naming
+this section, for the reasons the AWS section gives. The major and minor are those of the
+provider's current release when the constraint is set, and never lower than the highest
+`hashicorp/azurerm` floor declared by a published Azure module a catalog Recipe sources
+whose constraint admits the catalog's major. A floor in another major is not compared: a
+constraint such as `~> 4.12` admits no azurerm 5 release, so the module declaring it
+cannot share a root with a body at `~> 5.14` whatever the numbers say. Where an Azure
+Verified Module brings `Azure/azapi`, `Azure/modtm` or `hashicorp/random`, those
+providers keep the module's ranges and Terraform installs one release of each.
+
+A published module a Recipe sources keeps its publisher's own constraint. The Azure
+Verified Module `recipe/terraform/postgres-flexible-server` vendors declares
+`hashicorp/azurerm` `~> 4.12`, `Azure/azapi` `~> 2.4`, `Azure/modtm` `~> 0.3` and
+`hashicorp/random` `~> 3.6`. Because it admits no azurerm 5 release, that Recipe and a
+body at the catalog's string go in different terraform boundaries, and the published
+Recipes' descriptions name the ones that cannot share a root with it. The module's pin
+moves when its publisher releases a version admitting azurerm 5. Published bodies that
+declare another string, a range or an exact version, stay as published; a published
+version is final.
+
+Every Recipe the catalog authors that wraps an Azure Verified Module turns the module's
+telemetry off: `enableTelemetry: false` for a Bicep module (see "A published Bicep
+module") and `enable_telemetry = false` for a Terraform one. A Recipe may offer
+`infra.overrides.enable_telemetry: true` to keep it; the `arm` Recipes refuse that value
+and say so. A published Recipe that leaves the module's default stays as published.
+This is a catalog convention: the compiler pipes the block as text and reads nothing in it.
+
 ### Optional credential slots for self-managed datastores
 
 A self-managed datastore Component declares its password as an **optional**
