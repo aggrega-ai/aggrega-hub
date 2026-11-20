@@ -124,12 +124,15 @@
 # 10 s; tofu init then tofu validate over its root take 0.2 s and 1.1 s, 1.2 to
 # 2.6 s with the copy and the reading; the copy of the index takes 0.2 s and
 # 22 MB, and a build's own tree linked from it 0.16 s to make and 0.08 s to
-# remove. On a machine with 24 processing units and 62 GiB, --all took 338 s
-# building one Release at a time and 51 s twelve at a time; --staged reaching
-# proofs/terraform-google/container-service alone, 284 s and 33 s.
-# The cache is 3.0 GB, 2.5 GB of it the provider mirror, which init links from
-# rather than copies (a root's data directory and plugin cache take 0.1 MB). A
-# commit reaching no fixture costs the rules alone, under a second.
+# remove. On a machine with 24 processing units and 62 GiB, 34 GiB of it
+# available and a one-minute load near 10 from other work, --all built and
+# judged 215 Releases in 160 s, twelve at a time; a commit changing the shared
+# Terraform and Container Apps libraries, which reaches the container-service
+# fixtures of arm, terraform-aws, terraform-azurerm and terraform-google, took
+# 132 s through the pre-commit hook. The cache is 3.0 GB, 2.5 GB of it the
+# provider mirror, which init links from rather than copies (a root's data
+# directory and plugin cache take 0.1 MB). A commit reaching no fixture costs
+# the rules alone, under a second.
 #
 # OFFLINE BY CONSTRUCTION. tofu runs with a CLI configuration naming the cache's
 # mirror alone, refusing the module registries registry.opentofu.org and
