@@ -142,11 +142,12 @@
 #     passed only under a condition (parameter-value).
 #   - A value written as a literal, not wholly as an expression (rule 3 below),
 #     meets the declaration (parameter-value): its type, string, securestring,
-#     int, bool, object, secureobject or array; its allowedValues, each item of
-#     an array, strings compared without case as rule 1 compares enum strings;
-#     minValue and maxValue for an int; minLength and maxLength for a string or
-#     an array. A declaration naming a type its definitions declare, by $ref,
-#     is read with that definition under it.
+#     int, bool, object, secureobject or array, a JSON number written with a
+#     fraction or an exponent being no int; its allowedValues, each item of an
+#     array not written as an expression, strings compared without case as
+#     rule 1 compares enum strings; minValue and maxValue for an int; minLength
+#     and maxLength for a string or an array. A declaration naming a type its
+#     definitions declare, by $ref, is read with that definition under it.
 #
 # THE READING RULES. Read as written, the vendor's schemas refuse templates
 # Resource Manager deploys, and pass misspelt properties it refuses. These
@@ -840,6 +841,8 @@ def entry_problem(entry, d):
     if isinstance(allowed, list):
         items = value if isinstance(value, list) and expected is list else [value]
         for item in items:
+            if is_expression(item):
+                continue
             if not any(same_value(item, a) for a in allowed):
                 return f"{shortened(item)} is not one of the allowedValues the nested template declares, {shortened(allowed)}"
     number = isinstance(value, int) and not isinstance(value, bool)

@@ -2131,6 +2131,8 @@ ST_CASES=(
   st_arm_parameter_required_missing
   st_arm_parameter_wrong_type
   st_arm_parameter_not_allowed
+  st_arm_parameter_array_not_allowed
+  st_arm_parameter_array_item_expression
   st_arm_parameter_expression
   st_arm_schemas_missing
   st_arm_template_absolute
@@ -2891,8 +2893,9 @@ END_OF_TEMPLATE
 # string with a default and not passed, an int with a default and a minValue,
 # an int with allowedValues passed as an expression, an int whose whole entry is
 # an expression, as Bicep writes an entry passed under a condition, a
-# securestring passed as a Key Vault reference, an array, a parameter of a type
-# its definitions declare, and a nullable object not passed.
+# securestring passed as a Key Vault reference, an array, an array with
+# allowedValues, a parameter of a type its definitions declare, and a nullable
+# object not passed.
 # shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
 st_arm_parameters_template() {
   cat >"$1" <<'END_OF_TEMPLATE'
@@ -2947,6 +2950,7 @@ st_arm_parameters_template() {
           "highAvailability": {
             "value": "Disabled"
           },
+          "zones": {"value": [1, 2]},
           "backupRetentionDays": "[if(equals(parameters('zone'), -1), createObject('value', 7), createObject('value', 14))]"
         },
         "template": {
@@ -2969,6 +2973,7 @@ st_arm_parameters_template() {
             "databases": {"type": "array"},
             "highAvailability": {"$ref": "#/definitions/highAvailabilityType"},
             "backupRetentionDays": {"type": "int", "minValue": 7, "maxValue": 35, "defaultValue": 7},
+            "zones": {"type": "array", "allowedValues": [1, 2, 3], "defaultValue": []},
             "tags": {"type": "object", "nullable": true}
           },
           "resources": {}
@@ -3112,6 +3117,21 @@ st_arm_parameter_not_allowed() {
     { st_broken "write a template"; return; }
   st_arm_caught "a literal outside the parameter's allowedValues (tier Premium)" \
     "arm|parameter-value|$ST_ARM_TEMPLATE/database/properties/parameters/tier"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_parameter_array_not_allowed() {
+  st_arm_run st_arm_parameters_template 's/"zones": {"value": \[1, 2\]}/"zones": {"value": [1, 4]}/' ||
+    { st_broken "write a template"; return; }
+  st_arm_caught "an item of an array outside the parameter's allowedValues (zones 4)" \
+    "arm|parameter-value|$ST_ARM_TEMPLATE/database/properties/parameters/zones"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_parameter_array_item_expression() {
+  st_arm_run st_arm_parameters_template "s/\"zones\": {\"value\": \\[1, 2\\]}/\"zones\": {\"value\": [1, \"[parameters('zone')]\"]}/" ||
+    { st_broken "write a template"; return; }
+  st_passed "an item of an array parameter written as an expression, which Resource Manager evaluates when it deploys (zones [parameters('zone')])"
 }
 
 # shellcheck disable=SC2329 # a case, run by name from ST_CASES
