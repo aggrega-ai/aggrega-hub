@@ -9,16 +9,19 @@
 #
 # THE INDEX, NOT THE WORKING TREE. Every file a rule reads is read from the index
 # with git, as the published-version guard reads it, so what is judged is what the
-# commit carries: an unstaged fix cannot pass a broken staged file.
+# commit carries: an unstaged fix cannot pass a broken staged file. A fixture is
+# built in a copy of the index for the same reason, and the selection reads the
+# fixtures' locks from the index.
 #
 # THE MARKER IS WRITTEN WHOLE NOWHERE HERE. The vendor-text marker is composed from
 # its two parts when the script runs, so no file in this repository carries it and
 # the rule needs no exemption for this script.
 #
-# RULES BEFORE ANY VALIDATOR. The vendor-text rule, the pass-through rule and the
-# cfn-lint configuration rule read blobs with git and match text with grep and
-# awk, and they run before any validator is looked for, so they hold on a machine
-# where nothing is primed. A container Recipe, and a rule .cfnlintrc.yaml
+# RULES BEFORE ANY VALIDATOR. The vendor-text rule, the pass-through rule, the
+# cfn-lint configuration rule and the fixtures' layout and selection read blobs
+# with git and match text with grep and awk, and they run before any validator is
+# looked for, so they hold on a machine where nothing is primed; only a commit
+# changing the known-findings file needs python3 to read it. A container Recipe, and a rule .cfnlintrc.yaml
 # ignores, are recognised by their text rather than by a YAML parser for the same
 # reason: a rule depends on no tool the machine may lack.
 #
@@ -26,7 +29,11 @@
 # scripts/vendor-validators.json. The cache directory is named by the SHA-256 of
 # that file, so a changed pin file finds no cache until it is primed, and a cache
 # never answers for a pin file it was not primed from. Nothing outside the cache
-# runs as a validator: a tofu or cfn-lint on PATH may be any version.
+# runs as a validator: a tofu or cfn-lint on PATH may be any version. --staged
+# and --all name the cache by the pin file the index holds, since that is the
+# file the commit carries; --prime and --self-test act on this checkout and read
+# the one in the working tree. A pin file changed and not yet staged is primed
+# by --prime and required by neither judging form until it is staged.
 #
 # A BUILD BETWEEN RELEASES COUNTS AS ITS RELEASE. aggrega version reports such a
 # build as git describe writes it, 0.10.0-41-g697285c71-dirty. Read as a semantic
@@ -52,6 +59,39 @@
 # validator that cannot give a reading is no verdict: the run exits 3 naming
 # why, so a caller that must go on runs the function in a subshell. --help holds
 # the ids and the attribution. A caller runs require_validators first.
+#
+# A FIXTURE IS BUILT AS ITS OWN WORKSPACE, AND ONLY AS THAT. Each Release is
+# built in the copy of the index with --workspace-root naming the fixture, an
+# empty global configuration (--config) and AGGREGA_CATALOG_DIRS,
+# AGGREGA_WORKSPACE_ROOT and AGGREGA_CONFIG unset, so nothing on the machine
+# changes what it resolves: a global auto_pull, say, would rewrite the lock in
+# the copy and hide a lock out of date. Its sources are the ones aggrega pull
+# fetched into the fixture's .aggrega/cache/ in the checkout; the build reaches
+# them through AGGREGA_ARTIFACT_CACHE_DIR, which must be relative to the
+# workspace root (an absolute value halts the build), so it is that directory
+# named relative to the copy. The build reads it and writes nothing there.
+#
+# A LOCK IS READ AS TEXT. The selection matches what a commit changes against
+# the entities and libraries each fixture's lock records, read with awk in the
+# layout aggrega pull writes, so it needs no YAML parser and the rules before any
+# validator stay free of tools. A lock from which nothing can be read is
+# refused, so a change in that layout fails loudly rather than selecting
+# nothing.
+#
+# A KNOWN FINDING BELONGS TO A PUBLISHED VERSION. A published version is final:
+# a finding in it can only be listed, with its reason, and the list only
+# shrinks, since an entry whose finding no longer appears is refused as stale.
+# A version not yet published can still change, so a finding in it is mended
+# and an entry naming it is refused.
+#
+# MEASURED COST, on an amd64 development machine: building the release.yaml of
+# proofs/terraform-google/baseline offline with --verify-determinism takes 7 to
+# 10 s; tofu init then tofu validate over its root take 0.2 s and 1.1 s, 1.2 to
+# 2.6 s with the copy and the reading; the copy of the index takes 0.2 s and
+# 22 MB.
+# The cache is 3.0 GB, 2.5 GB of it the provider mirror, which init links from
+# rather than copies (a root's data directory and plugin cache take 0.1 MB). A
+# commit reaching no fixture costs the rules alone, under a second.
 #
 # OFFLINE BY CONSTRUCTION. tofu runs with a CLI configuration naming the cache's
 # mirror alone, refusing the two public module registries by name, and with
@@ -94,11 +134,14 @@ USAGE
   scripts/vendor-validate.sh -h | --help
 
   --staged     judge the commit being made, as the index holds it, by VENDOR
-               TEXT and THE CANONICAL PASS-THROUGH: the form for a pre-commit
-               hook.
+               TEXT, THE CANONICAL PASS-THROUGH and, when the commit changes
+               it, THE CFN-LINT CONFIGURATION; then build THE FIXTURES the
+               commit reaches (WHAT A COMMIT SELECTS) and hold their findings
+               to KNOWN FINDINGS: the form for a pre-commit hook.
   --all        judge everything the index holds by VENDOR TEXT, THE
                CANONICAL PASS-THROUGH and THE CFN-LINT CONFIGURATION, then
-               require THE VALIDATORS.
+               build every fixture and hold every finding and every entry
+               of KNOWN FINDINGS to each other.
   --prime      fetch every validator the pin file names into the cache, verify
                each checksum, and run --self-test against the result. The one
                form that uses the network.
@@ -116,9 +159,9 @@ USAGE
                cache.
 
   It judges the repository it belongs to, wherever it is run from. AGGREGA_BIN
-  names the aggrega binary (default: aggrega on PATH). PUBLISHED_REMOTE names
-  the remote whose published branch is read (default: the remote the
-  checked-out branch tracks, else origin).
+  names the aggrega binary that builds the fixtures (default: aggrega on
+  PATH). PUBLISHED_REMOTE names the remote whose published branch is read
+  (default: the remote the checked-out branch tracks, else origin).
 
 VENDOR TEXT (--staged, --all; runs first)
   aggrega import, drafting an entity from a vendor's resource schema, opens
@@ -151,16 +194,22 @@ THE CANONICAL PASS-THROUGH (--staged, --all)
   (.ci-published-digests on <remote>/published, as last fetched) is final and
   keeps the file it was published with, so it is not judged.
 
-THE CFN-LINT CONFIGURATION (--all)
+  When no published ref has been fetched, every version counts as
+  unpublished: this rule then judges all of them, and every entry of KNOWN
+  FINDINGS judged is refused as naming an unpublished version. Fetch it:
+      git fetch <remote> published
+
+THE CFN-LINT CONFIGURATION (--all; --staged when the commit changes it)
   .cfnlintrc.yaml, at the top of this repository, is the one configuration
   cfn-lint reads. Each rule it ignores is a line of its own under
   ignore_checks, - <rule>, with its reason in a comment beside it or on the
   line directly above: what the rule reports, and why a template this catalog
-  renders is right to carry it anyway. An entry with no reason, or rules
+  renders is right to carry it anyway. An entry with no reason, rules
   written in brackets on the ignore_checks line itself (an empty list, [],
-  aside), is refused, naming the line and the rule; so is the file's absence
-  from the index. The file is read from the index, as a text, with no YAML
-  parser.
+  aside), and a line under ignore_checks that is neither an entry, a comment
+  nor blank, are refused, naming the line and the rule; so is the file's
+  absence from the index. The file is read from the index, as a text, with
+  no YAML parser.
 
 THE VALIDATORS
   scripts/vendor-validators.json pins each validator: OpenTofu by version and
@@ -257,13 +306,102 @@ FINDINGS
   provenance, or one naming no such entity or more than one, is attributed to
   -: no catalog entity version answers for it.
 
+THE FIXTURES (--staged, --all)
+  A fixture is a workspace of its own at proofs/<target>/<group>/, its
+  target one of arm, cloudformation, terraform-aws, terraform-azurerm,
+  terraform-google and terraform-cloudflare, its group naming what it
+  proves: baseline holds one instance of the newest version of each cloud
+  Recipe for its target, with a FeatureRecipe attached where a Recipe's
+  slot asks for one. It holds:
+    .aggrega-config.yaml   workspace.catalog_dirs naming ./catalog first
+                           where the fixture carries a catalog of its
+                           own, then ../../../aggrega-catalog; and
+                           default_registry: hub.aggrega.ai
+    its Aggregate and its Manifest
+    release.yaml, release-<slug>.yaml
+                           its Releases, each beside the lock aggrega
+                           pull writes for it, <release>.lock
+  A workspace under proofs/ laid out otherwise, a fixture holding no
+  Release, and a Release with no lock in the index are refused.
+
+  The sources a lock pins live in the fixture's .aggrega/cache/ in the
+  checkout, which git ignores. aggrega pull fills it and writes the lock:
+      (cd proofs/<target>/<group> && aggrega pull --release release.yaml)
+
+  A fixture is built in a copy of the index — the catalog, proofs/,
+  scripts/ and .cfnlintrc.yaml as the commit carries them — under a
+  temporary directory removed when the run exits, so a fix left unstaged
+  cannot pass a broken staged file and no build output lands in the
+  checkout. Each Release is built there with
+      aggrega build --offline --verify-determinism
+  reading its sources from the checkout's .aggrega/cache/, named to the
+  build relative to the copy through AGGREGA_ARTIFACT_CACHE_DIR, and
+  writing nothing there; no configuration but the fixture's own reaches
+  the build. A Release other than a negative one must build: one that
+  halts is refused, naming the fixture, the Release and why; a lock out
+  of date (E0130) is refused, naming the pull that renews it; a source
+  missing from the cache (E0137) gives no verdict, naming the same pull.
+  Every validator then runs over each boundary the build rendered (THE
+  VALIDATORS), and each finding is held to KNOWN FINDINGS.
+
+NEGATIVE RELEASES
+  release-negative-<slug>.yaml, with its .lock and a .expect beside it, is
+  a Release that must halt. Its .expect holds one line, which the halted
+  build's output must contain: assertion "<key>" for a Recipe's assertion,
+  as the build names one (Recipe "<name>" instance "<i>" assertion
+  "<key>"), and a fixed phrase of the sentence for a refusal raised inside
+  a mapping or a template, which the build quotes whole. A negative
+  Release that builds is refused; so is one halting on another condition,
+  naming the line expected and the halt; and one with no .expect, or a
+  .expect holding other than one line with text.
+
+WHAT A COMMIT SELECTS (--staged)
+  --staged builds the fixtures the commit reaches, each lock read from the
+  index:
+    - a path in a version directory of the catalog — a Recipe, a
+      FeatureRecipe, a Component, a Feature, or a mapping, artifact,
+      schema or workload library — selects each fixture whose lock
+      records that entity or library at that version;
+    - a path in a fixture selects that fixture;
+    - scripts/vendor-validators.json, and the files this script runs
+      (itself, scripts/vendor-validate-arm.py and the libraries in
+      scripts/lib/ it sources), select every fixture and run --self-test
+      as the index holds them;
+    - .cfnlintrc.yaml selects every cloudformation fixture, and runs THE
+      CFN-LINT CONFIGURATION;
+    - scripts/vendor-validators-known-findings.json selects each fixture
+      reaching the entity version an entry it adds or removes names.
+  A Recipe or FeatureRecipe version directory for arm, cloudformation or
+  terraform that the commit changes and no fixture reaches is refused,
+  naming it, since no validator would judge it: build it in a fixture. A
+  commit selecting nothing passes once the rules above hold, with no
+  validator required.
+
+KNOWN FINDINGS (--staged, --all)
+  scripts/vendor-validators-known-findings.json lists the findings each
+  published entity version is known to carry: format, 1, and findings,
+  each entry an entity (<kind>/<capability>/<name>, as FINDINGS
+  attributes one), its version, the finding's id and its reason, naming
+  what in that version causes it. A published version is final, so its
+  findings are listed rather than mended; a version not yet published is
+  mended. A finding is refused unless an entry lists its id for the
+  entity version it is attributed to, and one attributed to - can never
+  be listed. An entry is refused when its version is not published (THE
+  CANONICAL PASS-THROUGH says when one is), and as stale when a fixture
+  built that version and its finding did not appear, so the list only
+  shrinks. --all builds every fixture and judges every entry, refusing
+  one whose version no fixture builds; --staged judges each entry the
+  commit adds, refusing one whose version no fixture reaches, and each
+  naming a version a fixture it built reaches.
+
 EXIT CODES
   0  passed: nothing refused
   1  refused: every finding is named; for --self-test, a case that did not
      give its expected verdict, named
   2  a usage error
   3  no verdict: a requirement is missing, each named with the one command
-     that supplies it; a git command failed; or --prime failed and left
+     that supplies it — a source a fixture's lock pins missing from its
+     cache among them; a git command failed; or --prime failed and left
      nothing primed
 END_OF_HELP
 )"
@@ -308,10 +446,26 @@ TOP="$(git -C "$HERE/.." rev-parse --show-toplevel 2>/dev/null)" || { echo "$ME:
 cd "$TOP" || exit 3
 export GIT_OPTIONAL_LOCKS=0
 
+# --prime and --self-test read the pin file in the working tree; --staged and
+# --all read the one the index holds, from the copy of the index they build in,
+# so the cache they require is the one primed for the pin file the commit carries.
 PIN_FILE="$HERE/vendor-validators.json"
+PIN_REL="scripts/vendor-validators.json"
 CANONICAL="scripts/container-pass-through/main.tf"
 CFNLINTRC=".cfnlintrc.yaml"
 TF_RECIPES="$CATALOG_ROOT/recipe/terraform"
+KNOWN_FINDINGS="scripts/vendor-validators-known-findings.json"
+PROOFS="proofs"
+# The targets a fixture directory is named for, and the capabilities whose
+# Recipes and FeatureRecipes a fixture must reach when a commit changes them.
+FIXTURE_TARGETS=" arm cloudformation terraform-aws terraform-azurerm terraform-google terraform-cloudflare "
+CLOUD_CAPABILITIES=" arm cloudformation terraform "
+# The files this script runs: itself, the Azure Resource Manager check and the
+# libraries it sources. A commit changing one runs the staged copy's --self-test
+# and every fixture.
+GATE_SCRIPTS=" scripts/vendor-validate.sh scripts/vendor-validate-arm.py scripts/lib/catalog-entities.sh scripts/lib/published-branch.sh "
+# What the gate copies out of the index to build in.
+MATERIALIZED=("$CATALOG_ROOT" "$PROOFS" scripts "$CFNLINTRC")
 PRIME_CMD="$HERE/vendor-validate.sh --prime"
 TMP="$(mktemp -d)" || exit 3
 trap 'rm -rf "$TMP"' EXIT
@@ -337,24 +491,39 @@ fi
 # the marker, naming the file and each line.
 vendor_text_rule() {
   local path line rc=0
-  local -A judged=() seen=()
+  local -a judged=()
+  local -A seen=()
+  : >"$TMP/vendor-text-hits"
   if [ "$MODE" = staged ]; then
     git diff --cached --name-only -z --no-renames --diff-filter=ACMRT "$BASE" >"$TMP/vendor-text-paths" ||
       no_verdict "git cannot list what the commit stages"
-    while IFS= read -r -d '' path; do judged[$path]=1; done <"$TMP/vendor-text-paths"
+    while IFS= read -r -d '' path; do judged+=("$path"); done <"$TMP/vendor-text-paths"
     [ "${#judged[@]}" -gt 0 ] || return 0
+    # Only the paths judged are searched, named literally, a bounded number to
+    # each search, so a commit's cost follows what it stages, not the index.
+    while [ "${#judged[@]}" -gt 0 ]; do
+      vendor_text_search -- "${judged[@]:0:256}"
+      judged=("${judged[@]:256}")
+    done
+  else
+    vendor_text_search
   fi
-  # The whole index is searched at once; with -o each hit is the path, the line
-  # number and the marker itself, so no file's own text can break the reading.
-  git grep --cached --no-recurse-submodules --no-color --no-column -a -z -n -o -F \
-    -e "$VENDOR_MARKER" >"$TMP/vendor-text-hits" || rc=$?
-  [ "$rc" -le 1 ] || no_verdict "git cannot search the index"
   while IFS= read -r -d '' path && IFS= read -r -d '' line && IFS= read -r _; do
-    if [ "$MODE" = staged ] && [ -z "${judged[$path]+set}" ]; then continue; fi
     [ -z "${seen[$path:$line]+set}" ] || continue
     seen[$path:$line]=1
     refuse "$path:$line: carries the marker $VENDOR_MARKER, which opens a passage aggrega import took from a vendor schema. Vendor text is not committed to this catalog: write the passage in your own words, remove the marker, and stage the file again."
   done <"$TMP/vendor-text-hits"
+}
+
+# vendor_text_search [-- PATH...] — appends to vendor-text-hits each line of the
+# index carrying the marker, in the PATHs given (taken literally) or in the whole
+# index. With -o each hit is the path, the line number and the marker itself, so
+# no file's own text can break the reading.
+vendor_text_search() {
+  local rc=0
+  git --literal-pathspecs grep --cached --no-recurse-submodules --no-color --no-column -a -z -n -o -F \
+    -e "$VENDOR_MARKER" "$@" >>"$TMP/vendor-text-hits" || rc=$?
+  [ "$rc" -le 1 ] || no_verdict "git cannot search the index"
 }
 
 # --- the canonical pass-through ----------------------------------------------------
@@ -412,7 +581,8 @@ is_container() {
 
 # recorded_published PATH VERSION — whether the record holds the reference ending
 # in /PATH at VERSION. The record is read once, from <remote>/published as last
-# fetched; with none fetched, nothing is recorded.
+# fetched; with none fetched, nothing is recorded, which is said once on standard
+# error.
 PUB_ROWS_READ=0
 PUB_ROWS=""
 recorded_published() {
@@ -424,6 +594,9 @@ recorded_published() {
     if git cat-file -e "$pub:$DIGESTS_FILE" 2>/dev/null; then
       PUB_ROWS="$(git show "$pub:$DIGESTS_FILE" | published_rows)" ||
         no_verdict "git cannot read $remote/$PUBLISHED_BRANCH:$DIGESTS_FILE"
+    else
+      printf '%s: note — %s/%s has not been fetched, so every version counts as unpublished; fetch it: git fetch %s %s\n' \
+        "$ME" "$remote" "$PUBLISHED_BRANCH" "$remote" "$PUBLISHED_BRANCH" >&2
     fi
   fi
   printf '%s\n' "$PUB_ROWS" | awk -F'\t' -v p="/$1" -v v="$2" '
@@ -498,7 +671,8 @@ pass_through_drift() {
 # - <rule>, with its reason in a comment beside it or on the line directly above;
 # awk prints, for each that breaks this, its line number, a tab and what to write.
 # A list written in brackets, empty or not, gives no rule a line of its own, so
-# only the empty one, [], passes.
+# only the empty one, [], passes; so does no line under ignore_checks but a
+# comment, a blank line or an entry - <rule>.
 # shellcheck disable=SC2016 # awk's own $, not the shell's
 CFNLINTRC_AWK='
   function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
@@ -506,6 +680,9 @@ CFNLINTRC_AWK='
   function unquote(s) { if (s ~ /^".*"$/ || s ~ /^\047.*\047$/) s = substr(s, 2, length(s) - 2); return s }
   { sub(/\r$/, "") }
   in_list && $0 ~ /^[^ \t#-]/ { in_list = 0 }
+  in_list && $0 ~ /^[ \t]+[^ \t#-]/ {
+    printf "%d\twrites %s under ignore_checks, which is not an entry - <rule>: write each rule cfn-lint ignores as a line - <rule> under ignore_checks, with its reason in a comment beside it or on the line above\n", NR, trim($0)
+  }
   in_list && $0 ~ /^[ \t]*-/ {
     entry = $0
     sub(/^[ \t]*-[ \t]*/, "", entry)
@@ -1221,6 +1398,564 @@ arm_findings() {
   read_findings "$tree" arm arm "$boundary" "$template" "$work/arm.out" "$rc"
 }
 
+# --- the fixtures ----------------------------------------------------------------
+# A fixture is a workspace of its own under proofs/<target>/<group>/, whose
+# Releases build the catalog's cloud Recipes; --help holds the layout and the
+# contract. Every file is read from the index: the selection reads the fixtures'
+# locks as the index holds them, and the builds run in a copy of the index.
+
+# Each versioned entry a release.lock records, as the key the selection matches
+# on: entity:<kind>:<uri>@<version> for an entity, its uri without a :<version>
+# of its own, and library:<section>:<name>@<version> for a library. The lock is
+# read as the text aggrega pull writes: each section's name at the margin, each
+# entry opening with "    - " and its fields indented six spaces.
+# shellcheck disable=SC2016 # awk's own $, not the shell's
+LOCK_KEYS_AWK='
+  function flush(   u) {
+    if (uri != "" && version != "") {
+      if (section == "entities") { u = uri; sub(/:[^:\/]*$/, "", u); print "entity:" kind ":" u "@" version }
+      else if (section ~ /_libraries$/) print "library:" section ":" uri "@" version
+    }
+    kind = ""; uri = ""; version = ""
+  }
+  function field(line,   key, value) {
+    sub(/^[ -]+/, "", line)
+    key = line; sub(/:.*$/, "", key)
+    value = line; sub(/^[^:]*:[ \t]*/, "", value); gsub(/^["\047]|["\047]$/, "", value)
+    if (key == "kind") kind = value
+    else if (key == "uri") uri = value
+    else if (key == "resolved_version") version = value
+  }
+  { sub(/\r$/, "") }
+  /^[A-Za-z_]/ { flush(); section = $0; sub(/:.*$/, "", section); next }
+  /^    - [a-z_]+:/ { flush(); field($0); next }
+  /^      [a-z_]+:/ { field($0) }
+  END { flush() }'
+
+# The metadata.name of the YAML awk reads.
+# shellcheck disable=SC2016 # awk's own $, not the shell's
+METADATA_NAME_AWK='
+  { sub(/\r$/, "") }
+  /^metadata:[ \t]*$/ { inside = 1; next }
+  inside && /^[^ \t#]/ { exit }
+  inside && /^  name:/ { sub(/^  name:[ \t]*/, ""); sub(/[ \t]+#.*$/, ""); gsub(/^["\047]|["\047]$/, ""); print; exit }'
+
+# pull_command FIXTURE RELEASE — the command that pulls RELEASE's lock in FIXTURE.
+pull_command() {
+  printf '(cd %s && aggrega pull --release %s)' "$1" "$2"
+}
+
+# fixtures_rule — FIXTURES gets every fixture the index holds, in byte order, and
+# IS_FIXTURE marks each; a workspace under proofs/ laid out otherwise is refused.
+fixtures_rule() {
+  local path dir target
+  FIXTURES=()
+  declare -gA IS_FIXTURE=()
+  git ls-files -z -- "$PROOFS/" >"$TMP/proof-paths" || no_verdict "git cannot list $PROOFS/"
+  while IFS= read -r -d '' path; do
+    [ "${path##*/}" = .aggrega-config.yaml ] || continue
+    dir="${path%/*}"
+    target="${dir#"$PROOFS"/}"
+    target="${target%%/*}"
+    if [[ $dir =~ ^$PROOFS/[^/]+/[^/]+$ && $FIXTURE_TARGETS == *" $target "* ]]; then
+      FIXTURES+=("$dir")
+      IS_FIXTURE[$dir]=1
+    else
+      refuse "$path: a workspace under $PROOFS/ outside the fixture layout. A fixture is $PROOFS/<target>/<group>/, its target one of:$FIXTURE_TARGETS(see --help): move it there."
+    fi
+  done <"$TMP/proof-paths"
+}
+
+# fixture_releases FIXTURE — RELEASES gets the Releases FIXTURE holds in the
+# index, release.yaml and release-<slug>.yaml directly in it, in byte order.
+fixture_releases() {
+  local path name
+  RELEASES=()
+  git --literal-pathspecs ls-files -z -- "$1/" >"$TMP/fixture-paths" || no_verdict "git cannot list $1/"
+  while IFS= read -r -d '' path; do
+    [ "${path%/*}" = "$1" ] || continue
+    name="${path##*/}"
+    case "$name" in release.yaml | release-?*.yaml) RELEASES+=("$name") ;; esac
+  done <"$TMP/fixture-paths"
+}
+
+# expect_line FILE — the one line with text the .expect FILE holds, its
+# surrounding blanks and carriage return dropped.
+expect_line() {
+  awk '{ sub(/\r$/, ""); sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") } $0 != "" { print; exit }' "$1"
+}
+
+# fixture_shape_rule FIXTURE — refuses a fixture holding no Release, a Release
+# with no lock beside it, and a negative Release with no .expect holding one
+# line with text, each read from the index.
+fixture_shape_rule() {
+  local fx="$1" name lock expect lines
+  fixture_releases "$fx"
+  if [ "${#RELEASES[@]}" -eq 0 ]; then
+    refuse "$fx: a fixture holding no Release, release.yaml or release-<slug>.yaml, so it proves nothing: add one, or remove the fixture."
+    return
+  fi
+  for name in "${RELEASES[@]}"; do
+    lock="$fx/${name%.yaml}.lock"
+    git cat-file -e ":$lock" 2>/dev/null ||
+      refuse "$fx/$name: no lock beside it in the index, and a fixture builds from its lock alone: pull it and stage it — $(pull_command "$fx" "$name"); git add -- $lock"
+    case "$name" in release-negative-?*.yaml) ;; *) continue ;; esac
+    expect="$fx/${name%.yaml}.expect"
+    if ! staged_blob "$expect" "$TMP/expect"; then
+      refuse "$fx/$name: a negative Release with no ${name%.yaml}.expect in the index: write in it the one line its halted build's output must contain — assertion \"<key>\" for an assertion, a fixed phrase of the sentence for a refusal — and stage it."
+      continue
+    fi
+    lines="$(grep -c '[^[:space:]]' "$TMP/expect")"
+    [ "$lines" = 1 ] ||
+      refuse "$expect: holds $lines lines with text, and a negative Release's .expect holds one: the line its halted build's output must contain."
+  done
+}
+
+# reach_table — REACH gets, for each key a fixture's locks in the index reach, the
+# fixtures reaching it, space-separated; a lock from which no versioned entry can
+# be read is refused.
+reach_table() {
+  local fx name lock key
+  declare -gA REACH=()
+  for fx in ${FIXTURES[@]+"${FIXTURES[@]}"}; do
+    fixture_releases "$fx"
+    for name in ${RELEASES[@]+"${RELEASES[@]}"}; do
+      lock="$fx/${name%.yaml}.lock"
+      # A lock missing from the index is refused by fixture_shape_rule.
+      staged_blob "$lock" "$TMP/lock" || continue
+      awk "$LOCK_KEYS_AWK" "$TMP/lock" >"$TMP/lock-keys"
+      if [ ! -s "$TMP/lock-keys" ]; then
+        refuse "$lock: no resolved entity can be read from it, so no change can be traced to this fixture: pull it again and stage it — $(pull_command "$fx" "$name"); git add -- $lock"
+        continue
+      fi
+      while IFS= read -r key; do
+        [[ " ${REACH[$key]:-} " == *" $fx "* ]] || REACH[$key]="${REACH[$key]:+${REACH[$key]} }$fx"
+      done <"$TMP/lock-keys"
+    done
+  done
+}
+
+# library_name VDIR — the metadata.name of the library whose version directory
+# is VDIR, read from the index, else from BASE for a library the commit removes.
+library_name() {
+  local vdir="$1" rev path
+  for rev in "" "$BASE"; do
+    if [ -z "$rev" ]; then
+      git --literal-pathspecs ls-files -z -- "$vdir/" >"$TMP/library-paths"
+    else
+      git --literal-pathspecs ls-tree -r -z --name-only "$rev" -- "$vdir/" >"$TMP/library-paths"
+    fi || no_verdict "git cannot list $vdir/"
+    while IFS= read -r -d '' path; do
+      [ "${path%/*}" = "$vdir" ] || continue
+      case "$path" in *.yaml | *.yml) ;; *) continue ;; esac
+      git show "$rev:$path" >"$TMP/library.yaml" 2>/dev/null || continue
+      case "$(peek_kind "$TMP/library.yaml")" in *Library) ;; *) continue ;; esac
+      awk "$METADATA_NAME_AWK" "$TMP/library.yaml"
+      return 0
+    done <"$TMP/library-paths"
+  done
+  return 1
+}
+
+# catalog_key PATH — the key, as LOCK_KEYS_AWK prints it, of the entity or
+# library version PATH lies under: an entity's read from its directory, a
+# library's name from its YAML. Returns 1 for a path under no version directory.
+catalog_key() {
+  local vdir rest kind_dir name version section=""
+  vdir="$(version_dir "$1")" || return 1
+  rest="${vdir#"$CATALOG_ROOT"/}"
+  kind_dir="${rest%%/*}"
+  rest="${rest#*/}"
+  version="${rest##*/}"
+  name="${rest%/*}"
+  case "$kind_dir" in
+    feature-recipe) printf 'entity:feature_recipe:%s@%s\n' "$name" "$version" ;;
+    mappinglibrary) section=mapping_libraries ;;
+    artifactlibrary) section=artifact_libraries ;;
+    schemalibrary) section=schema_libraries ;;
+    workloadlibrary) section=workload_libraries ;;
+    *) printf 'entity:%s:%s@%s\n' "$kind_dir" "$name" "$version" ;;
+  esac
+  [ -n "$section" ] || return 0
+  name="$(library_name "$vdir")" || return 1
+  printf 'library:%s:%s@%s\n' "$section" "$name" "$version"
+}
+
+# entry_key ENTITY VERSION — the key of a known-findings entry's entity version.
+entry_key() {
+  local kind="${1%%/*}"
+  [ "$kind" != featurerecipe ] || kind=feature_recipe
+  printf 'entity:%s:%s@%s\n' "$kind" "${1#*/}" "$2"
+}
+
+# select_fixtures FIXTURE... — marks each FIXTURE to be built.
+declare -A SELECTED=()
+select_fixtures() {
+  local fx
+  for fx in "$@"; do SELECTED[$fx]=1; done
+}
+
+# select_staged — selects the fixtures the commit reaches (--help, WHAT A COMMIT
+# SELECTS), sets SELF_TEST when the gate's own files change, and refuses each
+# cloud Recipe or FeatureRecipe version the commit changes that no fixture
+# reaches.
+select_staged() {
+  local path key vdir rest kind_dir capability fx what rc
+  local -A unreached=()
+  git diff --cached --name-only -z --no-renames "$BASE" >"$TMP/staged-paths" ||
+    no_verdict "git cannot list what the commit stages"
+  while IFS= read -r -d '' path; do
+    if [ "$path" = "$PIN_REL" ] || [[ $GATE_SCRIPTS == *" $path "* ]]; then
+      SELF_TEST=1
+      select_fixtures ${FIXTURES[@]+"${FIXTURES[@]}"}
+      continue
+    fi
+    case "$path" in
+      "$CFNLINTRC")
+        cfnlintrc_rule
+        for fx in ${FIXTURES[@]+"${FIXTURES[@]}"}; do
+          [[ $fx != "$PROOFS/cloudformation/"* ]] || select_fixtures "$fx"
+        done
+        ;;
+      "$KNOWN_FINDINGS") KNOWN_STAGED=1 ;;
+      "$PROOFS"/*/*/*)
+        rest="${path#"$PROOFS"/}"
+        fx="$PROOFS/${rest%%/*}"
+        rest="${rest#*/}"
+        fx="$fx/${rest%%/*}"
+        [ -z "${IS_FIXTURE[$fx]+set}" ] || select_fixtures "$fx"
+        ;;
+      "$CATALOG_ROOT"/*)
+        rc=0
+        key="$(catalog_key "$path")" || rc=$?
+        case "$rc" in 0) ;; 1) continue ;; *) exit 3 ;; esac
+        if [ -n "${REACH[$key]:-}" ]; then
+          # shellcheck disable=SC2086 # the fixtures, space-separated
+          select_fixtures ${REACH[$key]}
+          continue
+        fi
+        vdir="$(version_dir "$path")"
+        rest="${vdir#"$CATALOG_ROOT"/}"
+        kind_dir="${rest%%/*}"
+        rest="${rest#*/}"
+        capability="${rest%%/*}"
+        case "$kind_dir" in
+          recipe) what=Recipe ;;
+          feature-recipe) what=FeatureRecipe ;;
+          *) continue ;;
+        esac
+        [[ $CLOUD_CAPABILITIES == *" $capability "* ]] || continue
+        [ -z "${unreached[$vdir]+set}" ] || continue
+        unreached[$vdir]=1
+        # A version directory the commit removes whole has nothing left to build.
+        [ -n "$(git --literal-pathspecs ls-files -- "$vdir/")" ] || continue
+        refuse "$vdir: a cloud $what version the commit changes, and no fixture under $PROOFS/ reaches it, so no vendor validator judges it. Build it in a fixture: an instance of it in a fixture's Aggregate, bound in its Manifest (a FeatureRecipe attached where a Recipe's slot asks for one); then pull that fixture's Release and stage its lock."
+        ;;
+    esac
+  done <"$TMP/staged-paths"
+  [ "$KNOWN_STAGED" = 0 ] || select_known_changes
+}
+
+# The known-findings reader: it reads the file named, as the index or a commit
+# holds it, and prints one line per entry, entry TAB entity TAB version TAB id,
+# and one line per fault, bad TAB what is wrong, in the file's order.
+PY_KNOWN="$(cat <<'END_OF_PYTHON'
+import json, re, sys
+
+path = sys.argv[1]
+ENTITY = re.compile(r"(recipe|featurerecipe)/(arm|cloudformation|terraform)/[A-Za-z0-9][A-Za-z0-9._-]*")
+VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?")
+IDENT = re.compile(r"(tofu|cfn-lint|arm)\|[^|\t\r\n]+\|[^\t\r\n]+")
+KEYS = ("entity", "version", "id", "reason")
+
+def bad(why):
+    print(f"bad\t{why}")
+
+try:
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+except (OSError, ValueError) as e:
+    bad(f"it is not readable as JSON ({' '.join(str(e).split())})")
+    sys.exit(0)
+if not isinstance(doc, dict) or doc.get("format") != 1 or set(doc) != {"format", "findings"}:
+    bad("it is not an object holding format, 1, and findings, the format this script reads")
+    sys.exit(0)
+if not isinstance(doc["findings"], list):
+    bad("findings is not a list of entries")
+    sys.exit(0)
+seen = set()
+for i, e in enumerate(doc["findings"]):
+    where = f"findings[{i}]"
+    if not isinstance(e, dict) or set(e) != set(KEYS):
+        bad(f"{where} is not an object holding exactly entity, version, id and reason")
+        continue
+    entity, version, ident, reason = (e[k] for k in KEYS)
+    if not (isinstance(entity, str) and ENTITY.fullmatch(entity)):
+        bad(f"{where}.entity is not <kind>/<capability>/<name>, kind recipe or featurerecipe, capability arm, cloudformation or terraform")
+    elif not (isinstance(version, str) and VERSION.fullmatch(version)):
+        bad(f"{where}.version is not a version X.Y.Z")
+    elif not (isinstance(ident, str) and IDENT.fullmatch(ident)):
+        bad(f"{where}.id is not a finding id, <validator>|<rule>|<address>")
+    elif not (isinstance(reason, str) and reason.strip()):
+        bad(f"{where}.reason is empty: name what in that published version causes the finding")
+    elif (entity, version, ident) in seen:
+        bad(f"{where} lists {entity}@{version} {ident} a second time")
+    else:
+        seen.add((entity, version, ident))
+        print(f"entry\t{entity}\t{version}\t{ident}")
+END_OF_PYTHON
+)"
+
+# read_known REV FILE — writes to FILE what PY_KNOWN reads in the known-findings
+# file as REV holds it, "" for the index; returns 1 when REV holds none.
+read_known() {
+  local out
+  command -v python3 >/dev/null 2>&1 ||
+    no_verdict "python3 is not on PATH, and $KNOWN_FINDINGS is read with it; install Python 3"
+  if [ -z "$1" ]; then
+    staged_blob "$KNOWN_FINDINGS" "$TMP/known.json" || return 1
+  else
+    git cat-file -e "$1:$KNOWN_FINDINGS" 2>/dev/null || return 1
+    git show "$1:$KNOWN_FINDINGS" >"$TMP/known.json" || no_verdict "git cannot read $KNOWN_FINDINGS at $1"
+  fi
+  out="$(python3 -I -c "$PY_KNOWN" "$TMP/known.json")" || no_verdict "$KNOWN_FINDINGS cannot be read: $out"
+  printf '%s\n' "$out" >"$2"
+}
+
+# load_known — KNOWN gets the entries of the known-findings file the index holds,
+# entity@version TAB id, in the file's order; each fault in the file is refused.
+# Read once.
+KNOWN_LOADED=0
+KNOWN=()
+load_known() {
+  local what entity version id
+  [ "$KNOWN_LOADED" = 0 ] || return 0
+  KNOWN_LOADED=1
+  if ! read_known "" "$TMP/known"; then
+    refuse "$KNOWN_FINDINGS: not in the index. It lists the findings each published entity version is known to carry: restore it from git and stage it (git add -- $KNOWN_FINDINGS)."
+    return
+  fi
+  while IFS=$'\t' read -r what entity version id; do
+    case "$what" in
+      entry) KNOWN+=("$entity@$version"$'\t'"$id") ;;
+      bad) refuse "$KNOWN_FINDINGS: $entity." ;;
+    esac
+  done <"$TMP/known"
+}
+
+# select_known_changes — the commit changes the known-findings file: selects the
+# fixtures reaching the entity version each added or removed entry names, marks
+# each added entry in KNOWN_ADDED to be judged, and refuses an added entry whose
+# entity version no fixture reaches, since nothing could ever show its finding.
+declare -A KNOWN_ADDED=()
+select_known_changes() {
+  local row what entity version id key
+  local -A before=() after=()
+  load_known
+  for row in ${KNOWN[@]+"${KNOWN[@]}"}; do after[$row]=1; done
+  if read_known "$BASE" "$TMP/known-before"; then
+    while IFS=$'\t' read -r what entity version id; do
+      [ "$what" != entry ] || before["$entity@$version"$'\t'"$id"]=1
+    done <"$TMP/known-before"
+  fi
+  for row in "${!after[@]}" "${!before[@]}"; do
+    [ -z "${after[$row]+set}" ] || [ -z "${before[$row]+set}" ] || continue
+    entity="${row%%@*}"
+    version="${row#*@}"
+    version="${version%%$'\t'*}"
+    key="$(entry_key "$entity" "$version")"
+    if [ -n "${REACH[$key]:-}" ]; then
+      # shellcheck disable=SC2086 # the fixtures, space-separated
+      select_fixtures ${REACH[$key]}
+    fi
+    [ -n "${after[$row]+set}" ] || continue
+    KNOWN_ADDED[$row]=1
+    [ -n "${REACH[$key]:-}" ] ||
+      refuse "$KNOWN_FINDINGS: the entry for $entity@$version (${row#*$'\t'}) names a version no fixture under $PROOFS/ builds, so its finding can never be shown: build that version in a fixture, or remove the entry."
+  done
+}
+
+# materialize — writes what the index holds of the catalog, the fixtures, the
+# scripts and the cfn-lint configuration into TREE, under the run's temporary
+# directory, removed when the run exits; the pin file read from then on is the
+# one the index holds.
+materialize() {
+  TREE="$TMP/tree"
+  mkdir -p "$TREE" || no_verdict "cannot make $TREE"
+  git ls-files -z -- "${MATERIALIZED[@]}" | git checkout-index -z --stdin --prefix="$TREE/" ||
+    no_verdict "git cannot write what the index holds into $TREE"
+  printf '{}\n' >"$TMP/aggrega-config.yaml" || no_verdict "cannot write $TMP/aggrega-config.yaml"
+  PIN_FILE="$TREE/$PIN_REL"
+}
+
+# staged_self_test — runs --self-test as the index holds this script and its pin
+# file, from TREE, made a repository of its own for it.
+staged_self_test() {
+  local rc=0
+  echo "$ME: the commit changes the gate's own files: --self-test, as the index holds them"
+  (
+    for var in $(git rev-parse --local-env-vars); do unset "$var"; done
+    git -C "$TREE" init -q && bash "$TREE/scripts/vendor-validate.sh" --self-test
+  ) || rc=$?
+  case "$rc" in
+    0) ;;
+    1) refuse "--self-test, as the index holds this script and its pin file, did not give every expected verdict (above): mend the staged scripts." ;;
+    *) exit 3 ;;
+  esac
+}
+
+# build_release FIXTURE RELEASE CACHE — builds RELEASE of FIXTURE in its copy in
+# TREE, offline, rendering every node twice: BUILD_RC and BUILD_OUT get the exit
+# status and everything it printed. The sources come from CACHE, the fixture's
+# cache in this checkout named relative to the copy, and nothing is written there;
+# no configuration but the fixture's own reaches the build.
+build_release() {
+  local dir="$TREE/$1"
+  rm -rf -- "$dir/dist"
+  BUILD_RC=0
+  BUILD_OUT="$(cd -- "$dir" && env -u AGGREGA_CATALOG_DIRS -u AGGREGA_WORKSPACE_ROOT -u AGGREGA_CONFIG \
+    AGGREGA_ARTIFACT_CACHE_DIR="$3" NO_COLOR=1 "$AGGREGA" build --config "$TMP/aggrega-config.yaml" \
+    --workspace-root "$dir" --offline --verify-determinism --quiet --release "$2" 2>&1)" || BUILD_RC=$?
+}
+
+# halt_excerpt — the lines of BUILD_OUT that say why the build halted, indented:
+# from the first diagnostic on, at most twelve.
+halt_excerpt() {
+  printf '%s\n' "$BUILD_OUT" | awk '
+    !started && (/^\[/ || /^aggrega build:/) { started = 1 }
+    started && n < 12 { print "    " $0; n++ }
+    { last[NR % 12] = $0 }
+    END { if (!started) for (i = NR - 11; i <= NR; i++) if (i > 0) print "    " last[i % 12] }'
+}
+
+# build_halted FIXTURE RELEASE — the build of RELEASE halted: a source missing
+# from the fixture's cache gives no verdict, and a lock out of date is refused,
+# each naming the pull; returns 1 for any other halt, left to the caller.
+build_halted() {
+  local fx="$1" name="$2"
+  case "$BUILD_OUT" in
+    *E0137*)
+      no_verdict "$fx/$name: a source its lock pins is missing from $fx/.aggrega/cache, where this checkout keeps the fixture's sources. Fetch them (network, once): $(pull_command "$fx" "$name")" ;;
+    *E0130*)
+      refuse "$fx/${name%.yaml}.lock: out of date — the Release no longer resolves to what it records, so what the commit carries cannot be built from it. Pull it again and stage it: $(pull_command "$fx" "$name"); git add -- $fx/${name%.yaml}.lock"$'\n'"$(halt_excerpt)"
+      return 0 ;;
+  esac
+  return 1
+}
+
+# boundary_findings FIXTURE RELEASE — runs every validator over each boundary
+# the build rendered, appending each finding to findings as FIXTURE TAB RELEASE
+# TAB boundary TAB id TAB attribution TAB message; prints how many.
+boundary_findings() {
+  local fx="$1" name="$2" b runner out rc n=0 id attr message
+  for b in "$TREE/$fx/dist"/*/; do
+    [ -d "$b" ] || continue
+    b="${b%/}"
+    for runner in tofu_findings cfn_lint_findings arm_findings; do
+      rc=0
+      out="$("$runner" "$TREE" "$b")" || rc=$?
+      case "$rc" in 0 | 1) ;; *) exit 3 ;; esac
+      while IFS=$'\t' read -r id attr message; do
+        [ -n "$id" ] || continue
+        n=$((n + 1))
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$fx" "$name" "${b##*/}" "$id" "$attr" "$message" >>"$TMP/findings"
+      done <<<"$out"
+    done
+  done
+  printf '%s\n' "$n"
+}
+
+# seconds_since START — the seconds since START, an EPOCHREALTIME, to a tenth.
+seconds_since() {
+  awk -v a="$1" -v b="$EPOCHREALTIME" 'BEGIN { printf "%.1f", b - a }'
+}
+
+# check_fixture FIXTURE — builds each Release of FIXTURE: a positive one must
+# build, and its findings go to findings, the entity versions its lock reaches
+# to BUILT; a negative one must halt with output holding its .expect line.
+declare -A BUILT=()
+check_fixture() {
+  local fx="$1" dir="$TREE/$1" name cache expect started built n key
+  cache="$(python3 -I -c 'import os, sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
+    "$TOP/$fx/.aggrega/cache" "$dir")" || no_verdict "cannot name $TOP/$fx/.aggrega/cache relative to $dir"
+  fixture_releases "$fx"
+  for name in "${RELEASES[@]}"; do
+    # A Release with no lock, or a negative one with no .expect, is refused by
+    # fixture_shape_rule.
+    [ -f "$dir/${name%.yaml}.lock" ] || continue
+    started="$EPOCHREALTIME"
+    build_release "$fx" "$name" "$cache"
+    built="$(seconds_since "$started")"
+    case "$name" in
+      release-negative-?*.yaml)
+        [ -f "$dir/${name%.yaml}.expect" ] || continue
+        expect="$(expect_line "$dir/${name%.yaml}.expect")"
+        if [ "$BUILD_RC" -eq 0 ]; then
+          refuse "$fx/$name: a negative Release, and it builds. It must halt, with output holding its .expect line: $expect. Give it the one fault it exists for, or move it out of release-negative-*."
+        elif [[ $BUILD_OUT == *"$expect"* ]]; then
+          echo "$ME: $fx/$name halts as its .expect says ($built s)"
+        elif ! build_halted "$fx" "$name"; then
+          refuse "$fx/$name: a negative Release halting on another condition than the one its .expect names. Expected output holding: $expect; the build halted with:"$'\n'"$(halt_excerpt)"
+        fi
+        continue
+        ;;
+    esac
+    if [ "$BUILD_RC" -ne 0 ]; then
+      build_halted "$fx" "$name" ||
+        refuse "$fx/$name: the build halts, offline, rendering every node twice:"$'\n'"$(halt_excerpt)"
+      continue
+    fi
+    started="$EPOCHREALTIME"
+    n="$(boundary_findings "$fx" "$name")" || exit 3
+    echo "$ME: $fx/$name built in $built s; its boundaries validated in $(seconds_since "$started") s, $n finding(s)"
+    while IFS= read -r key; do
+      case "$key" in
+        entity:recipe:*) BUILT["recipe/${key#entity:recipe:}"]=1 ;;
+        entity:feature_recipe:*) BUILT["featurerecipe/${key#entity:feature_recipe:}"]=1 ;;
+      esac
+    done < <(awk "$LOCK_KEYS_AWK" "$dir/${name%.yaml}.lock")
+  done
+}
+
+# judge_known — holds every finding to the known-findings file and the file to the
+# findings: a finding is refused unless an entry lists its id for the entity
+# version it is attributed to; an entry judged is refused when its version is not
+# published, and when a fixture built that version and its finding did not
+# appear. --all judges every entry, refusing one whose version no fixture built;
+# --staged judges those the commit adds and those naming a version it built.
+judge_known() {
+  local fx name boundary id attr message row entity version
+  local -A listed=() produced=()
+  load_known
+  for row in ${KNOWN[@]+"${KNOWN[@]}"}; do listed[$row]=1; done
+  while IFS=$'\t' read -r fx name boundary id attr message; do
+    produced["$attr"$'\t'"$id"]=1
+    [ -z "${listed["$attr"$'\t'"$id"]+set}" ] || continue
+    if [ "$attr" = - ]; then
+      refuse "$fx/$name: dist/$boundary: $id — $message. No catalog entity version answers for it, so it cannot be listed as known: mend the fixture."
+    elif recorded_published "${attr%@*}" "${attr##*@}"; then
+      refuse "$fx/$name: dist/$boundary: $id, from $attr — $message. $attr is published and cannot change: list the finding in $KNOWN_FINDINGS, its entity ${attr%@*}, version ${attr##*@}, this id and the reason, naming what in that version causes it."
+    else
+      refuse "$fx/$name: dist/$boundary: $id, from $attr — $message. $attr is not published, so it can still change: mend it there."
+    fi
+  done <"$TMP/findings"
+  for row in ${KNOWN[@]+"${KNOWN[@]}"}; do
+    entity="${row%%@*}"
+    version="${row#*@}"
+    version="${version%%$'\t'*}"
+    id="${row#*$'\t'}"
+    [ "$MODE" = all ] || [ -n "${KNOWN_ADDED[$row]+set}" ] || [ -n "${BUILT[$entity@$version]+set}" ] || continue
+    recorded_published "$entity" "$version" ||
+      refuse "$KNOWN_FINDINGS: the entry for $entity@$version ($id) names a version not published, as the published record last fetched holds it. A version not yet published can still change, so its finding is mended, not listed: remove the entry and mend the finding."
+    if [ -n "${BUILT[$entity@$version]+set}" ]; then
+      [ -n "${produced["$entity@$version"$'\t'"$id"]+set}" ] ||
+        refuse "$KNOWN_FINDINGS: the entry for $entity@$version ($id) is stale: a fixture built that version and the finding did not appear. Remove the entry."
+    elif [ "$MODE" = all ]; then
+      refuse "$KNOWN_FINDINGS: the entry for $entity@$version ($id) names a version no fixture under $PROOFS/ builds, so its finding can never be shown: build that version in a fixture, or remove the entry."
+    fi
+  done
+}
+
 # --- the prime -------------------------------------------------------------------
 # prime_fail WHAT — --prime failed: the cache directory is removed, so nothing is
 # primed, and the run exits 3.
@@ -1342,9 +2077,12 @@ ST_CASES=(
   st_pass_through_by_import
   st_canonical_changed
   st_canonical_changed_published_kept
+  st_cloud_version_unreached
   st_clean_commit
   st_cfnlintrc_reason_missing
   st_cfnlintrc_flow_list
+  st_cfnlintrc_entry_not_a_line
+  st_cfnlintrc_staged
   st_cfnlintrc_reasons_given
   st_unprimed
   st_primed_for_another_pin_file
@@ -1417,8 +2155,9 @@ st_broken() {
 }
 
 # st_repo — makes ST_REPO, a scratch repository holding a copy of this script's
-# directory, this repository's .cfnlintrc.yaml and a terraform container Recipe
-# carrying the canonical pass-through, all committed.
+# directory with a known-findings file listing nothing, this repository's
+# .cfnlintrc.yaml and a terraform container Recipe carrying the canonical
+# pass-through, all committed.
 # shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
 st_repo() {
   ST_N=$((ST_N + 1))
@@ -1426,6 +2165,7 @@ st_repo() {
   local recipe="$ST_REPO/$ST_RECIPE"
   mkdir -p "$recipe/module" &&
     cp -R "$HERE" "$ST_REPO/scripts" &&
+    printf '{"format": 1, "findings": []}\n' >"$ST_REPO/$KNOWN_FINDINGS" &&
     cp "$TOP/.cfnlintrc.yaml" "$ST_REPO/.cfnlintrc.yaml" &&
     cp "$HERE/container-pass-through/main.tf" "$recipe/module/main.tf" &&
     st_recipe_yaml probe-service >"$recipe/recipe.yaml" &&
@@ -1483,7 +2223,8 @@ st_run() {
 }
 
 # st_stubs — the stand-ins the cases run: aggrega binaries answering a version,
-# and a tofu and a cfn-lint on PATH answering one no pin names.
+# one of them building too, and a tofu and a cfn-lint on PATH answering a
+# version no pin names.
 st_stubs() {
   local a b c low
   IFS=. read -r a b c <<<"$PIN_AGGREGA_MIN"
@@ -1496,6 +2237,7 @@ st_stubs() {
   st_stub_aggrega "$ST_ROOT/bin/aggrega-at-minimum" "$PIN_AGGREGA_MIN"
   st_stub_aggrega "$ST_ROOT/bin/aggrega-below-minimum" "$ST_BELOW_MIN"
   st_stub_aggrega "$ST_ROOT/bin/aggrega-between-releases" "$PIN_AGGREGA_MIN-41-g697285c71-dirty"
+  st_stub_aggrega_builds "$ST_ROOT/bin/aggrega-builds" "$PIN_AGGREGA_MIN"
   st_stub_tofu "$ST_ROOT/path/tofu" 0.0.0
   st_stub_cfn_lint "$ST_ROOT/path/cfn-lint" 0.0.0
 }
@@ -1503,6 +2245,13 @@ st_stubs() {
 # shellcheck disable=SC2016 # the stub's own $1, not this script's
 st_stub_aggrega() {
   printf '#!/bin/sh\n[ "$1 $2 $3" = "version -o json" ] || exit 2\nprintf %s\n' \
+    "'{\"version\": \"$2\", \"commit\": \"0000000\"}\\n'" >"$1" && chmod +x "$1"
+}
+# An aggrega that also builds: a build renders one boundary holding nothing, in
+# the directory it runs in.
+# shellcheck disable=SC2016 # the stub's own $1, not this script's
+st_stub_aggrega_builds() {
+  printf '#!/bin/sh\ncase "$1" in\n  version) printf %s ;;\n  build) mkdir -p dist/main ;;\n  *) exit 2 ;;\nesac\n' \
     "'{\"version\": \"$2\", \"commit\": \"0000000\"}\\n'" >"$1" && chmod +x "$1"
 }
 st_stub_tofu() {
@@ -1641,16 +2390,40 @@ st_canonical_changed_published_kept() {
   st_passed "a changed canonical file, a published container Recipe keeping its own"
 }
 
-# shellcheck disable=SC2329 # a case, run by name from ST_CASES
-st_clean_commit() {
+# st_next_version — stages, in ST_REPO, the container Recipe's next version,
+# carrying the canonical pass-through, and an edited README.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_next_version() {
   local next="$TF_RECIPES/probe-service/1.1.0"
-  { st_repo && mkdir -p "$ST_REPO/$next/module" &&
+  mkdir -p "$ST_REPO/$next/module" &&
     cp "$ST_REPO/$CANONICAL" "$ST_REPO/$next/module/main.tf" &&
     st_recipe_yaml probe-service >"$ST_REPO/$next/recipe.yaml" &&
     printf 'Edited.\n' >>"$ST_REPO/README.md" &&
-    git -C "$ST_REPO" add -- "$next" README.md; } || { st_broken "stage a clean change"; return; }
+    git -C "$ST_REPO" add -- "$next" README.md
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cloud_version_unreached() {
+  { st_repo && st_next_version; } || { st_broken "stage a Recipe version"; return; }
   st_run --staged
-  st_passed "a clean commit"
+  st_caught "a cloud Recipe version the commit adds, which no fixture reaches" 1 \
+    "$TF_RECIPES/probe-service/1.1.0: a cloud Recipe version" "no fixture under $PROOFS/ reaches it"
+}
+
+# The same version, reached by a fixture whose lock records it; the stub aggrega
+# builds it into a boundary holding nothing to validate.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_clean_commit() {
+  local home="$ST_ROOT/home-$((ST_N + 1))" fx="$PROOFS/terraform-google/probe"
+  { st_repo && st_cache "$home" "$PIN_TOFU_VERSION" "${PIN_PYTHON[cfn-lint]}" && st_next_version &&
+    mkdir -p "$ST_REPO/$fx" &&
+    printf 'workspace: {}\n' >"$ST_REPO/$fx/.aggrega-config.yaml" &&
+    printf 'kind: Release\n' >"$ST_REPO/$fx/release.yaml" &&
+    printf '%s\n' "entities:" "    - kind: recipe" "      uri: terraform/probe-service:1.1.0" \
+      "      resolved_version: 1.1.0" >"$ST_REPO/$fx/release.lock" &&
+    git -C "$ST_REPO" add -- "$fx"; } || { st_broken "stage a clean change"; return; }
+  st_run --staged HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-builds"
+  st_passed "a clean commit: a container Recipe version a fixture reaches, carrying the canonical pass-through"
 }
 
 # st_cfnlintrc LINE... — writes .cfnlintrc.yaml in ST_REPO from the lines given,
@@ -1674,6 +2447,25 @@ st_cfnlintrc_flow_list() {
   st_run --all
   st_caught "rules ignored in .cfnlintrc.yaml as a list on one line, with no line for a reason" 1 \
     ".cfnlintrc.yaml:1:" "E3012"
+}
+
+# The list's entry written as a list in brackets on the line below ignore_checks.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfnlintrc_entry_not_a_line() {
+  { st_repo && st_cfnlintrc "ignore_checks:" "  [E3012]  # The reason E3012 is ignored."; } ||
+    { st_broken "stage .cfnlintrc.yaml"; return; }
+  st_run --all
+  st_caught "a rule ignored in .cfnlintrc.yaml on a line under ignore_checks that is no entry - <rule>" 1 \
+    ".cfnlintrc.yaml:2:" "[E3012]"
+}
+
+# The rule also judges a commit changing the file.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfnlintrc_staged() {
+  { st_repo && st_cfnlintrc "# cfn-lint's configuration." "ignore_checks:" "  - E3012"; } ||
+    { st_broken "stage .cfnlintrc.yaml"; return; }
+  st_run --staged
+  st_caught "a commit changing .cfnlintrc.yaml to ignore a rule with no reason" 1 ".cfnlintrc.yaml:3:" "E3012"
 }
 
 # shellcheck disable=SC2329 # a case, run by name from ST_CASES
@@ -2458,13 +3250,38 @@ case "$MODE" in
   staged | all)
     vendor_text_rule
     pass_through_rule
-    [ "$MODE" != all ] || cfnlintrc_rule
+    fixtures_rule
+    SELF_TEST=0
+    KNOWN_STAGED=0
+    if [ "$MODE" = all ]; then
+      cfnlintrc_rule
+      select_fixtures ${FIXTURES[@]+"${FIXTURES[@]}"}
+      load_known
+    else
+      reach_table
+      select_staged
+    fi
+    for fx in ${FIXTURES[@]+"${FIXTURES[@]}"}; do
+      [ -z "${SELECTED[$fx]+set}" ] || fixture_shape_rule "$fx"
+    done
+    [ "$REFUSED" -eq 0 ] || exit 1
+    if [ "$MODE" = staged ] && [ "${#SELECTED[@]}" -eq 0 ] && [ "$SELF_TEST" = 0 ]; then
+      echo "$ME: passed — no vendor text staged, every container Recipe the commit reaches carries the canonical pass-through, and no fixture reaches what it changes"
+      exit 0
+    fi
+    materialize
+    require_validators
+    [ "$SELF_TEST" = 0 ] || staged_self_test
+    : >"$TMP/findings" || no_verdict "cannot write $TMP/findings"
+    for fx in ${FIXTURES[@]+"${FIXTURES[@]}"}; do
+      [ -z "${SELECTED[$fx]+set}" ] || check_fixture "$fx"
+    done
+    judge_known
     [ "$REFUSED" -eq 0 ] || exit 1
     if [ "$MODE" = all ]; then
-      require_validators
-      echo "$ME: passed — no vendor text, every container Recipe carries the canonical pass-through, every rule $CFNLINTRC ignores carries its reason, and the validators are primed ($CACHE_DIR)"
+      echo "$ME: passed — no vendor text, every container Recipe carries the canonical pass-through, every rule $CFNLINTRC ignores carries its reason, every fixture builds as its Releases say, and every finding is listed as known, each entry still shown ($CACHE_DIR)"
     else
-      echo "$ME: passed — no vendor text staged, and every container Recipe the commit reaches carries the canonical pass-through"
+      echo "$ME: passed — no vendor text staged, every container Recipe the commit reaches carries the canonical pass-through, and each fixture it reaches builds as its Releases say, every finding listed as known"
     fi
     ;;
   self-test)
