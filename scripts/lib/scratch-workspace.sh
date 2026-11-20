@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # scripts/lib/scratch-workspace.sh — the Aggrega workspace a run uses when nothing
-# else gives it one. Sourced by scripts/publish-diff.sh and
-# scripts/published-version-guard.sh; it defines a function and two constants and runs
+# else gives it one. Sourced by each script in this repository that runs aggrega
+# outside a workspace of its own; it defines a function and two constants and runs
 # nothing.
 #
 # WHY A RUN NEEDS ONE. A Recipe or FeatureRecipe whose source is fetched from a

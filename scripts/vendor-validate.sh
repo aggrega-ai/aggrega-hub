@@ -10,8 +10,14 @@
 # THE INDEX, NOT THE WORKING TREE. Every file a rule reads is read from the index
 # with git, as the published-version guard reads it, so what is judged is what the
 # commit carries: an unstaged fix cannot pass a broken staged file. A fixture is
-# built in a copy of the index for the same reason, and the selection reads the
-# fixtures' locks from the index.
+# built in a copy of the index for the same reason, the selection reads the
+# fixtures' locks from the index, and the Azure Resource Manager check runs from
+# that copy. The bash that judges cannot run from it: the hook runs this script
+# from the checkout, and the script sources its libraries from beside itself. So
+# --staged refuses, before any rule runs, while a file of the gate differs from
+# the index, and a commit is judged by the gate it carries. --all, a run on
+# demand rather than a commit's, runs this script and its libraries as the
+# checkout holds them.
 #
 # THE MARKER IS WRITTEN WHOLE NOWHERE HERE. The vendor-text marker is composed from
 # its two parts when the script runs, so no file in this repository carries it and
@@ -20,10 +26,11 @@
 # RULES BEFORE ANY VALIDATOR. The vendor-text rule, the pass-through rule, the
 # cfn-lint configuration rule and the fixtures' layout and selection read blobs
 # with git and match text with grep and awk, and they run before any validator is
-# looked for, so they hold on a machine where nothing is primed; only a commit
-# changing the known-findings file needs python3 to read it. A container Recipe, and a rule .cfnlintrc.yaml
-# ignores, are recognised by their text rather than by a YAML parser for the same
-# reason: a rule depends on no tool the machine may lack.
+# looked for, so they hold on a machine where nothing is primed. Of them, only
+# reading the known-findings file needs python3, which --all does every time and
+# --staged when the commit changes that file. A container Recipe, and a rule
+# .cfnlintrc.yaml ignores, are recognised by their text rather than by a YAML
+# parser for the same reason: a rule depends on no tool the machine may lack.
 #
 # ONE PIN FILE, ONE CACHE PER PIN FILE. Every version and checksum lives in
 # scripts/vendor-validators.json. The cache directory is named by the SHA-256 of
@@ -49,9 +56,11 @@
 # arm_findings each take TREE, the tree a build read its catalog from (the
 # directory holding aggrega-catalog/ and .cfnlintrc.yaml), and BOUNDARY, one
 # boundary directory the build rendered (dist/<directory>/). Each validates the
-# root it reads when BOUNDARY holds it, and prints nothing and returns 0 when it
-# does not, so a caller runs all three on every boundary. On standard output it
-# prints one line per finding, sorted:
+# root it reads when BOUNDARY holds it, and prints nothing and returns 2 when it
+# does not, so a caller runs every one on every boundary and counts the roots
+# validated: a positive Release none of whose boundaries holds a root would
+# otherwise pass with nothing judged. On standard output it prints one line per
+# finding, sorted:
 #     <id> TAB <attribution> TAB <message>
 # the attribution - for none; the message is the validator's, on one line, and
 # may name a line number, which the id never does. It returns 0 with no finding
@@ -105,7 +114,10 @@
 # a finding in it can only be listed, with its reason, and the list only
 # shrinks, since an entry whose finding no longer appears is refused as stale.
 # A version not yet published can still change, so a finding in it is mended
-# and an entry naming it is refused.
+# and an entry naming it is refused. A finding's id carries names the fixture
+# gives, an instance's among them, so two fixtures building one version show
+# findings of their own: an entry is judged stale only by a run that built
+# every fixture reaching its version.
 #
 # MEASURED COST, on an amd64 development machine: building the release.yaml of
 # proofs/terraform-google/baseline offline with --verify-determinism takes 7 to
@@ -120,10 +132,10 @@
 # commit reaching no fixture costs the rules alone, under a second.
 #
 # OFFLINE BY CONSTRUCTION. tofu runs with a CLI configuration naming the cache's
-# mirror alone, refusing the two public module registries by name, and with
-# every proxy variable pointing at a local port that refuses, so a module source
-# that would reach the network fails at once, as a finding naming the module,
-# rather than waiting on it.
+# mirror alone, refusing the module registries registry.opentofu.org and
+# registry.terraform.io by name, and with every proxy variable pointing at a
+# local port that refuses, so a module source that would reach the network fails
+# at once, as a finding naming the module, rather than waiting on it.
 #
 # MOVING A PIN. Pin a release once it is at least three days old. Each value is
 # what its publisher states:
@@ -159,11 +171,12 @@ USAGE
   scripts/vendor-validate.sh --self-test
   scripts/vendor-validate.sh -h | --help
 
-  --staged     judge the commit being made, as the index holds it, by VENDOR
-               TEXT, THE CANONICAL PASS-THROUGH and, when the commit changes
-               it, THE CFN-LINT CONFIGURATION; then build THE FIXTURES the
-               commit reaches (WHAT A COMMIT SELECTS) and hold their findings
-               to KNOWN FINDINGS: the form for a pre-commit hook.
+  --staged     judge the commit being made, as the index holds it, by THE
+               GATE'S OWN FILES, VENDOR TEXT, THE CANONICAL PASS-THROUGH and,
+               when the commit changes it, THE CFN-LINT CONFIGURATION; then
+               build THE FIXTURES the commit reaches (WHAT A COMMIT SELECTS)
+               and hold their findings to KNOWN FINDINGS: the form for a
+               pre-commit hook.
   --all        judge everything the index holds by VENDOR TEXT, THE
                CANONICAL PASS-THROUGH and THE CFN-LINT CONFIGURATION, then
                build every fixture and hold every finding and every entry
@@ -191,7 +204,18 @@ USAGE
   PATH). PUBLISHED_REMOTE names the remote whose published branch is read
   (default: the remote the checked-out branch tracks, else origin).
 
-VENDOR TEXT (--staged, --all; runs first)
+THE GATE'S OWN FILES (--staged; runs first)
+  This script, scripts/vendor-validate-arm.py and the libraries in
+  scripts/lib/ it sources are the gate. --staged refuses, naming each, a file
+  of the gate whose working tree differs from the index, before any other
+  rule runs: bash runs this script and its libraries as the checkout holds
+  them, so a change not staged would judge the commit by rules the commit
+  does not carry. Stage the change, or undo it. The Azure Resource Manager check runs
+  from the copy of the index the fixtures are built in, in --staged and --all
+  alike; --all runs this script and its libraries as the checkout holds them
+  and refuses nothing for this.
+
+VENDOR TEXT (--staged, --all)
   aggrega import, drafting an entity from a vendor's resource schema, opens
   every passage it takes from that schema with the marker
       @MARKER@
@@ -229,15 +253,20 @@ THE CANONICAL PASS-THROUGH (--staged, --all)
 
 THE CFN-LINT CONFIGURATION (--all; --staged when the commit changes it)
   .cfnlintrc.yaml, at the top of this repository, is the one configuration
-  cfn-lint reads. Each rule it ignores is a line of its own under
+  cfn-lint reads, and ignore_checks is the one key it holds: any other key,
+  such as ignore_templates, configure_rules or append_rules, changes which
+  templates cfn-lint reads, which rules it runs or how they judge, with no
+  reason reviewed beside it. Each rule it ignores is a line of its own under
   ignore_checks, - <rule>, with its reason in a comment beside it or on the
   line directly above: what the rule reports, and why a template this catalog
-  renders is right to carry it anyway. An entry with no reason, rules
-  written in brackets on the ignore_checks line itself (an empty list, [],
-  aside), and a line under ignore_checks that is neither an entry, a comment
-  nor blank, are refused, naming the line and the rule; so is the file's
-  absence from the index. The file is read from the index, as a text, with
-  no YAML parser.
+  renders is right to carry it anyway. A line outside that list that is not
+  ignore_checks: at the margin, a comment nor blank — another key, a document
+  marker or a directive — is refused, naming it; so are an entry with no
+  reason, rules written in brackets on the ignore_checks line itself (an
+  empty list, [], aside), and a line under ignore_checks that is neither an
+  entry, a comment nor blank, each naming the line and the rule; and the
+  file's absence from the index. The file is read from the index, as a text,
+  with no YAML parser.
 
 THE VALIDATORS
   scripts/vendor-validators.json pins each validator: OpenTofu by version and
@@ -281,7 +310,8 @@ THE VALIDATORS
               mending one finding can bring another to light.
     cfn-lint  <boundary>/cloudformation/cloudformation-stack.json, with
               --config-file .cfnlintrc.yaml --non-zero-exit-code warning
-              --regions us-east-1. Every error and warning is a finding.
+              --regions us-east-1, and nothing on its standard input. Every
+              error and warning is a finding.
               cfn-lint reads no configuration file but .cfnlintrc.yaml (THE
               CFN-LINT CONFIGURATION above). It would also take rules to
               ignore, and more, from a template's own Metadata, under the
@@ -378,7 +408,9 @@ THE FIXTURES (--staged, --all)
   (E0130) is refused, naming the pull that renews it; a source missing
   from the cache (E0137) gives no verdict, naming the same pull. Every
   validator then runs over each boundary the build rendered (THE
-  VALIDATORS), and each finding is held to KNOWN FINDINGS.
+  VALIDATORS), and each finding is held to KNOWN FINDINGS. A Release whose
+  boundaries hold no root any validator reads is refused, naming it, since
+  no validator would judge anything it builds.
 
 NEGATIVE RELEASES
   release-negative-<slug>.yaml, with its .lock and a .expect beside it, is
@@ -398,7 +430,11 @@ WHAT A COMMIT SELECTS (--staged)
       FeatureRecipe, a Component, a Feature, or a mapping, artifact,
       schema or workload library — selects each fixture whose lock
       records that entity or library at that version, a negative
-      Release's lock among them;
+      Release's lock among them. A library is matched by the name its
+      YAML gives, read as aggrega writes it: kind: <kind>Library at the
+      margin and the name indented two spaces under metadata:. A library
+      version from which no name can be read that way is refused, naming
+      it;
     - a path in a fixture selects that fixture;
     - scripts/vendor-validators.json, and the files this script runs
       (itself, scripts/vendor-validate-arm.py and the libraries in
@@ -425,12 +461,15 @@ KNOWN FINDINGS (--staged, --all)
   mended. A finding is refused unless an entry lists its id for the
   entity version it is attributed to, and one attributed to - can never
   be listed. An entry is refused when its version is not published (THE
-  CANONICAL PASS-THROUGH says when one is), and as stale when a fixture
-  built that version and its finding did not appear, so the list only
-  shrinks. --all builds every fixture and judges every entry, refusing
-  one whose version no fixture builds; --staged judges each entry the
-  commit adds, refusing one whose version no fixture reaches, and each
-  naming a version a fixture it built reaches.
+  CANONICAL PASS-THROUGH says when one is), and as stale when the run
+  built every fixture reaching that version and its finding did not
+  appear, so the list only shrinks; a finding's id carries names the
+  fixture gives, an instance's among them, so one fixture built says
+  nothing of the findings another shows. --all builds every fixture and
+  judges every entry, refusing one whose version no fixture builds;
+  --staged judges each entry the commit adds, refusing one whose version
+  no fixture reaches, in the order the file holds them, and each naming a
+  version a fixture it built reaches.
 
 EXIT CODES
   0  passed: nothing refused
@@ -476,6 +515,9 @@ done
 [ -n "$MODE" ] || { echo "$ME: name one of $FORMS (see --help)" >&2; exit 2; }
 
 set -uo pipefail
+# Every glob, comparison and text tool runs in the C locale, so the order a glob
+# lists its matches in is byte order on every machine.
+export LC_ALL=C
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 3
 # shellcheck source=lib/catalog-entities.sh
 . "$HERE/lib/catalog-entities.sh" || exit 3
@@ -516,6 +558,9 @@ GATE_SCRIPTS=" scripts/vendor-validate.sh scripts/vendor-validate-arm.py scripts
 # What the gate copies out of the index to build in.
 MATERIALIZED=("$CATALOG_ROOT" "$PROOFS" scripts "$CFNLINTRC")
 PRIME_CMD="$HERE/vendor-validate.sh --prime"
+# The Azure Resource Manager check: this checkout's, until materialize names the
+# copy the index holds.
+ARM_CHECK="$HERE/vendor-validate-arm.py"
 TMP="$(mktemp -d)" || exit 3
 # stop_builds — stops every build still running beside the run and waits for each
 # to end, so that none outlives the run or writes into its temporary directory
@@ -554,6 +599,21 @@ if git rev-parse -q --verify 'HEAD^{commit}' >/dev/null; then
 else
   BASE="$(git hash-object -t tree /dev/null)" || no_verdict "git cannot name the empty tree"
 fi
+
+# --- the gate's own files -----------------------------------------------------------
+# gate_unstaged_rule — refuses, naming each, every file of the gate (GATE_SCRIPTS)
+# whose working tree differs from the index: bash runs this script and the
+# libraries it sources as the checkout holds them, so a change not staged would
+# judge the commit by rules the commit does not carry.
+gate_unstaged_rule() {
+  local path
+  # shellcheck disable=SC2086 # the gate's files, space-separated
+  git --literal-pathspecs diff --name-only -z -- $GATE_SCRIPTS >"$TMP/gate-unstaged" ||
+    no_verdict "git cannot compare the gate's own files in the working tree with the index"
+  while IFS= read -r -d '' path; do
+    refuse "$path: changed in the working tree and not staged. --staged runs the gate's own files as this checkout holds them, so a change not staged would judge this commit by rules the commit does not carry: stage it (git add -- $path) or undo it, then commit again."
+  done <"$TMP/gate-unstaged"
+}
 
 # --- vendor text -------------------------------------------------------------------
 # vendor_text_rule — refuses every file the commit adds, changes, copies or renames
@@ -737,12 +797,15 @@ pass_through_drift() {
 }
 
 # --- the cfn-lint configuration ---------------------------------------------------
-# Each rule .cfnlintrc.yaml ignores, under ignore_checks, is a line of its own,
-# - <rule>, with its reason in a comment beside it or on the line directly above;
-# awk prints, for each that breaks this, its line number, a tab and what to write.
-# A list written in brackets, empty or not, gives no rule a line of its own, so
-# only the empty one, [], passes; so does no line under ignore_checks but a
-# comment, a blank line or an entry - <rule>.
+# ignore_checks is the one key .cfnlintrc.yaml holds, and each rule it ignores is
+# a line of its own, - <rule>, with its reason in a comment beside it or on the
+# line directly above; awk prints, for each line that breaks this, its line
+# number, a tab and what to write. Outside the list under ignore_checks, a line
+# is a comment, a blank line or ignore_checks: at the margin, so any other key,
+# a document marker or a directive is refused, indented or not. A list written
+# in brackets, empty or not, gives no rule a line of its own, so only the empty
+# one, [], passes; so does no line under ignore_checks but a comment, a blank
+# line or an entry - <rule>.
 # shellcheck disable=SC2016 # awk's own $, not the shell's
 CFNLINTRC_AWK='
   function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
@@ -759,6 +822,11 @@ CFNLINTRC_AWK='
     rule = unquote(uncomment(entry))
     if (entry !~ /[ \t]#[ \t]*[^ \t]/ && previous !~ /^[ \t]*#[ \t]*[^ \t]/)
       printf "%d\tignores the cfn-lint rule %s with no reason beside it or on the line above: write, in a comment there, what the rule reports and why a template this catalog renders is right to carry it anyway, or remove the entry\n", NR, rule
+  }
+  !in_list && $0 !~ /^[ \t]*(#|$)/ && $0 !~ /^ignore_checks[ \t]*:/ {
+    key = uncomment($0)
+    sub(/[ \t]*:.*$/, "", key)
+    printf "%d\twrites %s, and ignore_checks is the one key this file holds: any other key changes which templates cfn-lint reads, which rules it runs or how they judge, with no reason reviewed beside it; remove it\n", NR, key
   }
   !in_list && $0 ~ /^ignore_checks[ \t]*:/ {
     rest = $0
@@ -902,16 +970,15 @@ python_package_version() {
 # not yet marked primed.
 PRIMING=0
 
-# arm_check DIR TEMPLATE... — runs the Azure Resource Manager check
-# (vendor-validate-arm.py) with the cache's Python over the cache's schemas on
-# each TEMPLATE, a path relative to DIR: the path every finding's id carries.
-# Exits as the check does: 0 no finding, 1 findings, 2 a usage error, 3 no
-# verdict.
+# arm_check DIR TEMPLATE... — runs the Azure Resource Manager check (ARM_CHECK)
+# with the cache's Python over the cache's schemas on each TEMPLATE, a path
+# relative to DIR: the path every finding's id carries. Exits as the check does:
+# 0 no finding, 1 findings, 2 a usage error, 3 no verdict.
 # shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
 arm_check() {
   local dir="$1"
   shift
-  (cd -- "$dir" && "$CACHE_DIR/venv/bin/python" -I "$HERE/vendor-validate-arm.py" "$CACHE_DIR/arm-schemas/schemas" "$@")
+  (cd -- "$dir" && "$CACHE_DIR/venv/bin/python" -I "$ARM_CHECK" "$CACHE_DIR/arm-schemas/schemas" "$@")
 }
 
 # cache_causes — adds to CAUSES what the cache lacks: a mark that it is primed for
@@ -1406,7 +1473,7 @@ tofu_run() {
 # shellcheck disable=SC2329 # called by name, as a fixture's check calls it
 tofu_findings() {
   local tree="$1" boundary="$2" work init=0 validate=-
-  [ -d "$boundary/terraform" ] || return 0
+  [ -d "$boundary/terraform" ] || return 2
   [ -f "$boundary/terraform/aggrega.modules.tf" ] ||
     no_verdict "$boundary/terraform holds no aggrega.modules.tf, the root configuration the terraform provider renders, so tofu has no root to validate"
   tofu_config
@@ -1427,7 +1494,7 @@ tofu_findings() {
 # shellcheck disable=SC2329 # called by name, as a fixture's check calls it
 cfn_lint_findings() {
   local tree="$1" boundary="$2" template="cloudformation/cloudformation-stack.json" work set_aside key rc=0 lines=1
-  [ -d "$boundary/cloudformation" ] || return 0
+  [ -d "$boundary/cloudformation" ] || return 2
   [ -f "$boundary/$template" ] ||
     no_verdict "$boundary/cloudformation holds no cloudformation-stack.json, the stack template the cloudformation provider renders, so cfn-lint has no template to lint"
   # cfn-lint reads a configuration file that is not there as an empty one.
@@ -1445,7 +1512,7 @@ cfn_lint_findings() {
   fi
   (cd -- "$work" && env -i PATH="$PATH" HOME="$work" LANG=C.UTF-8 PYTHONUTF8=1 \
     "$CACHE_DIR/venv/bin/cfn-lint" --config-file "$tree/.cfnlintrc.yaml" --non-zero-exit-code warning \
-    --regions us-east-1 --format json -- "$template") >"$work/cfn-lint.json" 2>"$work/cfn-lint.err" || rc=$?
+    --regions us-east-1 --format json -- "$template") </dev/null >"$work/cfn-lint.json" 2>"$work/cfn-lint.err" || rc=$?
   [ -s "$work/cfn-lint.json" ] ||
     no_verdict "cfn-lint gave no reading of $boundary/$template (exit $rc): $(tail -n 3 "$work/cfn-lint.err" | tr '\n' ' ')"
   read_findings "$tree" cloudformation cfn-lint "$boundary" "$template" "$work/cfn-lint.json" "$rc" "$lines"
@@ -1455,15 +1522,20 @@ cfn_lint_findings() {
 # BOUNDARY holds; prints its findings attributed through TREE's catalog.
 # shellcheck disable=SC2329 # called by name, as a fixture's check calls it
 arm_findings() {
-  local tree="$1" boundary="$2" template="arm/arm-template.json" work rc=0
-  [ -d "$boundary/arm" ] || return 0
+  local tree="$1" boundary="$2" template="arm/arm-template.json" work why rc=0
+  [ -d "$boundary/arm" ] || return 2
   [ -f "$boundary/$template" ] ||
     no_verdict "$boundary/arm holds no arm-template.json, the template the arm provider renders, so the Azure Resource Manager check has no template to read"
   work="$(mktemp -d "$TMP/arm.XXXXXX")" || no_verdict "cannot make a directory in $TMP"
   arm_check "$boundary" "$template" >"$work/arm.out" 2>"$work/arm.err" || rc=$?
   case "$rc" in
     0 | 1) ;;
-    *) no_verdict "the Azure Resource Manager check gives no verdict on $boundary/$template (exit $rc): $(tail -n 3 "$work/arm.err" | tr '\n' ' ')" ;;
+    *)
+      why="$(tail -n 3 "$work/arm.err" | tr '\n' ' ')"
+      # The check runs from the copy of the index, and names the command that
+      # primes the cache beside itself; the command to run is this checkout's.
+      [ -z "${TREE:-}" ] || why="${why//"$TREE/scripts/vendor-validate.sh"/"$HERE/vendor-validate.sh"}"
+      no_verdict "the Azure Resource Manager check gives no verdict on $boundary/$template (exit $rc): $why" ;;
   esac
   read_findings "$tree" arm arm "$boundary" "$template" "$work/arm.out" "$rc"
 }
@@ -1618,9 +1690,12 @@ reach_table() {
 }
 
 # library_name VDIR — the metadata.name of the library whose version directory
-# is VDIR, read from the index, else from BASE for a library the commit removes.
+# is VDIR, read from the index, else from BASE for a library the commit removes:
+# the YAML directly in VDIR whose kind:, at the margin, ends in Library, its name
+# indented two spaces under metadata:, as aggrega writes them. Returns 2 when
+# neither holds such a YAML or its name is empty.
 library_name() {
-  local vdir="$1" rev path
+  local vdir="$1" rev path name
   for rev in "" "$BASE"; do
     if [ -z "$rev" ]; then
       git --literal-pathspecs ls-files -z -- "$vdir/" >"$TMP/library-paths"
@@ -1632,16 +1707,19 @@ library_name() {
       case "$path" in *.yaml | *.yml) ;; *) continue ;; esac
       git show "$rev:$path" >"$TMP/library.yaml" 2>/dev/null || continue
       case "$(peek_kind "$TMP/library.yaml")" in *Library) ;; *) continue ;; esac
-      awk "$METADATA_NAME_AWK" "$TMP/library.yaml"
+      name="$(awk "$METADATA_NAME_AWK" "$TMP/library.yaml")"
+      [ -n "$name" ] || return 2
+      printf '%s\n' "$name"
       return 0
     done <"$TMP/library-paths"
   done
-  return 1
+  return 2
 }
 
 # catalog_key PATH — the key, as LOCK_KEYS_AWK prints it, of the entity or
 # library version PATH lies under: an entity's read from its directory, a
-# library's name from its YAML. Returns 1 for a path under no version directory.
+# library's name from its YAML. Returns 1 for a path under no version directory,
+# and 2 for a library version whose name cannot be read (library_name).
 catalog_key() {
   local vdir rest kind_dir name version section=""
   vdir="$(version_dir "$1")" || return 1
@@ -1659,7 +1737,7 @@ catalog_key() {
     *) printf 'entity:%s:%s@%s\n' "$kind_dir" "$name" "$version" ;;
   esac
   [ -n "$section" ] || return 0
-  name="$(library_name "$vdir")" || return 1
+  name="$(library_name "$vdir")" || return "$?"
   printf 'library:%s:%s@%s\n' "$section" "$name" "$version"
 }
 
@@ -1683,7 +1761,7 @@ select_fixtures() {
 # positive Release reaches.
 select_staged() {
   local path key vdir rest kind_dir capability fx what only rc
-  local -A unreached=()
+  local -A unreached=() unreadable=()
   git diff --cached --name-only -z --no-renames "$BASE" >"$TMP/staged-paths" ||
     no_verdict "git cannot list what the commit stages"
   while IFS= read -r -d '' path; do
@@ -1710,7 +1788,18 @@ select_staged() {
       "$CATALOG_ROOT"/*)
         rc=0
         key="$(catalog_key "$path")" || rc=$?
-        case "$rc" in 0) ;; 1) continue ;; *) exit 3 ;; esac
+        case "$rc" in
+          0) ;;
+          1) continue ;;
+          2)
+            vdir="$(version_dir "$path")"
+            [ -z "${unreadable[$vdir]+set}" ] || continue
+            unreadable[$vdir]=1
+            refuse "$vdir: a library version the commit changes, and no library name can be read from it, so no fixture reaching it can be found: write its YAML directly in this directory, kind: <kind>Library at the margin and its name indented two spaces under metadata:, as aggrega writes them."
+            continue
+            ;;
+          *) exit 3 ;;
+        esac
         # shellcheck disable=SC2086 # the fixtures, space-separated
         [ -z "${NEGATIVE_REACH[$key]:-}" ] || select_fixtures ${NEGATIVE_REACH[$key]}
         if [ -n "${REACH[$key]:-}" ]; then
@@ -1834,18 +1923,24 @@ load_known() {
 # fixtures reaching the entity version each added or removed entry names, marks
 # each added entry in KNOWN_ADDED to be judged, and refuses an added entry whose
 # entity version no fixture reaches, since nothing could ever show its finding.
+# The entries are taken in the order the file holds them, each it adds first,
+# then each it removes, so its refusals come out in that order.
 declare -A KNOWN_ADDED=()
 select_known_changes() {
   local row what entity version id key
+  local -a removed=()
   local -A before=() after=()
   load_known
   for row in ${KNOWN[@]+"${KNOWN[@]}"}; do after[$row]=1; done
   if read_known "$BASE" "$TMP/known-before"; then
     while IFS=$'\t' read -r what entity version id; do
-      [ "$what" != entry ] || before["$entity@$version"$'\t'"$id"]=1
+      [ "$what" = entry ] || continue
+      row="$entity@$version"$'\t'"$id"
+      before[$row]=1
+      [ -n "${after[$row]+set}" ] || removed+=("$row")
     done <"$TMP/known-before"
   fi
-  for row in "${!after[@]}" "${!before[@]}"; do
+  for row in ${KNOWN[@]+"${KNOWN[@]}"} ${removed[@]+"${removed[@]}"}; do
     [ -z "${after[$row]+set}" ] || [ -z "${before[$row]+set}" ] || continue
     entity="${row%%@*}"
     version="${row#*@}"
@@ -1864,8 +1959,8 @@ select_known_changes() {
 
 # materialize — writes what the index holds of the catalog, the fixtures, the
 # scripts and the cfn-lint configuration into TREE, under the run's temporary
-# directory, removed when the run exits; the pin file read from then on is the
-# one the index holds.
+# directory, removed when the run exits; the pin file read and the Azure
+# Resource Manager check run from then on are the ones the index holds.
 materialize() {
   TREE="$TMP/tree"
   mkdir -p "$TREE" || no_verdict "cannot make $TREE"
@@ -1873,6 +1968,7 @@ materialize() {
     no_verdict "git cannot write what the index holds into $TREE"
   printf '{}\n' >"$TMP/aggrega-config.yaml" || no_verdict "cannot write $TMP/aggrega-config.yaml"
   PIN_FILE="$TREE/$PIN_REL"
+  ARM_CHECK="$TREE/scripts/vendor-validate-arm.py"
 }
 
 # staged_self_test — runs --self-test as the index holds this script and its pin
@@ -1950,17 +2046,22 @@ build_halted() {
 # boundary_findings FIXTURE RELEASE TREE — runs every validator over each
 # boundary the build rendered in TREE, the build's own tree, appending each
 # finding to findings as FIXTURE TAB RELEASE TAB boundary TAB id TAB attribution
-# TAB message; prints how many.
+# TAB message; prints how many findings, a space, and how many roots the
+# validators read.
 # shellcheck disable=SC2329 # called from judge_build, which bounded_jobs reaches by name
 boundary_findings() {
-  local fx="$1" name="$2" tree="$3" b runner out rc n=0 id attr message
+  local fx="$1" name="$2" tree="$3" b runner out rc n=0 roots=0 id attr message
   for b in "$tree/$fx/dist"/*/; do
     [ -d "$b" ] || continue
     b="${b%/}"
     for runner in tofu_findings cfn_lint_findings arm_findings; do
       rc=0
       out="$("$runner" "$tree" "$b")" || rc=$?
-      case "$rc" in 0 | 1) ;; *) exit 3 ;; esac
+      case "$rc" in
+        0 | 1) roots=$((roots + 1)) ;;
+        2) continue ;;
+        *) exit 3 ;;
+      esac
       while IFS=$'\t' read -r id attr message; do
         [ -n "$id" ] || continue
         n=$((n + 1))
@@ -1968,7 +2069,7 @@ boundary_findings() {
       done <<<"$out"
     done
   done
-  printf '%s\n' "$n"
+  printf '%s %s\n' "$n" "$roots"
 }
 
 # seconds_since START — the seconds since START, an EPOCHREALTIME, to a tenth.
@@ -2057,12 +2158,13 @@ build_read() {
 
 # judge_build FIXTURE RELEASE TREE SECONDS — judges the build of RELEASE of
 # FIXTURE, rendered in TREE in SECONDS, by BUILD_RC and BUILD_OUT: a positive one
-# must build, and its findings go to findings, the entity versions its lock
-# reaches to BUILT; a negative one must halt with output holding its .expect line.
+# must build and render a root a validator reads, and its findings go to
+# findings, each entity version its lock reaches to BUILT (built_by); a negative
+# one must halt with output holding its .expect line.
 declare -A BUILT=()
 # shellcheck disable=SC2329 # called from build_read, which bounded_jobs calls by name
 judge_build() {
-  local fx="$1" name="$2" tree="$3" built="$4" dir="$TREE/$1" expect started n key
+  local fx="$1" name="$2" tree="$3" built="$4" dir="$TREE/$1" expect started counts n roots key
   case "$name" in
     release-negative-?*.yaml)
       [ -f "$dir/${name%.yaml}.expect" ] || return 0
@@ -2083,22 +2185,49 @@ judge_build() {
     return 0
   fi
   started="$EPOCHREALTIME"
-  n="$(boundary_findings "$fx" "$name" "$tree")" || exit 3
+  counts="$(boundary_findings "$fx" "$name" "$tree")" || exit 3
+  read -r n roots <<<"$counts"
+  if [ "$roots" -eq 0 ]; then
+    refuse "$fx/$name: a positive Release whose build renders no root a vendor validator reads (--help, THE VALIDATORS), so no validator judges anything it builds: give it an instance of a cloud Recipe of its target, or remove it."
+    return 0
+  fi
   echo "$ME: $fx/$name built in $built s; its boundaries validated in $(seconds_since "$started") s, $n finding(s)"
   while IFS= read -r key; do
     case "$key" in
-      entity:recipe:*) BUILT["recipe/${key#entity:recipe:}"]=1 ;;
-      entity:feature_recipe:*) BUILT["featurerecipe/${key#entity:feature_recipe:}"]=1 ;;
+      entity:recipe:*) built_by "recipe/${key#entity:recipe:}" "$fx" ;;
+      entity:feature_recipe:*) built_by "featurerecipe/${key#entity:feature_recipe:}" "$fx" ;;
     esac
   done < <(awk "$LOCK_KEYS_AWK" "$dir/${name%.yaml}.lock")
+}
+
+# built_by ENTITY@VERSION FIXTURE — records in BUILT that a positive Release of
+# FIXTURE built ENTITY at VERSION: BUILT holds, for each, the fixtures that built
+# it, space-separated.
+# shellcheck disable=SC2329 # called from judge_build, which bounded_jobs reaches by name
+built_by() {
+  [[ " ${BUILT[$1]:-} " == *" $2 "* ]] || BUILT[$1]="${BUILT[$1]:+${BUILT[$1]} }$2"
+}
+
+# every_reaching_fixture_built ENTITY VERSION — whether the run built ENTITY at
+# VERSION in every fixture whose lock reaches it. A finding's id carries names a
+# fixture gives, an instance's among them, so a fixture built says nothing of
+# the findings another shows. --all builds every fixture.
+every_reaching_fixture_built() {
+  local fx key built=" ${BUILT[$1@$2]:-} "
+  [ "$MODE" = staged ] || return 0
+  key="$(entry_key "$1" "$2")"
+  for fx in ${REACH[$key]:-}; do
+    [[ $built == *" $fx "* ]] || return 1
+  done
 }
 
 # judge_known — holds every finding to the known-findings file and the file to the
 # findings: a finding is refused unless an entry lists its id for the entity
 # version it is attributed to; an entry judged is refused when its version is not
-# published, and when a fixture built that version and its finding did not
-# appear. --all judges every entry, refusing one whose version no fixture built;
-# --staged judges those the commit adds and those naming a version it built.
+# published, and as stale when every fixture reaching that version built it and
+# its finding did not appear. --all judges every entry, refusing one whose
+# version no fixture built; --staged judges those the commit adds and those
+# naming a version it built.
 judge_known() {
   local fx name boundary id attr message row entity version
   local -A listed=() produced=()
@@ -2126,8 +2255,9 @@ judge_known() {
     recorded_published "$entity" "$version" ||
       refuse "$KNOWN_FINDINGS: the entry for $entity@$version ($id) names a version not published, as the published record last fetched holds it. A version not yet published can still change, so its finding is mended, not listed: remove the entry and mend the finding."
     if [ -n "${BUILT[$entity@$version]+set}" ]; then
+      every_reaching_fixture_built "$entity" "$version" || continue
       [ -n "${produced["$entity@$version"$'\t'"$id"]+set}" ] ||
-        refuse "$KNOWN_FINDINGS: the entry for $entity@$version ($id) is stale: a fixture built that version and the finding did not appear. Remove the entry."
+        refuse "$KNOWN_FINDINGS: the entry for $entity@$version ($id) is stale: every fixture reaching that version built it, and the finding did not appear. Remove the entry."
     elif [ "$MODE" = all ]; then
       refuse "$KNOWN_FINDINGS: the entry for $entity@$version ($id) names a version no fixture under $PROOFS/ builds, so its finding can never be shown: build that version in a fixture, or remove the entry."
     fi
@@ -2256,11 +2386,21 @@ ST_CASES=(
   st_canonical_changed
   st_canonical_changed_published_kept
   st_cloud_version_unreached
+  st_cloud_version_negative_only
+  st_library_name_unreadable
   st_clean_commit
+  st_gate_unstaged
+  st_positive_renders_no_root
+  st_known_added_in_file_order
+  st_known_one_fixture_of_two_built
+  st_known_stale
+  st_arm_check_from_index
+  st_arm_no_verdict_names_checkout
   st_all_no_fixture
   st_cfnlintrc_reason_missing
   st_cfnlintrc_flow_list
   st_cfnlintrc_entry_not_a_line
+  st_cfnlintrc_other_key
   st_cfnlintrc_staged
   st_cfnlintrc_reasons_given
   st_unprimed
@@ -2311,9 +2451,10 @@ ST_CASES=(
 # The container Recipe every scratch repository carries.
 ST_RECIPE="$TF_RECIPES/probe-service/1.0.0"
 
-# self_test — runs every case; fails when one does not give its expected verdict.
-# Its callers run it in a subshell, (self_test), so nothing it sets for the
-# scratch repositories reaches the rest of the run.
+# self_test — runs every case; exits 1 when one does not give its expected
+# verdict, and 3 when the cases cannot be set up. Its callers run it in a
+# subshell, (self_test), so nothing it sets for the scratch repositories reaches
+# the rest of the run.
 self_test() {
   local var c
   # A scratch repository is a repository of its own: no variable git set for the
@@ -2326,8 +2467,8 @@ self_test() {
   ST_ROOT="$TMP/self-test"
   ST_N=0
   ST_FAILED=0
-  mkdir -p "$ST_ROOT" || exit 1
-  st_stubs
+  mkdir -p "$ST_ROOT" || no_verdict "cannot make $ST_ROOT"
+  st_stubs || no_verdict "cannot write the stand-ins the cases run under $ST_ROOT"
   echo "$ME --self-test:"
   for c in "${ST_CASES[@]}"; do "$c"; done
   if [ "$ST_FAILED" -gt 0 ]; then
@@ -2369,7 +2510,7 @@ st_repo() {
 
 # st_fixture GROUP VERSION — writes in ST_REPO the fixture
 # proofs/terraform-google/GROUP, whose Release's lock records the container
-# Recipe at VERSION. The stub aggrega builds it into a boundary holding nothing.
+# Recipe at VERSION. A stub aggrega builds it into the boundary it renders.
 # shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
 st_fixture() {
   local fx="$ST_REPO/$PROOFS/terraform-google/$1"
@@ -2417,19 +2558,22 @@ st_publish() {
 }
 
 # st_run FORM [NAME=VALUE...] — runs the copy of this script in ST_REPO with FORM
-# and the environment given; ST_RC and ST_OUT get its exit status and everything
-# it printed.
+# and the environment given, a line on its standard input that no validator it
+# runs may read (st_stub_cfn_lint); ST_RC and ST_OUT get its exit status and
+# everything it printed.
 # shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
 st_run() {
   local form="$1"
   shift
   ST_RC=0
-  ST_OUT="$(cd "$ST_REPO" && env "$@" bash "$ST_REPO/scripts/vendor-validate.sh" "$form" 2>&1)" || ST_RC=$?
+  ST_OUT="$(cd "$ST_REPO" && env "$@" bash "$ST_REPO/scripts/vendor-validate.sh" "$form" 2>&1 \
+    <<<"a line no validator reads")" || ST_RC=$?
 }
 
 # st_stubs — the stand-ins the cases run: aggrega binaries answering a version,
-# each building a boundary holding nothing, and a tofu and a cfn-lint on PATH
-# answering a version no pin names.
+# each building one boundary, holding a stack template, an Azure Resource
+# Manager template or nothing; and a tofu and a cfn-lint on PATH answering a
+# version no pin names.
 st_stubs() {
   local a b c low
   IFS=. read -r a b c <<<"$PIN_AGGREGA_MIN"
@@ -2438,26 +2582,75 @@ st_stubs() {
   else low="$((a - 1)).99.99"
   fi
   ST_BELOW_MIN="$low"
-  mkdir -p "$ST_ROOT/bin" "$ST_ROOT/path" || return 1
-  st_stub_aggrega "$ST_ROOT/bin/aggrega-at-minimum" "$PIN_AGGREGA_MIN"
-  st_stub_aggrega "$ST_ROOT/bin/aggrega-below-minimum" "$ST_BELOW_MIN"
-  st_stub_aggrega "$ST_ROOT/bin/aggrega-between-releases" "$PIN_AGGREGA_MIN-41-g697285c71-dirty"
-  st_stub_tofu "$ST_ROOT/path/tofu" 0.0.0
-  st_stub_cfn_lint "$ST_ROOT/path/cfn-lint" 0.0.0
+  mkdir -p "$ST_ROOT/bin" "$ST_ROOT/path" &&
+    st_stub_aggrega "$ST_ROOT/bin/aggrega-at-minimum" "$PIN_AGGREGA_MIN" cloudformation &&
+    st_stub_aggrega "$ST_ROOT/bin/aggrega-below-minimum" "$ST_BELOW_MIN" cloudformation &&
+    st_stub_aggrega "$ST_ROOT/bin/aggrega-between-releases" "$PIN_AGGREGA_MIN-41-g697285c71-dirty" cloudformation &&
+    st_stub_aggrega "$ST_ROOT/bin/aggrega-arm" "$PIN_AGGREGA_MIN" arm &&
+    st_stub_aggrega "$ST_ROOT/bin/aggrega-no-root" "$PIN_AGGREGA_MIN" none &&
+    st_stub_tofu "$ST_ROOT/path/tofu" 0.0.0 &&
+    st_stub_cfn_lint "$ST_ROOT/path/cfn-lint" 0.0.0
 }
 
-# An aggrega answering its version, and building one boundary holding nothing in
-# the directory it runs in.
-# shellcheck disable=SC2016 # the stub's own $1, not this script's
+# st_render ROOT — the shell line a stub aggrega renders ROOT with, in the
+# boundary dist/main of the directory it runs in: cloudformation, a stack
+# template declaring nothing; arm, an Azure Resource Manager template declaring
+# nothing; none, nothing at all. The line holds no &, which a bash replacing a
+# pattern with it would read as the text matched.
+# shellcheck disable=SC2329 # called from the stubs, which the cases write
+st_render() {
+  case "$1" in
+    cloudformation)
+      printf '%s' "mkdir -p dist/main/cloudformation || exit 1; printf '{\"AWSTemplateFormatVersion\": \"2010-09-09\", \"Resources\": {}}\\n' >dist/main/cloudformation/cloudformation-stack.json" ;;
+    arm) printf '%s' "mkdir -p dist/main/arm || exit 1; printf '{\"resources\": {}}\\n' >dist/main/arm/arm-template.json" ;;
+    none) printf '%s' "mkdir -p dist/main" ;;
+  esac
+}
+
+# st_stub_aggrega FILE VERSION ROOT — an aggrega answering VERSION, and building
+# one boundary holding ROOT (st_render) in the directory it runs in.
 st_stub_aggrega() {
-  printf '#!/bin/sh\ncase "$1" in\n  version) printf %s ;;\n  build) mkdir -p dist/main ;;\n  *) exit 2 ;;\nesac\n' \
-    "'{\"version\": \"$2\", \"commit\": \"0000000\"}\\n'" >"$1" && chmod +x "$1"
+  local text
+  text="$(cat <<'END_OF_STUB'
+#!/bin/sh
+case "$1" in
+  version) printf '{"version": "@VERSION@", "commit": "0000000"}\n' ;;
+  build) @RENDER@ ;;
+  *) exit 2 ;;
+esac
+END_OF_STUB
+)"
+  text="${text//@VERSION@/$2}"
+  printf '%s\n' "${text//@RENDER@/$(st_render "$3")}" >"$1" && chmod +x "$1"
 }
 st_stub_tofu() {
   printf '#!/bin/sh\nprintf %s\n' "'{\"terraform_version\": \"$2\"}\\n'" >"$1" && chmod +x "$1"
 }
+# st_stub_cfn_lint FILE VERSION — a cfn-lint answering VERSION to --version and,
+# linting, a reading holding no finding. The run gives cfn-lint nothing to read
+# on its standard input, and each case's run is handed a line there (st_run), so
+# one that reads a line exits 9, naming it.
 st_stub_cfn_lint() {
-  printf '#!/bin/sh\necho "cfn-lint %s"\n' "$2" >"$1" && chmod +x "$1"
+  local text
+  text="$(cat <<'END_OF_STUB'
+#!/bin/sh
+case "$1" in
+  --version) echo "cfn-lint @VERSION@" ;;
+  *)
+    if read -r line; then
+      echo "cfn-lint read its standard input: $line" >&2
+      exit 9
+    fi
+    echo '[]' ;;
+esac
+END_OF_STUB
+)"
+  printf '%s\n' "${text//@VERSION@/$2}" >"$1" && chmod +x "$1"
+}
+# st_stub_python FILE — a Python that is the python3 on PATH.
+# shellcheck disable=SC2329 # called from st_cache, which the cases call
+st_stub_python() {
+  printf '#!/bin/sh\nexec python3 "$@"\n' >"$1" && chmod +x "$1"
 }
 
 # st_stub_nproc FILE COUNT — an nproc counting COUNT processing units.
@@ -2469,7 +2662,7 @@ st_stub_nproc() {
 # st_stub_aggrega_side_by_side FILE LOG — an aggrega answering the oldest version
 # this script accepts, and building a Release in the directory it runs in: a
 # negative one halts naming the planted fault, any other renders one boundary
-# holding nothing. While LOG/meet exists, each build first waits, ten seconds at
+# holding a stack template (st_render). While LOG/meet exists, each build first waits, ten seconds at
 # most, until another runs beside it, marking LOG/met once one does; a negative
 # one then takes half a second longer; and each adds its Release to LOG/ended as
 # it ends.
@@ -2507,13 +2700,14 @@ case "$release" in
     [ "$meet" = 0 ] || sleep 0.5
     echo "rendering halted: the planted fault"
     status=1 ;;
-  *) mkdir -p dist/main ;;
+  *) @RENDER@ ;;
 esac
 [ "$meet" = 0 ] || echo "$release" >>"$log/ended"
 exit "$status"
 END_OF_STUB
 )"
   text="${text//@VERSION@/$PIN_AGGREGA_MIN}"
+  text="${text//@RENDER@/$(st_render cloudformation)}"
   printf '%s\n' "${text//@LOG@/$2}" >"$1" && chmod +x "$1"
 }
 
@@ -2525,13 +2719,15 @@ st_untimed() {
 }
 
 # st_cache HOME TOFU CFN_LINT [DIGEST] — a primed cache under HOME, for DIGEST
-# (default: this pin file's), whose tofu and cfn-lint answer the versions given.
+# (default: this pin file's), whose tofu and cfn-lint answer the versions given
+# and whose Python is the python3 on PATH.
 # shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
 st_cache() {
   local dir="$1/.cache/aggrega/vendor-validators/${4:-$PIN_DIGEST}"
   mkdir -p "$dir/opentofu" "$dir/venv/bin" &&
     st_stub_tofu "$dir/opentofu/tofu" "$2" &&
     st_stub_cfn_lint "$dir/venv/bin/cfn-lint" "$3" &&
+    st_stub_python "$dir/venv/bin/python" &&
     printf '%s\n' "${4:-$PIN_DIGEST}" >"$dir/primed"
 }
 
@@ -2683,6 +2879,171 @@ st_clean_commit() {
   st_passed "a clean commit: a container Recipe version a fixture reaches, carrying the canonical pass-through"
 }
 
+# The same version, recorded only by the lock of a negative Release, which halts
+# before any validator runs.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cloud_version_negative_only() {
+  local fx
+  { st_repo && st_next_version && fx="$ST_REPO/$PROOFS/terraform-google/probe-negative" && mkdir -p "$fx" &&
+    printf 'workspace: {}\n' >"$fx/.aggrega-config.yaml" &&
+    printf 'kind: Release\n' >"$fx/release-negative-fault.yaml" &&
+    printf '%s\n' "entities:" "    - kind: recipe" "      uri: terraform/probe-service:1.1.0" \
+      "      resolved_version: 1.1.0" >"$fx/release-negative-fault.lock" &&
+    printf 'the planted fault\n' >"$fx/release-negative-fault.expect" &&
+    git -C "$ST_REPO" add -- "$PROOFS"; } || { st_broken "stage a negative Release"; return; }
+  st_run --staged
+  st_caught "a cloud Recipe version the commit adds, which only a negative Release reaches" 1 \
+    "$TF_RECIPES/probe-service/1.1.0: a cloud Recipe version" "only a negative Release records it"
+}
+
+# A library version whose YAML writes its name indented four spaces under
+# metadata:, where the selection reads it at two.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_library_name_unreadable() {
+  local lib="$CATALOG_ROOT/mappinglibrary/probe-mappings/1.0.0"
+  { st_repo && mkdir -p "$ST_REPO/$lib" &&
+    printf '%s\n' "apiVersion: aggrega.ai/v1beta1" "kind: MappingLibrary" "metadata:" "    name: ProbeMappings" \
+      "    version: 1.0.0" "spec:" "  mappings: {}" >"$ST_REPO/$lib/library.yaml" &&
+    git -C "$ST_REPO" add -- "$lib"; } || { st_broken "stage a library"; return; }
+  st_run --staged
+  st_caught "a library version the commit adds, whose name the selection cannot read" 1 "$lib: a library version"
+}
+
+# A library the gate sources, changed in the working tree and not staged, while
+# the commit stages something else.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_gate_unstaged() {
+  { st_repo && printf '# Changed.\n' >>"$ST_REPO/scripts/lib/bounded-jobs.sh" &&
+    printf 'Edited.\n' >>"$ST_REPO/README.md" && git -C "$ST_REPO" add -- README.md; } ||
+    { st_broken "change a file of the gate"; return; }
+  st_run --staged
+  st_caught "a file of the gate changed in the working tree and not staged" 1 \
+    "scripts/lib/bounded-jobs.sh: changed in the working tree and not staged"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_positive_renders_no_root() {
+  local home="$ST_ROOT/home-$((ST_N + 1))"
+  { st_repo && st_cache "$home" "$PIN_TOFU_VERSION" "${PIN_PYTHON[cfn-lint]}"; } || { st_broken "make a cache"; return; }
+  st_run --all HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-no-root"
+  st_caught "a positive Release whose build renders no root a validator reads" 1 \
+    "$PROOFS/terraform-google/probe/release.yaml: a positive Release whose build renders no root"
+}
+
+# st_known_entry ENTITY ID — one entry of a known-findings file, at version 1.0.0.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_known_entry() {
+  printf '{"entity": "%s", "version": "1.0.0", "id": "%s", "reason": "The planted fault."}' "$1" "$2"
+}
+
+# Entries the commit adds, each naming a version no fixture builds: each is
+# refused, in the order the file holds them.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_known_added_in_file_order() {
+  local name entries="" want="" got label="entries the commit adds to the known findings, refused in the order the file holds them"
+  for name in probe-f probe-a probe-e probe-b probe-d probe-c probe-h probe-g; do
+    entries="${entries:+$entries, }$(st_known_entry "recipe/terraform/$name" "cfn-lint|E3002|Resources/Planted/Properties/X")"
+    want="$want recipe/terraform/$name@"
+  done
+  { st_repo && printf '{"format": 1, "findings": [%s]}\n' "$entries" >"$ST_REPO/$KNOWN_FINDINGS" &&
+    git -C "$ST_REPO" add -- "$KNOWN_FINDINGS"; } || { st_broken "stage the known findings"; return; }
+  st_run --staged
+  got="$(grep -o 'the entry for recipe/terraform/probe-[a-h]@' <<<"$ST_OUT" | sed 's/^the entry for / /' | tr -d '\n')"
+  if [ "$ST_RC" -ne 1 ] || [ "$got" != "$want" ]; then
+    ST_OUT="refused in the order:$got"$'\n'"$ST_OUT"
+    st_failed "$label" "exit 1, the entries refused in the order:$want"
+    return
+  fi
+  printf '  caught  %s\n' "$label"
+}
+
+# st_known_two_fixtures — makes ST_REPO, then commits a second fixture,
+# probe-other, reaching the container Recipe at 1.0.0 as probe does, that version
+# recorded as published, and a known finding of it that probe-other alone would
+# show, a finding whose id carries a name probe-other gives.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_known_two_fixtures() {
+  st_repo && st_fixture probe-other 1.0.0 &&
+    st_publish "hub.aggrega.ai/${ST_RECIPE#"$CATALOG_ROOT"/}" &&
+    printf '{"format": 1, "findings": [%s]}\n' \
+      "$(st_known_entry recipe/terraform/probe-service "cfn-lint|E3002|Resources/ProbeOther/Properties/Planted")" \
+      >"$ST_REPO/$KNOWN_FINDINGS" &&
+    git -C "$ST_REPO" add -- "$PROOFS" "$KNOWN_FINDINGS" && git -C "$ST_REPO" commit -q -m "a second fixture"
+}
+
+# A commit reaching probe alone builds one of the two fixtures reaching the
+# version, so the entry naming what probe-other shows is not judged stale.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_known_one_fixture_of_two_built() {
+  local home="$ST_ROOT/home-$((ST_N + 1))"
+  { st_known_two_fixtures && st_cache "$home" "$PIN_TOFU_VERSION" "${PIN_PYTHON[cfn-lint]}" &&
+    printf '# Edited.\n' >>"$ST_REPO/$PROOFS/terraform-google/probe/release.yaml" &&
+    git -C "$ST_REPO" add -- "$PROOFS"; } || { st_broken "stage a fixture"; return; }
+  st_run --staged HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-at-minimum"
+  st_passed "a known finding of a version two fixtures reach, kept while the commit builds one of them"
+}
+
+# The same entry, with the commit reaching both fixtures.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_known_stale() {
+  local home="$ST_ROOT/home-$((ST_N + 1))"
+  { st_known_two_fixtures && st_cache "$home" "$PIN_TOFU_VERSION" "${PIN_PYTHON[cfn-lint]}" &&
+    printf '# Edited.\n' >>"$ST_REPO/$PROOFS/terraform-google/probe/release.yaml" &&
+    printf '# Edited.\n' >>"$ST_REPO/$PROOFS/terraform-google/probe-other/release.yaml" &&
+    git -C "$ST_REPO" add -- "$PROOFS"; } || { st_broken "stage two fixtures"; return; }
+  st_run --staged HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-at-minimum"
+  st_caught "a known finding that every fixture reaching its version, built, does not show" 1 \
+    "the entry for recipe/terraform/probe-service@1.0.0 (cfn-lint|E3002|Resources/ProbeOther/Properties/Planted) is stale"
+}
+
+# st_arm_check_stub FILE VERDICT — writes at FILE a stand-in for the Azure
+# Resource Manager check: planted, one finding; clean, none; no-verdict, no
+# verdict, naming the command that primes the cache beside it, as the check does.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_arm_check_stub() {
+  case "$2" in
+    planted)
+      printf '%s\n' 'import sys' \
+        'print("arm|type|arm/arm-template.json/app/properties/planted\tthe planted fault")' \
+        'print("1 finding(s)")' 'sys.exit(1)' ;;
+    clean) printf '%s\n' 'print("0 finding(s)")' ;;
+    no-verdict)
+      printf '%s\n' 'import os, sys' \
+        'prime = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor-validate.sh") + " --prime"' \
+        'print(f"no verdict: a schema is missing. Prime the cache (network, once): {prime}", file=sys.stderr)' \
+        'sys.exit(3)' ;;
+  esac >"$1"
+}
+
+# The index holds a check finding the planted fault, the working tree one
+# finding nothing: the run judges by the one the index holds.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_check_from_index() {
+  local home="$ST_ROOT/home-$((ST_N + 1))"
+  { st_repo && st_cache "$home" "$PIN_TOFU_VERSION" "${PIN_PYTHON[cfn-lint]}" &&
+    st_arm_check_stub "$ST_REPO/scripts/vendor-validate-arm.py" planted &&
+    git -C "$ST_REPO" add -- scripts/vendor-validate-arm.py &&
+    st_arm_check_stub "$ST_REPO/scripts/vendor-validate-arm.py" clean; } ||
+    { st_broken "stage an Azure Resource Manager check"; return; }
+  st_run --all HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-arm"
+  st_caught "an Azure Resource Manager check changed in the working tree alone, the one the index holds judging" 1 \
+    "arm|type|arm/arm-template.json/app/properties/planted"
+}
+
+# The check the index holds gives no verdict, naming the command that primes the
+# cache beside it: the run names that command in this checkout.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_no_verdict_names_checkout() {
+  local home="$ST_ROOT/home-$((ST_N + 1))"
+  { st_repo && st_cache "$home" "$PIN_TOFU_VERSION" "${PIN_PYTHON[cfn-lint]}" &&
+    st_arm_check_stub "$ST_REPO/scripts/vendor-validate-arm.py" no-verdict &&
+    git -C "$ST_REPO" add -- scripts/vendor-validate-arm.py; } ||
+    { st_broken "stage an Azure Resource Manager check"; return; }
+  st_run --all HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-arm"
+  st_caught "the Azure Resource Manager check giving no verdict, the prime command named in this checkout" 3 \
+    "Prime the cache (network, once): $ST_REPO/scripts/vendor-validate.sh --prime"
+}
+
 # shellcheck disable=SC2329 # a case, run by name from ST_CASES
 st_all_no_fixture() {
   local home="$ST_ROOT/home-$((ST_N + 1))"
@@ -2723,6 +3084,15 @@ st_cfnlintrc_entry_not_a_line() {
   st_run --all
   st_caught "a rule ignored in .cfnlintrc.yaml on a line under ignore_checks that is no entry - <rule>" 1 \
     ".cfnlintrc.yaml:2:" "[E3012]"
+}
+
+# A key beside ignore_checks, which would change what cfn-lint reads.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfnlintrc_other_key() {
+  { st_repo && st_cfnlintrc "ignore_checks: []" "ignore_templates:" "  - cloudformation/*.json"; } ||
+    { st_broken "stage .cfnlintrc.yaml"; return; }
+  st_run --all
+  st_caught "a key in .cfnlintrc.yaml other than ignore_checks" 1 ".cfnlintrc.yaml:2:" "ignore_templates"
 }
 
 # The rule also judges a commit changing the file.
@@ -3782,6 +4152,10 @@ st_arm_boundary_attributed() {
 # --- the run ---------------------------------------------------------------------
 case "$MODE" in
   staged | all)
+    if [ "$MODE" = staged ]; then
+      gate_unstaged_rule
+      [ "$REFUSED" -eq 0 ] || exit 1
+    fi
     vendor_text_rule
     pass_through_rule
     fixtures_rule
@@ -3827,7 +4201,8 @@ case "$MODE" in
     load_pins
     cache_causes
     [ "${#CAUSES[@]}" -eq 0 ] || no_verdict "${CAUSES[@]}"
-    (self_test) || exit 1
+    # A case that did not give its verdict exits 1, and no verdict exits 3.
+    (self_test) || exit "$?"
     ;;
   prime)
     prime

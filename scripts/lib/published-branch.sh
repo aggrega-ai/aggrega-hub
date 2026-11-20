@@ -1,9 +1,9 @@
 # shellcheck shell=bash
 # scripts/lib/published-branch.sh — the published branch's contract, read and
 # written the one way every script in this repository reads and writes it.
-# Sourced by scripts/record-published.sh, scripts/published-version-guard.sh and
-# scripts/publish-diff.sh in this repository, and by the readers outside it that
-# take the branch's contract from here rather than restating it — the release
+# Sourced by each script in this repository that reads or writes the branch, and
+# by the readers outside it that take the branch's contract from here rather
+# than restating it — the release
 # publisher's step that records the core plugins, and the workspace's annotation
 # drift check; it defines functions and constants and runs nothing.
 #

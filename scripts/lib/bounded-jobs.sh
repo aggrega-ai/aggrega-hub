@@ -1,16 +1,16 @@
 # shellcheck shell=bash
 # scripts/lib/bounded-jobs.sh — run one command per item, with at most a given
 # number running at once, and hand every item's result back in the order the items
-# were given. Sourced by scripts/publish-diff.sh and
-# scripts/published-version-guard.sh; it defines functions and runs nothing.
+# were given. Sourced by each script in this repository that runs one command per
+# item; it defines functions and runs nothing.
 #
 # WHY THE RESULTS COME BACK IN ORDER. Each item's command is a separate process —
-# an `aggrega push`, or its dry run — that spends most of its time waiting on a
-# registry and on start-up, so running several at once shortens a run without
-# changing any one of them. What must not change is what the run prints and
-# records: every item's output whole, never interleaved with another's, in item
-# order, and every count, list and verdict derived from those outputs in item order
-# too. So no command writes to the terminal while others run: each writes its
+# an `aggrega push`, its dry run, or a fixture's `aggrega build` — that spends
+# most of its time waiting on a registry, on start-up or on its own work, so
+# running several at once shortens a run without changing any one of them. What
+# must not change is what the run prints and records: every item's output whole,
+# never interleaved with another's, in item order, and every count, list and
+# verdict derived from those outputs in item order too. So no command writes to the terminal while others run: each writes its
 # standard output and standard error to files of its own, and the caller reads them
 # back item by item, as soon as that item and every item before it have finished.
 #
