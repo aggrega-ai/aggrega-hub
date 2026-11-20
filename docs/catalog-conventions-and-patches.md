@@ -2448,6 +2448,270 @@ module") and `enable_telemetry = false` for a Terraform one. A Recipe may offer
 and say so. A published Recipe that leaves the module's default stays as published.
 This is a catalog convention: the compiler pipes the block as text and reads nothing in it.
 
+### Proving a cloud Recipe: fixtures and the vendor validators
+
+A Recipe for `arm`, `cloudformation` or `terraform` is proven by building it and
+handing what the build renders to the vendors' own validators, offline.
+`scripts/vendor-validate.sh --help` is the contract: the selection rules, the
+finding ids, the exit codes and every refusal are stated there, and this section
+teaches how an author works with them.
+
+**Fixtures.** A fixture is a workspace of its own at `proofs/<target>/<group>/`,
+the target one of `arm`, `cloudformation`, `terraform-aws`, `terraform-azurerm`,
+`terraform-google` and `terraform-cloudflare`, the group naming what it proves.
+A `baseline` fixture holds one instance of the newest version of each cloud Recipe
+for its target, with a FeatureRecipe attached where a Recipe's slot asks for one.
+A fixture holds:
+
+- `.aggrega-config.yaml`, whose `workspace.catalog_dirs` names `./catalog` first
+  where the fixture carries a catalog of its own and then `../../../aggrega-catalog`,
+  with `default_registry: hub.aggrega.ai`;
+- its Aggregate and its Manifest;
+- `release.yaml` and `release-<slug>.yaml`, its Releases, each beside the lock
+  `aggrega pull` writes for it, `<release>.lock`.
+
+The sources a lock pins live in the fixture's `.aggrega/cache/`, which git
+ignores; `(cd proofs/<target>/<group> && aggrega pull --release release.yaml)` fills
+it and writes the lock. A workspace under `proofs/` laid out otherwise, a fixture
+holding no Release and a Release with no lock in the index are refused.
+
+A fixture carries obvious placeholders and nothing real: the Azure subscription
+`00000000-0000-0000-0000-000000000000`, the AWS account `123456789012`, the Google
+project `example-project` and `example.com` names, with resource groups, networks,
+roles and secrets named `example-…` as stand-ins for what an operator already has.
+A fixture that proves how a product uses a shared shape carries a `catalog/` of its
+own holding a placeholder Component and the product Recipes realizing it (see "The
+shared container-service shape"); a product Recipe there is written as a catalog
+author would write one.
+
+**Negatives.** `release-negative-<slug>.yaml`, with its `.lock` and a `.expect`
+beside it, is a Release that must halt. A negative Release names the Aggregate and
+Manifest that carry its fault, which may be files of their own,
+`aggregate-negative-<slug>.yaml` and `manifest-negative-<slug>.yaml`, so that each
+fixture file holds one fault. Its `.expect` holds one line of text, which the halted
+build's output must contain: `assertion "<key>"` for a Recipe's assertion, as the
+build names one, and a fixed phrase of the sentence for a refusal raised inside a
+mapping or a template, which the build quotes whole. `vendor-validate.sh` refuses a
+negative Release that builds, one that halts on another condition than the line
+expected, and one with no `.expect` or a `.expect` holding other than one line with
+text. A negative asserts the exact condition it exists for, never "any error".
+
+**What the gate builds and validates.** The gate builds each Release of a fixture
+in a copy of the index with `aggrega build --offline --verify-determinism`, reading
+sources from the fixture's cache; a Release that is not negative and halts is
+refused, a lock out of date (E0130) names the `aggrega pull` that renews it, and a
+source missing from the cache (E0137) gives no verdict. It then runs each validator
+over each boundary the build rendered:
+
+- `tofu` (OpenTofu), `init -backend=false` then `validate`, over the root
+  configuration `terraform/aggrega.modules.tf`, with providers taken from a local
+  mirror and no registry reachable;
+- `cfn-lint` over `cloudformation/cloudformation-stack.json`, with
+  `.cfnlintrc.yaml` as its one configuration, in `us-east-1`;
+- `scripts/vendor-validate-arm.py` over `arm/arm-template.json`.
+
+The ARM check holds a template to the template syntax Microsoft documents and each
+resource to the vendor's own schema for its type at its `apiVersion`, read with a
+fixed set of reading rules that mend where the vendor's schemas disagree with what
+Resource Manager deploys: enum strings compare without case, `oneOf` reads as
+`anyOf`, a value written wholly as an expression is accepted, objects are closed so
+a misspelt property is named, and a property a resource provider takes and its
+specification omits is listed in the script with the provider's documentation of
+it. The script's header states the rules and its limits.
+
+Each finding carries an id of the form `<validator>|<rule>|<address>` with no line
+number, so the same fault keeps its id across runs, and is attributed to the
+catalog entity version that rendered it through the provenance the build stamps.
+A finding that no entity version answers for is attributed to `-` and can never be
+listed as known.
+
+**Known findings.** `scripts/vendor-validators-known-findings.json` lists the
+findings each published entity version is known to carry, each with the finding's
+id and the reason naming what in that version causes it. A published version is
+final, so its finding is listed rather than mended; a version not yet published is
+mended, and an entry naming one is refused. An entry whose finding no longer
+appears is refused as stale, so the list only shrinks. A finding is refused unless
+an entry lists it.
+
+**The cfn-lint configuration.** `.cfnlintrc.yaml` ignores `W3005`, which reports a
+`DependsOn` that a `GetAtt` or `Ref` in the same resource already enforces. A
+resource of a later sync wave carries a `DependsOn` on every resource of the
+earlier waves of its directory, whatever it references, so a Component reading an
+earlier wave's value through a `GetAtt` always repeats an ordering the `DependsOn`
+gives. The rule is ignored for the whole catalog, because the gate takes an ignore by rule
+in this one file and sets aside any a template names for one resource, so it also
+passes a redundant `DependsOn` an author writes; no catalog Recipe writes one. Each ignored rule is a line of its own with
+its reason beside it, and `vendor-validate.sh` refuses an entry with no reason. A
+template's own `Metadata` cannot add an ignore: the gate lints a copy with every
+`cfn-lint` key set aside.
+
+**Vendor text.** Vendor text is not committed to the catalog. The resource-schema
+importers write a marker before every text taken from a vendor schema, and
+`vendor-validate.sh` refuses a file whose staged content carries that marker,
+naming the file and the line. The whole staged file is read, so the marker cannot
+be added, changed, copied or renamed in. Write the entity's own words.
+
+**Priming and missing tools.** `scripts/vendor-validate.sh --prime` fetches every
+validator the pin file `scripts/vendor-validators.json` names into
+`~/.cache/aggrega/vendor-validators/`, verifies each checksum and runs
+`--self-test` against the result; it is the one form that uses the network. A form
+that needs a validator and finds the cache unprimed, a cached tool not answering
+its pinned version, or an `aggrega` binary older than the pin file's
+`aggrega_min_version` gives no verdict (exit 3), naming the one command that
+supplies what is missing; it never falls back to a tool on `PATH`. A Recipe version
+the commit changes that no fixture builds is refused, since no validator would
+judge it: build it in a fixture. A commit that reaches no fixture costs the
+rules alone; `--all` builds every fixture and is a heavy command, and the script's
+header holds the measured cost.
+
+**What the gate does not check.**
+
+- Infrastructure Manager applies Terraform 1.5.7 on its free tier, and the gate runs
+  OpenTofu, which accepts constructs that Terraform 1.5.7 rejects. The Terraform 1.5
+  language ceiling for Google bodies stays a convention, as the Google section says.
+- HashiCorp Terraform beyond what OpenTofu shares is not run.
+- Anything only a deploy shows: quotas, regional availability, IAM, and whether a
+  service takes a setting its schema lists.
+- A misspelt `module.<instance>.service.<field>` read in a product Recipe's
+  `provides`: `tofu validate` accepts it and the error comes at plan.
+- What the ARM check states as its limits: a nested template resource whose template is linked, or
+  whose expressions evaluate in the parent's scope, is not held to its template's
+  parameter declarations; the members of an object or array parameter, a null value
+  and a Key Vault reference are not held to the declared type; a child resource
+  listed under a resource's own `resources` is read by its parent's schema alone;
+  and the check is stricter than Resource Manager for a property only a subtype of
+  a discriminated union lists and for a child resource declared outside its parent
+  with a literal `parent/child` name.
+
+### The shared container-service shape
+
+A container product, a Component whose Recipe runs one container, is realized by one
+body per target, held once in a library and imported by every
+Recipe that runs a container there. A catalog Recipe for the generic
+`core/compute/server`, `worker` and `task` primitives and a product Recipe both
+import the same body, so a fix to the body reaches both.
+
+| Target | Body | Arguments | Entries | A product Recipe carries |
+|---|---|---|---|---|
+| Terraform, Google Cloud Run | ArtifactLibrary `CloudRunModule` | MappingLibrary `CloudRunArguments` | `Service`, `WorkerPool`, `Job` | the fixed pass-through module, `artifacts.service` importing the body, the arguments entry as `valuesMapping`, its locals and its `provides` |
+| Terraform, Amazon ECS on Fargate | ArtifactLibrary `EcsFargateModule` | MappingLibrary `EcsFargateArguments` | `Service`, `Task` | the same |
+| Terraform, Azure Container Apps | ArtifactLibrary `ContainerAppModule` | MappingLibrary `ContainerAppArguments` | `App`, `Job` | the same |
+| CloudFormation, Amazon ECS on Fargate | ArtifactLibrary `EcsFargateFragment` | none: the fragment renders in the importing Recipe's context | `Service`, `Task` | `artifacts.service` importing the fragment, its locals and its `provides` |
+| Azure Resource Manager, Azure Container Apps | none: the Recipe sources the Azure Verified Modules module `avm/res/app/container-app` or `avm/res/app/job` | MappingLibrary `ContainerAppParameters` | `AppParameters`, `JobParameters` | `source` naming the module, the parameters entry as `valuesMapping`, its locals and its `provides` |
+
+On Terraform a Recipe consumes the body with
+`artifacts: { service: { $import: <Library>#/artifacts/<Entry> } }` and the arguments
+with `valuesMapping: { $import: <Library>#/mappings/<Entry> }`; the import replaces
+the whole `valuesMapping`. The arguments entry renders one key, `config`, the one
+argument of the component's module block, and the body is the module `service`
+that `config` reaches. The Recipe reads the body's outputs as
+`module.<instance>.service.<output>`. The catalog's Recipes that use the shape are
+`recipe/terraform/{server,worker}-cloud-run`, `{server,worker}-ecs`, `task-ecs` and
+`{server,worker}-container-apps`, `recipe/cloudformation/{server,worker,task}-ecs`
+and `recipe/arm/{server,worker}-container-apps`.
+
+**The locals contract.** What differs between the Recipes that import one entry is
+read from the `locals` each declares. Each local is optional, and a local the Recipe
+does not declare reads as empty rather than stopping the build:
+
+| Local | What it holds |
+|---|---|
+| `default_image` | the image the component runs while `infra.image` is unset; a Recipe running the Release's own code declares none, so the Release names the image |
+| `container_port` | the port the container listens on; while it is undeclared, `infra.port` where the Component declares one |
+| `value_env` | a JSON object mapping each own value the Recipe delivers by default, `values.<key>`, to the variable it is delivered as |
+| `socket_env` | a JSON object mapping each socket whose connections the Recipe delivers by default to an object mapping each variable to the key of the target's `provides` it carries; locals cannot read connections, so the names travel as this table |
+| `probe_path` | the HTTP path the container's probes request; where it is undeclared no probe is rendered |
+| `gpu` | `{"count": 1, "type": <accelerator>}`, read on Cloud Run alone |
+
+A local holds a string, so `value_env`, `socket_env` and `gpu` are written as JSON
+text. A target that cannot realize a local refuses it by name where it is declared:
+the Amazon ECS entries refuse `probe_path` and `gpu`, and Container Apps refuses
+`gpu`. A refusal is the build halting with an error naming what to remove, never a
+silent drop.
+
+**The fixed pass-through.** A Terraform container Recipe's `module/main.tf` is
+`scripts/container-pass-through/main.tf`, byte for byte: it takes `config` as a
+variable, passes it to `./service`, and returns that module as its `service` output.
+It exists because the body an ArtifactLibrary bundle supplies lands in the
+component's module directory as `service/main.tf`, a sub-directory Terraform does
+not read as part of the module, so something has to call it. One fixed text lets
+every container Recipe carry the same call, and `vendor-validate.sh` refuses a
+container Recipe version whose `module/main.tf` differs from it, naming both paths;
+a version recorded as published is final and is not judged.
+
+**`moved.tf` and kept names.** A Recipe version that moves a resource into the
+shared body keeps what the engine tracks a resource by. A Terraform Recipe ships a `moved.tf`
+mapping each address its earlier versions declared to `module.service.<address>`, so
+Terraform keeps the running resource rather than replacing it; a `moved` block
+holds within one root only. A CloudFormation Recipe derives each logical ID from
+the component's name as its earlier versions do, such as `PaymentsApi` for the
+service and `PaymentsApiTaskDefinition` for its task definition, so CloudFormation
+carries each resource across an upgrade as the same resource. An Azure Resource
+Manager Recipe keeps the name of its nested template resource, so a redeploy updates the
+app.
+
+**Library versioning.** A published library version is final, and a Release's lock
+records the version each library resolved to.
+
+- A compatible fix, one that leaves every input and output of the body and every
+  local of the arguments as they are, is a later version of the library, and a Release
+  adopts it at its next `aggrega pull`.
+- A change to the contract between the arguments and a Recipe, such as a local
+  added or read differently, means a version of every Recipe that relies on it,
+  since a Recipe at a published version is final and cannot be mended.
+- An incompatible change takes a library name of its own, and the library it
+  departs from stays as published.
+
+**Files on each container service.** A file entry on the inject pipe reaches the
+container differently on each target, and each target states its behaviour in its
+library:
+
+- Cloud Run mounts each file as a Secret Manager secret volume at the file's
+  directory, one volume per directory, so two files in one directory are refused by
+  name; a file whose content is written out in full and longer than Secret Manager's
+  64 KiB payload limit is refused too, while content holding a `${…}` reference is
+  evaluated by the engine and refused by Secret Manager when the configuration is
+  applied.
+- Amazon ECS refuses a file entry by name on both Terraform and CloudFormation: a
+  Fargate task definition offers no way to write a file's content into the
+  container.
+- Container Apps on Terraform mounts each file as a secret of the app or job, one
+  Secret volume mounted by sub path at each file's path.
+- Container Apps on Azure Resource Manager refuses a file entry by name, since the
+  content would reach the container as the value of a secret written into the
+  template as text.
+
+An `arg` entry and any custom mechanism are refused on every target.
+
+**Behaviours of the Container Apps entries.**
+
+- On Azure Resource Manager the shared parameters read every connection, so a
+  connection whose target publishes a `provides` key declared sensitive halts the
+  build there, naming the parameters. The route for such a credential is Key Vault,
+  named under `infra.overrides.secrets`.
+- A Container Apps job runs with a deadline of 30 minutes on each execution, this
+  realization's choice, because Container Apps requires a replica timeout of every
+  job.
+
+The Container Apps bodies on Terraform declare the constraint of "One Azure provider
+constraint for every Azure body", so a boundary holding one cannot also hold a
+Recipe that requires azurerm 4; that section names which.
+
+**Deliberate near-duplicates.** Every target holds its own environment assembly,
+and the reading of `.context.self_inject` is repeated in each Recipe that reads it:
+the same steps, differing in the variables each target reserves and the mechanisms
+it delivers. The Fargate size table and the schedule translation are held in both
+`EcsFargateArguments` and `EcsFargateFragment`. A values mapping and a
+CloudFormation template are different kinds, and no catalog kind composes a part of
+a template into another, so each copy says it is deliberate in place and a change
+to one is made to all of them.
+
+**Proving a product Recipe.** A product Recipe on the shared shape is built in the
+`container-service` fixture of its target, whose own `catalog/` holds a placeholder
+product and its Recipes. Its negatives fix one fault each in a Recipe, an Aggregate
+or a Manifest, and assert the refusal the library raises, so a change to a library
+is proven by the fixture that reaches it.
+
 ### Optional credential slots for self-managed datastores
 
 A self-managed datastore Component declares its password as an **optional**
