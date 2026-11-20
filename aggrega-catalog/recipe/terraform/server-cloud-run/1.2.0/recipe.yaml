@@ -1,0 +1,166 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: server-cloud-run
+  version: 1.2.0
+  description: >
+    The generic long-running server primitive as one Cloud Run service running
+    the Release's image on infra.port, on the Cloud Run body and arguments
+    the catalog shares. Reach for it in a Google Cloud project with a VPC
+    network; for terraform/server-ecs or cloudformation/server-ecs in an AWS
+    account, and helm/server on Kubernetes.
+
+    Its ingress is internal: VPC networks in the project, a Shared VPC network
+    it sends traffic to and an internal load balancer reach it, the internet
+    does not. No invoker binding is emitted, so only a caller the operator
+    grants the Cloud Run Invoker role gets through. The project, region, VPC
+    network and service account are the operator's, each required under
+    infra.overrides; a subnet and network tags are optional. Beside the
+    service, only a Secret Manager secret for each file the component is
+    handed is emitted — no service account, IAM binding, network, firewall
+    rule, load balancer or domain mapping.
+
+    Each env entry an edge's inject block, or the component's own, dictates
+    becomes a container variable of that name, written whole, so a
+    neighbour's Terraform reference is evaluated by the engine; each file
+    entry is mounted at its path from a secret volume holding it alone, which
+    the service account reads. A name Cloud Run reserves or refuses, a file
+    path it cannot mount, and arg and other entries are refused by name.
+    Scaling is manual, at infra.replicas instances, and the container runs at
+    the smallest whole-vCPU size meeting infra.compute, so the Component's
+    defaults run at 1 vCPU and 512 MiB.
+
+    GoogleCloudPlatform/cloud-run/google is not sourced: at v0.34.2, its
+    newest, it caps hashicorp/google below 8, excluding the range every Google
+    body here declares.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/compute/server:1.1.0
+
+  # The module beside this Recipe is the fixed pass-through every container
+  # Recipe of this catalog carries byte for byte: its one input, config, goes
+  # to the service module the artifacts below import, and that module comes
+  # back out as its service output. entity.lock pins it.
+  #
+  # Google's Cloud Run module, GoogleCloudPlatform/cloud-run/google, at v0.34.2,
+  # the newest version its registry entry and its repository's tags carry,
+  # declares a Cloud Run service in its v2 directory, which is whole: it calls no
+  # module and reaches no sibling directory. Its versions.tf declares
+  # hashicorp/google and hashicorp/google-beta as ">= 6, < 8". Every Google body
+  # the catalog authors declares hashicorp/google "~> 8.8", and Terraform
+  # installs one provider version for a root configuration, so no version
+  # satisfies both: a root configuration holding that module beside a
+  # Memorystore instance or a Cloud Run worker pool of this catalog fails to
+  # initialise. The module is therefore not sourced, and the service is the
+  # catalog's own Service body.
+  source: ./module
+
+  # This Recipe reads from infra.overrides:
+  #   project_id          - string (config.project_id), required
+  #   region              - string (config.location), required
+  #   private_network     - string (config.network), required
+  #   service_account     - string (config.service_account), required
+  #   subnetwork          - string (config.subnetwork)
+  #   network_tags        - []string (config.tags)
+  #   deletion_protection - bool (config.deletion_protection; default true)
+  #
+  # Each is passed to the key of the body's config named in brackets, which
+  # CloudRunModule's Service body documents; network, subnetwork and tags set
+  # the service's one network interface. Four keys reuse a spelling other
+  # Recipes already read for the same concept, so an operator writes each under
+  # one name across the catalog's terraform Google Recipes: project_id, region
+  # and private_network, as the Cloud SQL and Memorystore Recipes read them,
+  # and deletion_protection, as the Cloud SQL Recipes read it. These are the
+  # keys terraform/worker-cloud-run reads, under the same names.
+  #
+  # project_id, region, private_network and service_account are required and
+  # none has a default: the project, the network and the identity the server
+  # runs as are provisioned outside this Release, no project-independent value
+  # exists for any of them, and this Recipe never chooses a network or an
+  # identity for the operator. private_network is the network's resource link,
+  # projects/<project>/global/networks/<name>; the service takes addresses from
+  # subnetwork, or from the subnet named as the network while subnetwork is
+  # unset, which must be a /26 or larger for Direct VPC egress. Egress is
+  # private ranges only: traffic to a private address goes through the network
+  # by Direct VPC egress, and other traffic leaves as it would with no network
+  # named.
+  # service_account is the email of the account the server runs as, which the
+  # server's code calls Google Cloud with, and which reads each file's secret
+  # volume, so the operator grants it the Secret Manager Secret Accessor role on
+  # those secrets; no IAM binding is emitted. The identity applying the
+  # configuration needs leave to act as it. network_tags are matched by the
+  # operator's egress firewall rules. deletion_protection is the provider's own
+  # guard, true unless the Release turns it off, under which Terraform refuses
+  # to destroy or replace the service.
+  #
+  # Who reaches the server. The service's ingress is internal, fixed in the
+  # body: Cloud Run admits requests from VPC networks in the service's
+  # project, from the Shared VPC network the service sends traffic to, from an
+  # internal Application Load Balancer and from resources a VPC Service Controls
+  # perimeter around it allows, and refuses the internet. A caller on Cloud Run
+  # reaches it only through a VPC network, so its own egress has to carry the
+  # request there. On top of that, Cloud Run checks every request for the
+  # Cloud Run Invoker role, and this Recipe grants it to nobody: the operator
+  # grants it outside the Release to the identities that may call, which
+  # present a Google-signed identity token. A wider ingress, a public invoker or
+  # a load balancer is not something this Recipe renders.
+  #
+  # The instance count. Scaling is manual at the service level, so Cloud Run
+  # runs exactly infra.replicas instances whatever the traffic, and ignores a
+  # revision's own minimum and maximum, of which this Recipe sets none.
+  #
+  # Files. Each file entry an edge's inject block dictates is mounted at its
+  # path, as CloudRunModule describes: one Secret Manager secret per file,
+  # replicated automatically in project_id, holding the content in one
+  # version, mounted as a secret volume at the file's directory with the file
+  # alone in it, so whatever the image holds in that directory is hidden. A
+  # file's content is held in the secret version and in Terraform state. No
+  # file, no secret.
+  #
+  # Every Component value and infra key is honoured or refused by name, in
+  # CloudRunArguments#/mappings/ServiceArguments:
+  #   honoured — infra.image (required), infra.port as the container's port,
+  #     which Cloud Run also hands the container as PORT, infra.replicas as the
+  #     service's instance count, infra.compute.cpu and infra.compute.memory as
+  #     the size that entry chooses, the overrides above, and env and file
+  #     entries.
+  #   refused — infra.published_port, a port published on the host with Docker
+  #     Compose, which a Cloud Run service has no host to publish on; a compute
+  #     quantity that entry cannot read, and a pair larger than the largest
+  #     size; a component name Cloud Run does not take for a service; an edge or
+  #     the component's own inject block injecting a variable under a name Cloud
+  #     Run reserves or refuses; a file path Cloud Run cannot mount; and an
+  #     edge's arg or custom-mechanism entry.
+  #
+  # The component packages no upstream product, so this Recipe declares none of
+  # the locals CloudRunArguments reads: no default image, so the Release names
+  # the one it runs; the port is infra.port; no own value and no socket is
+  # delivered by default, since the Component has none; and no probe and no GPU.
+
+  artifacts:
+    # The Service body: the service and the secrets holding its files.
+    service:
+      $import: CloudRunModule#/artifacts/Service
+    # A configuration applied with terraform/server-cloud-run 1.1.0 or 1.0.0
+    # holds the service at google_cloud_run_v2_service.this in this component's
+    # module, where those versions declared it; this version declares it in the
+    # service module. The block moves it there, so Terraform keeps the running
+    # service rather than replacing it.
+    moved.tf: |
+      moved {
+        from = google_cloud_run_v2_service.this
+        to   = module.service.google_cloud_run_v2_service.this
+      }
+
+  # The component publishes nothing across an edge, so nothing is emitted for
+  # one.
+  provides: {}
+
+  valuesMapping:
+    $import: CloudRunArguments#/mappings/ServiceArguments
