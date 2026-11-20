@@ -72,8 +72,8 @@ USAGE
              default 1, one at a time. At any bound the findings are the ones a
              run one at a time gives, in the same order. Above 1 each dry run
              fetches into a workspace of its own (THE RECORD, below), so with a
-             workspace given to the guard — one AGGREGA_WORKSPACE_ROOT names, or
-             one the repository is in — it judges one at a time and says so
+             workspace given to the guard — one AGGREGA_WORKSPACE_ROOT names, or,
+             with --files, one the repository is in — it judges one at a time and says so
              once. More than one at once needs bash 5.1 or later.
 
   It judges the repository it belongs to, wherever it is run from; relative
@@ -90,9 +90,12 @@ THE RECORD
   whose remote source is written out in full, aggrega push --dry-run fetches that
   source to compare its pin, into the cache of the Aggrega workspace the dry run
   uses: the one AGGREGA_WORKSPACE_ROOT names, else the one aggrega finds. With
-  that variable unset, a repository that is in no workspace — a checkout on its
-  own — gets a scratch workspace in the run's temporary directory, removed when
-  the run exits; with --jobs above 1 each dry run gets a scratch workspace of its
+  that variable unset, a scratch workspace is made in the run's temporary
+  directory, removed when the run exits, when the folder the dry runs run in is
+  in no workspace. With --staged that folder is a scratch directory in the run's
+  temporary directory, so a repository that is itself inside a workspace gets a
+  scratch one too; with --files it is the repository's top, so a checkout on its
+  own does. With --jobs above 1 each dry run gets a scratch workspace of its
   own there instead, because two fetches of one source into one workspace's
   artifact cache at once can read each other's partly written copy. With no
   published branch fetched, nothing is
@@ -376,14 +379,15 @@ recorded_digests() {
     $2 == v && ($1 == substr(p, 2) || (length($1) > length(p) && substr($1, length($1) - length(p) + 1) == p)) { print $3 }'
 }
 
-# settle_workspace — names the workspace the dry runs use
-# (scripts/lib/scratch-workspace.sh), and decides how they share it: above a bound
+# settle_workspace DIR... — names the workspace the dry runs use
+# (scripts/lib/scratch-workspace.sh), asking the binary about each DIR, the folder
+# a dry run resolves its workspace from, and decides how they share it: above a bound
 # of 1, a workspace of their own each when the guard made the scratch one, and one
 # at a time, said once, when a workspace was given to it.
 JUDGE_WORKSPACES=0
 settle_workspace() {
   local given="${AGGREGA_WORKSPACE_ROOT:-}"
-  scratch_workspace_root "$TMP" "$TOP" || broken "cannot make a scratch workspace in $TMP"
+  scratch_workspace_root "$TMP" "$@" || broken "cannot make a scratch workspace in $TMP"
   [ "$JOBS" -gt 1 ] || return 0
   if [ -z "$given" ] && [ -n "${AGGREGA_WORKSPACE_ROOT:-}" ]; then
     JUDGE_WORKSPACES=1
@@ -488,7 +492,10 @@ if [ -n "$ROWS" ]; then
   else
     mapfile -d '' -t CHANGED < <(git diff --cached --name-only -z --no-renames "$BASE" -- "$CATALOG_ROOT/")
     if [ "${#CHANGED[@]}" -gt 0 ]; then
-      settle_workspace
+      # The --staged dry runs run in scratch directories beneath $TMP, so the
+      # workspace is decided from there: the repository's top may lie in a
+      # workspace that a scratch directory beneath $TMP does not.
+      settle_workspace "$TMP"
       if load_publishable_kinds Plugin; then
         declare -A SEEN=()
         for f in "${CHANGED[@]}"; do
