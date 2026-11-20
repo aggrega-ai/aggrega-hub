@@ -82,8 +82,10 @@ USAGE
   --self-test  prove, in scratch repositories under a temporary directory,
                that each rule refuses the fault it exists for and passes a
                clean commit, that a missing or mismatched validator or binary
-               gives no verdict, and that each cached validator answers its
-               pinned version. Needs the primed cache.
+               gives no verdict, that each cached validator answers its
+               pinned version, and that the Azure Resource Manager check
+               refuses each fault it exists for, by its finding id, and
+               passes a clean template. Needs the primed cache.
 
   It judges the repository it belongs to, wherever it is run from. AGGREGA_BIN
   names the aggrega binary (default: aggrega on PATH). PUBLISHED_REMOTE names
@@ -143,6 +145,11 @@ THE VALIDATORS
   needs curl, sha256sum, tar, unzip and python3 with its venv module. Each pin
   file's cache is a directory of its own; one no pin file names any more can
   be removed by hand.
+
+  The Azure Resource Manager check, scripts/vendor-validate-arm.py, runs with
+  the cache's Python over the cached schemas: the template syntax Microsoft
+  documents, then each resource against the vendor's schema for its type at
+  its apiVersion. Its header holds its rules and its finding ids.
 
   A form that requires the validators requires, before it runs any: the cache
   primed for this pin file; the cached tofu and cfn-lint answering their
@@ -506,6 +513,18 @@ python_package_version() {
 # not yet marked primed.
 PRIMING=0
 
+# arm_check DIR TEMPLATE... — runs the Azure Resource Manager check
+# (vendor-validate-arm.py) with the cache's Python over the cache's schemas on
+# each TEMPLATE, a path relative to DIR: the path every finding's id carries.
+# Exits as the check does: 0 no finding, 1 findings, 2 a usage error, 3 no
+# verdict.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+arm_check() {
+  local dir="$1"
+  shift
+  (cd -- "$dir" && "$CACHE_DIR/venv/bin/python" -I "$HERE/vendor-validate-arm.py" "$CACHE_DIR/arm-schemas/schemas" "$@")
+}
+
 # cache_causes — adds to CAUSES what the cache lacks: a mark that it is primed for
 # this pin file, and a tofu and a cfn-lint answering their pinned versions.
 cache_causes() {
@@ -708,6 +727,15 @@ ST_CASES=(
   st_binary_below_minimum
   st_binary_between_releases
   st_validators_answer_pins
+  st_arm_clean
+  st_arm_wrong_type
+  st_arm_wrong_type_nested
+  st_arm_resource_key_misspelt
+  st_arm_template_section_unknown
+  st_arm_api_version_uncovered
+  st_arm_property_misspelt
+  st_arm_composed_clean
+  st_arm_schemas_missing
 )
 # The container Recipe every scratch repository carries.
 ST_RECIPE="$TF_RECIPES/probe-service/1.0.0"
@@ -1076,6 +1104,319 @@ st_validators_answer_pins() {
     ST_OUT="$(printf '%s\n' "${wrong[@]}")"
   fi
   st_passed "each cached validator answers its pinned version: tofu $PIN_TOFU_VERSION, cfn-lint ${PIN_PYTHON[cfn-lint]}, jsonschema ${PIN_PYTHON[jsonschema]}, referencing ${PIN_PYTHON[referencing]}"
+}
+
+# The Azure Resource Manager check, run by arm_check: the cache's Python over the
+# cache's schemas. A negative case plants one fault with sed in a clean template
+# and expects that fault's id and no other finding.
+ST_ARM_TEMPLATE="arm-template.json"
+
+# st_arm_template FILE — a clean languageVersion 2.0 template: an existing
+# environment, a container app reading a neighbour through reference(), a nested
+# deployment wrapping a small inline template with enableTelemetry false,
+# outputs and metadata. Two of its enum values, single and inner, are written in
+# another case than the schemas', and its CPU count is an expression, as Bicep
+# writes them.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_arm_template() {
+  cat >"$1" <<'END_OF_TEMPLATE'
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "languageVersion": "2.0",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "A clean template the self-test checks."
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "environmentName": {
+      "type": "string",
+      "defaultValue": "example-environment"
+    }
+  },
+  "resources": {
+    "environment": {
+      "existing": true,
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2025-07-01",
+      "name": "[parameters('environmentName')]"
+    },
+    "worker": {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2026-01-01",
+      "name": "example-worker",
+      "location": "[parameters('location')]",
+      "properties": {
+        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('environmentName'))]",
+        "configuration": {
+          "activeRevisionsMode": "single"
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "worker",
+              "image": "example.com/worker:1.0.0",
+              "resources": {
+                "cpu": "[json('0.25')]",
+                "memory": "0.5Gi"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "api": {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2026-01-01",
+      "name": "example-api",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "worker"
+      ],
+      "properties": {
+        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('environmentName'))]",
+        "configuration": {
+          "activeRevisionsMode": "single",
+          "ingress": {
+            "external": true,
+            "targetPort": 80,
+            "transport": "auto"
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "api",
+              "image": "example.com/api:1.0.0",
+              "env": [
+                {
+                  "name": "WORKER_REVISION",
+                  "value": "[reference('worker').latestRevisionName]"
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 3
+          }
+        }
+      }
+    },
+    "module": {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "example-module",
+      "metadata": {
+        "aggrega.ai/provenance": {
+          "aggrega.ai/recipe-uri": "example-app:1.0.0"
+        }
+      },
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "name": {
+            "value": "example-app"
+          },
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "environmentResourceId": {
+            "value": "[resourceId('Microsoft.App/managedEnvironments', parameters('environmentName'))]"
+          },
+          "enableTelemetry": {
+            "value": false
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "languageVersion": "2.0",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "name": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "environmentResourceId": {
+              "type": "string"
+            },
+            "enableTelemetry": {
+              "type": "bool",
+              "defaultValue": true
+            }
+          },
+          "resources": {
+            "app": {
+              "type": "Microsoft.App/containerApps",
+              "apiVersion": "2026-01-01",
+              "name": "[parameters('name')]",
+              "location": "[parameters('location')]",
+              "properties": {
+                "environmentId": "[parameters('environmentResourceId')]",
+                "configuration": {
+                  "ingress": {
+                    "external": false,
+                    "targetPort": 8080,
+                    "transport": "http"
+                  }
+                },
+                "template": {
+                  "containers": [
+                    {
+                      "name": "app",
+                      "image": "example.com/app:1.0.0"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "outputs": {
+            "fqdn": {
+              "type": "string",
+              "value": "[reference('app').configuration.ingress.fqdn]"
+            }
+          }
+        }
+      }
+    }
+  },
+  "outputs": {
+    "apiFqdn": {
+      "type": "string",
+      "value": "[reference('api').configuration.ingress.fqdn]"
+    },
+    "appFqdn": {
+      "type": "string",
+      "value": "[reference('module').outputs.fqdn.value]"
+    }
+  }
+}
+END_OF_TEMPLATE
+}
+
+# st_arm_composed_template FILE — a clean template whose one resource's
+# properties object is composed from several schemas through allOf: one lists
+# componentType and configurations, and each alternative of a union pairs a
+# component's schema with one listing componentType alone. Its name is a
+# format() expression, as Bicep writes a child resource's name.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_arm_composed_template() {
+  cat >"$1" <<'END_OF_TEMPLATE'
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "languageVersion": "2.0",
+  "contentVersion": "1.0.0.0",
+  "resources": {
+    "admin": {
+      "type": "Microsoft.App/managedEnvironments/javaComponents",
+      "apiVersion": "2026-01-01",
+      "name": "[format('{0}/{1}', 'example-environment', 'example-admin')]",
+      "properties": {
+        "componentType": "SpringBootAdmin",
+        "configurations": [
+          {
+            "propertyName": "spring.boot.admin.ui.title",
+            "value": "Example"
+          }
+        ]
+      }
+    }
+  }
+}
+END_OF_TEMPLATE
+}
+
+# st_arm_run WRITER [SED_SCRIPT] — writes a template with WRITER into a
+# directory of its own, applies SED_SCRIPT to it, and runs the check on it
+# there; ST_RC and ST_OUT get its exit status and everything it printed.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_arm_run() {
+  ST_N=$((ST_N + 1))
+  local dir="$ST_ROOT/arm-$ST_N"
+  { mkdir -p "$dir" && "$1" "$dir/$ST_ARM_TEMPLATE"; } || return 1
+  if [ -n "${2:-}" ]; then sed -i "$2" "$dir/$ST_ARM_TEMPLATE" || return 1; fi
+  ST_RC=0
+  ST_OUT="$(arm_check "$dir" "$ST_ARM_TEMPLATE" 2>&1)" || ST_RC=$?
+}
+
+# st_arm_caught LABEL ID — the run found exactly one finding, the one named ID.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_arm_caught() {
+  st_caught "$1" 1 "$2" $'\n'"1 finding(s)"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_clean() {
+  st_arm_run st_arm_template || { st_broken "write a template"; return; }
+  st_passed "a clean languageVersion 2.0 template: an existing environment, a container app reading a neighbour through reference(), a nested deployment with telemetry off, outputs, metadata"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_wrong_type() {
+  st_arm_run st_arm_template 's/"targetPort": 80,/"targetPort": "eighty",/' || { st_broken "write a template"; return; }
+  st_arm_caught "a literal of the wrong type in a resource (targetPort \"eighty\")" \
+    "arm|type|$ST_ARM_TEMPLATE/api/properties/configuration/ingress/targetPort"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_wrong_type_nested() {
+  st_arm_run st_arm_template 's/"targetPort": 8080,/"targetPort": "eighty",/' || { st_broken "write a template"; return; }
+  st_arm_caught "a literal of the wrong type inside a nested deployment's template" \
+    "arm|type|$ST_ARM_TEMPLATE/module/properties/template/resources/app/properties/configuration/ingress/targetPort"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_resource_key_misspelt() {
+  st_arm_run st_arm_template 's/"dependsOn"/"dependOn"/' || { st_broken "write a template"; return; }
+  st_arm_caught "a misspelt resource key (dependOn)" "arm|resource-key|$ST_ARM_TEMPLATE/api/dependOn"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_template_section_unknown() {
+  st_arm_run st_arm_template '0,/"contentVersion": "1.0.0.0",/s//&\n  "output": {},/' || { st_broken "write a template"; return; }
+  st_arm_caught "a template section outside the documented ones" "arm|template-key|$ST_ARM_TEMPLATE/output"
+}
+
+# The worker's apiVersion is the first one written as 2026-01-01.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_api_version_uncovered() {
+  st_arm_run st_arm_template '0,/"apiVersion": "2026-01-01"/s//"apiVersion": "2026-01-03"/' || { st_broken "write a template"; return; }
+  st_arm_caught "an apiVersion the pinned schemas lack" "arm|no-schema|$ST_ARM_TEMPLATE/worker/apiVersion"
+}
+
+# The api's ingress is the first one written.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_property_misspelt() {
+  st_arm_run st_arm_template '0,/"ingress": {/s//"ingresss": {/' || { st_broken "write a template"; return; }
+  st_arm_caught "a misspelt property (ingresss)" \
+    "arm|additionalProperties|$ST_ARM_TEMPLATE/api/properties/configuration/ingresss"
+}
+
+# The closed reading spans the composition: read one schema at a time, the
+# schema listing componentType alone would refuse configurations.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_composed_clean() {
+  st_arm_run st_arm_composed_template || { st_broken "write a template"; return; }
+  st_passed "a type composed from several schemas through allOf, its properties listed across them"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_schemas_missing() {
+  local dir="$ST_ROOT/arm-no-schemas"
+  { mkdir -p "$dir" && st_arm_template "$dir/$ST_ARM_TEMPLATE"; } || { st_broken "write a template"; return; }
+  ST_RC=0
+  ST_OUT="$(cd -- "$dir" && "$CACHE_DIR/venv/bin/python" -I "$HERE/vendor-validate-arm.py" \
+    "$dir/no-schemas" "$ST_ARM_TEMPLATE" 2>&1)" || ST_RC=$?
+  st_caught "the Azure Resource Manager check with no schemas in the cache" 3 "$PRIME_CMD"
 }
 
 # --- the run ---------------------------------------------------------------------
