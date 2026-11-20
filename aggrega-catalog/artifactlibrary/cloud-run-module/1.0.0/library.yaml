@@ -1,0 +1,702 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: ArtifactLibrary
+metadata:
+  name: CloudRunModule
+  version: 1.0.0
+  description: >
+    The Terraform bodies every Cloud Run Recipe runs its container in, held
+    once: Service, a Cloud Run service; WorkerPool, a Cloud Run worker pool;
+    and Job, a Cloud Run job with, when a schedule is given, the Cloud
+    Scheduler job that starts it. A Recipe imports one beside its fixed
+    pass-through module, `artifacts: { service: { $import:
+    CloudRunModule#/artifacts/Service } }`, and renders the body's one input,
+    config, with the matching CloudRunArguments entry.
+
+    Each body declares its resource and, for each file the component is
+    handed, a Secret Manager secret holding the file, mounted into the
+    container; nothing else. No service account, IAM binding, network,
+    firewall rule, load balancer or domain mapping is emitted: each belongs to
+    the operator. The Recipe reads the body's outputs as
+    module.<instance>.service.<output>.
+spec:
+  artifacts:
+    # The three bundles. Each is one file, main.tf, which lands in the
+    # importing component's module directory as service/main.tf, the child
+    # module the fixed pass-through calls with its config input and hands back
+    # as its service output; a Recipe therefore reads an output below as
+    # module.<instance>.service.<output>. The files are static HCL: no
+    # template action runs in them, so every component importing a bundle gets
+    # the same bytes, and everything that differs between components arrives
+    # in config, which the CloudRunArguments entry of the same name renders and
+    # checks. The bodies keep to the Terraform 1.5 language, as every Google
+    # body in this catalog does.
+    #
+    # config. One object, typed in each body: the names are those of the
+    # arguments it sets, except network, subnetwork and tags, which set the
+    # one network interface, port, the main container's port, environment,
+    # its variables, files, the files mounted into it, probe_path, the HTTP
+    # path its probes request, and gpu, the GPU it is given. A key a
+    # component does not need is left out of config and reads as null, or as
+    # empty for files, so nothing is emitted for it.
+    #
+    # Files. Each file the component is handed becomes one Secret Manager
+    # secret, replicated automatically, in the component's project, and one
+    # version of it holding the file's content. The secret's ID is the
+    # resource's name joined with file- and the first sixteen hexadecimal
+    # characters of the SHA-256 of the file's path, so a file keeps its secret
+    # while others are added or removed, and two components' secrets differ
+    # while their names do. Secret Manager takes one ID once in a project, so
+    # two components of one name in two regions of a project collide there.
+    # The secret is mounted as a
+    # volume of its own at the file's directory, holding the one file under
+    # its name: Cloud Run mounts a secret volume at a directory, and takes no
+    # sub path on a secret volume, so it cannot place a file alone. Whatever
+    # the image holds in that directory is hidden while the volume is
+    # mounted. The volume reads the version holding the content, by number,
+    # so a changed file is a new version and a new revision; the version is
+    # created before the one it replaces is destroyed. A file's content is
+    # held in the secret version and in Terraform state. The identity the
+    # container runs as reads the secret, so the operator grants
+    # service_account the Secret Manager Secret Accessor role on it; no IAM
+    # binding is emitted. Which paths can be mounted is checked where config
+    # is rendered.
+    #
+    # GPU. Where config carries gpu, the container's limits take one
+    # nvidia.com/gpu and the resource's node selector the accelerator gpu
+    # names, and a service keeps CPU allocated outside requests, which Cloud
+    # Run requires of an instance with a GPU. The sizes a GPU needs are
+    # chosen where config is rendered.
+    #
+    # The required_providers block in each file pins hashicorp/google by the
+    # constraint the catalog conventions' "One Google provider constraint for
+    # every Google body" section states, and repeats it because a body is
+    # copied whole into each component's module and imports nothing. Every
+    # resource here is generally available in that provider, so no body needs
+    # hashicorp/google-beta.
+
+    # A Cloud Run service with internal ingress and a fixed instance count. Its
+    # outputs are name and uri, the service's main URI.
+    Service:
+      main.tf: |
+        # required_providers pins hashicorp/google so the engine installs a provider whose
+        # resource schema this module was written against. It is a range rather than an
+        # exact version because every Google module in one root configuration shares one
+        # installed provider, and two exact pins that differ fail init. The constraint
+        # string is the one the Aggrega catalog conventions' "One Google provider
+        # constraint for every Google body" section states; this file repeats it
+        # deliberately, because a vendored module is copied byte for byte and imports
+        # nothing.
+        terraform {
+          required_providers {
+            google = {
+              source  = "hashicorp/google"
+              version = "~> 8.8"
+            }
+          }
+        }
+
+        # Everything that differs between components, rendered and checked by
+        # CloudRunArguments#/mappings/ServiceArguments. A key left out reads as null, or
+        # as empty for files.
+        variable "config" {
+          type = object({
+            project_id            = string
+            location              = string
+            name                  = string
+            image                 = string
+            port                  = number
+            cpu                   = string
+            memory                = string
+            manual_instance_count = number
+            environment           = map(string)
+            service_account       = string
+            network               = string
+            subnetwork            = optional(string)
+            tags                  = optional(list(string))
+            deletion_protection   = optional(bool)
+            files                 = optional(map(string), {})
+            probe_path            = optional(string)
+            gpu = optional(object({
+              count = number
+              type  = string
+            }))
+          })
+        }
+
+        # Each file by its path: the secret holding it, the volume mounting it, the
+        # directory the volume is mounted at and the file's name there.
+        locals {
+          files = {
+            for path in keys(var.config.files) : path => {
+              secret_id = "${var.config.name}-file-${substr(sha256(path), 0, 16)}"
+              volume    = "file-${substr(sha256(path), 0, 16)}"
+              directory = dirname(path)
+              filename  = basename(path)
+            }
+          }
+        }
+
+        resource "google_secret_manager_secret" "file" {
+          for_each  = local.files
+          project   = var.config.project_id
+          secret_id = each.value.secret_id
+
+          replication {
+            auto {}
+          }
+        }
+
+        resource "google_secret_manager_secret_version" "file" {
+          for_each    = local.files
+          secret      = google_secret_manager_secret.file[each.key].id
+          secret_data = var.config.files[each.key]
+
+          lifecycle {
+            create_before_destroy = true
+          }
+        }
+
+        # One Cloud Run service running the container, in a project, region and VPC
+        # network that already exist, under a service account that already exists.
+        #
+        # Ingress is internal only, written here rather than taken from config: the
+        # service accepts requests from VPC networks in its project, from the Shared VPC
+        # network it sends traffic to and from an internal Application Load Balancer, and
+        # none from the internet. No invoker binding is declared and the invoker check is
+        # left on, its default, so a caller reaches the service only with an identity the
+        # operator has granted the Cloud Run Invoker role.
+        #
+        # The service runs a fixed number of instances: scaling is manual at the service
+        # level, and manual_instance_count is how many run. Its egress to the operator's
+        # VPC network is Direct VPC egress, carrying traffic to private addresses alone, so
+        # a Cloud SQL or Memorystore address in that network is reachable and every other
+        # destination is reached as it would be with no network named. The revision runs
+        # in the second-generation execution environment, and its request concurrency is
+        # Cloud Run's default.
+        resource "google_cloud_run_v2_service" "this" {
+          project             = var.config.project_id
+          location            = var.config.location
+          name                = var.config.name
+          ingress             = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+          deletion_protection = var.config.deletion_protection
+
+          scaling {
+            scaling_mode          = "MANUAL"
+            manual_instance_count = var.config.manual_instance_count
+          }
+
+          template {
+            service_account       = var.config.service_account
+            execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
+
+            vpc_access {
+              egress = "PRIVATE_RANGES_ONLY"
+              network_interfaces {
+                network    = var.config.network
+                subnetwork = var.config.subnetwork
+                tags       = var.config.tags
+              }
+            }
+
+            dynamic "node_selector" {
+              for_each = var.config.gpu == null ? [] : [var.config.gpu]
+              content {
+                accelerator = node_selector.value.type
+              }
+            }
+
+            # One container, main, receiving requests on port. Its environment is one
+            # entry per key of environment, in the key order Terraform iterates a map in.
+            # Where probe_path is set, a startup and a liveness probe request it over
+            # HTTP on the same port; otherwise Cloud Run's own default startup probe
+            # applies.
+            containers {
+              name  = "main"
+              image = var.config.image
+
+              ports {
+                container_port = var.config.port
+              }
+
+              resources {
+                limits = merge(
+                  {
+                    cpu    = var.config.cpu
+                    memory = var.config.memory
+                  },
+                  var.config.gpu == null ? {} : { "nvidia.com/gpu" = tostring(var.config.gpu.count) },
+                )
+                cpu_idle = var.config.gpu == null ? null : false
+              }
+
+              dynamic "env" {
+                for_each = var.config.environment
+                content {
+                  name  = env.key
+                  value = env.value
+                }
+              }
+
+              dynamic "volume_mounts" {
+                for_each = local.files
+                content {
+                  name       = volume_mounts.value.volume
+                  mount_path = volume_mounts.value.directory
+                }
+              }
+
+              dynamic "startup_probe" {
+                for_each = var.config.probe_path == null ? [] : [var.config.probe_path]
+                content {
+                  http_get {
+                    path = startup_probe.value
+                  }
+                }
+              }
+
+              dynamic "liveness_probe" {
+                for_each = var.config.probe_path == null ? [] : [var.config.probe_path]
+                content {
+                  http_get {
+                    path = liveness_probe.value
+                  }
+                }
+              }
+            }
+
+            dynamic "volumes" {
+              for_each = local.files
+              content {
+                name = volumes.value.volume
+                secret {
+                  secret = google_secret_manager_secret.file[volumes.key].secret_id
+                  items {
+                    path    = volumes.value.filename
+                    version = google_secret_manager_secret_version.file[volumes.key].version
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        output "name" {
+          description = "Name of the service."
+          value       = google_cloud_run_v2_service.this.name
+        }
+
+        output "uri" {
+          description = "The service's main URI, https://<name>-<hash>.<region>.run.app, reachable from the callers its internal ingress admits."
+          value       = google_cloud_run_v2_service.this.uri
+        }
+
+    # A Cloud Run worker pool with a fixed instance count; it has no URI, so its
+    # one output is name.
+    WorkerPool:
+      main.tf: |
+        # required_providers pins hashicorp/google so the engine installs a provider whose
+        # resource schema this module was written against. It is a range rather than an
+        # exact version because every Google module in one root configuration shares one
+        # installed provider, and two exact pins that differ fail init. The constraint
+        # string is the one the Aggrega catalog conventions' "One Google provider
+        # constraint for every Google body" section states; this file repeats it
+        # deliberately, because a vendored module is copied byte for byte and imports
+        # nothing.
+        terraform {
+          required_providers {
+            google = {
+              source  = "hashicorp/google"
+              version = "~> 8.8"
+            }
+          }
+        }
+
+        # Everything that differs between components, rendered and checked by
+        # CloudRunArguments#/mappings/WorkerPoolArguments. A key left out reads as null,
+        # or as empty for files. port is only the port the probes request.
+        variable "config" {
+          type = object({
+            project_id            = string
+            location              = string
+            name                  = string
+            image                 = string
+            port                  = optional(number)
+            cpu                   = string
+            memory                = string
+            manual_instance_count = number
+            environment           = map(string)
+            service_account       = string
+            network               = string
+            subnetwork            = optional(string)
+            tags                  = optional(list(string))
+            deletion_protection   = optional(bool)
+            files                 = optional(map(string), {})
+            probe_path            = optional(string)
+            gpu = optional(object({
+              count = number
+              type  = string
+            }))
+          })
+        }
+
+        # Each file by its path: the secret holding it, the volume mounting it, the
+        # directory the volume is mounted at and the file's name there.
+        locals {
+          files = {
+            for path in keys(var.config.files) : path => {
+              secret_id = "${var.config.name}-file-${substr(sha256(path), 0, 16)}"
+              volume    = "file-${substr(sha256(path), 0, 16)}"
+              directory = dirname(path)
+              filename  = basename(path)
+            }
+          }
+        }
+
+        resource "google_secret_manager_secret" "file" {
+          for_each  = local.files
+          project   = var.config.project_id
+          secret_id = each.value.secret_id
+
+          replication {
+            auto {}
+          }
+        }
+
+        resource "google_secret_manager_secret_version" "file" {
+          for_each    = local.files
+          secret      = google_secret_manager_secret.file[each.key].id
+          secret_data = var.config.files[each.key]
+
+          lifecycle {
+            create_before_destroy = true
+          }
+        }
+
+        # One Cloud Run worker pool running the container, in a project, region and VPC
+        # network that already exist, under a service account that already exists. A
+        # worker pool has no endpoint and no URL, and the container declares no port.
+        #
+        # The worker pool runs a fixed number of instances: scaling is manual, and
+        # manual_instance_count is how many run. Its egress to the operator's VPC network
+        # is Direct VPC egress, carrying traffic to private addresses alone, so a Cloud
+        # SQL or Memorystore address in that network is reachable and every other
+        # destination is reached as it would be with no network named.
+        resource "google_cloud_run_v2_worker_pool" "this" {
+          project             = var.config.project_id
+          location            = var.config.location
+          name                = var.config.name
+          deletion_protection = var.config.deletion_protection
+
+          scaling {
+            scaling_mode          = "MANUAL"
+            manual_instance_count = var.config.manual_instance_count
+          }
+
+          template {
+            service_account = var.config.service_account
+
+            vpc_access {
+              egress = "PRIVATE_RANGES_ONLY"
+              network_interfaces {
+                network    = var.config.network
+                subnetwork = var.config.subnetwork
+                tags       = var.config.tags
+              }
+            }
+
+            dynamic "node_selector" {
+              for_each = var.config.gpu == null ? [] : [var.config.gpu]
+              content {
+                accelerator = node_selector.value.type
+              }
+            }
+
+            # One container, main. Its environment is one entry per key of environment,
+            # in the key order Terraform iterates a map in. Where probe_path is set, a
+            # startup and a liveness probe request it over HTTP on port; otherwise no
+            # probe is declared.
+            containers {
+              name  = "main"
+              image = var.config.image
+
+              resources {
+                limits = merge(
+                  {
+                    cpu    = var.config.cpu
+                    memory = var.config.memory
+                  },
+                  var.config.gpu == null ? {} : { "nvidia.com/gpu" = tostring(var.config.gpu.count) },
+                )
+              }
+
+              dynamic "env" {
+                for_each = var.config.environment
+                content {
+                  name  = env.key
+                  value = env.value
+                }
+              }
+
+              dynamic "volume_mounts" {
+                for_each = local.files
+                content {
+                  name       = volume_mounts.value.volume
+                  mount_path = volume_mounts.value.directory
+                }
+              }
+
+              dynamic "startup_probe" {
+                for_each = var.config.probe_path == null ? [] : [var.config.probe_path]
+                content {
+                  http_get {
+                    path = startup_probe.value
+                    port = var.config.port
+                  }
+                }
+              }
+
+              dynamic "liveness_probe" {
+                for_each = var.config.probe_path == null ? [] : [var.config.probe_path]
+                content {
+                  http_get {
+                    path = liveness_probe.value
+                    port = var.config.port
+                  }
+                }
+              }
+            }
+
+            dynamic "volumes" {
+              for_each = local.files
+              content {
+                name = volumes.value.volume
+                secret {
+                  secret = google_secret_manager_secret.file[volumes.key].secret_id
+                  items {
+                    path    = volumes.value.filename
+                    version = google_secret_manager_secret_version.file[volumes.key].version
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        output "name" {
+          description = "Name of the worker pool."
+          value       = google_cloud_run_v2_worker_pool.this.name
+        }
+
+    # A Cloud Run job, one task an execution, and, where config carries
+    # schedule, a Cloud Scheduler job in the same project and region starting
+    # an execution on it. The scheduler calls Cloud Run as service_account,
+    # the identity the job runs as, so that account needs leave to run the
+    # job, such as the Cloud Run Invoker role on it; the operator grants it,
+    # and no IAM binding is emitted. No time zone is set, so the schedule is
+    # read in Cloud Scheduler's default. Its one output is name.
+    Job:
+      main.tf: |
+        # required_providers pins hashicorp/google so the engine installs a provider whose
+        # resource schema this module was written against. It is a range rather than an
+        # exact version because every Google module in one root configuration shares one
+        # installed provider, and two exact pins that differ fail init. The constraint
+        # string is the one the Aggrega catalog conventions' "One Google provider
+        # constraint for every Google body" section states; this file repeats it
+        # deliberately, because a vendored module is copied byte for byte and imports
+        # nothing.
+        terraform {
+          required_providers {
+            google = {
+              source  = "hashicorp/google"
+              version = "~> 8.8"
+            }
+          }
+        }
+
+        # Everything that differs between components, rendered and checked by
+        # CloudRunArguments#/mappings/JobArguments. A key left out reads as null, or as
+        # empty for files. port is only the port the startup probe requests.
+        variable "config" {
+          type = object({
+            project_id          = string
+            location            = string
+            name                = string
+            image               = string
+            port                = optional(number)
+            cpu                 = string
+            memory              = string
+            environment         = map(string)
+            service_account     = string
+            network             = string
+            subnetwork          = optional(string)
+            tags                = optional(list(string))
+            deletion_protection = optional(bool)
+            files               = optional(map(string), {})
+            probe_path          = optional(string)
+            gpu = optional(object({
+              count = number
+              type  = string
+            }))
+            schedule = optional(string)
+          })
+        }
+
+        # Each file by its path: the secret holding it, the volume mounting it, the
+        # directory the volume is mounted at and the file's name there.
+        locals {
+          files = {
+            for path in keys(var.config.files) : path => {
+              secret_id = "${var.config.name}-file-${substr(sha256(path), 0, 16)}"
+              volume    = "file-${substr(sha256(path), 0, 16)}"
+              directory = dirname(path)
+              filename  = basename(path)
+            }
+          }
+        }
+
+        resource "google_secret_manager_secret" "file" {
+          for_each  = local.files
+          project   = var.config.project_id
+          secret_id = each.value.secret_id
+
+          replication {
+            auto {}
+          }
+        }
+
+        resource "google_secret_manager_secret_version" "file" {
+          for_each    = local.files
+          secret      = google_secret_manager_secret.file[each.key].id
+          secret_data = var.config.files[each.key]
+
+          lifecycle {
+            create_before_destroy = true
+          }
+        }
+
+        # One Cloud Run job running the container to completion, in a project, region and
+        # VPC network that already exist, under a service account that already exists.
+        # Each execution runs one task, retried as Cloud Run retries a task by default.
+        # Its egress to the operator's VPC network is Direct VPC egress, carrying traffic
+        # to private addresses alone, so a Cloud SQL or Memorystore address in that
+        # network is reachable and every other destination is reached as it would be with
+        # no network named.
+        resource "google_cloud_run_v2_job" "this" {
+          project             = var.config.project_id
+          location            = var.config.location
+          name                = var.config.name
+          deletion_protection = var.config.deletion_protection
+
+          template {
+            template {
+              service_account = var.config.service_account
+
+              vpc_access {
+                egress = "PRIVATE_RANGES_ONLY"
+                network_interfaces {
+                  network    = var.config.network
+                  subnetwork = var.config.subnetwork
+                  tags       = var.config.tags
+                }
+              }
+
+              dynamic "node_selector" {
+                for_each = var.config.gpu == null ? [] : [var.config.gpu]
+                content {
+                  accelerator = node_selector.value.type
+                }
+              }
+
+              # One container, main. Its environment is one entry per key of
+              # environment, in the key order Terraform iterates a map in. Where
+              # probe_path is set, a startup probe requests it over HTTP on port before
+              # the task counts as started; otherwise no probe is declared.
+              containers {
+                name  = "main"
+                image = var.config.image
+
+                resources {
+                  limits = merge(
+                    {
+                      cpu    = var.config.cpu
+                      memory = var.config.memory
+                    },
+                    var.config.gpu == null ? {} : { "nvidia.com/gpu" = tostring(var.config.gpu.count) },
+                  )
+                }
+
+                dynamic "env" {
+                  for_each = var.config.environment
+                  content {
+                    name  = env.key
+                    value = env.value
+                  }
+                }
+
+                dynamic "volume_mounts" {
+                  for_each = local.files
+                  content {
+                    name       = volume_mounts.value.volume
+                    mount_path = volume_mounts.value.directory
+                  }
+                }
+
+                dynamic "startup_probe" {
+                  for_each = var.config.probe_path == null ? [] : [var.config.probe_path]
+                  content {
+                    http_get {
+                      path = startup_probe.value
+                      port = var.config.port
+                    }
+                  }
+                }
+              }
+
+              dynamic "volumes" {
+                for_each = local.files
+                content {
+                  name = volumes.value.volume
+                  secret {
+                    secret = google_secret_manager_secret.file[volumes.key].secret_id
+                    items {
+                      path    = volumes.value.filename
+                      version = google_secret_manager_secret_version.file[volumes.key].version
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        # Where schedule is set, one Cloud Scheduler job in the same project and region
+        # starts an execution of the job on it, by a POST to the Cloud Run Admin API's
+        # run method for the job, with an OAuth token for service_account. That account
+        # needs leave to run the job, such as the Cloud Run Invoker role on it, which the
+        # operator grants; no IAM binding is emitted. The schedule is read in Cloud
+        # Scheduler's default time zone, since no time zone is set. With no schedule,
+        # nothing starts the job: it runs when someone executes it.
+        resource "google_cloud_scheduler_job" "this" {
+          count    = var.config.schedule == null ? 0 : 1
+          project  = var.config.project_id
+          region   = var.config.location
+          name     = var.config.name
+          schedule = var.config.schedule
+
+          http_target {
+            http_method = "POST"
+            uri         = "https://run.googleapis.com/v2/projects/${var.config.project_id}/locations/${var.config.location}/jobs/${google_cloud_run_v2_job.this.name}:run"
+
+            oauth_token {
+              service_account_email = var.config.service_account
+            }
+          }
+        }
+
+        output "name" {
+          description = "Name of the job."
+          value       = google_cloud_run_v2_job.this.name
+        }
