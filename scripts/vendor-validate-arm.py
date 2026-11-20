@@ -12,15 +12,17 @@
 #             holds the pinned jsonschema and referencing, and names this
 #             directory.
 #   TEMPLATE  a template file, named by the path each finding's id carries:
-#             vendor-validate.sh names it relative to the fixture, so no id
-#             carries a machine's directory.
+#             a path relative to the directory the check runs in, and inside
+#             it, so no id carries a machine's directory. An absolute path, or
+#             one leading out of that directory, is a usage error.
 #
 # OUTPUT AND EXIT CODES
 #   One line per finding: its id, a tab, and what is wrong and what to write
 #   instead. The last line is "<N> finding(s)".
 #     0  no finding
 #     1  findings, each named
-#     2  a usage error, or a TEMPLATE that cannot be read
+#     2  a usage error, a TEMPLATE not named relative to the directory the
+#        check runs in, or a TEMPLATE that cannot be read
 #     3  no verdict: SCHEMAS holds no schemas, or a schema they reference is
 #        missing; the message names the command that primes the cache
 #
@@ -672,6 +674,16 @@ class UsageError(Exception):
     """The arguments cannot be used."""
 
 
+def relative_template(template):
+    """Refuses TEMPLATE unless it is a path relative to the directory the check
+    runs in that stays inside it: the path each finding's id carries."""
+    norm = os.path.normpath(template)
+    if os.path.isabs(template) or norm == os.pardir or norm.startswith(os.pardir + os.sep):
+        raise UsageError(f"the template {template} is named by an absolute path or one leading out of the "
+                         "directory the check runs in, and each finding's id carries the path as named: "
+                         "name it relative to that directory, from inside it")
+
+
 USAGE = "usage: <python> -I scripts/vendor-validate-arm.py SCHEMAS TEMPLATE...  (see the header of this file)"
 
 
@@ -684,6 +696,8 @@ def main(argv):
         return 2
     prime = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor-validate.sh") + " --prime"
     try:
+        for template in argv[1:]:
+            relative_template(template)
         check = Check(Schemas(argv[0]))
         for template in argv[1:]:
             check.run(template, os.path.normpath(template))

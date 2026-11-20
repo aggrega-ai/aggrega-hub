@@ -37,6 +37,27 @@
 # case proves the script end to end — its arguments, its reading of the index and
 # its exit status — and never touches this repository or the cache it uses.
 #
+# THE VALIDATORS OVER A RENDERED BOUNDARY. tofu_findings, cfn_lint_findings and
+# arm_findings each take TREE, the tree a build read its catalog from (the
+# directory holding aggrega-catalog/ and .cfnlintrc.yaml), and BOUNDARY, one
+# boundary directory the build rendered (dist/<directory>/). Each validates the
+# root it reads when BOUNDARY holds it, and prints nothing and returns 0 when it
+# does not, so a caller runs all three on every boundary. On standard output it
+# prints one line per finding, sorted:
+#     <id> TAB <attribution> TAB <message>
+# the attribution - for none; the message is the validator's, on one line, and
+# may name a line number, which the id never does. It returns 0 with no finding
+# and 1 with findings. Warnings go to standard error and refuse nothing. A
+# validator that cannot give a reading is no verdict: the run exits 3 naming
+# why, so a caller that must go on runs the function in a subshell. --help holds
+# the ids and the attribution. A caller runs require_validators first.
+#
+# OFFLINE BY CONSTRUCTION. tofu runs with a CLI configuration naming the cache's
+# mirror alone, refusing the two public module registries by name, and with
+# every proxy variable pointing at a local port that refuses, so a module source
+# that would reach the network fails at once, as a finding naming the module,
+# rather than waiting on it.
+#
 # MOVING A PIN. Pin a release once it is at least three days old. Each value is
 # what its publisher states:
 #   opentofu.sha256       the line for tofu_<version>_linux_<arch>.tar.gz in the
@@ -83,9 +104,12 @@ USAGE
                that each rule refuses the fault it exists for and passes a
                clean commit, that a missing or mismatched validator or binary
                gives no verdict, that each cached validator answers its
-               pinned version, and that the Azure Resource Manager check
-               refuses each fault it exists for, by its finding id, and
-               passes a clean template. Needs the primed cache.
+               pinned version, that the Azure Resource Manager check refuses
+               each fault it exists for, by its finding id, and passes a
+               clean template, and that tofu, cfn-lint and that check, run
+               over a rendered boundary, each name a fault planted there by
+               its finding id and the entity version it belongs to, the id
+               holding across runs and line moves. Needs the primed cache.
 
   It judges the repository it belongs to, wherever it is run from. AGGREGA_BIN
   names the aggrega binary (default: aggrega on PATH). PUBLISHED_REMOTE names
@@ -151,6 +175,29 @@ THE VALIDATORS
   documents, then each resource against the vendor's schema for its type at
   its apiVersion. Its header holds its rules and its finding ids.
 
+  Each validator runs over a boundary directory a build rendered, offline:
+    tofu      the root configuration <boundary>/terraform/aggrega.modules.tf:
+              tofu init -backend=false -input=false, then tofu validate. The
+              cache's provider mirror is the one place a provider comes
+              from, each linked from the mirror rather than copied; a module
+              from a registry, or from any other remote source, fails init
+              at once. Both run in a scratch copy of the root, so nothing
+              they write lands in the boundary. Every error is a finding,
+              init's included; a warning is printed and refuses nothing.
+              tofu does not always report every error at once: an error in
+              a module block's arguments hides those inside the module, so
+              mending one finding can bring another to light.
+    cfn-lint  <boundary>/cloudformation/cloudformation-stack.json, with
+              --config-file .cfnlintrc.yaml --non-zero-exit-code warning
+              --regions us-east-1. Every error and warning is a finding.
+              cfn-lint reads no configuration file but .cfnlintrc.yaml, at
+              the top of this repository, where each rule ignored carries
+              its reason in a comment. It also reads rules to ignore from a
+              template's own Metadata, under the key cfn-lint, which no
+              Recipe in this catalog renders; this script does not refuse a
+              template carrying it.
+    arm       <boundary>/arm/arm-template.json, by the check above.
+
   A form that requires the validators requires, before it runs any: the cache
   primed for this pin file; the cached tofu and cfn-lint answering their
   pinned versions; and an aggrega binary at aggrega_min_version or later, its
@@ -159,6 +206,41 @@ THE VALIDATORS
   0.10.0. Each missing requirement gives no verdict, naming the one command
   that supplies it. Every validator runs from the cache by its full path: the
   tofu or cfn-lint on PATH is never used.
+
+FINDINGS
+  A finding's id is <validator>|<rule>|<address>, and carries no line number
+  and no absolute path, so the same fault keeps its id across runs and when
+  lines move above it:
+    tofu      the diagnostic's summary; the file, relative to the boundary,
+              then the block it lies in and the first quoted name in its
+              detail, joined with /:
+                tofu|Unsupported argument|terraform/modules/app/main.tf/
+                  resource "random_id" "app"/no_such_attribute
+              A diagnostic with no file, such as a provider the mirror
+              lacks, is addressed by the provider its detail names.
+    cfn-lint  the cfn-lint rule; the path to the value in the template,
+              Resources/<LogicalId>/<property path>:
+                cfn-lint|E3002|Resources/Queue/Properties/VisibilityTimeoutt
+    arm       the check's keyword; <template path>/<symbolic name>/
+              <property path>, as its header gives.
+  Each finding is attributed to the catalog entity version that rendered
+  it, <kind>/<capability>/<name>@<version> (recipe/terraform/server-ecs@1.1.0),
+  through the provenance the build stamps, which names <name>:<version>:
+    terraform       modules/<dir>/aggrega.provenance.tf, else the
+                    aggrega.ai/recipe-uri line in the comment block atop the
+                    file, else the one such line every file directly in
+                    modules/<dir>/ opens with; a finding in a module block
+                    of the root configuration takes the provenance of the
+                    directory the block's source names
+    cloudformation  the resource's Metadata, aggrega.ai/provenance
+    arm             the metadata, aggrega.ai/provenance, of the template's
+                    resource the address names first, a nested deployment
+                    carrying it for everything inside it
+  The capability is the validator's provider, and the kind, recipe or
+  featurerecipe, is that of the one Recipe or FeatureRecipe the catalog holds
+  at <kind directory>/<capability>/<name>/<version>/. A finding with no
+  provenance, or one naming no such entity or more than one, is attributed to
+  -: no catalog entity version answers for it.
 
 EXIT CODES
   0  passed: nothing refused
@@ -596,6 +678,406 @@ require_validators() {
   [ "${#CAUSES[@]}" -eq 0 ] || no_verdict "${CAUSES[@]}"
 }
 
+# --- the validators over a rendered boundary ---------------------------------------
+# The findings reader: it reads what a validator wrote and prints one line per
+# finding: its id, a tab, the provenance it was traced to (<name>:<version>, or -
+# for none), a tab, and its message, the lines sorted. Warnings, which refuse nothing, go to standard error.
+# When the validator's answer cannot be read, it prints why and exits 3. The first
+# argument names the validator, and the rest are what it reads:
+#   tofu      BOUNDARY WORK INIT_STATUS VALIDATE_STATUS — WORK holds the scratch
+#             copy of the root (WORK/terraform), init.json, init.err and, when
+#             init succeeded, validate.json and validate.err; VALIDATE_STATUS is
+#             - when validate did not run
+#   cfn-lint  BOUNDARY TEMPLATE OUTPUT STATUS
+#   arm       BOUNDARY TEMPLATE OUTPUT STATUS
+PY_FINDINGS="$(cat <<'END_OF_PYTHON'
+import json, os, re, sys
+
+mode, boundary = sys.argv[1], sys.argv[2]
+URI = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*:[0-9][0-9A-Za-z.+-]*")
+RECIPE_URI = re.compile(r"#\s*aggrega\.ai/recipe-uri:\s*(\S+)")
+PROVENANCE = ("aggrega.ai/provenance", "aggrega.ai/recipe-uri")
+
+def no_verdict(why):
+    print(why)
+    sys.exit(3)
+
+def one_line(text):
+    return " ".join(str(text).split())
+
+def get(obj, *keys):
+    for key in keys:
+        obj = obj.get(key) if isinstance(obj, dict) else None
+    return obj
+
+def uri(value):
+    return value if isinstance(value, str) and URI.fullmatch(value) else None
+
+def read_json(path, what):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        no_verdict(f"{what} cannot be read as JSON ({e})")
+
+def tail(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return one_line(" ".join(f.read().splitlines()[-5:]))
+    except OSError:
+        return ""
+
+# terraform: the recipe-uri the comment block atop a file names.
+def header_uri(path):
+    found = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith("#"):
+                    break
+                m = RECIPE_URI.fullmatch(line)
+                if m:
+                    found.append(m.group(1))
+    except (OSError, UnicodeDecodeError):
+        return None
+    return uri(found[0]) if len(found) == 1 else None
+
+# terraform: the provenance of a file in modules/<d>/ (the file FILE) or of the
+# directory as a whole (FILE None): its aggrega.provenance.tf, else the
+# recipe-uri atop FILE, else the one recipe-uri every file directly in it opens
+# with.
+def dir_uri(root, d, file=None):
+    base = os.path.join(root, "modules", d)
+    stamp = os.path.join(base, "aggrega.provenance.tf")
+    if os.path.isfile(stamp):
+        return header_uri(stamp)
+    own = header_uri(os.path.join(root, file)) if file else None
+    if own:
+        return own
+    try:
+        names = sorted(n for n in os.listdir(base) if n.endswith(".tf"))
+    except OSError:
+        return None
+    uris = {header_uri(os.path.join(base, n)) for n in names}
+    return uris.pop() if len(uris) == 1 else None
+
+# terraform: the directory under modules/ the module block NAME of the root file
+# PATH sources.
+def module_dir(path, name):
+    head = re.compile(r'module\s+"' + re.escape(name) + r'"\s*\{\s*')
+    source = re.compile(r'\s*source\s*=\s*"\./modules/([^"/]+)/?"\s*')
+    inside = False
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not inside:
+                    inside = bool(head.fullmatch(line))
+                elif line.startswith("}"):
+                    return None
+                else:
+                    m = source.fullmatch(line)
+                    if m:
+                        return m.group(1)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None
+
+def tofu_provenance(root, rel, context):
+    parts = rel.split("/")
+    if len(parts) >= 3 and parts[0] == "modules":
+        return dir_uri(root, parts[1], rel)
+    if len(parts) == 1:
+        m = re.fullmatch(r'module "([^"]+)"', context or "")
+        d = module_dir(os.path.join(root, rel), m.group(1)) if m else None
+        return dir_uri(root, d) if d else None
+    return None
+
+def tofu():
+    work, init_status, validate_status = sys.argv[3], sys.argv[4], sys.argv[5]
+    root = os.path.join(work, "terraform")
+    diagnostics = []
+    try:
+        with open(os.path.join(work, "init.json"), encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    no_verdict(f"tofu init wrote a line that is not JSON: {one_line(line)}")
+                if isinstance(event, dict) and event.get("type") == "diagnostic":
+                    diagnostics.append(("init", event.get("diagnostic")))
+    except OSError as e:
+        no_verdict(f"tofu init's output cannot be read ({e})")
+    init_errors = sum(1 for _, d in diagnostics if get(d, "severity") == "error")
+    if init_status != "0" and not init_errors:
+        no_verdict(f"tofu init exited {init_status} naming no error: {tail(os.path.join(work, 'init.err'))}")
+    if validate_status != "-":
+        result = read_json(os.path.join(work, "validate.json"), "tofu validate's output")
+        found = result.get("diagnostics") if isinstance(result, dict) else None
+        if not isinstance(found, list):
+            no_verdict(f"tofu validate exited {validate_status} with no diagnostics list: {tail(os.path.join(work, 'validate.err'))}")
+        diagnostics += [("validate", d) for d in found]
+        if validate_status != "0" and not any(get(d, "severity") == "error" for d in found):
+            no_verdict(f"tofu validate exited {validate_status} naming no error: {tail(os.path.join(work, 'validate.err'))}")
+    findings, warnings = set(), set()
+    for stage, d in diagnostics:
+        if not isinstance(d, dict):
+            no_verdict(f"tofu {stage} wrote a diagnostic that is not an object: {d!r}")
+        severity, summary, detail = d.get("severity"), one_line(d.get("summary") or ""), d.get("detail") or ""
+        # Providers come from the cache's mirror alone, so init always reckons
+        # their checksums locally, which says nothing of the root.
+        if stage == "init" and severity == "warning" and summary == "Incomplete lock file information for providers":
+            continue
+        filename = get(d, "range", "filename")
+        rel, outside = None, False
+        if isinstance(filename, str) and filename:
+            rel = os.path.relpath(filename, root) if os.path.isabs(filename) else os.path.normpath(filename)
+            # A file outside the root is named alone: no id carries a path of
+            # this machine, and no provenance answers for it.
+            outside = rel == os.pardir or rel.startswith(os.pardir + os.sep)
+            if outside:
+                rel = os.path.basename(filename)
+        context = get(d, "snippet", "context")
+        context = one_line(context) if isinstance(context, str) else ""
+        m = re.search(r'"([^"]+)"', detail) or re.search(
+            r"\bprovider ([A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)", detail)
+        name = one_line(m.group(1)) if m else ""
+        shown = (rel if outside else "terraform/" + rel) if rel else ""
+        address = "/".join(p for p in (one_line(shown), context, name) if p)
+        ident = f"tofu|{summary}|{address}"
+        line = get(d, "range", "start", "line")
+        where = f" ({shown}:{line})" if shown and isinstance(line, int) else ""
+        message = one_line(f"tofu {stage}: {summary}: {detail}{where}").replace(root, os.path.join(boundary, "terraform"))
+        if severity == "error":
+            prov = tofu_provenance(root, rel, context) if rel and not outside else None
+            findings.add((ident, prov or "-", message))
+        else:
+            warnings.add((ident, message))
+    for ident, message in sorted(warnings):
+        print(f"  warning  {ident}\t{message}", file=sys.stderr)
+    return findings
+
+def cfn_lint():
+    template, output, status = sys.argv[3], sys.argv[4], sys.argv[5]
+    matches = read_json(output, f"cfn-lint's reading of {template} (exit {status})")
+    if not isinstance(matches, list):
+        no_verdict(f"cfn-lint's reading of {template} (exit {status}) is not a list of findings")
+    try:
+        with open(os.path.join(boundary, template), encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        doc = None
+    findings, levels = set(), 0
+    for m in matches:
+        level, rule = get(m, "Level"), get(m, "Rule", "Id")
+        if level not in ("Error", "Warning"):
+            continue
+        levels |= 2 if level == "Error" else 4
+        path = get(m, "Location", "Path") or []
+        address = "/".join(one_line(p) for p in path) if isinstance(path, list) else ""
+        prov = None
+        if isinstance(path, list) and len(path) >= 2 and path[0] == "Resources":
+            prov = uri(get(get(doc, "Resources", str(path[1])), "Metadata", *PROVENANCE))
+        line = get(m, "Location", "Start", "LineNumber")
+        where = f" ({template}:{line})" if isinstance(line, int) else ""
+        message = one_line(f"cfn-lint {level.lower()}: {get(m, 'Message')}{where}")
+        findings.add((f"cfn-lint|{one_line(rule)}|{address}", prov or "-", message))
+    if status != str(levels):
+        no_verdict(f"cfn-lint exited {status}, which its {len(findings)} error(s) and warning(s) on {template} do not account for")
+    return findings
+
+# arm: a finding about a section of the rendered template itself names no
+# resource, so no Recipe.
+TEMPLATE_KEYWORDS = ("template-json", "template-key", "resources-form")
+
+def arm():
+    template, output, status = sys.argv[3], sys.argv[4], sys.argv[5]
+    try:
+        with open(output, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        no_verdict(f"the Azure Resource Manager check's output cannot be read ({e})")
+    m = re.fullmatch(r"([0-9]+) finding\(s\)", lines[-1]) if lines else None
+    if not m or int(m.group(1)) != len(lines) - 1 or status != ("1" if lines[:-1] else "0"):
+        no_verdict(f"the Azure Resource Manager check on {template} (exit {status}) gave no reading ending in its count of findings")
+    try:
+        with open(os.path.join(boundary, template), encoding="utf-8") as f:
+            resources = get(json.load(f), "resources")
+    except (OSError, ValueError):
+        resources = None
+    findings = set()
+    for line in lines[:-1]:
+        ident, _, message = line.partition("\t")
+        parts = ident.split("|", 2)
+        if len(parts) != 3 or parts[0] != "arm":
+            no_verdict(f"the Azure Resource Manager check wrote a line that is no finding: {one_line(line)}")
+        prov, rest = None, parts[2][len(template) + 1:] if parts[2].startswith(template + "/") else ""
+        if rest and not (parts[1] in TEMPLATE_KEYWORDS and "/" not in rest):
+            name = rest.split("/", 1)[0]
+            resource = None
+            if isinstance(resources, dict):
+                resource = resources.get(name)
+            elif isinstance(resources, list) and name.isdigit() and int(name) < len(resources):
+                resource = resources[int(name)]
+            prov = uri(get(resource, "metadata", *PROVENANCE))
+        findings.add((ident, prov or "-", one_line(f"arm: {message}")))
+    return findings
+
+findings = {"tofu": tofu, "cfn-lint": cfn_lint, "arm": arm}[mode]()
+for finding in sorted(findings):
+    print("\t".join(finding))
+END_OF_PYTHON
+)"
+
+# entity_attribution TREE CAPABILITY PROVENANCE — the catalog entity version
+# PROVENANCE (<name>:<version>, as the build stamps it) names among TREE's
+# CAPABILITY entities, as <kind>/<capability>/<name>@<version>, kind recipe or
+# featurerecipe; - when it names none, or more than one.
+# shellcheck disable=SC2329 # called from the runners below, which are called by name
+entity_attribution() {
+  local tree="$1" cap="$2" prov="$3" name="${3%:*}" version="${3##*:}" dir file kind found=""
+  if [[ $prov == *:* && $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $version =~ ^[0-9][0-9A-Za-z.+-]*$ ]]; then
+    for dir in "$tree/$CATALOG_ROOT"/*/"$cap/$name/$version"; do
+      for file in "$dir"/*.yaml "$dir"/*.yml; do
+        [ -f "$file" ] || continue
+        kind="$(peek_kind "$file")"
+        case "$kind" in Recipe | FeatureRecipe) ;; *) continue ;; esac
+        if [ -n "$found" ]; then
+          found="-"
+          break 2
+        fi
+        found="${kind,,}/$cap/$name@$version"
+      done
+    done
+  fi
+  printf '%s\n' "${found:--}"
+}
+
+# read_findings TREE CAPABILITY VALIDATOR ARG... — reads the validator's answer
+# with PY_FINDINGS and prints each finding as its id, a tab, its attribution, a
+# tab and its message. Returns 1 when there is a finding, 0 when there is none;
+# an answer that cannot be read gives no verdict.
+# shellcheck disable=SC2329 # called from the runners below, which are called by name
+read_findings() {
+  local tree="$1" cap="$2" out id prov message rc=0 n=0
+  out="$(python3 -I -c "$PY_FINDINGS" "${@:3}")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ -n "$out" ] || out="the answer of $3 cannot be read (exit $rc)"
+    no_verdict "$out"
+  fi
+  while IFS=$'\t' read -r id prov message; do
+    [ -n "$id" ] || continue
+    n=$((n + 1))
+    printf '%s\t%s\t%s\n' "$id" "$(entity_attribution "$tree" "$cap" "$prov")" "$message"
+  done <<<"$out"
+  [ "$n" -eq 0 ]
+}
+
+# The OpenTofu CLI configuration every root is initialised with, written once a
+# run: the cache's mirror is the one place providers come from, and the plugin
+# cache links each provider there rather than copying it. A module source on a
+# registry host fails at once, and every other remote source fails too, since
+# tofu_run points each proxy at a port that refuses: nothing reaches the network.
+TOFU_RC=""
+# shellcheck disable=SC2329 # called from the runners below, which are called by name
+tofu_config() {
+  [ -z "$TOFU_RC" ] || return 0
+  local mirror="$CACHE_DIR/providers" plugins="$TMP/tofu-plugin-cache"
+  [[ $mirror$plugins != *[\"\\\$]* ]] || no_verdict "the path $mirror or $plugins carries a character an OpenTofu configuration string cannot hold"
+  mkdir -p "$plugins" || no_verdict "cannot make $plugins"
+  printf '%s\n' \
+    "provider_installation {" \
+    "  filesystem_mirror {" \
+    "    path = \"$mirror\"" \
+    "  }" \
+    "}" \
+    "plugin_cache_dir = \"$plugins\"" \
+    "host \"registry.opentofu.org\" {" \
+    "  services = {}" \
+    "}" \
+    "host \"registry.terraform.io\" {" \
+    "  services = {}" \
+    "}" >"$TMP/tofu.tfrc" || no_verdict "cannot write $TMP/tofu.tfrc"
+  TOFU_RC="$TMP/tofu.tfrc"
+}
+
+# tofu_run WORK ARG... — runs the cache's tofu with ARG in WORK/terraform, in an
+# environment of its own: the CLI configuration above, its data directory in
+# WORK, no prompt, and every proxy pointing at a port that refuses, so a module
+# fetched over the network fails at once rather than waiting on it.
+# shellcheck disable=SC2329 # called from the runners below, which are called by name
+tofu_run() {
+  local work="$1" refuse="http://127.0.0.1:9"
+  shift
+  (cd -- "$work/terraform" && env -i PATH="$PATH" HOME="$work" LANG=C.UTF-8 \
+    TF_CLI_CONFIG_FILE="$TOFU_RC" TF_DATA_DIR="$work/data" TF_IN_AUTOMATION=1 TF_INPUT=0 \
+    HTTPS_PROXY="$refuse" HTTP_PROXY="$refuse" ALL_PROXY="$refuse" https_proxy="$refuse" \
+    http_proxy="$refuse" all_proxy="$refuse" NO_PROXY= no_proxy= \
+    GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND=false GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    "$CACHE_DIR/opentofu/tofu" "$@")
+}
+
+# tofu_findings TREE BOUNDARY — tofu init, then tofu validate, on the terraform
+# root BOUNDARY holds, in a scratch copy of it, so nothing either writes lands in
+# BOUNDARY; prints its findings attributed through TREE's catalog.
+# shellcheck disable=SC2329 # called by name, as a fixture's check calls it
+tofu_findings() {
+  local tree="$1" boundary="$2" work init=0 validate=-
+  [ -d "$boundary/terraform" ] || return 0
+  [ -f "$boundary/terraform/aggrega.modules.tf" ] ||
+    no_verdict "$boundary/terraform holds no aggrega.modules.tf, the root configuration the terraform provider renders, so tofu has no root to validate"
+  tofu_config
+  work="$(mktemp -d "$TMP/tofu.XXXXXX")" || no_verdict "cannot make a directory in $TMP"
+  cp -R -- "$boundary/terraform" "$work/terraform" || no_verdict "cannot copy $boundary/terraform to $work"
+  tofu_run "$work" init -backend=false -input=false -json >"$work/init.json" 2>"$work/init.err" || init=$?
+  if [ "$init" -eq 0 ]; then
+    validate=0
+    tofu_run "$work" validate -json >"$work/validate.json" 2>"$work/validate.err" || validate=$?
+  fi
+  read_findings "$tree" terraform tofu "$boundary" "$work" "$init" "$validate"
+}
+
+# cfn_lint_findings TREE BOUNDARY — cfn-lint, configured by TREE's .cfnlintrc.yaml
+# alone, on the stack template BOUNDARY holds; prints its findings attributed
+# through TREE's catalog.
+# shellcheck disable=SC2329 # called by name, as a fixture's check calls it
+cfn_lint_findings() {
+  local tree="$1" boundary="$2" template="cloudformation/cloudformation-stack.json" work rc=0
+  [ -d "$boundary/cloudformation" ] || return 0
+  [ -f "$boundary/$template" ] ||
+    no_verdict "$boundary/cloudformation holds no cloudformation-stack.json, the stack template the cloudformation provider renders, so cfn-lint has no template to lint"
+  # cfn-lint reads a configuration file that is not there as an empty one.
+  [ -f "$tree/.cfnlintrc.yaml" ] ||
+    no_verdict "$tree/.cfnlintrc.yaml is missing, and cfn-lint reads its rules from it; restore it from git"
+  work="$(mktemp -d "$TMP/cfn-lint.XXXXXX")" || no_verdict "cannot make a directory in $TMP"
+  (cd -- "$boundary" && env -i PATH="$PATH" HOME="$work" LANG=C.UTF-8 PYTHONUTF8=1 \
+    "$CACHE_DIR/venv/bin/cfn-lint" --config-file "$tree/.cfnlintrc.yaml" --non-zero-exit-code warning \
+    --regions us-east-1 --format json -- "$template") >"$work/cfn-lint.json" 2>"$work/cfn-lint.err" || rc=$?
+  [ -s "$work/cfn-lint.json" ] ||
+    no_verdict "cfn-lint gave no reading of $boundary/$template (exit $rc): $(tail -n 3 "$work/cfn-lint.err" | tr '\n' ' ')"
+  read_findings "$tree" cloudformation cfn-lint "$boundary" "$template" "$work/cfn-lint.json" "$rc"
+}
+
+# arm_findings TREE BOUNDARY — the Azure Resource Manager check on the template
+# BOUNDARY holds; prints its findings attributed through TREE's catalog.
+# shellcheck disable=SC2329 # called by name, as a fixture's check calls it
+arm_findings() {
+  local tree="$1" boundary="$2" template="arm/arm-template.json" work rc=0
+  [ -d "$boundary/arm" ] || return 0
+  [ -f "$boundary/$template" ] ||
+    no_verdict "$boundary/arm holds no arm-template.json, the template the arm provider renders, so the Azure Resource Manager check has no template to read"
+  work="$(mktemp -d "$TMP/arm.XXXXXX")" || no_verdict "cannot make a directory in $TMP"
+  arm_check "$boundary" "$template" >"$work/arm.out" 2>"$work/arm.err" || rc=$?
+  case "$rc" in
+    0 | 1) ;;
+    *) no_verdict "the Azure Resource Manager check gives no verdict on $boundary/$template (exit $rc): $(tail -n 3 "$work/arm.err" | tr '\n' ' ')" ;;
+  esac
+  read_findings "$tree" arm arm "$boundary" "$template" "$work/arm.out" "$rc"
+}
+
 # --- the prime -------------------------------------------------------------------
 # prime_fail WHAT — --prime failed: the cache directory is removed, so nothing is
 # primed, and the run exits 3.
@@ -736,6 +1218,18 @@ ST_CASES=(
   st_arm_property_misspelt
   st_arm_composed_clean
   st_arm_schemas_missing
+  st_arm_template_absolute
+  st_arm_template_escaping
+  st_tofu_unsupported_argument
+  st_tofu_registry_module
+  st_tofu_provider_not_mirrored
+  st_tofu_warning_printed
+  st_tofu_id_stable
+  st_cfn_lint_invalid_property
+  st_cfn_lint_unattributed
+  st_cfn_lint_ambiguous
+  st_cfn_lint_id_stable
+  st_arm_boundary_attributed
 )
 # The container Recipe every scratch repository carries.
 ST_RECIPE="$TF_RECIPES/probe-service/1.0.0"
@@ -1417,6 +1911,340 @@ st_arm_schemas_missing() {
   ST_OUT="$(cd -- "$dir" && "$CACHE_DIR/venv/bin/python" -I "$HERE/vendor-validate-arm.py" \
     "$dir/no-schemas" "$ST_ARM_TEMPLATE" 2>&1)" || ST_RC=$?
   st_caught "the Azure Resource Manager check with no schemas in the cache" 3 "$PRIME_CMD"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_template_absolute() {
+  ST_N=$((ST_N + 1))
+  local dir="$ST_ROOT/arm-$ST_N"
+  { mkdir -p "$dir" && st_arm_template "$dir/$ST_ARM_TEMPLATE"; } || { st_broken "write a template"; return; }
+  ST_RC=0
+  ST_OUT="$(arm_check "$dir" "$dir/$ST_ARM_TEMPLATE" 2>&1)" || ST_RC=$?
+  st_caught "a template named by an absolute path, which a finding's id would carry" 2 \
+    "$dir/$ST_ARM_TEMPLATE" "relative to"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_template_escaping() {
+  ST_N=$((ST_N + 1))
+  local dir="$ST_ROOT/arm-$ST_N"
+  { mkdir -p "$dir/run" && st_arm_template "$dir/$ST_ARM_TEMPLATE"; } || { st_broken "write a template"; return; }
+  ST_RC=0
+  ST_OUT="$(arm_check "$dir/run" "../$ST_ARM_TEMPLATE" 2>&1)" || ST_RC=$?
+  st_caught "a template named by a path leading out of the directory the check runs in" 2 \
+    "../$ST_ARM_TEMPLATE" "relative to"
+}
+
+# The validators over a rendered boundary, run as a fixture's check runs them:
+# tofu_findings, cfn_lint_findings or arm_findings on a tree holding a catalog
+# and .cfnlintrc.yaml, and a boundary holding one root. A negative case plants
+# one fault in a clean root and expects that fault's id, attributed to the entity
+# version whose provenance the root carries, and no other finding.
+
+# st_tree — ST_TREE, the tree every boundary case reads: a catalog holding the
+# entity versions the planted roots' provenance names, probe-twice twice over,
+# and this repository's .cfnlintrc.yaml, copied last. Made once.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_tree() {
+  ST_TREE="$ST_ROOT/tree"
+  [ ! -f "$ST_TREE/.cfnlintrc.yaml" ] || return 0
+  local c="$ST_TREE/$CATALOG_ROOT"
+  mkdir -p "$c/recipe/terraform/probe-app/1.0.0" "$c/feature-recipe/terraform/probe-password/1.0.0" \
+    "$c/recipe/cloudformation/probe-queue/1.0.0" "$c/recipe/arm/example-app/1.0.0" \
+    "$c/recipe/cloudformation/probe-twice/1.0.0" "$c/feature-recipe/cloudformation/probe-twice/1.0.0" &&
+    st_entity Recipe probe-app terraform >"$c/recipe/terraform/probe-app/1.0.0/recipe.yaml" &&
+    st_entity FeatureRecipe probe-password terraform >"$c/feature-recipe/terraform/probe-password/1.0.0/recipe.yaml" &&
+    st_entity Recipe probe-queue cloudformation >"$c/recipe/cloudformation/probe-queue/1.0.0/recipe.yaml" &&
+    st_entity Recipe example-app arm >"$c/recipe/arm/example-app/1.0.0/recipe.yaml" &&
+    st_entity Recipe probe-twice cloudformation >"$c/recipe/cloudformation/probe-twice/1.0.0/recipe.yaml" &&
+    st_entity FeatureRecipe probe-twice cloudformation >"$c/feature-recipe/cloudformation/probe-twice/1.0.0/recipe.yaml" &&
+    cp "$TOP/.cfnlintrc.yaml" "$ST_TREE/.cfnlintrc.yaml"
+}
+
+# st_entity KIND NAME CAPABILITY — an entity's YAML at version 1.0.0.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_entity() {
+  printf '%s\n' "apiVersion: aggrega.ai/v1beta1" "kind: $1" "metadata:" "  name: $2" "  version: 1.0.0" \
+    "spec:" "  capability: $3"
+}
+
+# st_boundary — ST_BOUNDARY, an empty boundary directory of the case's own.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_boundary() {
+  ST_N=$((ST_N + 1))
+  ST_BOUNDARY="$ST_ROOT/boundary-$ST_N"
+  mkdir -p "$ST_BOUNDARY"
+}
+
+# st_tf_root BOUNDARY — a clean terraform root as the terraform provider renders
+# one: aggrega.modules.tf calling a source: Recipe's module, which carries
+# aggrega.provenance.tf, and a FeatureRecipe's, whose file opens with the
+# provenance header. Both use hashicorp/random, which the mirror holds.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_tf_root() {
+  local root="$1/terraform"
+  mkdir -p "$root/modules/app" "$root/modules/app--password" || return 1
+  cat >"$root/aggrega.modules.tf" <<'END_OF_ROOT' &&
+# The root configuration the self-test validates.
+
+module "app--password" {
+  source = "./modules/app--password"
+}
+
+module "app" {
+  source = "./modules/app"
+
+  password = module.app--password.value
+}
+END_OF_ROOT
+    cat >"$root/modules/app/aggrega.provenance.tf" <<'END_OF_PROVENANCE' &&
+# Aggrega build provenance
+# aggrega.ai/component-id: app
+# aggrega.ai/provider: terraform
+# aggrega.ai/recipe-uri: probe-app:1.0.0
+END_OF_PROVENANCE
+    cat >"$root/modules/app/main.tf" <<'END_OF_MODULE' &&
+terraform {
+  required_providers {
+    random = {
+      source = "hashicorp/random"
+    }
+  }
+}
+
+variable "password" {
+  type      = string
+  sensitive = true
+}
+
+resource "random_id" "app" {
+  byte_length = 8
+}
+
+output "id" {
+  value = random_id.app.hex
+}
+END_OF_MODULE
+    cat >"$root/modules/app--password/random-password.tf" <<'END_OF_MODULE'
+# Aggrega build provenance
+# aggrega.ai/component-id: cfr--app--password
+# aggrega.ai/provider: terraform
+# aggrega.ai/recipe-uri: probe-password:1.0.0
+resource "random_password" "app_password" {
+  length  = 16
+  special = false
+}
+
+output "value" {
+  value     = random_password.app_password.result
+  sensitive = true
+}
+END_OF_MODULE
+}
+
+# st_cfn_stack BOUNDARY — a clean stack template as the cloudformation provider
+# renders one, its resource carrying the provenance metadata.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_cfn_stack() {
+  mkdir -p "$1/cloudformation" || return 1
+  cat >"$1/cloudformation/cloudformation-stack.json" <<'END_OF_TEMPLATE'
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Resources": {
+    "Queue": {
+      "Type": "AWS::SQS::Queue",
+      "Metadata": {
+        "aggrega.ai/provenance": {
+          "aggrega.ai/component-id": "queue",
+          "aggrega.ai/provider": "cloudformation",
+          "aggrega.ai/recipe-uri": "probe-queue:1.0.0"
+        }
+      },
+      "Properties": {
+        "QueueName": "example-queue",
+        "VisibilityTimeout": 30
+      }
+    }
+  },
+  "Outputs": {
+    "QueueUrl": {
+      "Value": {
+        "Ref": "Queue"
+      }
+    }
+  }
+}
+END_OF_TEMPLATE
+}
+
+# st_findings RUNNER — runs RUNNER on ST_TREE and ST_BOUNDARY; ST_RC, ST_OUT and
+# ST_ERR get its exit status, its standard output and its standard error.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_findings() {
+  ST_RC=0
+  ST_OUT="$("$1" "$ST_TREE" "$ST_BOUNDARY" 2>"$ST_ROOT/stderr")" || ST_RC=$?
+  ST_ERR="$(cat "$ST_ROOT/stderr")"
+}
+
+# st_ids — each finding ST_OUT holds, without its message.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_ids() {
+  printf '%s\n' "$ST_OUT" | cut -f1,2
+}
+
+# st_found LABEL ID ATTRIBUTION — the run exited 1 with exactly one finding: ID,
+# attributed to ATTRIBUTION.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_found() {
+  local want="$2"$'\t'"$3"$'\t'
+  if [ "$ST_RC" -eq 1 ] && [[ $ST_OUT != *$'\n'* ]] && [ "${ST_OUT#"$want"}" != "$ST_OUT" ]; then
+    printf '  caught  %s\n' "$1"
+    return
+  fi
+  ST_OUT="$ST_OUT${ST_ERR:+$'\n'$ST_ERR}"
+  st_failed "$1" "exit 1 and the one finding $2, attributed to $3"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_tofu_unsupported_argument() {
+  { st_tree && st_boundary && st_tf_root "$ST_BOUNDARY" &&
+    sed -i 's/^  byte_length = 8$/&\n  no_such_attribute = 1/' "$ST_BOUNDARY/terraform/modules/app/main.tf"; } ||
+    { st_broken "write a terraform root"; return; }
+  st_findings tofu_findings
+  st_found "an unsupported argument in a terraform root, caught by tofu" \
+    'tofu|Unsupported argument|terraform/modules/app/main.tf/resource "random_id" "app"/no_such_attribute' \
+    "recipe/terraform/probe-app@1.0.0"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_tofu_registry_module() {
+  { st_tree && st_boundary && st_tf_root "$ST_BOUNDARY" &&
+    printf '\nmodule "vpc" {\n  source  = "terraform-aws-modules/vpc/aws"\n  version = "6.0.0"\n}\n' \
+      >>"$ST_BOUNDARY/terraform/modules/app/main.tf"; } || { st_broken "write a terraform root"; return; }
+  st_findings tofu_findings
+  st_found "a module called from a registry: a finding of tofu init naming the module, with no network" \
+    "tofu|Error accessing remote module registry|terraform/modules/app/main.tf/vpc" \
+    "recipe/terraform/probe-app@1.0.0"
+}
+
+# A finding with no file names no provenance, so it is attributed to none.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_tofu_provider_not_mirrored() {
+  { st_tree && st_boundary && st_tf_root "$ST_BOUNDARY" &&
+    printf '\nresource "nosuch_thing" "app" {}\n' >>"$ST_BOUNDARY/terraform/modules/app/main.tf"; } ||
+    { st_broken "write a terraform root"; return; }
+  st_findings tofu_findings
+  st_found "a provider the mirror lacks: a finding of tofu init naming the provider" \
+    "tofu|Failed to query available provider packages|hashicorp/nosuch" "-"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_tofu_warning_printed() {
+  { st_tree && st_boundary && st_tf_root "$ST_BOUNDARY" &&
+    sed -i 's/^  special = false$/&\n  number  = true/' "$ST_BOUNDARY/terraform/modules/app--password/random-password.tf"; } ||
+    { st_broken "write a terraform root"; return; }
+  st_findings tofu_findings
+  if [ "$ST_RC" -eq 0 ] && [ -z "$ST_OUT" ] && [[ $ST_ERR == *"Attribute Deprecated"* ]]; then
+    printf '  passed  %s\n' "a deprecated argument: tofu's warning printed, refusing nothing"
+    return
+  fi
+  ST_OUT="$ST_OUT${ST_ERR:+$'\n'$ST_ERR}"
+  st_failed "a deprecated argument: tofu's warning printed, refusing nothing" "exit 0, no finding, the warning printed"
+}
+
+# Two runs, then a block written above the fault: the id holds, while the
+# message, which names the line, moves with it.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_tofu_id_stable() {
+  local file first first_ids second_ids label="the same tofu finding's id across two runs and after a block moves it down"
+  { st_tree && st_boundary && st_tf_root "$ST_BOUNDARY" &&
+    file="$ST_BOUNDARY/terraform/modules/app--password/random-password.tf" &&
+    sed -i 's/^  length  = 16$/&\n  no_such_attribute = 1/' "$file"; } || { st_broken "write a terraform root"; return; }
+  st_findings tofu_findings
+  first="$ST_OUT"
+  first_ids="$(st_ids)"
+  st_findings tofu_findings
+  second_ids="$(st_ids)"
+  sed -i 's/^resource "random_password"/locals {\n  moved = true\n}\n\n&/' "$file" || { st_broken "move a line"; return; }
+  st_findings tofu_findings
+  if [ "$second_ids" != "$first_ids" ] || [ "$(st_ids)" != "$first_ids" ] || [ "$ST_OUT" = "$first" ]; then
+    ST_RC=-1
+    ST_OUT="first run: $first"$'\n'"second run: $second_ids"$'\n'"after the move: $ST_OUT"
+    st_failed "$label" "one id from every run, and a message naming the moved line"
+    return
+  fi
+  st_found "$label" \
+    'tofu|Unsupported argument|terraform/modules/app--password/random-password.tf/resource "random_password" "app_password"/no_such_attribute' \
+    "featurerecipe/terraform/probe-password@1.0.0"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfn_lint_invalid_property() {
+  { st_tree && st_boundary && st_cfn_stack "$ST_BOUNDARY" &&
+    sed -i 's/"VisibilityTimeout": 30/"VisibilityTimeoutt": 30/' "$ST_BOUNDARY/cloudformation/cloudformation-stack.json"; } ||
+    { st_broken "write a stack template"; return; }
+  st_findings cfn_lint_findings
+  st_found "an invalid property in a stack template, caught by cfn-lint" \
+    "cfn-lint|E3002|Resources/Queue/Properties/VisibilityTimeoutt" "recipe/cloudformation/probe-queue@1.0.0"
+}
+
+# The resource's provenance names an entity version the catalog does not hold.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfn_lint_unattributed() {
+  { st_tree && st_boundary && st_cfn_stack "$ST_BOUNDARY" &&
+    sed -i -e 's/"VisibilityTimeout": 30/"VisibilityTimeoutt": 30/' -e 's/probe-queue:1.0.0/probe-unknown:1.0.0/' \
+      "$ST_BOUNDARY/cloudformation/cloudformation-stack.json"; } || { st_broken "write a stack template"; return; }
+  st_findings cfn_lint_findings
+  st_found "a finding whose provenance names no entity the catalog holds, attributed to none" \
+    "cfn-lint|E3002|Resources/Queue/Properties/VisibilityTimeoutt" "-"
+}
+
+# The resource's provenance names a Recipe and a FeatureRecipe at one capability,
+# name and version.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfn_lint_ambiguous() {
+  { st_tree && st_boundary && st_cfn_stack "$ST_BOUNDARY" &&
+    sed -i -e 's/"VisibilityTimeout": 30/"VisibilityTimeoutt": 30/' -e 's/probe-queue:1.0.0/probe-twice:1.0.0/' \
+      "$ST_BOUNDARY/cloudformation/cloudformation-stack.json"; } || { st_broken "write a stack template"; return; }
+  st_findings cfn_lint_findings
+  st_found "a finding whose provenance names two entities the catalog holds, attributed to none" \
+    "cfn-lint|E3002|Resources/Queue/Properties/VisibilityTimeoutt" "-"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_cfn_lint_id_stable() {
+  local file first first_ids second_ids label="the same cfn-lint finding's id across two runs and after a line moves it down"
+  { st_tree && st_boundary && st_cfn_stack "$ST_BOUNDARY" &&
+    file="$ST_BOUNDARY/cloudformation/cloudformation-stack.json" &&
+    sed -i 's/"VisibilityTimeout": 30/"VisibilityTimeout": "thirty"/' "$file"; } || { st_broken "write a stack template"; return; }
+  st_findings cfn_lint_findings
+  first="$ST_OUT"
+  first_ids="$(st_ids)"
+  st_findings cfn_lint_findings
+  second_ids="$(st_ids)"
+  sed -i 's/^  "AWSTemplateFormatVersion": "2010-09-09",$/&\n  "Description": "A stack the self-test lints.",/' "$file" ||
+    { st_broken "move a line"; return; }
+  st_findings cfn_lint_findings
+  if [ "$second_ids" != "$first_ids" ] || [ "$(st_ids)" != "$first_ids" ] || [ "$ST_OUT" = "$first" ]; then
+    ST_RC=-1
+    ST_OUT="first run: $first"$'\n'"second run: $second_ids"$'\n'"after the move: $ST_OUT"
+    st_failed "$label" "one id from every run, and a message naming the moved line"
+    return
+  fi
+  st_found "$label" "cfn-lint|E3012|Resources/Queue/Properties/VisibilityTimeout" "recipe/cloudformation/probe-queue@1.0.0"
+}
+
+# The fault lies inside the nested deployment, whose metadata carries the
+# provenance.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_boundary_attributed() {
+  { st_tree && st_boundary && mkdir -p "$ST_BOUNDARY/arm" && st_arm_template "$ST_BOUNDARY/arm/arm-template.json" &&
+    sed -i 's/"targetPort": 8080,/"targetPort": "eighty",/' "$ST_BOUNDARY/arm/arm-template.json"; } ||
+    { st_broken "write a template"; return; }
+  st_findings arm_findings
+  st_found "a fault in a rendered Azure Resource Manager template, attributed through its nested deployment's metadata" \
+    "arm|type|arm/arm-template.json/module/properties/template/resources/app/properties/configuration/ingress/targetPort" \
+    "recipe/arm/example-app@1.0.0"
 }
 
 # --- the run ---------------------------------------------------------------------
