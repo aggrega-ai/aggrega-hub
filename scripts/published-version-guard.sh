@@ -71,10 +71,10 @@ USAGE
   --jobs N   judge up to N entities at once, N a whole number of at least 1;
              default 1, one at a time. At any bound the findings are the ones a
              run one at a time gives, in the same order. Above 1 each dry run
-             fetches into a workspace of its own (THE RECORD, below), so with a
-             workspace given to the guard — one AGGREGA_WORKSPACE_ROOT names, or,
-             with --files, one the repository is in — it judges one at a time and says so
-             once. More than one at once needs bash 5.1 or later.
+             fetches into a workspace of its own (THE RECORD, below); with a
+             workspace given to the guard — one AGGREGA_WORKSPACE_ROOT names or,
+             with --files, one the repository is in — it judges one at a time
+             and says so once. More than one at once needs bash 5.1 or later.
 
   It judges the repository it belongs to, wherever it is run from; relative
   paths are read from where it is run. AGGREGA_BIN names the aggrega
@@ -387,6 +387,7 @@ recorded_digests() {
 JUDGE_WORKSPACES=0
 settle_workspace() {
   local given="${AGGREGA_WORKSPACE_ROOT:-}"
+  [ "$#" -gt 0 ] || broken "settle_workspace is called with no folder to resolve a workspace from"
   scratch_workspace_root "$TMP" "$@" || broken "cannot make a scratch workspace in $TMP"
   [ "$JOBS" -gt 1 ] || return 0
   if [ -z "$given" ] && [ -n "${AGGREGA_WORKSPACE_ROOT:-}" ]; then
@@ -473,8 +474,8 @@ if [ -n "$ROWS" ]; then
     if [ "${#ARGS[@]}" -gt 0 ]; then
       # The workspace the dry runs use (scripts/lib/scratch-workspace.sh), settled
       # here rather than at the top, so a run with nothing to judge never calls the
-      # binary.
-      settle_workspace
+      # binary. The --files dry runs run in the repository's top.
+      settle_workspace "$TOP"
       if load_publishable_kinds Plugin; then
         for f in "${ARGS[@]}"; do
           [ -f "$f" ] || { finding "$f: not judged — no such file"; continue; }
