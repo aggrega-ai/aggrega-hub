@@ -141,7 +141,8 @@ USAGE
   --all        judge everything the index holds by VENDOR TEXT, THE
                CANONICAL PASS-THROUGH and THE CFN-LINT CONFIGURATION, then
                build every fixture and hold every finding and every entry
-               of KNOWN FINDINGS to each other.
+               of KNOWN FINDINGS to each other; an index holding no
+               fixture is refused.
   --prime      fetch every validator the pin file names into the cache, verify
                each checksum, and run --self-test against the result. The one
                form that uses the network.
@@ -361,7 +362,8 @@ WHAT A COMMIT SELECTS (--staged)
     - a path in a version directory of the catalog — a Recipe, a
       FeatureRecipe, a Component, a Feature, or a mapping, artifact,
       schema or workload library — selects each fixture whose lock
-      records that entity or library at that version;
+      records that entity or library at that version, a negative
+      Release's lock among them;
     - a path in a fixture selects that fixture;
     - scripts/vendor-validators.json, and the files this script runs
       (itself, scripts/vendor-validate-arm.py and the libraries in
@@ -372,10 +374,11 @@ WHAT A COMMIT SELECTS (--staged)
     - scripts/vendor-validators-known-findings.json selects each fixture
       reaching the entity version an entry it adds or removes names.
   A Recipe or FeatureRecipe version directory for arm, cloudformation or
-  terraform that the commit changes and no fixture reaches is refused,
-  naming it, since no validator would judge it: build it in a fixture. A
-  commit selecting nothing passes once the rules above hold, with no
-  validator required.
+  terraform that the commit changes and no fixture builds — recorded by no
+  lock but a negative Release's, which halts before any validator runs — is
+  refused, naming it, since no validator would judge it: build it in a
+  fixture. A commit selecting nothing passes once the rules above hold,
+  with no validator required.
 
 KNOWN FINDINGS (--staged, --all)
   scripts/vendor-validators-known-findings.json lists the findings each
@@ -1511,15 +1514,21 @@ fixture_shape_rule() {
   done
 }
 
-# reach_table — REACH gets, for each key a fixture's locks in the index reach, the
-# fixtures reaching it, space-separated; a lock from which no versioned entry can
-# be read is refused.
+# reach_table — REACH gets, for each key the locks of the fixtures' Releases in
+# the index reach, the fixtures reaching it, space-separated; NEGATIVE_REACH the
+# same for their negative Releases' locks, which select a fixture to build but
+# prove nothing of what they record, since a negative Release halts before any
+# validator runs. A lock from which no versioned entry can be read is refused.
 reach_table() {
-  local fx name lock key
-  declare -gA REACH=()
+  local fx name lock key negative
+  declare -gA REACH=() NEGATIVE_REACH=()
   for fx in ${FIXTURES[@]+"${FIXTURES[@]}"}; do
     fixture_releases "$fx"
     for name in ${RELEASES[@]+"${RELEASES[@]}"}; do
+      case "$name" in
+        release-negative-?*.yaml) negative=1 ;;
+        *) negative=0 ;;
+      esac
       lock="$fx/${name%.yaml}.lock"
       # A lock missing from the index is refused by fixture_shape_rule.
       staged_blob "$lock" "$TMP/lock" || continue
@@ -1529,7 +1538,12 @@ reach_table() {
         continue
       fi
       while IFS= read -r key; do
-        [[ " ${REACH[$key]:-} " == *" $fx "* ]] || REACH[$key]="${REACH[$key]:+${REACH[$key]} }$fx"
+        if [ "$negative" = 1 ]; then
+          [[ " ${NEGATIVE_REACH[$key]:-} " == *" $fx "* ]] ||
+            NEGATIVE_REACH[$key]="${NEGATIVE_REACH[$key]:+${NEGATIVE_REACH[$key]} }$fx"
+        else
+          [[ " ${REACH[$key]:-} " == *" $fx "* ]] || REACH[$key]="${REACH[$key]:+${REACH[$key]} }$fx"
+        fi
       done <"$TMP/lock-keys"
     done
   done
@@ -1597,10 +1611,10 @@ select_fixtures() {
 
 # select_staged — selects the fixtures the commit reaches (--help, WHAT A COMMIT
 # SELECTS), sets SELF_TEST when the gate's own files change, and refuses each
-# cloud Recipe or FeatureRecipe version the commit changes that no fixture
-# reaches.
+# cloud Recipe or FeatureRecipe version the commit changes that no fixture's
+# positive Release reaches.
 select_staged() {
-  local path key vdir rest kind_dir capability fx what rc
+  local path key vdir rest kind_dir capability fx what only rc
   local -A unreached=()
   git diff --cached --name-only -z --no-renames "$BASE" >"$TMP/staged-paths" ||
     no_verdict "git cannot list what the commit stages"
@@ -1629,6 +1643,8 @@ select_staged() {
         rc=0
         key="$(catalog_key "$path")" || rc=$?
         case "$rc" in 0) ;; 1) continue ;; *) exit 3 ;; esac
+        # shellcheck disable=SC2086 # the fixtures, space-separated
+        [ -z "${NEGATIVE_REACH[$key]:-}" ] || select_fixtures ${NEGATIVE_REACH[$key]}
         if [ -n "${REACH[$key]:-}" ]; then
           # shellcheck disable=SC2086 # the fixtures, space-separated
           select_fixtures ${REACH[$key]}
@@ -1649,7 +1665,10 @@ select_staged() {
         unreached[$vdir]=1
         # A version directory the commit removes whole has nothing left to build.
         [ -n "$(git --literal-pathspecs ls-files -- "$vdir/")" ] || continue
-        refuse "$vdir: a cloud $what version the commit changes, and no fixture under $PROOFS/ reaches it, so no vendor validator judges it. Build it in a fixture: an instance of it in a fixture's Aggregate, bound in its Manifest (a FeatureRecipe attached where a Recipe's slot asks for one); then pull that fixture's Release and stage its lock."
+        only=""
+        [ -z "${NEGATIVE_REACH[$key]:-}" ] ||
+          only=" (only a negative Release records it, and a negative Release halts before any validator runs)"
+        refuse "$vdir: a cloud $what version the commit changes, and no fixture under $PROOFS/ builds it$only, so no vendor validator judges it. Build it in a fixture: an instance of it in a fixture's Aggregate, bound in its Manifest (a FeatureRecipe attached where a Recipe's slot asks for one); then pull that fixture's Release and stage its lock."
         ;;
     esac
   done <"$TMP/staged-paths"
@@ -2079,6 +2098,7 @@ ST_CASES=(
   st_canonical_changed_published_kept
   st_cloud_version_unreached
   st_clean_commit
+  st_all_no_fixture
   st_cfnlintrc_reason_missing
   st_cfnlintrc_flow_list
   st_cfnlintrc_entry_not_a_line
@@ -2156,8 +2176,8 @@ st_broken() {
 
 # st_repo — makes ST_REPO, a scratch repository holding a copy of this script's
 # directory with a known-findings file listing nothing, this repository's
-# .cfnlintrc.yaml and a terraform container Recipe carrying the canonical
-# pass-through, all committed.
+# .cfnlintrc.yaml, a terraform container Recipe carrying the canonical
+# pass-through and a fixture reaching it, all committed.
 # shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
 st_repo() {
   ST_N=$((ST_N + 1))
@@ -2169,10 +2189,24 @@ st_repo() {
     cp "$TOP/.cfnlintrc.yaml" "$ST_REPO/.cfnlintrc.yaml" &&
     cp "$HERE/container-pass-through/main.tf" "$recipe/module/main.tf" &&
     st_recipe_yaml probe-service >"$recipe/recipe.yaml" &&
+    st_fixture probe 1.0.0 &&
     printf 'A scratch repository the self-test judges.\n' >"$ST_REPO/README.md" &&
     git -C "$ST_REPO" init -q &&
     git -C "$ST_REPO" add -- . &&
     git -C "$ST_REPO" commit -q -m base
+}
+
+# st_fixture GROUP VERSION — writes in ST_REPO the fixture
+# proofs/terraform-google/GROUP, whose Release's lock records the container
+# Recipe at VERSION. The stub aggrega builds it into a boundary holding nothing.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_fixture() {
+  local fx="$ST_REPO/$PROOFS/terraform-google/$1"
+  mkdir -p "$fx" &&
+    printf 'workspace: {}\n' >"$fx/.aggrega-config.yaml" &&
+    printf 'kind: Release\n' >"$fx/release.yaml" &&
+    printf '%s\n' "entities:" "    - kind: recipe" "      uri: terraform/probe-service:$2" \
+      "      resolved_version: $2" >"$fx/release.lock"
 }
 
 # st_recipe_yaml NAME — a terraform container Recipe's recipe.yaml, importing its
@@ -2223,8 +2257,8 @@ st_run() {
 }
 
 # st_stubs — the stand-ins the cases run: aggrega binaries answering a version,
-# one of them building too, and a tofu and a cfn-lint on PATH answering a
-# version no pin names.
+# each building a boundary holding nothing, and a tofu and a cfn-lint on PATH
+# answering a version no pin names.
 st_stubs() {
   local a b c low
   IFS=. read -r a b c <<<"$PIN_AGGREGA_MIN"
@@ -2237,20 +2271,14 @@ st_stubs() {
   st_stub_aggrega "$ST_ROOT/bin/aggrega-at-minimum" "$PIN_AGGREGA_MIN"
   st_stub_aggrega "$ST_ROOT/bin/aggrega-below-minimum" "$ST_BELOW_MIN"
   st_stub_aggrega "$ST_ROOT/bin/aggrega-between-releases" "$PIN_AGGREGA_MIN-41-g697285c71-dirty"
-  st_stub_aggrega_builds "$ST_ROOT/bin/aggrega-builds" "$PIN_AGGREGA_MIN"
   st_stub_tofu "$ST_ROOT/path/tofu" 0.0.0
   st_stub_cfn_lint "$ST_ROOT/path/cfn-lint" 0.0.0
 }
 
-# shellcheck disable=SC2016 # the stub's own $1, not this script's
-st_stub_aggrega() {
-  printf '#!/bin/sh\n[ "$1 $2 $3" = "version -o json" ] || exit 2\nprintf %s\n' \
-    "'{\"version\": \"$2\", \"commit\": \"0000000\"}\\n'" >"$1" && chmod +x "$1"
-}
-# An aggrega that also builds: a build renders one boundary holding nothing, in
+# An aggrega answering its version, and building one boundary holding nothing in
 # the directory it runs in.
 # shellcheck disable=SC2016 # the stub's own $1, not this script's
-st_stub_aggrega_builds() {
+st_stub_aggrega() {
   printf '#!/bin/sh\ncase "$1" in\n  version) printf %s ;;\n  build) mkdir -p dist/main ;;\n  *) exit 2 ;;\nesac\n' \
     "'{\"version\": \"$2\", \"commit\": \"0000000\"}\\n'" >"$1" && chmod +x "$1"
 }
@@ -2407,23 +2435,26 @@ st_cloud_version_unreached() {
   { st_repo && st_next_version; } || { st_broken "stage a Recipe version"; return; }
   st_run --staged
   st_caught "a cloud Recipe version the commit adds, which no fixture reaches" 1 \
-    "$TF_RECIPES/probe-service/1.1.0: a cloud Recipe version" "no fixture under $PROOFS/ reaches it"
+    "$TF_RECIPES/probe-service/1.1.0: a cloud Recipe version" "no fixture under $PROOFS/ builds it"
 }
 
-# The same version, reached by a fixture whose lock records it; the stub aggrega
-# builds it into a boundary holding nothing to validate.
+# The same version, reached by a fixture whose lock records it.
 # shellcheck disable=SC2329 # a case, run by name from ST_CASES
 st_clean_commit() {
-  local home="$ST_ROOT/home-$((ST_N + 1))" fx="$PROOFS/terraform-google/probe"
+  local home="$ST_ROOT/home-$((ST_N + 1))"
   { st_repo && st_cache "$home" "$PIN_TOFU_VERSION" "${PIN_PYTHON[cfn-lint]}" && st_next_version &&
-    mkdir -p "$ST_REPO/$fx" &&
-    printf 'workspace: {}\n' >"$ST_REPO/$fx/.aggrega-config.yaml" &&
-    printf 'kind: Release\n' >"$ST_REPO/$fx/release.yaml" &&
-    printf '%s\n' "entities:" "    - kind: recipe" "      uri: terraform/probe-service:1.1.0" \
-      "      resolved_version: 1.1.0" >"$ST_REPO/$fx/release.lock" &&
-    git -C "$ST_REPO" add -- "$fx"; } || { st_broken "stage a clean change"; return; }
-  st_run --staged HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-builds"
+    st_fixture probe-next 1.1.0 && git -C "$ST_REPO" add -- "$PROOFS"; } || { st_broken "stage a clean change"; return; }
+  st_run --staged HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-at-minimum"
   st_passed "a clean commit: a container Recipe version a fixture reaches, carrying the canonical pass-through"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_all_no_fixture() {
+  local home="$ST_ROOT/home-$((ST_N + 1))"
+  { st_repo && st_cache "$home" "$PIN_TOFU_VERSION" "${PIN_PYTHON[cfn-lint]}" &&
+    git -C "$ST_REPO" rm -r -q -- "$PROOFS"; } || { st_broken "remove the fixture"; return; }
+  st_run --all HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-at-minimum"
+  st_caught "--all over an index holding no fixture" 1 "no fixture under $PROOFS/"
 }
 
 # st_cfnlintrc LINE... — writes .cfnlintrc.yaml in ST_REPO from the lines given,
@@ -3255,6 +3286,8 @@ case "$MODE" in
     KNOWN_STAGED=0
     if [ "$MODE" = all ]; then
       cfnlintrc_rule
+      [ "${#FIXTURES[@]}" -gt 0 ] ||
+        refuse "$PROOFS/: the index holds no fixture under $PROOFS/, so --all would build nothing and no vendor validator would judge any Recipe: restore the fixtures from git and stage them."
       select_fixtures ${FIXTURES[@]+"${FIXTURES[@]}"}
       load_known
     else
