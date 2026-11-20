@@ -50,6 +50,13 @@
 #     no-schema             the pinned schemas hold no definition for the
 #                           resource's type at its apiVersion (addressed at
 #                           the resource's apiVersion)
+#     parameter-key         a parameter a nested deployment passes that its
+#                           template does not declare, or one its template
+#                           requires that it does not pass (addressed
+#                           <deployment>/properties/parameters/<name>)
+#     parameter-value       a parameter a nested deployment passes that its
+#                           template's declaration refuses (addressed as
+#                           parameter-key)
 #   and, for a resource body, the JSON Schema (draft 4) keyword the value
 #   fails: type, enum, required, additionalProperties, pattern, minLength,
 #   maxLength, minimum, maximum, multipleOf, minItems, maxItems, uniqueItems,
@@ -114,6 +121,33 @@
 #     type@apiVersion, the newest apiVersions they cover for the type, and the
 #     remedy: write one of those, or move the arm_schemas pin.
 #
+# THE PARAMETERS, written from Microsoft Learn's pages "Parameters in templates"
+# (https://learn.microsoft.com/azure/azure-resource-manager/templates/parameters)
+# and "Link templates for deployment"
+# (https://learn.microsoft.com/azure/azure-resource-manager/templates/linked-templates).
+# A nested deployment whose template is written inline, and whose expressions
+# are evaluated in its own scope, passes its template's parameters in
+# properties.parameters, and Resource Manager holds them to the template's
+# declarations when it validates that deployment. The scope is its own where
+# properties.expressionEvaluationOptions.scope is inner, and, with no scope
+# written, where the template holding the deployment is languageVersion 2.0 or
+# later, which allows no other. Parameter names and type names compare without
+# case.
+#   - Each parameter passed is one the template declares (parameter-key).
+#   - Each parameter the template declares with no defaultValue, and not
+#     nullable, is passed (parameter-key).
+#   - Each entry passed is {"value": ...}, a Key Vault reference,
+#     {"reference": ...}, which Resource Manager resolves when it deploys and
+#     which is not read further, or an expression, as Bicep writes an entry
+#     passed only under a condition (parameter-value).
+#   - A value written as a literal, not wholly as an expression (rule 3 below),
+#     meets the declaration (parameter-value): its type, string, securestring,
+#     int, bool, object, secureobject or array; its allowedValues, each item of
+#     an array, strings compared without case as rule 1 compares enum strings;
+#     minValue and maxValue for an int; minLength and maxLength for a string or
+#     an array. A declaration naming a type its definitions declare, by $ref,
+#     is read with that definition under it.
+#
 # THE READING RULES. Read as written, the vendor's schemas refuse templates
 # Resource Manager deploys, and pass misspelt properties it refuses. These
 # rules read them as Resource Manager does:
@@ -167,10 +201,13 @@
 #
 # LIMITS. What the check passes that Resource Manager refuses, and where it is
 # stricter than Resource Manager:
-#   - A nested deployment's parameters are not held to the parameters its
-#     template declares: one the template does not declare, one it requires
-#     and is not passed, and a value outside its allowedValues all pass here,
-#     and fail when the template deploys.
+#   - Parameters are read only as THE PARAMETERS says: a deployment whose
+#     template is linked, which passes its parameters by parametersLink, or
+#     whose expressions are evaluated in its parent's scope (outer) is not
+#     held to them; a null value, and the members of an object or an array,
+#     are not held to the declaration (its properties, items, discriminator or
+#     additionalProperties); a Key Vault reference is not held to the
+#     declared type.
 #   - A child resource listed under a resource's own resources is read by its
 #     parent's schema alone: its keys are not held to the resource elements,
 #     and a nested deployment among them is not read as a template.
@@ -203,6 +240,7 @@ ME = "vendor-validate-arm"
 SCHEMA_HOSTS = ("https://schema.management.azure.com/schemas/", "http://schema.management.azure.com/schemas/")
 EXPRESSION_REF = SCHEMA_HOSTS[0] + "common/definitions.json#/definitions/expression"
 LEARN_PAGE = '"Understand the structure and syntax of ARM templates" (https://learn.microsoft.com/azure/azure-resource-manager/templates/syntax)'
+PARAMETERS_PAGE = '"Parameters in templates" (https://learn.microsoft.com/azure/azure-resource-manager/templates/parameters)'
 
 TEMPLATE_KEYS = ("$schema", "languageVersion", "contentVersion", "apiProfile", "definitions", "parameters",
                  "variables", "functions", "resources", "outputs", "metadata")
@@ -212,6 +250,9 @@ REFERENCE_KEYS = ("existing", "resourceGroup", "subscriptionId")
 TEMPLATE_LANGUAGE_KEYS = ("condition", "comments", "dependsOn", "copy", "scope", "existing", "resourceGroup",
                           "subscriptionId", "metadata")
 DEPLOYMENTS = "microsoft.resources/deployments"
+# The parameter types a template declares, by their names in lower case.
+PARAMETER_TYPES = {"string": str, "securestring": str, "int": int, "bool": bool, "object": dict,
+                   "secureobject": dict, "array": list}
 
 # Rule 5: each property a resource provider takes and its specification omits,
 # keyed by the type and apiVersion it is taken at, in lower case, then by its
@@ -604,9 +645,9 @@ class Check:
             if isinstance(resources, list) else ()
         resource_prefix = f"{prefix}/resources" if nested else prefix
         for name, resource in entries:
-            self.resource(resource, f"{resource_prefix}/{name}", scope)
+            self.resource(resource, f"{resource_prefix}/{name}", scope, symbolic)
 
-    def resource(self, resource, address, scope):
+    def resource(self, resource, address, scope, symbolic):
         if not isinstance(resource, dict):
             self.find("resource-key", address, "a resource is a JSON object.")
             return
@@ -637,6 +678,8 @@ class Check:
         properties = resource.get("properties")
         if type_.lower() == DEPLOYMENTS and isinstance(properties, dict) \
                 and isinstance(properties.get("template"), dict):
+            if evaluated_inner(properties, symbolic):
+                self.parameters(properties, address)
             self.template(properties["template"], f"{address}/properties/template", nested=True)
 
     def no_schema(self, address, type_, api_version, literal):
@@ -672,6 +715,35 @@ class Check:
                            f" at {at_address(address, nearest)}")
             self.find(error.validator, at, f"{message} ({label}).")
 
+    def parameters(self, properties, address):
+        """Holds the parameters a nested deployment, at ADDRESS, passes to those
+        its inline template declares (THE PARAMETERS)."""
+        template = properties["template"]
+        passed, declared = properties.get("parameters", {}), template.get("parameters", {})
+        if "parametersLink" in properties or not isinstance(passed, dict) or not isinstance(declared, dict):
+            return
+        definitions = template.get("definitions")
+        definitions = definitions if isinstance(definitions, dict) else {}
+        by_name = {k.lower(): k for k in declared}
+        passed_names = {k.lower() for k in passed}
+        at = f"{address}/properties/parameters"
+        for name, entry in passed.items():
+            if name.lower() not in by_name:
+                self.find("parameter-key", f"{at}/{name}",
+                          f"{name!r} is passed, and the nested template declares no such parameter: a deployment "
+                          f"passes only the parameters its template declares ({PARAMETERS_PAGE}).")
+                continue
+            problem = entry_problem(entry, declaration(declared[by_name[name.lower()]], definitions))
+            if problem:
+                self.find("parameter-value", f"{at}/{name}", f"{problem} ({PARAMETERS_PAGE}).")
+        for name, declared_as in declared.items():
+            d = declaration(declared_as, definitions)
+            if name.lower() in passed_names or "defaultValue" in d or d.get("nullable") is True:
+                continue
+            self.find("parameter-key", f"{at}/{name}",
+                      f"the nested template declares {name!r} with no defaultValue and not nullable, so it is "
+                      f"required, and the deployment does not pass it ({PARAMETERS_PAGE}).")
+
     def run(self, path, display):
         try:
             with open(path, encoding="utf-8") as f:
@@ -700,6 +772,87 @@ def brief(error):
     if len(quoted) <= 80 or quoted not in error.message:
         return error.message
     return error.message.replace(quoted, quoted[:60] + " …" + quoted[-1])
+
+
+def evaluated_inner(properties, symbolic):
+    """Whether a nested deployment's expressions are evaluated in its own
+    scope: scope inner, or no scope written in a template, SYMBOLIC, of
+    languageVersion 2.0 or later."""
+    options = properties.get("expressionEvaluationOptions")
+    scope = options.get("scope") if isinstance(options, dict) else None
+    if scope is None:
+        return symbolic
+    return isinstance(scope, str) and scope.lower() == "inner"
+
+
+def declaration(declared, definitions):
+    """A parameter's declaration, DECLARED, over the definition its $ref names
+    in DEFINITIONS, followed to any depth; its own keys win."""
+    chain, seen, d = [], set(), declared
+    while isinstance(d, dict):
+        chain.append(d)
+        ref = d.get("$ref")
+        if not isinstance(ref, str) or not ref.startswith("#/definitions/") or ref in seen:
+            break
+        seen.add(ref)
+        d = definitions.get(ref[len("#/definitions/"):])
+    merged = {}
+    for d in reversed(chain):
+        merged.update(d)
+    return merged
+
+
+def shortened(value):
+    """VALUE as JSON, shortened when long."""
+    text = json.dumps(value)
+    return text if len(text) <= 80 else text[:60] + " …" + text[-1]
+
+
+def same_value(value, allowed):
+    """Whether VALUE is the allowed value ALLOWED: strings compare without
+    case; a boolean equals only a boolean."""
+    if isinstance(value, str) and isinstance(allowed, str):
+        return value.lower() == allowed.lower()
+    if isinstance(value, bool) or isinstance(allowed, bool):
+        return type(value) is type(allowed) and value == allowed
+    return value == allowed
+
+
+def entry_problem(entry, d):
+    """What the declaration D refuses in a parameter ENTRY a deployment
+    passes, or None."""
+    if is_expression(entry):
+        return None
+    if not isinstance(entry, dict) or not ("value" in entry or "reference" in entry):
+        return ('a parameter a deployment passes is {"value": ...}, or a Key Vault reference, '
+                '{"reference": ...}')
+    if "value" not in entry:
+        return None
+    value = entry["value"]
+    if value is None or is_expression(value):
+        return None
+    kind = d.get("type")
+    expected = PARAMETER_TYPES.get(kind.lower()) if isinstance(kind, str) else None
+    if expected is not None and (not isinstance(value, expected)
+                                 or (expected is int and isinstance(value, bool))):
+        return f"{shortened(value)} is not of the type {kind} the nested template declares for this parameter"
+    allowed = d.get("allowedValues")
+    if isinstance(allowed, list):
+        items = value if isinstance(value, list) and expected is list else [value]
+        for item in items:
+            if not any(same_value(item, a) for a in allowed):
+                return f"{shortened(item)} is not one of the allowedValues the nested template declares, {shortened(allowed)}"
+    number = isinstance(value, int) and not isinstance(value, bool)
+    sized = isinstance(value, (str, list))
+    for key, applies, measure, refused in (
+            ("minValue", number, value, lambda m, b: m < b),
+            ("maxValue", number, value, lambda m, b: m > b),
+            ("minLength", sized, len(value) if sized else 0, lambda m, b: m < b),
+            ("maxLength", sized, len(value) if sized else 0, lambda m, b: m > b)):
+        bound = d.get(key)
+        if applies and isinstance(bound, int) and not isinstance(bound, bool) and refused(measure, bound):
+            return f"{shortened(value)} is outside the {key}, {bound}, the nested template declares"
+    return None
 
 
 def resource_body(resource, declared):

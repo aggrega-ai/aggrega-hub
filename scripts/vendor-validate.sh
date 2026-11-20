@@ -1949,6 +1949,8 @@ judge_known() {
   for row in ${KNOWN[@]+"${KNOWN[@]}"}; do listed[$row]=1; done
   while IFS=$'\t' read -r fx name boundary id attr message; do
     produced["$attr"$'\t'"$id"]=1
+    # A validator's message may end its own sentence; the refusal ends it once.
+    message="${message%.}"
     [ -z "${listed["$attr"$'\t'"$id"]+set}" ] || continue
     if [ "$attr" = - ]; then
       refuse "$fx/$name: dist/$boundary: $id — $message. No catalog entity version answers for it, so it cannot be listed as known: mend the fixture."
@@ -2124,6 +2126,12 @@ ST_CASES=(
   st_arm_documented_clean
   st_arm_documented_other_api_version
   st_arm_documented_misspelt
+  st_arm_parameters_clean
+  st_arm_parameter_undeclared
+  st_arm_parameter_required_missing
+  st_arm_parameter_wrong_type
+  st_arm_parameter_not_allowed
+  st_arm_parameter_expression
   st_arm_schemas_missing
   st_arm_template_absolute
   st_arm_template_escaping
@@ -2877,6 +2885,101 @@ st_arm_documented_template() {
 END_OF_TEMPLATE
 }
 
+# st_arm_parameters_template FILE — a clean template holding one nested
+# deployment, evaluated in its own scope, and the parameters its template
+# declares: a required string with length bounds, a string with allowedValues, a
+# string with a default and not passed, an int with a default and a minValue,
+# an int with allowedValues passed as an expression, an int whose whole entry is
+# an expression, as Bicep writes an entry passed under a condition, a
+# securestring passed as a Key Vault reference, an array, a parameter of a type
+# its definitions declare, and a nullable object not passed.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_arm_parameters_template() {
+  cat >"$1" <<'END_OF_TEMPLATE'
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "languageVersion": "2.0",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "zone": {
+      "type": "int",
+      "defaultValue": -1
+    }
+  },
+  "resources": {
+    "database": {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "example-database",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "name": {
+            "value": "example-db"
+          },
+          "tier": {
+            "value": "GeneralPurpose"
+          },
+          "storageSizeGB": {
+            "value": 64
+          },
+          "availabilityZone": {
+            "value": "[parameters('zone')]"
+          },
+          "administratorLoginPassword": {
+            "reference": {
+              "keyVault": {
+                "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/example-rg/providers/Microsoft.KeyVault/vaults/example-vault"
+              },
+              "secretName": "example-password"
+            }
+          },
+          "databases": {
+            "value": [
+              {
+                "name": "orders"
+              }
+            ]
+          },
+          "highAvailability": {
+            "value": "Disabled"
+          },
+          "backupRetentionDays": "[if(equals(parameters('zone'), -1), createObject('value', 7), createObject('value', 14))]"
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "languageVersion": "2.0",
+          "contentVersion": "1.0.0.0",
+          "definitions": {
+            "highAvailabilityType": {
+              "type": "string",
+              "allowedValues": ["Disabled", "ZoneRedundant"]
+            }
+          },
+          "parameters": {
+            "name": {"type": "string", "minLength": 3, "maxLength": 63},
+            "tier": {"type": "string", "allowedValues": ["Burstable", "GeneralPurpose", "MemoryOptimized"]},
+            "skuName": {"type": "string", "defaultValue": "Standard_D2ds_v5"},
+            "storageSizeGB": {"type": "int", "minValue": 32, "defaultValue": 32},
+            "availabilityZone": {"type": "int", "allowedValues": [-1, 1, 2, 3]},
+            "administratorLoginPassword": {"type": "securestring"},
+            "databases": {"type": "array"},
+            "highAvailability": {"$ref": "#/definitions/highAvailabilityType"},
+            "backupRetentionDays": {"type": "int", "minValue": 7, "maxValue": 35, "defaultValue": 7},
+            "tags": {"type": "object", "nullable": true}
+          },
+          "resources": {}
+        }
+      }
+    }
+  }
+}
+END_OF_TEMPLATE
+}
+
 # st_arm_run WRITER [SED_SCRIPT] — writes a template with WRITER into a
 # directory of its own, applies SED_SCRIPT to it, and runs the check on it
 # there; ST_RC and ST_OUT get its exit status and everything it printed.
@@ -2972,6 +3075,50 @@ st_arm_documented_misspelt() {
     { st_broken "write a template"; return; }
   st_arm_caught "a misspelling of a property the reading rules list (modelProviderDta)" \
     "arm|additionalProperties|$ST_ARM_TEMPLATE/chat/properties/modelProviderDta"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_parameters_clean() {
+  st_arm_run st_arm_parameters_template || { st_broken "write a template"; return; }
+  st_passed "a nested deployment passing the parameters its template declares: literals of their types and allowed values, an expression, a Key Vault reference, defaults and a nullable one left out"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_parameter_undeclared() {
+  st_arm_run st_arm_parameters_template '0,/"storageSizeGB": {/s//"storageSizeGBB": {/' ||
+    { st_broken "write a template"; return; }
+  st_arm_caught "a parameter passed to a nested deployment that its template does not declare (storageSizeGBB)" \
+    "arm|parameter-key|$ST_ARM_TEMPLATE/database/properties/parameters/storageSizeGBB"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_parameter_required_missing() {
+  st_arm_run st_arm_parameters_template 's/"skuName": {"type": "string", "defaultValue": "Standard_D2ds_v5"}/"skuName": {"type": "string"}/' ||
+    { st_broken "write a template"; return; }
+  st_arm_caught "a parameter a nested deployment's template requires and the deployment does not pass (skuName)" \
+    "arm|parameter-key|$ST_ARM_TEMPLATE/database/properties/parameters/skuName"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_parameter_wrong_type() {
+  st_arm_run st_arm_parameters_template 's/"value": 64/"value": "64"/' || { st_broken "write a template"; return; }
+  st_arm_caught "a literal of another type than the parameter declares (storageSizeGB \"64\")" \
+    "arm|parameter-value|$ST_ARM_TEMPLATE/database/properties/parameters/storageSizeGB"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_parameter_not_allowed() {
+  st_arm_run st_arm_parameters_template 's/"value": "GeneralPurpose"/"value": "Premium"/' ||
+    { st_broken "write a template"; return; }
+  st_arm_caught "a literal outside the parameter's allowedValues (tier Premium)" \
+    "arm|parameter-value|$ST_ARM_TEMPLATE/database/properties/parameters/tier"
+}
+
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_arm_parameter_expression() {
+  st_arm_run st_arm_parameters_template 's/"value": 64/"value": "[add(32, 32)]"/' ||
+    { st_broken "write a template"; return; }
+  st_passed "a parameter passed as an expression, which Resource Manager evaluates when it deploys (storageSizeGB [add(32, 32)])"
 }
 
 # shellcheck disable=SC2329 # a case, run by name from ST_CASES
