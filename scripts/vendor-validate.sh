@@ -61,15 +61,38 @@
 # the ids and the attribution. A caller runs require_validators first.
 #
 # A FIXTURE IS BUILT AS ITS OWN WORKSPACE, AND ONLY AS THAT. Each Release is
-# built in the copy of the index with --workspace-root naming the fixture, an
-# empty global configuration (--config) and AGGREGA_CATALOG_DIRS,
-# AGGREGA_WORKSPACE_ROOT and AGGREGA_CONFIG unset, so nothing on the machine
-# changes what it resolves: a global auto_pull, say, would rewrite the lock in
-# the copy and hide a lock out of date. Its sources are the ones aggrega pull
-# fetched into the fixture's .aggrega/cache/ in the checkout; the build reaches
-# them through AGGREGA_ARTIFACT_CACHE_DIR, which must be relative to the
-# workspace root (an absolute value halts the build), so it is that directory
-# named relative to the copy. The build reads it and writes nothing there.
+# built in a copy of the index of its own (RELEASES ARE BUILT SIDE BY SIDE),
+# with --workspace-root naming the fixture there, an empty global configuration
+# (--config) and AGGREGA_CATALOG_DIRS, AGGREGA_WORKSPACE_ROOT and
+# AGGREGA_CONFIG unset, so nothing on the machine changes what it resolves: a
+# global auto_pull, say, would rewrite the lock in the copy and hide a lock out
+# of date. Its sources are the ones aggrega pull fetched into the fixture's
+# .aggrega/cache/ in the checkout; the build reaches them through
+# AGGREGA_ARTIFACT_CACHE_DIR, which must be relative to the workspace root (an
+# absolute value halts the build), so it is that directory named relative to
+# the copy. The build reads it and writes nothing there.
+#
+# RELEASES ARE BUILT SIDE BY SIDE. A build is a process of its own, and two
+# builds share nothing either writes but aggrega's per-user caches, which
+# aggrega writes under a lock it takes across processes. So the Releases of
+# every fixture a run builds are built several at once, through
+# scripts/lib/bounded-jobs.sh, and judged one by one in the order a run
+# building one at a time takes them, each as soon as it and every one before it
+# have ended: the run prints, refuses and exits as that run does, line for line
+# but for the seconds. Each build has a tree of its own, a copy of the copy of
+# the index whose files are hard links to that copy's, and writes its dist/
+# there and nothing else; it writes nothing in the fixture's .aggrega/cache/
+# in the checkout. A build keeps 1.1 to 1.2 processing units busy and its
+# resident memory peaks at 0.95 to 1.05 GiB, so the run builds two Releases
+# for each three processing units nproc counts and one for each 1.5 GiB of
+# MemAvailable, leaving the host room for the validators and its other work,
+# and twelve at most: on 24 processing units, the Releases of
+# proofs/terraform-google/container-service took 144 s built two at a time,
+# 47 s eight, 33 s twelve, 29 s sixteen and 38 s twenty-four, so past twelve a
+# commit would take the machine from its author for little. Under a bash older
+# than 5.1 they are built one at a time. However the run ends, an interrupt
+# among the ways, it stops every build still running and waits for each to end
+# before removing its temporary directory.
 #
 # A LOCK IS READ AS TEXT. The selection matches what a commit changes against
 # the entities and libraries each fixture's lock records, read with awk in the
@@ -88,7 +111,10 @@
 # proofs/terraform-google/baseline offline with --verify-determinism takes 7 to
 # 10 s; tofu init then tofu validate over its root take 0.2 s and 1.1 s, 1.2 to
 # 2.6 s with the copy and the reading; the copy of the index takes 0.2 s and
-# 22 MB.
+# 22 MB, and a build's own tree linked from it 0.16 s to make and 0.08 s to
+# remove. On a machine with 24 processing units and 62 GiB, --all took 338 s
+# building one Release at a time and 51 s twelve at a time; --staged reaching
+# proofs/terraform-google/container-service alone, 284 s and 33 s.
 # The cache is 3.0 GB, 2.5 GB of it the provider mirror, which init links from
 # rather than copies (a root's data directory and plugin cache take 0.1 MB). A
 # commit reaching no fixture costs the rules alone, under a second.
@@ -149,15 +175,16 @@ USAGE
   --self-test  prove, in scratch repositories under a temporary directory,
                that each rule refuses the fault it exists for and passes a
                clean commit, that a missing or mismatched validator or binary
-               gives no verdict, that each cached validator answers its
-               pinned version, that the Azure Resource Manager check refuses
-               each fault it exists for, by its finding id, and passes a
-               clean template, and that tofu, cfn-lint and that check, run
-               over a rendered boundary, each name a fault planted there by
-               its finding id and the entity version it belongs to, the id
-               holding across runs and line moves, cfn-lint's even where the
-               template tells cfn-lint to ignore its rule. Needs the primed
-               cache.
+               gives no verdict, that Releases built side by side are
+               reported as a run building one at a time reports them, that
+               each cached validator answers its pinned version, that the
+               Azure Resource Manager check refuses each fault it exists
+               for, by its finding id, and passes a clean template, and that
+               tofu, cfn-lint and that check, run over a rendered boundary,
+               each name a fault planted there by its finding id and the
+               entity version it belongs to, the id holding across runs and
+               line moves, cfn-lint's even where the template tells cfn-lint
+               to ignore its rule. Needs the primed cache.
 
   It judges the repository it belongs to, wherever it is run from. AGGREGA_BIN
   names the aggrega binary that builds the fixtures (default: aggrega on
@@ -333,16 +360,24 @@ THE FIXTURES (--staged, --all)
   scripts/ and .cfnlintrc.yaml as the commit carries them — under a
   temporary directory removed when the run exits, so a fix left unstaged
   cannot pass a broken staged file and no build output lands in the
-  checkout. Each Release is built there with
+  checkout. Each Release is built in a copy of that copy of its own, its
+  files linked rather than copied, with
       aggrega build --offline --verify-determinism
   reading its sources from the checkout's .aggrega/cache/, named to the
   build relative to the copy through AGGREGA_ARTIFACT_CACHE_DIR, and
   writing nothing there; no configuration but the fixture's own reaches
-  the build. A Release other than a negative one must build: one that
-  halts is refused, naming the fixture, the Release and why; a lock out
-  of date (E0130) is refused, naming the pull that renews it; a source
-  missing from the cache (E0137) gives no verdict, naming the same pull.
-  Every validator then runs over each boundary the build rendered (THE
+  the build. Releases are built several at once — two for each three
+  processing units nproc counts, one for each @BUILD_MIB@ MiB of available
+  memory, @BUILD_CEILING@ at most; one at a time under a bash older than 5.1 — and
+  each is judged in turn, in the order a run building one at a time takes
+  them, so the run prints and decides what that run does. An interrupted
+  run stops its builds before removing its temporary directory.
+
+  A Release other than a negative one must build: one that halts is
+  refused, naming the fixture, the Release and why; a lock out of date
+  (E0130) is refused, naming the pull that renews it; a source missing
+  from the cache (E0137) gives no verdict, naming the same pull. Every
+  validator then runs over each boundary the build rendered (THE
   VALIDATORS), and each finding is held to KNOWN FINDINGS.
 
 NEGATIVE RELEASES
@@ -408,6 +443,8 @@ EXIT CODES
      nothing primed
 END_OF_HELP
 )"
+  text="${text//@BUILD_MIB@/$BUILD_MIB}"
+  text="${text//@BUILD_CEILING@/$BUILD_CEILING}"
   printf '%s\n' "${text//@MARKER@/$VENDOR_MARKER}"
 }
 
@@ -416,6 +453,13 @@ END_OF_HELP
 VENDOR_MARKER_HEAD="[vendor schema"
 VENDOR_MARKER_TAIL="text]"
 VENDOR_MARKER="$VENDOR_MARKER_HEAD $VENDOR_MARKER_TAIL"
+
+# How many Releases are built at once (RELEASES ARE BUILT SIDE BY SIDE, at the
+# top; build_bound): never more than BUILD_CEILING, two for each three
+# processing units, and one for each BUILD_MIB MiB of the memory the host has
+# available.
+BUILD_CEILING=12
+BUILD_MIB=1536
 
 ME="vendor-validate"
 FORMS="--staged, --all, --prime or --self-test"
@@ -437,6 +481,8 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 3
 . "$HERE/lib/catalog-entities.sh" || exit 3
 # shellcheck source=lib/published-branch.sh
 . "$HERE/lib/published-branch.sh" || exit 3
+# shellcheck source=lib/bounded-jobs.sh
+. "$HERE/lib/bounded-jobs.sh" || exit 3
 
 # A binary named by a relative path is made absolute before the script moves.
 AGGREGA="${AGGREGA_BIN:-aggrega}"
@@ -466,12 +512,33 @@ CLOUD_CAPABILITIES=" arm cloudformation terraform "
 # The files this script runs: itself, the Azure Resource Manager check and the
 # libraries it sources. A commit changing one runs the staged copy's --self-test
 # and every fixture.
-GATE_SCRIPTS=" scripts/vendor-validate.sh scripts/vendor-validate-arm.py scripts/lib/catalog-entities.sh scripts/lib/published-branch.sh "
+GATE_SCRIPTS=" scripts/vendor-validate.sh scripts/vendor-validate-arm.py scripts/lib/catalog-entities.sh scripts/lib/published-branch.sh scripts/lib/bounded-jobs.sh "
 # What the gate copies out of the index to build in.
 MATERIALIZED=("$CATALOG_ROOT" "$PROOFS" scripts "$CFNLINTRC")
 PRIME_CMD="$HERE/vendor-validate.sh --prime"
 TMP="$(mktemp -d)" || exit 3
-trap 'rm -rf "$TMP"' EXIT
+# stop_builds — stops every build still running beside the run and waits for each
+# to end, so that none outlives the run or writes into its temporary directory
+# once that is removed. Asked to stop, a build stops its aggrega and then itself
+# (build_run).
+# shellcheck disable=SC2329 # called from the EXIT trap
+stop_builds() {
+  local running
+  local -a pids
+  running="$(jobs -p)"
+  if [ -n "$running" ]; then
+    mapfile -t pids <<<"$running"
+    kill -TERM "${pids[@]}" 2>/dev/null
+  fi
+  wait
+}
+# However the run ends, it ends through exit: an interrupt, a termination request
+# and a hang-up each exit, so the builds are stopped and the temporary directory
+# removed every time.
+trap 'stop_builds; rm -rf "$TMP"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 REFUSED=0
 refuse() { REFUSED=1; printf '✗ %s\n' "$1"; }
@@ -1484,6 +1551,7 @@ fixture_releases() {
 
 # expect_line FILE — the one line with text the .expect FILE holds, its
 # surrounding blanks and carriage return dropped.
+# shellcheck disable=SC2329 # called from judge_build, which bounded_jobs reaches by name
 expect_line() {
   awk '{ sub(/\r$/, ""); sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") } $0 != "" { print; exit }' "$1"
 }
@@ -1823,22 +1891,38 @@ staged_self_test() {
   esac
 }
 
-# build_release FIXTURE RELEASE CACHE — builds RELEASE of FIXTURE in its copy in
-# TREE, offline, rendering every node twice: BUILD_RC and BUILD_OUT get the exit
-# status and everything it printed. The sources come from CACHE, the fixture's
-# cache in this checkout named relative to the copy, and nothing is written there;
-# no configuration but the fixture's own reaches the build.
+# build_bound — prints how many Releases are built at once: two for each three
+# processing units nproc counts, one for each BUILD_MIB MiB of MemAvailable,
+# BUILD_CEILING at most and one at least; one where this bash cannot run two at
+# once, or where either count cannot be read.
+build_bound() {
+  local cpus mib bound="$BUILD_CEILING"
+  bounded_jobs_concurrency_available || { echo 1; return 0; }
+  cpus="$(nproc 2>/dev/null)"
+  mib="$(awk '$1 == "MemAvailable:" { print int($2 / 1024); exit }' /proc/meminfo 2>/dev/null)"
+  bounded_jobs_bound_ok "$cpus" || cpus=1
+  [[ $mib =~ ^[0-9]+$ ]] || mib=0
+  [ "$((cpus * 2 / 3))" -ge "$bound" ] || bound="$((cpus * 2 / 3))"
+  [ "$((mib / BUILD_MIB))" -ge "$bound" ] || bound="$((mib / BUILD_MIB))"
+  [ "$bound" -ge 1 ] || bound=1
+  echo "$bound"
+}
+
+# build_release DIR RELEASE CACHE — replaces this shell with the build of RELEASE
+# in the fixture at DIR, offline, rendering every node twice, everything it prints
+# on standard output. The sources come from CACHE, the fixture's cache in this
+# checkout named relative to DIR, and nothing is written there; no configuration
+# but the fixture's own reaches the build.
+# shellcheck disable=SC2329 # called from build_run, which bounded_jobs calls by name
 build_release() {
-  local dir="$TREE/$1"
-  rm -rf -- "$dir/dist"
-  BUILD_RC=0
-  BUILD_OUT="$(cd -- "$dir" && env -u AGGREGA_CATALOG_DIRS -u AGGREGA_WORKSPACE_ROOT -u AGGREGA_CONFIG \
+  cd -- "$1" && exec env -u AGGREGA_CATALOG_DIRS -u AGGREGA_WORKSPACE_ROOT -u AGGREGA_CONFIG \
     AGGREGA_ARTIFACT_CACHE_DIR="$3" NO_COLOR=1 "$AGGREGA" build --config "$TMP/aggrega-config.yaml" \
-    --workspace-root "$dir" --offline --verify-determinism --quiet --release "$2" 2>&1)" || BUILD_RC=$?
+    --workspace-root "$1" --offline --verify-determinism --quiet --release "$2" 2>&1
 }
 
 # halt_excerpt — the lines of BUILD_OUT that say why the build halted, indented:
 # from the first diagnostic on, at most twelve.
+# shellcheck disable=SC2329 # called from judge_build, which bounded_jobs reaches by name
 halt_excerpt() {
   printf '%s\n' "$BUILD_OUT" | awk '
     !started && (/^\[/ || /^aggrega build:/) { started = 1 }
@@ -1850,6 +1934,7 @@ halt_excerpt() {
 # build_halted FIXTURE RELEASE — the build of RELEASE halted: a source missing
 # from the fixture's cache gives no verdict, and a lock out of date is refused,
 # each naming the pull; returns 1 for any other halt, left to the caller.
+# shellcheck disable=SC2329 # called from judge_build, which bounded_jobs reaches by name
 build_halted() {
   local fx="$1" name="$2"
   case "$BUILD_OUT" in
@@ -1862,17 +1947,19 @@ build_halted() {
   return 1
 }
 
-# boundary_findings FIXTURE RELEASE — runs every validator over each boundary
-# the build rendered, appending each finding to findings as FIXTURE TAB RELEASE
-# TAB boundary TAB id TAB attribution TAB message; prints how many.
+# boundary_findings FIXTURE RELEASE TREE — runs every validator over each
+# boundary the build rendered in TREE, the build's own tree, appending each
+# finding to findings as FIXTURE TAB RELEASE TAB boundary TAB id TAB attribution
+# TAB message; prints how many.
+# shellcheck disable=SC2329 # called from judge_build, which bounded_jobs reaches by name
 boundary_findings() {
-  local fx="$1" name="$2" b runner out rc n=0 id attr message
-  for b in "$TREE/$fx/dist"/*/; do
+  local fx="$1" name="$2" tree="$3" b runner out rc n=0 id attr message
+  for b in "$tree/$fx/dist"/*/; do
     [ -d "$b" ] || continue
     b="${b%/}"
     for runner in tofu_findings cfn_lint_findings arm_findings; do
       rc=0
-      out="$("$runner" "$TREE" "$b")" || rc=$?
+      out="$("$runner" "$tree" "$b")" || rc=$?
       case "$rc" in 0 | 1) ;; *) exit 3 ;; esac
       while IFS=$'\t' read -r id attr message; do
         [ -n "$id" ] || continue
@@ -1885,55 +1972,125 @@ boundary_findings() {
 }
 
 # seconds_since START — the seconds since START, an EPOCHREALTIME, to a tenth.
+# shellcheck disable=SC2329 # called from build_run and judge_build, which bounded_jobs reaches by name
 seconds_since() {
   awk -v a="$1" -v b="$EPOCHREALTIME" 'BEGIN { printf "%.1f", b - a }'
 }
 
-# check_fixture FIXTURE — builds each Release of FIXTURE: a positive one must
-# build, and its findings go to findings, the entity versions its lock reaches
-# to BUILT; a negative one must halt with output holding its .expect line.
-declare -A BUILT=()
-check_fixture() {
-  local fx="$1" dir="$TREE/$1" name cache expect started built n key
-  cache="$(python3 -I -c 'import os, sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
-    "$TOP/$fx/.aggrega/cache" "$dir")" || no_verdict "cannot name $TOP/$fx/.aggrega/cache relative to $dir"
+# The Releases to build, by position: the fixture each lies in, and its file
+# name; and, in the subshell building one, the build running there.
+BUILD_FX=()
+BUILD_NAME=()
+BUILD_CHILD=""
+
+# queue_fixture FIXTURE — queues each Release of FIXTURE to be built.
+queue_fixture() {
+  local fx="$1" name
   fixture_releases "$fx"
   for name in "${RELEASES[@]}"; do
     # A Release with no lock, or a negative one with no .expect, is refused by
     # fixture_shape_rule.
-    [ -f "$dir/${name%.yaml}.lock" ] || continue
-    started="$EPOCHREALTIME"
-    build_release "$fx" "$name" "$cache"
-    built="$(seconds_since "$started")"
-    case "$name" in
-      release-negative-?*.yaml)
-        [ -f "$dir/${name%.yaml}.expect" ] || continue
-        expect="$(expect_line "$dir/${name%.yaml}.expect")"
-        if [ "$BUILD_RC" -eq 0 ]; then
-          refuse "$fx/$name: a negative Release, and it builds. It must halt, with output holding its .expect line: $expect. Give it the one fault it exists for, or move it out of release-negative-*."
-        elif [[ $BUILD_OUT == *"$expect"* ]]; then
-          echo "$ME: $fx/$name halts as its .expect says ($built s)"
-        elif ! build_halted "$fx" "$name"; then
-          refuse "$fx/$name: a negative Release halting on another condition than the one its .expect names. Expected output holding: $expect; the build halted with:"$'\n'"$(halt_excerpt)"
-        fi
-        continue
-        ;;
-    esac
-    if [ "$BUILD_RC" -ne 0 ]; then
-      build_halted "$fx" "$name" ||
-        refuse "$fx/$name: the build halts, offline, rendering every node twice:"$'\n'"$(halt_excerpt)"
-      continue
-    fi
-    started="$EPOCHREALTIME"
-    n="$(boundary_findings "$fx" "$name")" || exit 3
-    echo "$ME: $fx/$name built in $built s; its boundaries validated in $(seconds_since "$started") s, $n finding(s)"
-    while IFS= read -r key; do
-      case "$key" in
-        entity:recipe:*) BUILT["recipe/${key#entity:recipe:}"]=1 ;;
-        entity:feature_recipe:*) BUILT["featurerecipe/${key#entity:feature_recipe:}"]=1 ;;
-      esac
-    done < <(awk "$LOCK_KEYS_AWK" "$dir/${name%.yaml}.lock")
+    [ -f "$TREE/$fx/${name%.yaml}.lock" ] || continue
+    BUILD_FX+=("$fx")
+    BUILD_NAME+=("$name")
   done
+}
+
+# build_fixtures — builds every Release queued, up to build_bound at once, and
+# judges each in queue order (build_read).
+build_fixtures() {
+  [ "${#BUILD_FX[@]}" -gt 0 ] || return 0
+  mkdir -p "$TMP/build" || no_verdict "cannot make $TMP/build"
+  bounded_jobs "$(build_bound)" "$TMP/build" build_run build_read "${!BUILD_FX[@]}"
+}
+
+# build_run INDEX — builds the Release queued at INDEX in a tree of its own,
+# $TMP/build/INDEX/tree: a copy of TREE whose files are hard links to TREE's, in
+# which the build writes its own dist/. The build's output goes to
+# $TMP/build/INDEX/out and, once it has ended, its exit status and its seconds to
+# $TMP/build/INDEX/built; standard output names what kept it from building.
+# Asked to stop, it stops the build, waits for it to end, and exits.
+# shellcheck disable=SC2329 # called by name, through bounded_jobs
+build_run() {
+  local fx="${BUILD_FX[$1]}" name="${BUILD_NAME[$1]}" work="$TMP/build/$1" dir cache started rc=0
+  # shellcheck disable=SC2064 # the Release is named now, as the trap is set
+  trap "build_stop $(printf '%q' "$fx/$name")" INT TERM
+  dir="$work/tree/$fx"
+  { mkdir -- "$work" && cp -al -- "$TREE" "$work/tree" && rm -rf -- "$dir/dist"; } ||
+    { echo "cannot link $TREE into $work/tree"; return 1; }
+  cache="$(python3 -I -c 'import os, sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
+    "$TOP/$fx/.aggrega/cache" "$dir")" || { echo "cannot name $TOP/$fx/.aggrega/cache relative to $dir"; return 1; }
+  started="$EPOCHREALTIME"
+  (build_release "$dir" "$name" "$cache") >"$work/out" </dev/null &
+  BUILD_CHILD=$!
+  wait "$BUILD_CHILD" || rc=$?
+  BUILD_CHILD=""
+  printf '%s %s\n' "$rc" "$(seconds_since "$started")" >"$work/built"
+}
+
+# build_stop RELEASE — stops the build running in this subshell, waits for it to
+# end, and exits, naming RELEASE as stopped.
+# shellcheck disable=SC2329 # called from the trap build_run sets
+build_stop() {
+  [ -z "$BUILD_CHILD" ] || kill -TERM "$BUILD_CHILD" 2>/dev/null
+  wait
+  echo "$1: the build was stopped before it ended"
+  exit 1
+}
+
+# build_read INDEX ITEM STATUS OUTFILE — judges the build of the Release queued
+# at INDEX (judge_build), then removes its tree; ITEM is INDEX again, the queue
+# being handed to bounded_jobs by position. A build that did not run gives no
+# verdict, naming why, as build_run wrote it to OUTFILE.
+# shellcheck disable=SC2329 # called by name, through bounded_jobs
+build_read() {
+  local work="$TMP/build/$1" why built
+  if [ ! -f "$work/built" ]; then
+    why="$(cat -- "$4")"
+    no_verdict "${why:-the build of ${BUILD_FX[$1]}/${BUILD_NAME[$1]} ended before it reported (exit $3)}"
+  fi
+  read -r BUILD_RC built <"$work/built"
+  BUILD_OUT="$(cat -- "$work/out")"
+  judge_build "${BUILD_FX[$1]}" "${BUILD_NAME[$1]}" "$work/tree" "$built"
+  rm -rf -- "$work"
+}
+
+# judge_build FIXTURE RELEASE TREE SECONDS — judges the build of RELEASE of
+# FIXTURE, rendered in TREE in SECONDS, by BUILD_RC and BUILD_OUT: a positive one
+# must build, and its findings go to findings, the entity versions its lock
+# reaches to BUILT; a negative one must halt with output holding its .expect line.
+declare -A BUILT=()
+# shellcheck disable=SC2329 # called from build_read, which bounded_jobs calls by name
+judge_build() {
+  local fx="$1" name="$2" tree="$3" built="$4" dir="$TREE/$1" expect started n key
+  case "$name" in
+    release-negative-?*.yaml)
+      [ -f "$dir/${name%.yaml}.expect" ] || return 0
+      expect="$(expect_line "$dir/${name%.yaml}.expect")"
+      if [ "$BUILD_RC" -eq 0 ]; then
+        refuse "$fx/$name: a negative Release, and it builds. It must halt, with output holding its .expect line: $expect. Give it the one fault it exists for, or move it out of release-negative-*."
+      elif [[ $BUILD_OUT == *"$expect"* ]]; then
+        echo "$ME: $fx/$name halts as its .expect says ($built s)"
+      elif ! build_halted "$fx" "$name"; then
+        refuse "$fx/$name: a negative Release halting on another condition than the one its .expect names. Expected output holding: $expect; the build halted with:"$'\n'"$(halt_excerpt)"
+      fi
+      return 0
+      ;;
+  esac
+  if [ "$BUILD_RC" -ne 0 ]; then
+    build_halted "$fx" "$name" ||
+      refuse "$fx/$name: the build halts, offline, rendering every node twice:"$'\n'"$(halt_excerpt)"
+    return 0
+  fi
+  started="$EPOCHREALTIME"
+  n="$(boundary_findings "$fx" "$name" "$tree")" || exit 3
+  echo "$ME: $fx/$name built in $built s; its boundaries validated in $(seconds_since "$started") s, $n finding(s)"
+  while IFS= read -r key; do
+    case "$key" in
+      entity:recipe:*) BUILT["recipe/${key#entity:recipe:}"]=1 ;;
+      entity:feature_recipe:*) BUILT["featurerecipe/${key#entity:feature_recipe:}"]=1 ;;
+    esac
+  done < <(awk "$LOCK_KEYS_AWK" "$dir/${name%.yaml}.lock")
 }
 
 # judge_known — holds every finding to the known-findings file and the file to the
@@ -2114,6 +2271,7 @@ ST_CASES=(
   st_binary_missing
   st_binary_below_minimum
   st_binary_between_releases
+  st_builds_side_by_side
   st_validators_answer_pins
   st_arm_clean
   st_arm_wrong_type
@@ -2300,6 +2458,70 @@ st_stub_tofu() {
 }
 st_stub_cfn_lint() {
   printf '#!/bin/sh\necho "cfn-lint %s"\n' "$2" >"$1" && chmod +x "$1"
+}
+
+# st_stub_nproc FILE COUNT — an nproc counting COUNT processing units.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_stub_nproc() {
+  printf '#!/bin/sh\necho %s\n' "$2" >"$1" && chmod +x "$1"
+}
+
+# st_stub_aggrega_side_by_side FILE LOG — an aggrega answering the oldest version
+# this script accepts, and building a Release in the directory it runs in: a
+# negative one halts naming the planted fault, any other renders one boundary
+# holding nothing. While LOG/meet exists, each build first waits, ten seconds at
+# most, until another runs beside it, marking LOG/met once one does; a negative
+# one then takes half a second longer; and each adds its Release to LOG/ended as
+# it ends.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_stub_aggrega_side_by_side() {
+  local text
+  text="$(cat <<'END_OF_STUB'
+#!/bin/sh
+case "$1" in
+  version) printf '{"version": "@VERSION@", "commit": "0000000"}\n'; exit 0 ;;
+  build) ;;
+  *) exit 2 ;;
+esac
+log='@LOG@' release='' prev='' meet=0 status=0
+for arg in "$@"; do
+  [ "$prev" != --release ] || release="$arg"
+  prev="$arg"
+done
+if [ -e "$log/meet" ]; then
+  meet=1
+  : >"$log/running.$release"
+  n=0
+  until [ -e "$log/met" ] || [ "$n" -ge 100 ]; do
+    if [ "$(ls -- "$log" | grep -c '^running\.')" -ge 2 ]; then
+      : >"$log/met"
+    else
+      sleep 0.1
+      n=$((n + 1))
+    fi
+  done
+  rm -f -- "$log/running.$release"
+fi
+case "$release" in
+  release-negative-*)
+    [ "$meet" = 0 ] || sleep 0.5
+    echo "rendering halted: the planted fault"
+    status=1 ;;
+  *) mkdir -p dist/main ;;
+esac
+[ "$meet" = 0 ] || echo "$release" >>"$log/ended"
+exit "$status"
+END_OF_STUB
+)"
+  text="${text//@VERSION@/$PIN_AGGREGA_MIN}"
+  printf '%s\n' "${text//@LOG@/$2}" >"$1" && chmod +x "$1"
+}
+
+# st_untimed — standard input, with every time a run prints, <seconds> s, read
+# as N s.
+# shellcheck disable=SC2329 # called from the cases, which run by name from ST_CASES
+st_untimed() {
+  sed -E 's/[0-9]+\.[0-9] s/N s/g'
 }
 
 # st_cache HOME TOFU CFN_LINT [DIGEST] — a primed cache under HOME, for DIGEST
@@ -2591,6 +2813,54 @@ st_binary_between_releases() {
   { st_repo && st_cache "$home" "$PIN_TOFU_VERSION" "${PIN_PYTHON[cfn-lint]}"; } || { st_broken "make a cache"; return; }
   st_run --all HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-between-releases"
   st_passed "an aggrega build between releases, $PIN_AGGREGA_MIN-41-g697285c71-dirty, counted as $PIN_AGGREGA_MIN"
+}
+
+# Two Releases of one fixture, a negative one first in byte order and a positive
+# one, built by a run counting one processing unit, room for one build at a
+# time, then by a run counting three, room for two. The second prints what the
+# first prints, line for line but for the seconds, and exits as it does, though
+# in it the two builds run at once and the positive one ends first. Where this
+# bash or the memory available leaves room for one build at a time, the second
+# run builds one at a time too, and the outputs alone are compared.
+# shellcheck disable=SC2329 # a case, run by name from ST_CASES
+st_builds_side_by_side() {
+  local home="$ST_ROOT/home-$((ST_N + 1))" log="$ST_ROOT/side-by-side" fx serial serial_rc together=0
+  local label="a fixture's two Releases built side by side, the positive one ending first, reported as a run one at a time reports them"
+  { st_repo && st_cache "$home" "$PIN_TOFU_VERSION" "${PIN_PYTHON[cfn-lint]}" &&
+    fx="$ST_REPO/$PROOFS/terraform-google/probe" &&
+    printf 'kind: Release\n' >"$fx/release-negative-fault.yaml" &&
+    cp "$fx/release.lock" "$fx/release-negative-fault.lock" &&
+    printf 'the planted fault\n' >"$fx/release-negative-fault.expect" &&
+    git -C "$ST_REPO" add -- "$PROOFS" &&
+    mkdir -p "$log" "$ST_ROOT/one-unit" "$ST_ROOT/three-units" &&
+    st_stub_nproc "$ST_ROOT/one-unit/nproc" 1 && st_stub_nproc "$ST_ROOT/three-units/nproc" 3 &&
+    st_stub_aggrega_side_by_side "$ST_ROOT/bin/aggrega-side-by-side" "$log"; } ||
+    { st_broken "stage a second Release"; return; }
+  st_run --all HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-side-by-side" PATH="$ST_ROOT/one-unit:$PATH"
+  serial_rc="$ST_RC"
+  serial="$(st_untimed <<<"$ST_OUT")"
+  if [ "$serial_rc" -ne 0 ] ||
+    [[ $serial != *"/probe/release-negative-fault.yaml halts as its .expect says"*$'\n'*"/probe/release.yaml built in"* ]]; then
+    st_failed "$label" "the run one at a time to exit 0, reporting the negative Release, then the positive one"
+    return
+  fi
+  if [ "$(PATH="$ST_ROOT/three-units:$PATH" build_bound)" -ge 2 ]; then
+    together=1
+    : >"$log/meet" || { st_broken "write $log/meet"; return; }
+  fi
+  st_run --all HOME="$home" AGGREGA_BIN="$ST_ROOT/bin/aggrega-side-by-side" PATH="$ST_ROOT/three-units:$PATH"
+  if [ "$ST_RC" -ne "$serial_rc" ] || [ "$(st_untimed <<<"$ST_OUT")" != "$serial" ]; then
+    ST_OUT="$(diff <(printf '%s\n' "$serial") <(st_untimed <<<"$ST_OUT"))"
+    st_failed "$label" "exit $serial_rc and the output of the run one at a time"
+    return
+  fi
+  if [ "$together" = 1 ] && { [ ! -e "$log/met" ] || [ "$(head -n 1 "$log/ended")" != release.yaml ]; }; then
+    ST_OUT="the builds ended in this order: $(tr '\n' ' ' <"$log/ended")"
+    [ -e "$log/met" ] || ST_OUT="the two builds never ran at once; $ST_OUT"
+    st_failed "$label" "the two builds to run at once, the positive one ending first"
+    return
+  fi
+  st_passed "$label"
 }
 
 # The cache this script runs from, not a copy: each validator it holds answers the
@@ -3540,8 +3810,9 @@ case "$MODE" in
     [ "$SELF_TEST" = 0 ] || staged_self_test
     : >"$TMP/findings" || no_verdict "cannot write $TMP/findings"
     for fx in ${FIXTURES[@]+"${FIXTURES[@]}"}; do
-      [ -z "${SELECTED[$fx]+set}" ] || check_fixture "$fx"
+      [ -z "${SELECTED[$fx]+set}" ] || queue_fixture "$fx"
     done
+    build_fixtures
     judge_known
     [ "$REFUSED" -eq 0 ] || exit 1
     if [ "$MODE" = all ]; then
