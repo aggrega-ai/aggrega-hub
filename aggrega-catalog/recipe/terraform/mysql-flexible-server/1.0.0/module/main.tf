@@ -22,13 +22,17 @@ terraform {
 # nothing else: no network, subnet, DNS zone, firewall rule or resource group,
 # each of which belongs to the operator.
 #
-# The storage keeps the size the caller gives: it does not grow on its own as
-# it fills, so the next plan never finds it larger than the configuration says,
-# which the service could not shrink back.
+# The server is created with the storage size the caller gives, and storage
+# auto-grow is on: the service grows the storage as it fills, which keeps a full
+# server from turning read-only, and the service keeps auto-grow on for every
+# server with high availability. Storage the service has grown cannot be shrunk,
+# so the size the service reports afterwards is not read back as a change to
+# undo, and a later change to storage_size_gb is not applied to a server that
+# exists.
 #
 # A server with zone-redundant high availability swaps its primary and standby
 # zones when it fails over, so the zones the service reports afterwards are not
-# read back as changes to undo.
+# read back as changes to undo either.
 resource "azurerm_mysql_flexible_server" "this" {
   name                   = var.name
   resource_group_name    = var.resource_group_name
@@ -46,7 +50,7 @@ resource "azurerm_mysql_flexible_server" "this" {
 
   storage {
     size_gb           = var.storage_size_gb
-    auto_grow_enabled = false
+    auto_grow_enabled = true
   }
 
   dynamic "high_availability" {
@@ -57,7 +61,7 @@ resource "azurerm_mysql_flexible_server" "this" {
   }
 
   lifecycle {
-    ignore_changes = [zone, high_availability[0].standby_availability_zone]
+    ignore_changes = [zone, high_availability[0].standby_availability_zone, storage[0].size_gb]
   }
 }
 

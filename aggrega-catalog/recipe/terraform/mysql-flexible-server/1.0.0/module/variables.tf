@@ -66,7 +66,7 @@ variable "backup_retention_days" {
 
 variable "storage_size_gb" {
   type        = number
-  description = "Storage provisioned for the server, in GiB, 20 to 16384."
+  description = "Storage the server is created with, in GiB, 20 to 16384; the service grows it from there."
 }
 
 variable "high_availability_mode" {
