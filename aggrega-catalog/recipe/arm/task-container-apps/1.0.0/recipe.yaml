@@ -1,0 +1,193 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: task-container-apps
+  version: 1.0.0
+  # The licence of the vendored module, the Azure Verified Modules programme's
+  # Container Apps job module: the third-party template this Recipe pins and
+  # wraps in the output. The job it creates is a service the reader contracts
+  # for directly with Microsoft, under Azure's terms.
+  license: MIT
+  description: >
+    The generic ephemeral compute primitive as an Azure Container Apps job
+    running the Release's image to completion, deployed from an Azure
+    Resource Manager template through Microsoft's Azure Verified Modules
+    module avm/res/app/job at 0.7.2, MIT, fetched from mcr.microsoft.com and
+    pinned by digest in entity.lock; ContainerAppParameters binds its
+    parameters. Reach for it where the Release deploys an Azure Resource
+    Manager template, and for terraform/task-container-apps where it deploys
+    Terraform.
+
+    A scheduled task runs on its schedule, evaluated in UTC. A task with no
+    schedule carrying core/manual-trigger is deployed without starting, for
+    the operator to start each run with az containerapp job start; any other
+    unscheduled task is refused by name, as nothing on Azure starts it.
+
+    The environment is the operator's, required under infra.overrides;
+    user-assigned identities, a private registry and Key Vault secrets are
+    optional. The template holds one nested deployment, which creates only
+    the job; the module's telemetry resource, which reports to Microsoft by
+    default, is turned off.
+
+    Each env entry an inject block dictates becomes a container variable;
+    timeout arrives by default as TASK_TIMEOUT, for the code to honour.
+    Container Apps stops a run at the job's replica timeout, 30 minutes
+    unless infra.overrides.replica_timeout_in_seconds sets another, whatever
+    timeout says. A value declared sensitive halts the build: keep it in Key
+    Vault and name it under infra.overrides.secrets. The job runs at the
+    smallest Consumption size meeting infra.compute; an infra.overrides key
+    this Recipe does not read halts.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: arm
+  implements: core/compute/task:1.0.1
+
+  # The module's compiled template, as the Azure Verified Modules programme
+  # publishes it to its registry at version 0.7.2, the module Bicep names
+  # br/public:avm/res/app/job:0.7.2. `aggrega pin` records the digests of its
+  # manifest and of its template layer in entity.lock, and every build reads
+  # exactly those bytes. The provider reads the template, main.json, and wraps
+  # it as one nested deployment. Its parameters carry everything this Recipe
+  # binds: the environment, the containers, the trigger and its configuration,
+  # the replica timeout, the identities, the registries, the secrets and the
+  # telemetry switch.
+  source:
+    kind: bicep-module-oci
+    url: oci://mcr.microsoft.com/bicep/avm/res/app/job
+    version: 0.7.2
+
+  # This Recipe reads from infra.overrides:
+  #   container_app_environment_id - string (environmentResourceId; location), required
+  #   identity_ids                 - []string (managedIdentities.userAssignedResourceIds)
+  #   registry_server              - string (registries[0].server)
+  #   registry_identity            - string (registries[0].identity)
+  #   registry_username            - string (registries[0].username)
+  #   registry_password_secret_id  - string (a secrets entry's keyVaultUrl)
+  #   registry_password_identity   - string (that secrets entry's identity)
+  #   secrets                      - map[string]{origin: string, identity: string} (secrets; containers[0].env)
+  #   replica_timeout_in_seconds   - integer (replicaTimeout; default 1800)
+  #   registry_password            - refused: the password is read from Key Vault
+  #   enable_telemetry             - refused while true: telemetry is always off
+  # location and resource_group_name are admitted and not read: the job runs
+  # in its environment's region, read from the environment when the template
+  # deploys, and is created in the resource group the template is deployed
+  # to. terraform/task-container-apps requires both, so one set of overrides
+  # serves the two Recipes.
+  #
+  # Each key but secrets is the one terraform/task-container-apps reads for
+  # the same concept, under the same spelling, so an operator writes one set of
+  # overrides across both; the module parameter each sets is given in brackets.
+  # secrets is named after the module's own secrets parameter, as
+  # arm/server-container-apps and arm/worker-container-apps read it. Those
+  # Recipes read every key above but replica_timeout_in_seconds under the same
+  # names, and ContainerAppParameters#/mappings/JobParameters sets out how each
+  # is read: the environment by its resource ID, which also gives the job its
+  # region; the identities, registry and Key Vault secrets by reference, so no
+  # identity is created and no credential's value is written into the
+  # template.
+  #
+  # How a run starts. With values.schedule set, the job's trigger is Schedule:
+  # Container Apps starts an execution on it, reading it as a cron expression
+  # of the fields minute, hour, day of the month, month and day of the week,
+  # evaluated in UTC, and Container Apps offers no other time zone for a job.
+  # The expression is passed as it is written, and Container Apps judges it
+  # when the template deploys. With no schedule the trigger is Manual, and the
+  # template creates the job without starting an execution: a task carrying
+  # core/manual-trigger asked for exactly that, and the operator starts each
+  # run with az containerapp job start --name <component> --resource-group
+  # <the group the template is deployed to>, which takes a role allowed to
+  # start the job. The attachment is realized through a FeatureRecipe for arm
+  # that the Manifest binds to core/manual-trigger, and a Manifest binding none
+  # halts the build, naming the attachment. A scheduled job can be started by
+  # hand too. A task with no schedule and no core/manual-trigger attachment
+  # asks for a run when the Release deploys, which nothing here starts, so it
+  # is refused by name.
+  #
+  # The deadline. Container Apps requires a replica timeout of every job and
+  # stops a replica still running when it passes: replica_timeout_in_seconds,
+  # a whole number of seconds, 1 or more, and 1800 seconds, 30 minutes, the
+  # module's own default, where it is unset. It is independent of
+  # values.timeout, which reaches the container as a variable for the code to
+  # honour and sets no deadline of its own: an operator wanting Container Apps
+  # to stop a run when the code's own timeout passes sets
+  # replica_timeout_in_seconds to match it. Each
+  # execution runs one replica, and the module's default replica retry limit,
+  # 0, stands, so a failed replica is not retried.
+  #
+  # The nested deployment's symbolic name and its name are folded from the
+  # instance id, and the job is named after the component, so a redeploy
+  # updates the job.
+  #
+  # Every Component value and infra key is honoured, refused by name in
+  # ContainerAppParameters#/mappings/JobParameters and the assertions below, or
+  # not read:
+  #   honoured — values.schedule as the job's schedule; values.timeout as the
+  #     locals below say; infra.image (required); infra.compute.cpu and
+  #     infra.compute.memory as the Consumption size that entry chooses; the
+  #     overrides above; and env entries.
+  #   refused — a task with no schedule and no core/manual-trigger
+  #     attachment; any infra.overrides key not listed above, registry_password
+  #     and enable_telemetry while true; an override that is not of the form
+  #     above; a compute quantity that entry cannot read, and a pair larger
+  #     than the largest size; a component name Container Apps does not take
+  #     for a job; a variable under a name Container Apps sets in every job
+  #     itself, or under TASK_TIMEOUT while the timeout is delivered under that
+  #     default name, or one both delivered and named in secrets; a value
+  #     declared sensitive, delivered or published by a target the component
+  #     connects to; and a file, arg or custom-mechanism entry.
+  #   not read — values.display_name and values.description, documentation
+  #     knobs no Azure setting takes; infra.overrides.location and
+  #     resource_group_name, as above.
+  assertions:
+    overrides_known: >-
+      {{- $known := list "container_app_environment_id" "identity_ids" "registry_server" "registry_identity" "registry_username" "registry_password_secret_id" "registry_password_identity" "secrets" "replica_timeout_in_seconds" "location" "resource_group_name" "enable_telemetry" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (or (has $k $known) (eq $k "registry_password")) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads container_app_environment_id, identity_ids, registry_server, registry_identity, registry_username, registry_password_secret_id, registry_password_identity, secrets and replica_timeout_in_seconds from infra.overrides, admits location, resource_group_name and enable_telemetry false without reading them, and takes no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # A run that happens once has nothing on Azure to start it, so it halts
+    # here. A task carrying core/manual-trigger asked for a run nothing starts
+    # until the operator does, so it is not refused for having no schedule.
+    # The attachment is found by its Feature's type, with any version it was
+    # authored with set aside. Nothing else reads it: a scheduled task renders
+    # alike with the attachment or without. registry_password, and
+    # enable_telemetry while true, pass the assertion above and are refused by
+    # name in ContainerAppParameters#/mappings/JobParameters.
+    run_is_started: >-
+      {{- $s := trim (toString (optional .values "schedule" "")) -}}
+      {{- $manual := false -}}
+      {{- range $name, $attachment := optional . "features" dict -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/manual-trigger" }}{{ $manual = true }}{{ end -}}
+      {{- end -}}
+      {{- if and (not $s) (not $manual) -}}
+      {{- fail (printf "the component %q has no schedule and carries no core/manual-trigger attachment, so it runs once, and nothing on Azure starts a run that happens once: Azure Resource Manager deploys a Container Apps job with no schedule without starting an execution, so the run would never happen. Give the component a schedule in the Aggregate; attach core/manual-trigger to it there to deploy the job alone, for the operator to start each run with az containerapp job start; or map core/compute/task to helm/task in the Manifest, which runs it once on Kubernetes" .metadata.instance_id) -}}
+      {{- end -}}
+
+  # Target-expected names: the image is the Release's, so no upstream
+  # documentation names a spelling for the developer's timeout value. It is
+  # delivered under the name helm/task delivers it under, and only when the
+  # developer set it: a value set, even empty, renders its variable, and an
+  # unset value renders none. That name is a default: it is rendered only while
+  # no entry of the component's own inject block, in any mechanism, delivers the
+  # timeout, and an edge or that block delivering that name as well halts,
+  # naming which, rather than one value silently replacing the other. The
+  # schedule is not delivered as a variable: it becomes the job's schedule. The
+  # component packages no upstream product, so no other local
+  # ContainerAppParameters reads is declared: no default image, so the Release
+  # names the one it runs; no port, so the job's container is probed on none;
+  # no probe path, no GPU and no socket.
+  locals:
+    value_env: '{"values.timeout": "TASK_TIMEOUT"}'
+
+  # The component publishes nothing across an edge, so nothing is emitted for
+  # one.
+  provides: {}
+
+  valuesMapping:
+    $import: ContainerAppParameters#/mappings/JobParameters
