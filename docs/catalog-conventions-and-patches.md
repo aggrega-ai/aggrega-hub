@@ -2445,6 +2445,19 @@ moves when its publisher releases a version admitting azurerm 5. Published bodie
 declare another string, a range or an exact version, stay as published; a published
 version is final.
 
+One exception is narrow. A shared body that re-versions a published body keeps that
+body's range, so a Release holding the published version upgrades in place: the two
+Terraform Container Apps bodies of `ContainerAppModule`, `App` and `Job`, declare
+**`>= 4.18, < 6`**, the range of `terraform/server-container-apps` 1.1.0 and
+`terraform/worker-container-apps` 1.0.0. A root takes the highest version every
+constraint in it admits, so these bodies beside `terraform/postgres-flexible-server`
+1.0.0 select azurerm 4 and beside bodies at `~> 5.14` select azurerm 5.14. The catalog
+validates such a body under the newest release of each major its range admits, 4.81.0
+and 5.14.0, and two fixtures do: `proofs/terraform-azurerm/container-service/release.yaml`
+selects 5.14.0, and `release-postgres-boundary.yaml`, which holds the bodies beside
+`terraform/postgres-flexible-server` 1.0.0, selects 4.81.0. Every other Azure body keeps
+`~> 5.14`.
+
 Every Recipe the catalog authors that wraps an Azure Verified Module turns the module's
 telemetry off: `enableTelemetry: false` for a Bicep module (see "A published Bicep
 module") and `enable_telemetry = false` for a Terraform one. A Recipe may offer
@@ -2719,11 +2732,10 @@ An `arg` entry and any custom mechanism are refused on every target.
   on Azure Resource Manager the module's default retry limit, 0, stands, so it is not
   retried.
 
-The Container Apps bodies on Terraform declare the constraint of "One Azure provider
-constraint for every Azure body", so a boundary holding one cannot also hold a
-Recipe whose constraint admits no azurerm release at 5.14 or later:
-`terraform/postgres-flexible-server` 1.0.0 (azurerm 4) and
-`terraform/azure-api-management` 1.0.0 (exactly 5.9.0).
+The Container Apps bodies on Terraform declare `>= 4.18, < 6`, the exception stated in
+"One Azure provider constraint for every Azure body", so one boundary holds them beside
+`terraform/postgres-flexible-server` 1.0.0 (azurerm 4), `terraform/azure-api-management`
+1.0.0 (exactly 5.9.0), `terraform/redis-azure-managed` and the Azure OpenAI Recipes.
 
 **A job's schedule.** The Cloud Run and Container Apps `Job` entries, on Terraform and on
 Azure Resource Manager, pass `values.schedule` to the service as it is written: they
