@@ -2421,7 +2421,7 @@ there. This is a convention whose enforcement is not implemented, because
 
 The same rule holds for Azure, with its own string. Every Terraform body the catalog
 authors for Azure declares `hashicorp/azurerm` in its `required_providers` block as
-**`~> 5.14`**, one string in every such body, carried by each body with a comment naming
+**`~> 5.14`**, one string in every such body except as stated below for a shared body that re-versions a published one, carried by each body with a comment naming
 this section, for the reasons the AWS section gives. The major and minor are those of the
 provider's current release when the constraint is set, and never lower than the highest
 `hashicorp/azurerm` floor declared by a published Azure module a catalog Recipe sources
@@ -2446,14 +2446,14 @@ declare another string, a range or an exact version, stay as published; a publis
 version is final.
 
 One exception is narrow. A shared body that re-versions a published body keeps that
-body's range, so a Release holding the published version upgrades in place: the two
+body's range, so a Release holding the published version upgrades in place: the
 Terraform Container Apps bodies of `ContainerAppModule`, `App` and `Job`, declare
 **`>= 4.18, < 6`**, the range of `terraform/server-container-apps` 1.1.0 and
 `terraform/worker-container-apps` 1.0.0. A root takes the highest version every
 constraint in it admits, so these bodies beside `terraform/postgres-flexible-server`
 1.0.0 select azurerm 4 and beside bodies at `~> 5.14` select azurerm 5.14. The catalog
 validates such a body under the newest release of each major its range admits, 4.81.0
-and 5.14.0, and two fixtures do: `proofs/terraform-azurerm/container-service/release.yaml`
+and 5.14.0, and these fixtures prove it: `proofs/terraform-azurerm/container-service/release.yaml`
 selects 5.14.0, and `release-postgres-boundary.yaml`, which holds the bodies beside
 `terraform/postgres-flexible-server` 1.0.0, selects 4.81.0. Every other Azure body keeps
 `~> 5.14`.
