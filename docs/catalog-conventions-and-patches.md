@@ -2724,9 +2724,10 @@ An `arg` entry and any custom mechanism are refused on every target.
   connection whose target publishes a `provides` key declared sensitive halts the
   build there, naming the parameters. The route for such a credential is Key Vault,
   named under `infra.overrides.secrets`.
-- A Container Apps job runs with a deadline of 30 minutes on each execution, this
-  realization's choice, because Container Apps requires a replica timeout of every
-  job.
+- A Container Apps job runs with a deadline on each execution, because Container
+  Apps requires a replica timeout of every job: `infra.overrides.replica_timeout_in_seconds`,
+  a whole number of seconds, 1 or more, where the Release sets it, and otherwise 30
+  minutes, this realization's choice.
 - A failed replica of a job is retried as each target leaves it: the Terraform `Job`
   body sets no retry limit, so whether it is retried is left to Container Apps, while
   on Azure Resource Manager the module's default retry limit, 0, stands, so it is not
