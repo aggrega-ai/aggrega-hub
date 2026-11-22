@@ -1,0 +1,352 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: redis-memorystore
+  version: 1.0.0
+  description: >
+    Redis on Google Cloud Memorystore for Redis, as one instance reached from
+    the operator's VPC network, rendered by vendoring a Terraform module kept
+    beside this Recipe. The terraform-google-modules project's Memorystore
+    module is not sourced, because it calls a module from the Terraform
+    registry, which initialising it would fetch outside any pin.
+
+    Reach for it where the cache is a Memorystore for Redis instance in the
+    operator's Google Cloud project; reach for terraform/redis-elasticache on
+    AWS, terraform/redis-azure-managed on Azure, and terraform/valkey-memorystore
+    for Valkey on Google Cloud.
+
+    The project, region, network and capacity are the operator's, named in
+    infra.overrides.project_id, region, private_network and memory_size_gb;
+    the Recipe emits no network. infra.overrides.tier chooses BASIC, one node,
+    the default, or STANDARD_HA, with a replica it fails over to. The cache
+    runs without authentication, so the private network alone gates it: the
+    service accepts no password a Release supplies, and an attached password
+    halts naming the slot.
+
+    host publishes a reference to the instance's primary endpoint, or the DNS
+    name in infra.overrides.host; port is 6379. With infra.client_tls true the
+    service serves TLS alone on 6378, which port then publishes, with the
+    instance's own certificate authority, and protocol is redis-tls.
+    infra.engine_version must name a version the service offers, so the
+    Component's default halts here, and so does each value the service cannot
+    apply.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/redis:1.0.0
+
+  # The module this Recipe vendors lives beside it, and is copied verbatim into
+  # the component's own directory; entity.lock pins its files. Its main.tf pins
+  # hashicorp/google by the one range every Google body in this catalog
+  # declares, says why, and keeps to the Terraform 1.5 language those bodies
+  # keep to.
+  #
+  # The terraform-google-modules project publishes a Memorystore module,
+  # terraform-google-modules/memorystore/google, at v16.4.1 its newest version.
+  # Its root, the Redis instance module, calls terraform-google-modules/project-factory/google's
+  # project_services module from the Terraform registry, so initialising it
+  # fetches that module at whatever the registry then serves, which neither
+  # this Recipe's lock nor Terraform's own covers. It is therefore not sourced,
+  # and the instance is declared here instead. The module enables no Google
+  # API: the operator enables the Memorystore for Redis API in the project.
+  #
+  # The body is a module the Recipe sources rather than an artifacts: body
+  # because its outputs, the primary endpoint's address, are referenced from
+  # the boundary's root configuration, where a source: Recipe's valuesMapping
+  # becomes the arguments of its module block.
+  source: ./module
+
+  locals:
+    # The Redis version, the major and minor version infra.engine_version
+    # begins with: 7.2 from 7.2 or 7.2.4. Memorystore for Redis takes it
+    # spelled REDIS_7_2, and its 6.x line, Redis 6.2, as REDIS_6_X.
+    engine_version: '{{ regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version) }}'
+    # The service tier, infra.overrides.tier or BASIC, the service's own
+    # default: one node with no replica.
+    tier: '{{ optional (optional .infra "overrides" dict) "tier" "BASIC" }}'
+    # The name the Release gives the instance under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   project_id      - string (project), required
+  #   region          - string (region), required
+  #   private_network - string (authorized_network), required
+  #   memory_size_gb  - integer (memory_size_gb), required
+  #   tier            - string (tier; default "BASIC")
+  #   replica_count   - integer (replica_count, with read_replicas_mode; STANDARD_HA alone)
+  #   host            - string (published as provides.host; not passed to the module)
+  #
+  # project_id, region, private_network, replica_count and host are the keys,
+  # under the same names, that terraform/valkey-memorystore reads for the same
+  # concepts; memory_size_gb and tier are named for the resource arguments
+  # they set. project_id, region and private_network are required: they place
+  # the instance in the operator's project, region and network, and this
+  # Recipe never chooses any of them. private_network is the network's
+  # resource link, projects/<project>/global/networks/<name>; the instance
+  # connects to it by direct peering, which the service sets up when it
+  # creates the instance. memory_size_gb is required too: it is the
+  # instance's capacity, 1 to 300 GiB, and no Component value sizes it.
+  #
+  # tier is BASIC, one node, or STANDARD_HA, a primary and one replica in
+  # another zone it fails over to. replica_count, on a STANDARD_HA instance,
+  # is that replica count: 1, the service's own, or 2 to 5, which the service
+  # runs as read replicas, offered from Redis 5.0 on an instance of 5 GiB or
+  # more; a BASIC instance takes no replica.
+  #
+  # node_type, which terraform/valkey-memorystore reads, is not read, and the
+  # assertion admitting the keys above refuses it by name: Memorystore for
+  # Redis sizes an instance by memory_size_gb and its tier.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against Memorystore for Redis's own documentation:
+  #   honoured — values.maxmemory, as the instance's maxmemory-gb, converted
+  #     to GiB from the value's Redis units, 20% to 100% of memory_size_gb, the
+  #     share the service takes; values.maxmemory_policy and values.databases,
+  #     as the configurations of those names, with the policies and range of 1
+  #     to 100 the service takes; values.persistence.enabled, as RDB
+  #     persistence with an hourly snapshot; infra.engine_version (major and
+  #     minor, among the versions the service offers); infra.client_tls; and
+  #     the overrides above.
+  #   refused — values.appendonly true, since the service keeps RDB snapshots
+  #     alone; infra.port other than 6379, the Component's default; a
+  #     maxmemory, a maxmemory policy or a database count the service does not
+  #     take; a component name the service does not take for an instance; an
+  #     attachment to server_certificate; a password as set out below; and any
+  #     other key under infra.overrides.
+  #   not read — infra.port while it is 6379; infra.compute.cpu and
+  #     infra.compute.memory, and infra.storage.size and infra.storage.type,
+  #     whose Component defaults size a container and its volume: the service
+  #     sizes the instance by infra.overrides.memory_size_gb and provisions no
+  #     volume, and a Recipe cannot tell those defaults from a value the
+  #     Release wrote, so the Component's descriptions say so instead.
+  #     infra.image_serves_vector_search, which describes an image this Recipe
+  #     does not run.
+  #
+  # Authentication is off. Memorystore for Redis's AUTH runs on an AUTH string
+  # the service generates for itself, and takes no password a Release
+  # supplies, so an attached password halts naming the slot rather than render
+  # a credential that protects nothing. The private network and the operator's
+  # firewall are what gate the cache.
+  #
+  # With infra.client_tls true the instance encrypts in transit, serves TLS
+  # alone on port 6378, and presents a certificate from the instance's own
+  # certificate authority. A consumer checks it against that authority, which
+  # its server_ca slot takes as a Secret holding the chain under ca.crt: the
+  # operator reads it with gcloud redis instances describe, or from the
+  # module's server_ca output in the Terraform state, once the instance
+  # exists.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "project_id" "region" "private_network" "memory_size_gb" "tier" "replica_count" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "node_type" -}}
+      {{- fail "infra.overrides.node_type is set, and Memorystore for Redis sizes an instance by its capacity and tier, not by a node type: remove infra.overrides.node_type from the Release, and set infra.overrides.memory_size_gb, and infra.overrides.tier for a replica, instead" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads project_id, region, private_network, memory_size_gb, tier, replica_count and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    project_region_network_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "project_id" "region" "private_network" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release places its Memorystore instance in the operator's own Google Cloud project, region and VPC network, and this Recipe never chooses any of them, but infra.overrides.%s carries none: set infra.overrides.project_id, infra.overrides.region and infra.overrides.private_network in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+    private_network_is_a_link: >-
+      {{- $n := toString (optional (optional .infra "overrides" dict) "private_network" "") -}}
+      {{- if and $n (not (regexMatch `^projects/[^/]+/global/networks/[^/]+$` $n)) -}}
+      {{- fail (printf "infra.overrides.private_network is %q, and Memorystore for Redis takes the VPC network its instance is reached from as the network's resource link: set it to projects/<project>/global/networks/<name>" $n) -}}
+      {{- end -}}
+    memory_size_gb_offered: >-
+      {{- $m := toString (optional (optional .infra "overrides" dict) "memory_size_gb" "") -}}
+      {{- if not (and (regexMatch `^[0-9]+$` $m) (ge (atoi $m) 1) (le (atoi $m) 300)) -}}
+      {{- fail (printf "infra.overrides.memory_size_gb is %q, and it is the capacity of the Memorystore for Redis instance, which no Component value sizes, a whole number of GiB from 1 to 300: set it in the Release, such as 1" $m) -}}
+      {{- end -}}
+    tier_offered: >-
+      {{- if not (has .locals.tier (list "BASIC" "STANDARD_HA")) -}}
+      {{- fail (printf "infra.overrides.tier is %q, and Memorystore for Redis offers the BASIC tier, one node, and the STANDARD_HA tier, a primary and a replica it fails over to: set it to one of them, or leave it unset for BASIC" .locals.tier) -}}
+      {{- end -}}
+    # A STANDARD_HA instance runs one replica unless read replicas are on,
+    # which run 1 to 5 and are on only from Redis 5.0, on an instance of 5 GiB
+    # or more; a BASIC instance runs none.
+    replicas: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "replica_count" -}}
+      {{- $r := toString $o.replica_count -}}
+      {{- if eq .locals.tier "BASIC" -}}
+      {{- if ne $r "0" -}}
+      {{- fail (printf "infra.overrides.replica_count is %s, and a BASIC Memorystore for Redis instance runs one node with no replica: remove infra.overrides.replica_count from the Release, or set infra.overrides.tier to STANDARD_HA" $r) -}}
+      {{- end -}}
+      {{- else -}}
+      {{- if not (and (regexMatch `^[0-9]+$` $r) (ge (atoi $r) 1) (le (atoi $r) 5)) -}}
+      {{- fail (printf "infra.overrides.replica_count is %s, and a STANDARD_HA Memorystore for Redis instance runs 1 to 5 replicas: set it to a whole number from 1 to 5, or leave it unset for one replica" $r) -}}
+      {{- end -}}
+      {{- if gt (atoi $r) 1 -}}
+      {{- $m := toString (optional $o "memory_size_gb" "") -}}
+      {{- if and (regexMatch `^[0-9]+$` $m) (lt (atoi $m) 5) -}}
+      {{- fail (printf "infra.overrides.replica_count is %s, and Memorystore for Redis runs more than one replica as read replicas, which it offers on an instance of 5 GiB or more, while infra.overrides.memory_size_gb is %s: set memory_size_gb to 5 or more, or replica_count to 1" $r $m) -}}
+      {{- end -}}
+      {{- if has .locals.engine_version (list "3.2" "4.0") -}}
+      {{- fail (printf "infra.overrides.replica_count is %s, and Memorystore for Redis runs more than one replica as read replicas, which it offers from Redis 5.0, while infra.engine_version is %q: set infra.engine_version to 5.0 or later, or replica_count to 1" $r (toString .infra.engine_version)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this cache reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the instance serves port 6379, or 6378 with infra.client_tls` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The instance is named after the component, as the other managed Recipes
+    # name theirs, so the name is checked here, where it is known, against the
+    # rule the Google Cloud provider holds an instance ID to.
+    instance_id_allowed: >-
+      {{- if not (regexMatch `^[a-z][a-z0-9-]{0,39}[a-z0-9]$` .metadata.instance_id) -}}
+      {{- fail (printf "the component %q names its Memorystore instance, and an instance ID is 2 to 41 lowercase letters, digits and hyphens, starting with a letter and ending with a letter or digit: rename the component in the Aggregate to such a name" .metadata.instance_id) -}}
+      {{- end -}}
+    # The Redis versions Memorystore for Redis offers, read off its
+    # supported-versions page; its 6.x line runs Redis 6.2. A version it adds
+    # later is refused here until this list names it.
+    engine_version_offered: >-
+      {{- if not (has .locals.engine_version (list "3.2" "4.0" "5.0" "6.2" "7.0" "7.2")) -}}
+      {{- fail (printf "infra.engine_version is %q, and Memorystore for Redis runs Redis 3.2, 4.0, 5.0, 6.2, 7.0 and 7.2, which this Recipe reads off the major and minor version the value begins with; the Component's default is an image tag naming a release the service does not run: set infra.engine_version in the Release to one of them, such as 7.2" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    port_is_the_service_port: >-
+      {{- if ne (int .infra.port) 6379 -}}
+      {{- fail (printf "infra.port is %v, and Memorystore for Redis serves an instance on port 6379, or 6378 with infra.client_tls, which this Recipe publishes as port: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+    # maxmemory in Redis's own units, b, k, kb, m, mb, g or gb, is converted to
+    # the GiB the service's maxmemory-gb takes, written as the shortest
+    # decimal that reads back as the same number, such as 0.5 for 512mb; the
+    # service takes 20% to 100% of the instance's capacity. Whether it takes
+    # every such decimal, such as 0.9313225746154785 for 1000m, is the apply's
+    # to judge.
+    engine_configs_accepted: >-
+      {{- with optional .values "maxmemory" "" -}}
+      {{- $s := lower (toString .) -}}
+      {{- if not (regexMatch `^[0-9]+(b|k|kb|m|mb|g|gb)?$` $s) -}}
+      {{- fail (printf "values.maxmemory is %q, and this Recipe converts maxmemory to the GiB Memorystore for Redis takes from a number of bytes or a number followed by k, kb, m, mb, g or gb: set values.maxmemory to such a value, such as 512mb" (toString .)) -}}
+      {{- end -}}
+      {{- $cap := toString (optional (optional $.infra "overrides" dict) "memory_size_gb" "") -}}
+      {{- if regexMatch `^[0-9]+$` $cap -}}
+      {{- $unit := regexReplaceAll `^[0-9]+` $s "" -}}
+      {{- $mult := get (dict "" 1 "b" 1 "k" 1000 "kb" 1024 "m" 1000000 "mb" 1048576 "g" 1000000000 "gb" 1073741824) $unit -}}
+      {{- $gib := divf (mul (atoi (regexFind `^[0-9]+` $s)) $mult) 1073741824 -}}
+      {{- if or (lt $gib (mulf 0.2 (atoi $cap))) (gt $gib (float64 (atoi $cap))) -}}
+      {{- fail (printf "values.maxmemory is %q, %v GiB, and Memorystore for Redis takes a maxmemory of 20%% to 100%% of the instance's capacity, which infra.overrides.memory_size_gb sets to %s GiB: set values.maxmemory within that range, or remove it to use the whole capacity" (toString .) $gib $cap) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- with optional .values "maxmemory_policy" "" -}}
+      {{- if not (has (toString .) (list "noeviction" "allkeys-lru" "volatile-lru" "allkeys-random" "volatile-random" "volatile-ttl" "volatile-lfu" "allkeys-lfu")) -}}
+      {{- fail (printf "values.maxmemory_policy is %q, and Memorystore for Redis takes noeviction, allkeys-lru, volatile-lru, allkeys-random, volatile-random, volatile-ttl, volatile-lfu and allkeys-lfu: set values.maxmemory_policy to one of them" (toString .)) -}}
+      {{- end -}}
+      {{- if and (hasSuffix "-lfu" (toString .)) (eq $.locals.engine_version "3.2") -}}
+      {{- fail (printf "values.maxmemory_policy is %q, and Memorystore for Redis offers the LFU policies from Redis 4.0, while infra.engine_version is %q: set infra.engine_version to 4.0 or later, or choose another policy" (toString .) (toString $.infra.engine_version)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- with optional .values "databases" "" -}}
+      {{- if gt (int .) 100 -}}
+      {{- fail (printf "values.databases is %v, and Memorystore for Redis takes up to 100 databases: set values.databases to 100 or fewer" .) -}}
+      {{- end -}}
+      {{- end -}}
+    # Memorystore for Redis persists an instance by RDB snapshots alone and
+    # writes no append-only file.
+    persistence_offered: >-
+      {{- if .values.appendonly -}}
+      {{- fail "values.appendonly is true, and Memorystore for Redis persists an instance by RDB snapshots alone and writes no append-only file: remove values.appendonly from the Aggregate, and set values.persistence.enabled for an hourly RDB snapshot" -}}
+      {{- end -}}
+    tls_and_credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "server_certificate" -}}
+      {{- fail "a certificate is attached to the server_certificate slot, and Memorystore for Redis presents a certificate from the instance's own certificate authority, which takes none: remove the attachment; infra.client_tls alone turns TLS on here" -}}
+      {{- end -}}
+      {{- if hasKey $f "password" -}}
+      {{- fail "a password is attached to the password slot, and Memorystore for Redis accepts no password a Release supplies: its AUTH runs on an AUTH string the service generates, so this Recipe runs the cache without authentication, gated by the private network alone: remove the attachment, and restrict who reaches the cache with the network's firewall rules" -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the module's host output — the address of the instance's primary endpoint
+  # in the operator's network, which takes reads and writes — through this
+  # component's module call, which the boundary's root configuration declares
+  # under .context.instance_id for a component declared in the Aggregate the
+  # Release deploys. Terraform resolves it at apply time, so it resolves only
+  # for a consumer authored as a source: Recipe in the same root
+  # configuration; a consumer on another target receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record for it, so the operator points the name at the instance outside
+  # the Release. A consumer in the same root configuration receives the name as
+  # well, and a name carries no reference for Terraform to order its module
+  # after this one by; a later syncWave on the consumer's boundary, sharing
+  # this boundary's directory, orders the two. A consumer checking the
+  # instance's certificate needs a name the certificate carries, which the
+  # operator's own name may not be.
+  #
+  # port is 6379, where the service serves the instance, or 6378 while
+  # infra.client_tls is on, when the instance serves TLS alone there. protocol
+  # is redis, or redis-tls while infra.client_tls is on. vector_search is
+  # published empty: the service runs a vector search of its own on Redis 7.2,
+  # and whether it serves the query engine's FT.CREATE and FT.SEARCH as a
+  # semantic cache issues them is not established here, so a gateway wired to
+  # this instance as its cache store halts rather than relying on it.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.host}{{ end }}"
+    port: "{{ if .infra.client_tls }}6378{{ else }}6379{{ end }}"
+    protocol: "{{ if .infra.client_tls }}redis-tls{{ else }}redis{{ end }}"
+    vector_search: ""
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # instance is named after the component. redis_configs carries only the
+  # values the Aggregate sets, so an instance with none keeps the service's
+  # own configuration; maxmemory-gb is the value of values.maxmemory in GiB.
+  # replica_count and read_replicas_mode are passed only for 2 to 5 replicas
+  # on a STANDARD_HA instance, which the service runs as read replicas; the
+  # service's own single replica needs neither. The databases configuration
+  # is set when the instance is created, and the service does not change it
+  # afterwards.
+  valuesMapping: |
+    {{- $o := optional .infra "overrides" dict }}
+    {{- $cfg := dict }}
+    {{- with optional .values "maxmemory" "" }}
+    {{- $s := lower (toString .) }}
+    {{- $mult := get (dict "" 1 "b" 1 "k" 1000 "kb" 1024 "m" 1000000 "mb" 1048576 "g" 1000000000 "gb" 1073741824) (regexReplaceAll `^[0-9]+` $s "") }}
+    {{- $_ := set $cfg "maxmemory-gb" (toString (divf (mul (atoi (regexFind `^[0-9]+` $s)) $mult) 1073741824)) }}
+    {{- end }}
+    {{- with optional .values "maxmemory_policy" "" }}{{ $_ := set $cfg "maxmemory-policy" (toString .) }}{{ end }}
+    {{- with optional .values "databases" "" }}{{ $_ := set $cfg "databases" (toString .) }}{{ end }}
+    {{- $replicas := 0 }}
+    {{- if and (eq .locals.tier "STANDARD_HA") (hasKey $o "replica_count") }}{{ $replicas = atoi (toString $o.replica_count) }}{{ end }}
+    project_id: "{{ $o.project_id }}"
+    region: "{{ $o.region }}"
+    name: "{{ .context.instance_id }}"
+    tier: "{{ .locals.tier }}"
+    memory_size_gb: {{ $o.memory_size_gb }}
+    redis_version: "REDIS_{{ if eq .locals.engine_version "6.2" }}6_X{{ else }}{{ replace "." "_" .locals.engine_version }}{{ end }}"
+    authorized_network: "{{ $o.private_network }}"
+    transit_encryption_mode: "{{ if .infra.client_tls }}SERVER_AUTHENTICATION{{ else }}DISABLED{{ end }}"
+    redis_configs: {{ toJson $cfg }}
+    {{- if gt $replicas 1 }}
+    replica_count: {{ $replicas }}
+    read_replicas_mode: "READ_REPLICAS_ENABLED"
+    {{- end }}
+    persistence_mode: "{{ if .values.persistence.enabled }}RDB{{ else }}DISABLED{{ end }}"
