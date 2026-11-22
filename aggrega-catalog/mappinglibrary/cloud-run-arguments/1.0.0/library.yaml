@@ -16,7 +16,9 @@ metadata:
 
     Each entry names the resource after the component, places it in the
     operator's project, region, VPC network and service account from
-    infra.overrides, sizes it from infra.compute, and delivers env entries as
+    infra.overrides, sizes it from infra.compute, runs a service at
+    infra.replicas instances or, for a Component declaring
+    infra.min_replicas, scales it automatically, and delivers env entries as
     variables and file entries as files, refusing by name what Cloud Run
     cannot take. What differs between importers is read from the locals each
     declares: a default image, the container's port, the variable each own
@@ -33,8 +35,9 @@ spec:
     # which set what differs between a service, a worker pool and a job: the
     # entry's name, the resource's word, the name rule, the variables Cloud
     # Run sets itself, whether a port is required, whether an instance count
-    # is rendered and whether a schedule is; a change to one is made to every
-    # one of them.
+    # is rendered, whether a schedule is, whether the resource may scale
+    # automatically and whether a task timeout is read; a change to one is
+    # made to every one of them.
     #
     # What the importing Recipe declares, as its locals, each optional; a
     # local the Recipe does not declare reads as empty here rather than
@@ -154,14 +157,36 @@ spec:
     # service_account, each required and a string, private_network as
     # projects/<project>/global/networks/<name>; subnetwork, a string;
     # network_tags, a list of strings; and deletion_protection, true or
-    # false. infra.published_port, a Docker Compose setting, halts, and
+    # false. A job reads two more: time_zone, a non-empty string naming the
+    # time zone of the tz database Cloud Scheduler reads the schedule in,
+    # which Cloud Scheduler judges when the configuration is applied and
+    # which halts on a component with no schedule, as no scheduler job is
+    # rendered for it to apply to; and timeout, how long Cloud Run lets each
+    # attempt of the task run, a duration in seconds ending with s, as the
+    # google provider takes it, more than 0s and at most 604800s, the 168
+    # hours Cloud Run's job documentation gives as the longest task timeout.
+    # A task with a GPU has a lower limit there, which Cloud Run judges when
+    # the configuration is applied.
+    # infra.published_port, a Docker Compose setting, halts, and
     # infra.replicas is a service's and a worker pool's instance count, 1
-    # where the Component declares none.
+    # where the Component declares none. A service whose Component declares
+    # infra.min_replicas, as core/compute/function does, is scaled
+    # automatically instead: infra.min_replicas is the revision's minimum
+    # instance count and infra.max_replicas, where the Component declares
+    # it, its maximum, and a minimum above the maximum halts, as Cloud Run
+    # refuses it. The Component's own defaults reach this entry in .infra,
+    # so the Component's declaration alone decides the form, and a Release
+    # cannot set an infra key its Component does not declare. The two keys
+    # are read with index and never written as .infra.min_replicas: a field
+    # written so anywhere in a template is added to .infra, empty, where the
+    # Component does not declare it, and the entry would then find it.
 
     # A Cloud Run service, for CloudRunModule#/artifacts/Service. Cloud Run
     # sets PORT, K_SERVICE, K_REVISION and K_CONFIGURATION in every service
     # itself. The container's port is required, and infra.replicas is the
-    # service's instance count.
+    # service's instance count, unless its Component declares
+    # infra.min_replicas: then the service scales automatically between
+    # infra.min_replicas and infra.max_replicas.
     ServiceArguments: |
       {{- $entry := "CloudRunArguments#/mappings/ServiceArguments" }}
       {{- $resource := "service" }}
@@ -172,6 +197,8 @@ spec:
       {{- $portRequired := true }}
       {{- $instances := true }}
       {{- $scheduled := false }}
+      {{- $scalable := true }}
+      {{- $timed := false }}
       {{- $id := .context.instance_id }}
       {{- if not (regexMatch $nameRule $id) }}
       {{- fail (printf "the component %q names its Cloud Run %s, and %s: rename the component in the Aggregate to such a name" $id $resource $nameSentence) }}
@@ -390,6 +417,33 @@ spec:
       {{- if and (hasKey $o "deletion_protection") (not (kindIs "bool" (index $o "deletion_protection"))) }}
       {{- fail (printf "infra.overrides.deletion_protection of %q is %s, and this realization reads it as true or false: set it in the Release to false to let Terraform destroy the Cloud Run %s, or remove it" $id (toJson (index $o "deletion_protection")) $resource) }}
       {{- end }}
+      {{- $automatic := and $scalable (hasKey .infra "min_replicas") }}
+      {{- if and $automatic (hasKey .infra "max_replicas") }}
+      {{- if gt (int (index .infra "min_replicas")) (int (index .infra "max_replicas")) }}
+      {{- fail (printf "infra.min_replicas of %q is %d and infra.max_replicas %d, and Cloud Run takes a revision's minimum instance count no greater than its maximum: set infra.min_replicas in the Release to at most infra.max_replicas, or raise infra.max_replicas" $id (int (index .infra "min_replicas")) (int (index .infra "max_replicas"))) }}
+      {{- end }}
+      {{- end }}
+      {{- if and $scheduled (hasKey $o "time_zone") }}
+      {{- $v := index $o "time_zone" }}
+      {{- if not (and (typeIs "string" $v) $v) }}
+      {{- fail (printf "infra.overrides.time_zone of %q is %s, and this realization reads it as the name of a time zone of the tz database, such as Europe/Rome, in which Cloud Scheduler reads the schedule: set it in the Release to one, or remove it for UTC" $id (toJson $v)) }}
+      {{- end }}
+      {{- if not (toString (optional .values "schedule" "")) }}
+      {{- fail (printf "the component %q has no schedule, so no Cloud Scheduler job is rendered and infra.overrides.time_zone names the time zone of nothing: remove it from the Release" $id) }}
+      {{- end }}
+      {{- end }}
+      {{- $timeout := "" }}
+      {{- if and $timed (hasKey $o "timeout") }}
+      {{- $timeout = toString (index $o "timeout") }}
+      {{- $ok := and (regexMatch `^[0-9]{1,6}(\.[0-9]{1,9})?s$` $timeout) (regexMatch `[1-9]` $timeout) }}
+      {{- if $ok }}
+      {{- $whole := atoi (first (splitList "." (trimSuffix "s" $timeout))) }}
+      {{- if or (gt $whole 604800) (and (eq $whole 604800) (regexMatch `\.[0-9]*[1-9]` $timeout)) }}{{ $ok = false }}{{ end }}
+      {{- end }}
+      {{- if not $ok }}
+      {{- fail (printf "infra.overrides.timeout of %q is %s, and this realization reads it as how long Cloud Run lets each attempt of the %s's task run before stopping it, a duration in seconds ending with s, more than 0s and at most 604800s, the 168 hours Cloud Run allows a task, such as 3600s: set it in the Release to one, or remove it for Cloud Run's 10 minutes" $id (toJson (index $o "timeout")) $resource) }}
+      {{- end }}
+      {{- end }}
       config:
         project_id: {{ toJson $o.project_id }}
         location: {{ toJson $o.region }}
@@ -400,7 +454,12 @@ spec:
         {{- end }}
         cpu: "{{ index $size 0 }}"
         memory: "{{ index $size 1 }}Mi"
-        {{- if $instances }}
+        {{- if $automatic }}
+        min_instance_count: {{ index .infra "min_replicas" }}
+        {{- with optional .infra "max_replicas" "" }}
+        max_instance_count: {{ . }}
+        {{- end }}
+        {{- else if $instances }}
         manual_instance_count: {{ optional .infra "replicas" 1 }}
         {{- end }}
         environment: {{ toJson $env }}
@@ -428,6 +487,12 @@ spec:
         {{- with toString (optional .values "schedule" "") }}
         schedule: {{ toJson . }}
         {{- end }}
+        {{- with optional $o "time_zone" "" }}
+        time_zone: {{ toJson . }}
+        {{- end }}
+        {{- end }}
+        {{- with $timeout }}
+        timeout: {{ toJson . }}
         {{- end }}
 
     # A Cloud Run worker pool, for CloudRunModule#/artifacts/WorkerPool. Cloud
@@ -444,6 +509,8 @@ spec:
       {{- $portRequired := false }}
       {{- $instances := true }}
       {{- $scheduled := false }}
+      {{- $scalable := false }}
+      {{- $timed := false }}
       {{- $id := .context.instance_id }}
       {{- if not (regexMatch $nameRule $id) }}
       {{- fail (printf "the component %q names its Cloud Run %s, and %s: rename the component in the Aggregate to such a name" $id $resource $nameSentence) }}
@@ -662,6 +729,33 @@ spec:
       {{- if and (hasKey $o "deletion_protection") (not (kindIs "bool" (index $o "deletion_protection"))) }}
       {{- fail (printf "infra.overrides.deletion_protection of %q is %s, and this realization reads it as true or false: set it in the Release to false to let Terraform destroy the Cloud Run %s, or remove it" $id (toJson (index $o "deletion_protection")) $resource) }}
       {{- end }}
+      {{- $automatic := and $scalable (hasKey .infra "min_replicas") }}
+      {{- if and $automatic (hasKey .infra "max_replicas") }}
+      {{- if gt (int (index .infra "min_replicas")) (int (index .infra "max_replicas")) }}
+      {{- fail (printf "infra.min_replicas of %q is %d and infra.max_replicas %d, and Cloud Run takes a revision's minimum instance count no greater than its maximum: set infra.min_replicas in the Release to at most infra.max_replicas, or raise infra.max_replicas" $id (int (index .infra "min_replicas")) (int (index .infra "max_replicas"))) }}
+      {{- end }}
+      {{- end }}
+      {{- if and $scheduled (hasKey $o "time_zone") }}
+      {{- $v := index $o "time_zone" }}
+      {{- if not (and (typeIs "string" $v) $v) }}
+      {{- fail (printf "infra.overrides.time_zone of %q is %s, and this realization reads it as the name of a time zone of the tz database, such as Europe/Rome, in which Cloud Scheduler reads the schedule: set it in the Release to one, or remove it for UTC" $id (toJson $v)) }}
+      {{- end }}
+      {{- if not (toString (optional .values "schedule" "")) }}
+      {{- fail (printf "the component %q has no schedule, so no Cloud Scheduler job is rendered and infra.overrides.time_zone names the time zone of nothing: remove it from the Release" $id) }}
+      {{- end }}
+      {{- end }}
+      {{- $timeout := "" }}
+      {{- if and $timed (hasKey $o "timeout") }}
+      {{- $timeout = toString (index $o "timeout") }}
+      {{- $ok := and (regexMatch `^[0-9]{1,6}(\.[0-9]{1,9})?s$` $timeout) (regexMatch `[1-9]` $timeout) }}
+      {{- if $ok }}
+      {{- $whole := atoi (first (splitList "." (trimSuffix "s" $timeout))) }}
+      {{- if or (gt $whole 604800) (and (eq $whole 604800) (regexMatch `\.[0-9]*[1-9]` $timeout)) }}{{ $ok = false }}{{ end }}
+      {{- end }}
+      {{- if not $ok }}
+      {{- fail (printf "infra.overrides.timeout of %q is %s, and this realization reads it as how long Cloud Run lets each attempt of the %s's task run before stopping it, a duration in seconds ending with s, more than 0s and at most 604800s, the 168 hours Cloud Run allows a task, such as 3600s: set it in the Release to one, or remove it for Cloud Run's 10 minutes" $id (toJson (index $o "timeout")) $resource) }}
+      {{- end }}
+      {{- end }}
       config:
         project_id: {{ toJson $o.project_id }}
         location: {{ toJson $o.region }}
@@ -672,7 +766,12 @@ spec:
         {{- end }}
         cpu: "{{ index $size 0 }}"
         memory: "{{ index $size 1 }}Mi"
-        {{- if $instances }}
+        {{- if $automatic }}
+        min_instance_count: {{ index .infra "min_replicas" }}
+        {{- with optional .infra "max_replicas" "" }}
+        max_instance_count: {{ . }}
+        {{- end }}
+        {{- else if $instances }}
         manual_instance_count: {{ optional .infra "replicas" 1 }}
         {{- end }}
         environment: {{ toJson $env }}
@@ -700,6 +799,12 @@ spec:
         {{- with toString (optional .values "schedule" "") }}
         schedule: {{ toJson . }}
         {{- end }}
+        {{- with optional $o "time_zone" "" }}
+        time_zone: {{ toJson . }}
+        {{- end }}
+        {{- end }}
+        {{- with $timeout }}
+        timeout: {{ toJson . }}
         {{- end }}
 
     # A Cloud Run job, for CloudRunModule#/artifacts/Job. Cloud Run sets
@@ -710,6 +815,9 @@ spec:
     # sets it, is the cron expression the job is started on. The expression
     # is passed as it is written: this entry checks nothing in it, and Cloud
     # Scheduler judges it when the configuration is applied.
+    # infra.overrides.time_zone is the time zone it is read in, UTC where it
+    # is unset, and infra.overrides.timeout how long each attempt of the
+    # task runs, Cloud Run's 10 minutes where it is unset.
     JobArguments: |
       {{- $entry := "CloudRunArguments#/mappings/JobArguments" }}
       {{- $resource := "job" }}
@@ -720,6 +828,8 @@ spec:
       {{- $portRequired := false }}
       {{- $instances := false }}
       {{- $scheduled := true }}
+      {{- $scalable := false }}
+      {{- $timed := true }}
       {{- $id := .context.instance_id }}
       {{- if not (regexMatch $nameRule $id) }}
       {{- fail (printf "the component %q names its Cloud Run %s, and %s: rename the component in the Aggregate to such a name" $id $resource $nameSentence) }}
@@ -938,6 +1048,33 @@ spec:
       {{- if and (hasKey $o "deletion_protection") (not (kindIs "bool" (index $o "deletion_protection"))) }}
       {{- fail (printf "infra.overrides.deletion_protection of %q is %s, and this realization reads it as true or false: set it in the Release to false to let Terraform destroy the Cloud Run %s, or remove it" $id (toJson (index $o "deletion_protection")) $resource) }}
       {{- end }}
+      {{- $automatic := and $scalable (hasKey .infra "min_replicas") }}
+      {{- if and $automatic (hasKey .infra "max_replicas") }}
+      {{- if gt (int (index .infra "min_replicas")) (int (index .infra "max_replicas")) }}
+      {{- fail (printf "infra.min_replicas of %q is %d and infra.max_replicas %d, and Cloud Run takes a revision's minimum instance count no greater than its maximum: set infra.min_replicas in the Release to at most infra.max_replicas, or raise infra.max_replicas" $id (int (index .infra "min_replicas")) (int (index .infra "max_replicas"))) }}
+      {{- end }}
+      {{- end }}
+      {{- if and $scheduled (hasKey $o "time_zone") }}
+      {{- $v := index $o "time_zone" }}
+      {{- if not (and (typeIs "string" $v) $v) }}
+      {{- fail (printf "infra.overrides.time_zone of %q is %s, and this realization reads it as the name of a time zone of the tz database, such as Europe/Rome, in which Cloud Scheduler reads the schedule: set it in the Release to one, or remove it for UTC" $id (toJson $v)) }}
+      {{- end }}
+      {{- if not (toString (optional .values "schedule" "")) }}
+      {{- fail (printf "the component %q has no schedule, so no Cloud Scheduler job is rendered and infra.overrides.time_zone names the time zone of nothing: remove it from the Release" $id) }}
+      {{- end }}
+      {{- end }}
+      {{- $timeout := "" }}
+      {{- if and $timed (hasKey $o "timeout") }}
+      {{- $timeout = toString (index $o "timeout") }}
+      {{- $ok := and (regexMatch `^[0-9]{1,6}(\.[0-9]{1,9})?s$` $timeout) (regexMatch `[1-9]` $timeout) }}
+      {{- if $ok }}
+      {{- $whole := atoi (first (splitList "." (trimSuffix "s" $timeout))) }}
+      {{- if or (gt $whole 604800) (and (eq $whole 604800) (regexMatch `\.[0-9]*[1-9]` $timeout)) }}{{ $ok = false }}{{ end }}
+      {{- end }}
+      {{- if not $ok }}
+      {{- fail (printf "infra.overrides.timeout of %q is %s, and this realization reads it as how long Cloud Run lets each attempt of the %s's task run before stopping it, a duration in seconds ending with s, more than 0s and at most 604800s, the 168 hours Cloud Run allows a task, such as 3600s: set it in the Release to one, or remove it for Cloud Run's 10 minutes" $id (toJson (index $o "timeout")) $resource) }}
+      {{- end }}
+      {{- end }}
       config:
         project_id: {{ toJson $o.project_id }}
         location: {{ toJson $o.region }}
@@ -948,7 +1085,12 @@ spec:
         {{- end }}
         cpu: "{{ index $size 0 }}"
         memory: "{{ index $size 1 }}Mi"
-        {{- if $instances }}
+        {{- if $automatic }}
+        min_instance_count: {{ index .infra "min_replicas" }}
+        {{- with optional .infra "max_replicas" "" }}
+        max_instance_count: {{ . }}
+        {{- end }}
+        {{- else if $instances }}
         manual_instance_count: {{ optional .infra "replicas" 1 }}
         {{- end }}
         environment: {{ toJson $env }}
@@ -976,4 +1118,10 @@ spec:
         {{- with toString (optional .values "schedule" "") }}
         schedule: {{ toJson . }}
         {{- end }}
+        {{- with optional $o "time_zone" "" }}
+        time_zone: {{ toJson . }}
+        {{- end }}
+        {{- end }}
+        {{- with $timeout }}
+        timeout: {{ toJson . }}
         {{- end }}

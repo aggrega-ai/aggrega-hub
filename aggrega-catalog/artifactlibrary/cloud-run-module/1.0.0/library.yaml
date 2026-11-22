@@ -8,8 +8,10 @@ metadata:
   version: 1.0.0
   description: >
     The Terraform bodies every Cloud Run Recipe runs its container in, held
-    once: Service, a Cloud Run service; WorkerPool, a Cloud Run worker pool;
-    and Job, a Cloud Run job with, when a schedule is given, the Cloud
+    once: Service, a Cloud Run service running a fixed instance count, or
+    scaled automatically, to zero instances where its floor is 0, for a
+    Component declaring infra.min_replicas; WorkerPool, a Cloud Run worker
+    pool; and Job, a Cloud Run job with, when a schedule is given, the Cloud
     Scheduler job that starts it. A Recipe imports one beside its fixed
     pass-through module, `artifacts: { service: { $import:
     CloudRunModule#/artifacts/Service } }`, and renders the body's one input,
@@ -27,12 +29,18 @@ spec:
     # importing component's module directory as service/main.tf, the child
     # module the fixed pass-through calls with its config input and hands back
     # as its service output; a Recipe therefore reads an output below as
-    # module.<instance>.service.<output>. The files are static HCL: no
-    # template action runs in them, so every component importing a bundle gets
-    # the same bytes, and everything that differs between components arrives
-    # in config, which the CloudRunArguments entry of the same name renders and
-    # checks. The bodies keep to the Terraform 1.5 language, as every Google
-    # body in this catalog does.
+    # module.<instance>.service.<output>. The files are HCL in which one
+    # template action runs, in the Service body: it chooses how the service
+    # scales by whether the importing component's Component declares
+    # infra.min_replicas. A Component declaring it, as core/compute/function
+    # does, gets a service Cloud Run scales automatically between a floor and a
+    # ceiling, and any other a service running a fixed instance count. That
+    # declaration is the Component's, the same for every component of it, so
+    # every component of one Component gets the same bytes, and everything that
+    # differs between components arrives in config, which the CloudRunArguments
+    # entry of the same name renders and checks, reading the same declaration
+    # to choose the instance counts it renders. The bodies keep to the
+    # Terraform 1.5 language, as every Google body in this catalog does.
     #
     # config. One object, typed in each body: the names are those of the
     # arguments it sets, except network, subnetwork and tags, which set the
@@ -85,10 +93,13 @@ spec:
     # resource here is generally available in that provider, so no body needs
     # hashicorp/google-beta.
 
-    # A Cloud Run service with internal ingress and a fixed instance count. Its
+    # A Cloud Run service with internal ingress, running a fixed instance
+    # count, or, for a Component declaring infra.min_replicas, scaled
+    # automatically between min_instance_count and max_instance_count. Its
     # outputs are name and uri, the service's main URI.
     Service:
       main.tf: |
+        {{- $automatic := hasKey .infra "min_replicas" -}}
         # required_providers pins hashicorp/google so the engine installs a provider whose
         # resource schema this module was written against. It is a range rather than an
         # exact version because every Google module in one root configuration shares one
@@ -118,7 +129,12 @@ spec:
             port                  = number
             cpu                   = string
             memory                = string
+        {{- if $automatic }}
+            min_instance_count    = number
+            max_instance_count    = optional(number)
+        {{- else }}
             manual_instance_count = number
+        {{- end }}
             environment           = map(string)
             service_account       = string
             network               = string
@@ -177,8 +193,17 @@ spec:
         # left on, its default, so a caller reaches the service only with an identity the
         # operator has granted the Cloud Run Invoker role.
         #
+        {{- if $automatic }}
+        # Cloud Run scales the service automatically, its default, which this body leaves
+        # in place by declaring no service-level scaling: the revision keeps at least
+        # min_instance_count instances, none at all when it is 0, so an idle service
+        # holds no instance, and adds instances as requests arrive up to
+        # max_instance_count, or up to the limit Cloud Run calculates from the project's
+        # quota where config leaves it out. Its egress to the operator's
+        {{- else }}
         # The service runs a fixed number of instances: scaling is manual at the service
         # level, and manual_instance_count is how many run. Its egress to the operator's
+        {{- end }}
         # VPC network is Direct VPC egress, carrying traffic to private addresses alone, so
         # a Cloud SQL or Memorystore address in that network is reachable and every other
         # destination is reached as it would be with no network named. The revision runs
@@ -190,15 +215,24 @@ spec:
           name                = var.config.name
           ingress             = "INGRESS_TRAFFIC_INTERNAL_ONLY"
           deletion_protection = var.config.deletion_protection
+        {{- if not $automatic }}
 
           scaling {
             scaling_mode          = "MANUAL"
             manual_instance_count = var.config.manual_instance_count
           }
+        {{- end }}
 
           template {
             service_account       = var.config.service_account
             execution_environment = "EXECUTION_ENVIRONMENT_GEN2"
+        {{- if $automatic }}
+
+            scaling {
+              min_instance_count = var.config.min_instance_count
+              max_instance_count = var.config.max_instance_count
+            }
+        {{- end }}
 
             vpc_access {
               egress = "PRIVATE_RANGES_ONLY"
@@ -498,13 +532,15 @@ spec:
           value       = google_cloud_run_v2_worker_pool.this.name
         }
 
-    # A Cloud Run job, one task an execution, and, where config carries
-    # schedule, a Cloud Scheduler job in the same project and region starting
-    # an execution on it. The scheduler calls Cloud Run as service_account,
-    # the identity the job runs as, so that account needs leave to run the
-    # job, such as the Cloud Run Invoker role on it; the operator grants it,
-    # and no IAM binding is emitted. No time zone is set, so the schedule is
-    # read in Cloud Scheduler's default. Its one output is name.
+    # A Cloud Run job, one task an execution, each attempt of it stopped after
+    # timeout, Cloud Run's 10 minutes where config leaves it out, and, where
+    # config carries schedule, a Cloud Scheduler job in the same project and
+    # region starting an execution on it, reading the schedule in time_zone,
+    # or in UTC, Cloud Scheduler's default, where config leaves it out. The
+    # scheduler calls Cloud Run as service_account, the identity the job runs
+    # as, so that account needs leave to run the job, such as the Cloud Run
+    # Invoker role on it; the operator grants it, and no IAM binding is
+    # emitted. Its one output is name.
     Job:
       main.tf: |
         # required_providers pins hashicorp/google so the engine installs a provider whose
@@ -548,7 +584,9 @@ spec:
               count = number
               type  = string
             }))
-            schedule = optional(string)
+            schedule  = optional(string)
+            time_zone = optional(string)
+            timeout   = optional(string)
           })
         }
 
@@ -588,10 +626,13 @@ spec:
         # One Cloud Run job running the container to completion, in a project, region and
         # VPC network that already exist, under a service account that already exists.
         # Each execution runs one task, retried as Cloud Run retries a task by default.
-        # Its egress to the operator's VPC network is Direct VPC egress, carrying traffic
-        # to private addresses alone, so a Cloud SQL or Memorystore address in that
-        # network is reachable and every other destination is reached as it would be with
-        # no network named.
+        # Cloud Run stops an attempt of the task still running after timeout, a duration
+        # in seconds ending with s, and each retry may run as long again; where config
+        # leaves timeout out, Cloud Run's own default of 10 minutes stands. Its egress to
+        # the operator's VPC network is Direct VPC egress, carrying traffic to private
+        # addresses alone, so a Cloud SQL or Memorystore address in that network is
+        # reachable and every other destination is reached as it would be with no network
+        # named.
         resource "google_cloud_run_v2_job" "this" {
           project             = var.config.project_id
           location            = var.config.location
@@ -601,6 +642,7 @@ spec:
           template {
             template {
               service_account = var.config.service_account
+              timeout         = var.config.timeout
 
               vpc_access {
                 egress = "PRIVATE_RANGES_ONLY"
@@ -684,15 +726,17 @@ spec:
         # starts an execution of the job on it, by a POST to the Cloud Run Admin API's
         # run method for the job, with an OAuth token for service_account. That account
         # needs leave to run the job, such as the Cloud Run Invoker role on it, which the
-        # operator grants; no IAM binding is emitted. The schedule is read in Cloud
-        # Scheduler's default time zone, since no time zone is set. With no schedule,
-        # nothing starts the job: it runs when someone executes it.
+        # operator grants; no IAM binding is emitted. The schedule is read in time_zone,
+        # a time zone name of the tz database, or in UTC, Cloud Scheduler's default, where
+        # config leaves time_zone out. With no schedule, nothing starts the job: it runs
+        # when someone executes it.
         resource "google_cloud_scheduler_job" "this" {
-          count    = var.config.schedule == null ? 0 : 1
-          project  = var.config.project_id
-          region   = var.config.location
-          name     = var.config.name
-          schedule = var.config.schedule
+          count     = var.config.schedule == null ? 0 : 1
+          project   = var.config.project_id
+          region    = var.config.location
+          name      = var.config.name
+          schedule  = var.config.schedule
+          time_zone = var.config.time_zone
 
           http_target {
             http_method = "POST"
