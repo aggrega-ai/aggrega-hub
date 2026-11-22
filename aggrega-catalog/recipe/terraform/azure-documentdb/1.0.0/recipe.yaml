@@ -1,0 +1,469 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: azure-documentdb
+  version: 1.0.0
+  # The licence of the vendored module, the Azure Verified Modules programme's
+  # DocumentDB cluster module: the third-party code this Recipe pins and
+  # writes into the output. The cluster it provisions is a service the reader
+  # contracts for directly with Microsoft, under Azure's terms.
+  license: MIT
+  # The values, attachments and infra.overrides keys this Recipe refuses are
+  # listed, with their reasons, in the comments above the assertions.
+  description: >
+    Azure DocumentDB: one cluster, realized by Microsoft's Azure Verified
+    Modules module Azure/avm-res-documentdb-mongocluster/azurerm at v0.4.0,
+    MIT, fetched from its git repository at that tag; entity.lock pins the
+    tag's commit and archive digest.
+
+    Reach for it where the cluster lives in the operator's subscription and
+    the Release deploys Terraform; reach for arm/azure-documentdb where it
+    deploys an Azure Resource Manager template. The module admits
+    hashicorp/azurerm 4 alone, so this Recipe goes in a terraform boundary
+    apart from the Azure Recipes that need azurerm 5,
+    terraform/azure-api-management among them.
+
+    The resource group and region are the operator's, named in
+    infra.overrides; the module takes the group by its resource ID, which
+    Terraform composes when it applies from the subscription it runs
+    against. Public network access is off unless
+    infra.overrides.public_network_access is Enabled; the private endpoint or
+    the firewall rules a client reaches the cluster through are the
+    operator's, and none is emitted. The module's usage telemetry to
+    Microsoft is off; infra.overrides.enable_telemetry: true turns it on.
+
+    The administrator values.user names takes the core/random-password
+    attachment on the password slot as a Terraform reference, so the rendered
+    files carry no password; with nothing attached, or another credential,
+    the build halts naming the slot. host publishes a reference to the
+    cluster's name under mongocluster.cosmos.azure.com, or
+    infra.overrides.host; port is 10260; endpoint is the mongodb+srv://
+    address on host, carrying the login and no password.
+    infra.overrides.sku_name sets the cluster tier, M30 unless set, and
+    infra.overrides.shard_count the number of shards, 1 unless set.
+    infra.engine_version sets the MongoDB server version, 7.0 unless set. A
+    value or an infra.overrides key the service or the module cannot take
+    halts naming it, as do a storage size, a shard count, high availability
+    or a core/backup attachment the cluster tier does not take.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/azure-documentdb:1.0.0
+
+  # The published module, at the tag the registry publishes as version 0.4.0.
+  # A registry version of a module is a tag of its git repository, and the
+  # registry's own download for this version answers with a git source at the
+  # commit that tag names; Terraform's dependency lock file records providers
+  # and no module. So the pin is taken here: `aggrega pin` resolves the tag to
+  # its commit and records that commit and the archive's digest in entity.lock,
+  # and every build vendors exactly those bytes.
+  #
+  # The source names the repository root. The root's module calls are to its
+  # own ./modules/firewall_rule, ./modules/private_endpoint_connection and
+  # ./modules/user directories, which call none, so the configuration
+  # Terraform loads from it calls no registry module and initialising it
+  # fetches providers and nothing else. The repository's examples/ and tests/
+  # directories are vendored with it and never loaded.
+  #
+  # The module declares hashicorp/azurerm "~> 4.0", Azure/azapi "~> 2.12" and
+  # hashicorp/random "~> 3.5" in its own required_providers, and Terraform
+  # ">= 1.9, < 2.0". It creates the cluster as an azapi_resource of type
+  # Microsoft.DocumentDB/mongoClusters at API version 2025-09-01. It is
+  # vendored byte for byte, so this Recipe adds no provider constraint of its
+  # own. "~> 4.0" admits no azurerm 5 release, while the catalog's own Azure
+  # bodies declare "~> 5.14" and terraform/azure-api-management pins azurerm
+  # at exactly 5.9.0, so one root configuration cannot install a provider
+  # satisfying both: a Release places this cluster in a terraform boundary
+  # apart from those bodies. The Container Apps bodies of the generic compute
+  # Recipes admit azurerm 4 and 5 alike, so they share its boundary.
+  source:
+    kind: git-repository
+    url: https://github.com/Azure/terraform-azurerm-avm-res-documentdb-mongocluster.git
+    ref: v0.4.0
+
+  locals:
+    # The cluster tier, infra.overrides.sku_name or M30: two vCores and 8 GiB
+    # of memory per shard, the smallest tier the service gives a standby and
+    # more than one shard.
+    tier: '{{ $s := optional (optional .infra "overrides" dict) "sku_name" "M30" }}{{ if typeIs "string" $s }}{{ $s }}{{ end }}'
+    # The name the Release gives the cluster under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The login as it stands in the user part of a URI: every byte but a
+    # letter, a digit, - . _ and ~ percent-encoded.
+    user_in_uri: '{{ replace "+" "%20" (urlquery (toString .values.user)) }}'
+    # The options Microsoft's documentation gives a client in the cluster's
+    # mongodb+srv:// connection string.
+    uri_options: "tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false&maxIdleTimeMS=120000"
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # The FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Azure DocumentDB automated backups"
+
+  # This Recipe reads from infra.overrides:
+  #   resource_group_name    - string (parent_id, the group's resource ID, composed at apply
+  #                            time from the subscription Terraform runs against), required
+  #   location               - string (location), required
+  #   sku_name               - string (compute_tier; default "M30")
+  #   shard_count            - integer (shard_count; default 1)
+  #   public_network_access  - "Enabled" or "Disabled" (public_network_access; default "Disabled")
+  #   enable_telemetry       - bool (enable_telemetry; false unless set to true here,
+  #                            where the module's own default is true)
+  #   tags                   - map[string]string (tags)
+  #   host                   - string (published as provides.host and in provides.endpoint;
+  #                            not passed to the module)
+  #
+  # Each is named by the module input it sets, given in brackets, save
+  # resource_group_name, which every azurerm Recipe reads for the group it
+  # creates in; sku_name, which every Azure Recipe reads for the size class a
+  # service is provisioned at; and host, which every managed datastore Recipe
+  # reads for the address it publishes. arm/azure-documentdb reads each of
+  # them but resource_group_name and enable_telemetry under the same
+  # spelling: its template is the catalog's own, deployed into the group it
+  # is deployed to, and carries no telemetry. resource_group_name and
+  # location are required: they place the cluster in the operator's
+  # subscription, and this Recipe never chooses either.
+  #
+  # resource_group_name. The module takes the resource group by its resource
+  # ID. The boundary's root configuration declares the azurerm_client_config
+  # data source in client-config.tf, and parent_id is
+  # /subscriptions/<its subscription_id>/resourceGroups/<resource_group_name>,
+  # so the group is the one of that name in the subscription Terraform runs
+  # against, as for every other azurerm Recipe; Terraform reads the
+  # subscription when it plans, and the build reads none.
+  #
+  # sku_name names the cluster tier as the service spells it: M10, M20 or M25
+  # (burstable), M30, M40, M50, M60, M80 or M200, or Free. The service checks
+  # the name, and whether the region offers it, when Terraform applies.
+  #
+  # public_network_access. A cluster takes connections over its public
+  # endpoint, subject to the cluster's firewall rules, or over a private
+  # endpoint in a virtual network. Unset or Disabled, the module's own
+  # default, public network access is off and a client reaches the cluster
+  # only through a private endpoint; Enabled turns it on, and a client
+  # reaches it only where a firewall rule admits its address, since the
+  # service blocks every client until one does. This Recipe passes neither
+  # the module's private_endpoints nor its firewall_rules: each is the
+  # operator's, created for the cluster outside the Release, the way a
+  # virtual network's subnets and private DNS zones are.
+  #
+  # While enable_telemetry is true, the module's default, the module and its
+  # firewall rule, private endpoint connection and user directories each
+  # submit an empty Azure Resource Manager template to the subscription, in
+  # the cluster's region, which Microsoft counts as usage of the module. This
+  # Recipe passes false unless infra.overrides.enable_telemetry is true; any
+  # value that is not a boolean is refused below.
+  #
+  # Any other key under infra.overrides halts the build naming it, so a key
+  # misspelt, or meant for another Recipe, is never passed over unread.
+  #
+  # The module's own defaults stand for every input this mapping leaves out.
+  # These are worth knowing: the cluster takes logins the service
+  # authenticates itself; its storage type is the service's default, Premium
+  # SSD; and its server version is 7.0 while infra.engine_version is unset.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation and the
+  # module's inputs:
+  #   honoured — values.user, as the administrator login;
+  #     infra.engine_version, as the server version; the password attachment,
+  #     as the administrator's password; infra.storage.size, as each shard's
+  #     disk size in whole gibibytes; infra.ha.enabled, as each shard's
+  #     standby; a core/backup attachment, as the comment above the mapping
+  #     says; and the overrides above.
+  #   refused — infra.engine_version other than 5.0, 6.0, 7.0 or 8.0, the
+  #     versions the azurerm provider's own cluster resource takes;
+  #     infra.storage.size outside what the cluster tier takes;
+  #     infra.ha.enabled and more than one shard on a tier the service gives
+  #     neither; a cluster name the service refuses; values.user outside the
+  #     module's rule for a login; a credential on the password slot other
+  #     than core/random-password, or none, or one shorter than the module
+  #     takes; and any infra.overrides key not listed above.
+  #   not read — none.
+  #
+  # The administrator's password is the module's administrator_login_password:
+  # the password core/random-password's terraform/random-password realization
+  # draws at apply time, handed over as a Terraform reference, so no password
+  # is written into the rendered configuration, and the apply keeps it in the
+  # Terraform state, where an operator can read it. Neither the service nor
+  # the module draws one, so with nothing attached the build halts, and so it
+  # does on core/generated-secret, which leaves the drawing to the module, and
+  # on any other credential, which either carries its value as text, which
+  # would be written into the configuration, or carries none the service
+  # could take. The module takes a password of at least 12 characters, so a
+  # core/random-password attachment whose values.length is shorter halts.
+  assertions:
+    placement_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "resource_group_name" "location" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release places its cluster in the operator's own Azure resource group and region, and this Recipe never chooses either, but infra.overrides.%s carries none: set infra.overrides.resource_group_name and infra.overrides.location in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_known: >-
+      {{- $known := list "resource_group_name" "location" "sku_name" "shard_count" "public_network_access" "enable_telemetry" "tags" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads resource_group_name, location, sku_name, shard_count, public_network_access, enable_telemetry, tags and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $t := optional $o "enable_telemetry" false -}}
+      {{- if not (kindIs "bool" $t) -}}
+      {{- fail (printf "infra.overrides.enable_telemetry is %v, and it is passed to the module as a boolean: set it to true to turn the module's telemetry on, or to false or remove it to keep it off" $t) -}}
+      {{- end -}}
+      {{- $p := optional $o "public_network_access" "Disabled" -}}
+      {{- if not (has $p (list "Enabled" "Disabled")) -}}
+      {{- fail (printf "infra.overrides.public_network_access is %v, and it switches the cluster's public network access as the service spells it: set it to Enabled to turn it on, or to Disabled or remove it to keep it off" $p) -}}
+      {{- end -}}
+      {{- $s := optional $o "sku_name" "M30" -}}
+      {{- if not (and (typeIs "string" $s) (regexMatch `^(Free|M[0-9]+)$` (toString $s))) -}}
+      {{- fail (printf "infra.overrides.sku_name is %v, and the cluster tier is the name the service gives it, such as M10, M30, M50 or Free: set infra.overrides.sku_name to one, or remove it for M30" $s) -}}
+      {{- end -}}
+      {{- $n := optional $o "shard_count" 1 -}}
+      {{- if not (and (or (kindIs "int" $n) (kindIs "int64" $n) (and (kindIs "float64" $n) (eq (float64 (int $n)) $n))) (ge (int $n) 1) (le (int $n) 10)) -}}
+      {{- fail (printf "infra.overrides.shard_count is %v, and Azure DocumentDB takes 1 to 10 physical shards in a cluster: set infra.overrides.shard_count to a whole number in that range, or remove it for 1" $n) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (regexMatch `[/@\s:]` $h) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the name a consumer of this cluster looks its service record up under, given as a DNS name alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the service record names the nodes and their port` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The cluster is named after the component, and its name is also the first
+    # label of the address the service gives it under
+    # mongocluster.cosmos.azure.com, so it is unique across Azure; the rule the
+    # service's REST API specification gives a cluster name, 3 to 40 lowercase
+    # letters and digits in runs a single hyphen joins, is checked here, where
+    # the name is known.
+    cluster_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (and (regexMatch `^[a-z0-9]+(-[a-z0-9]+)*$` $n) (ge (len $n) 3) (le (len $n) 40)) -}}
+      {{- fail (printf "the component %q names its cluster, and a cluster name holds 3 to 40 lowercase letters, digits and hyphens, beginning and ending with a letter or a digit, with no two hyphens together: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+    # The module's own rule for the administrator login, which it checks when
+    # Terraform plans: 4 to 31 letters, digits, hyphens and underscores,
+    # beginning with a letter.
+    administrator_login: >-
+      {{- $u := toString .values.user -}}
+      {{- if not (regexMatch `^[A-Za-z][A-Za-z0-9_-]{3,30}$` $u) -}}
+      {{- fail (printf "values.user is %q, the cluster's administrator login, and the module this Recipe deploys takes a login of 4 to 31 letters, digits, hyphens and underscores, beginning with a letter: set values.user in the Aggregate to such a name" $u) -}}
+      {{- end -}}
+    engine_version_offered: >-
+      {{- with toString (optional .infra "engine_version" "") -}}
+      {{- if not (has . (list "5.0" "6.0" "7.0" "8.0")) -}}
+      {{- fail (printf "infra.engine_version is %q, and an Azure DocumentDB cluster runs MongoDB server version 5.0, 6.0, 7.0 or 8.0: set infra.engine_version in the Release to one, or remove it for 7.0" .) -}}
+      {{- end -}}
+      {{- end -}}
+    # Storage sizes, read off the service's documentation: 32 GiB to 32 TiB
+    # per shard; 32, 64 or 128 GiB on the burstable tiers M10, M20 and M25;
+    # at most 32 GiB on the Free tier.
+    storage: >-
+      {{- $size := toString .infra.storage.size -}}
+      {{- if not (regexMatch `^[0-9]+Gi$` $size) -}}
+      {{- fail (printf "infra.storage.size is %q, and this Recipe sets each shard's disk size in whole gibibytes: set infra.storage.size in the Release to such a size, such as 128Gi" $size) -}}
+      {{- end -}}
+      {{- $gi := int (trimSuffix "Gi" $size) -}}
+      {{- if or (lt $gi 32) (gt $gi 32768) -}}
+      {{- fail (printf "infra.storage.size is %q, and Azure DocumentDB gives each shard 32 GiB to 32 TiB of storage: set infra.storage.size in the Release to a size from 32Gi to 32768Gi" $size) -}}
+      {{- end -}}
+      {{- if and (has .locals.tier (list "M10" "M20" "M25")) (not (has $gi (list 32 64 128))) -}}
+      {{- fail (printf "infra.storage.size is %q, and Azure DocumentDB takes 32, 64 or 128 GiB of storage on the burstable tier %s: set infra.storage.size in the Release to 32Gi, 64Gi or 128Gi, or infra.overrides.sku_name to M30 or above" $size .locals.tier) -}}
+      {{- end -}}
+      {{- if and (eq .locals.tier "Free") (gt $gi 32) -}}
+      {{- fail (printf "infra.storage.size is %q, and Azure DocumentDB gives a Free tier cluster at most 32 GiB of storage: set infra.storage.size in the Release to 32Gi, or infra.overrides.sku_name to a paid tier" $size) -}}
+      {{- end -}}
+    # The service's limits by tier: the Free tier and the burstable tiers M10,
+    # M20 and M25 keep no standby, which M30 and above do, and a burstable
+    # tier holds one physical shard.
+    tier_limits: >-
+      {{- $t := .locals.tier -}}
+      {{- if and .infra.ha.enabled (has $t (list "Free" "M10" "M20" "M25")) -}}
+      {{- fail (printf "infra.ha.enabled is true, and infra.overrides.sku_name is %s, a tier Azure DocumentDB gives no standby, which M30 and above do: set infra.overrides.sku_name to M30 or above, or infra.ha.enabled to false" $t) -}}
+      {{- end -}}
+      {{- $n := optional (optional .infra "overrides" dict) "shard_count" 1 -}}
+      {{- if and (has $t (list "M10" "M20" "M25")) (gt (int $n) 1) -}}
+      {{- fail (printf "infra.overrides.shard_count is %v, and infra.overrides.sku_name is %s, a burstable tier Azure DocumentDB runs on one physical shard alone: remove infra.overrides.shard_count, or set infra.overrides.sku_name to M30 or above" $n $t) -}}
+      {{- end -}}
+    credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if not (hasKey $f "password") -}}
+      {{- fail "the password slot is empty, and neither Azure DocumentDB nor the module this Recipe deploys draws a password for the administrator values.user names: attach core/random-password to the password slot, bound to terraform/random-password in the Manifest" -}}
+      {{- end -}}
+      {{- $ty := first (splitList ":" (toString (optional $f.password "type" ""))) -}}
+      {{- if ne $ty "core/random-password" -}}
+      {{- fail (printf "the password slot is filled by %s, and this Recipe hands the cluster its administrator's password as a Terraform reference to one drawn at apply time, which core/random-password publishes through terraform/random-password; neither the service nor the module draws one, and another credential either carries its value as text, which would be written into the rendered configuration, or carries none the service could take: attach core/random-password to the password slot instead" (default "an attachment of no type" $ty)) -}}
+      {{- end -}}
+      {{- $n := int (optional (optional .features.password "values" dict) "length" 32) -}}
+      {{- if lt $n 12 -}}
+      {{- fail (printf "the password attached to the password slot sets values.length to %d, and the module this Recipe deploys takes an administrator's password of at least 12 characters: set values.length on the password attachment to 12 or more, or remove it for 32" $n) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. The
+  # service gives a cluster the name <cluster>.mongocluster.cosmos.azure.com,
+  # under which a mongodb+srv:// client looks up the service record listing
+  # the cluster's nodes and their port, 10260, as Microsoft's documentation of
+  # the cluster's connection string and of its private endpoints gives it.
+  # The module publishes that name only inside its connection string outputs,
+  # which it declares sensitive, so host names the module's mongo_cluster_name
+  # output, the cluster's name, through this component's module call, which
+  # the boundary's root configuration declares under .context.instance_id for
+  # a component declared in the Aggregate the Release deploys, and joins the
+  # service's domain to it. Terraform resolves it at apply time, so it
+  # resolves only for a consumer authored as a source: Recipe in the same root
+  # configuration; a consumer on another target receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference, and endpoint is built on it. It is the
+  # operator's deterministic pointer: the compiler pipes it as text and looks
+  # nothing up, and this Recipe emits no DNS record for it. A MongoDB driver
+  # looks the service record up under the name and accepts only nodes whose
+  # names end in the domain the name sits in, so the name is one under which
+  # the operator's DNS answers the cluster's service record, such as the
+  # cluster's own name resolved through a private DNS zone. A consumer in the
+  # same root configuration receives the name as well, and a name carries no
+  # reference for Terraform to order its module after this one by; a later
+  # syncWave on the consumer's boundary, sharing this boundary's directory,
+  # orders the two.
+  #
+  # port is 10260. user is the administrator login. endpoint is the cluster's
+  # connection string as the service publishes it, mongodb+srv://<user>@<host>,
+  # with the login percent-encoded and no password, and the options
+  # Microsoft's documentation gives a client.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.mongo_cluster_name}.mongocluster.cosmos.azure.com{{ end }}"
+    port: "10260"
+    user: "{{ .values.user }}"
+    endpoint: "mongodb+srv://{{ .locals.user_in_uri }}@{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.mongo_cluster_name}.mongocluster.cosmos.azure.com{{ end }}/?{{ .locals.uri_options }}"
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # cluster is named after the component, as the other managed Recipes name
+  # theirs. parent_id is the resource group's ID, composed at apply time as
+  # the comment above the assertions says. server_version is rendered only
+  # while infra.engine_version is set; otherwise the module's 7.0 stands.
+  #
+  # The administrator's password is the attachment's module output joined with
+  # a dot and wrapped in an interpolation, as terraform/random-password
+  # publishes it.
+  #
+  # enable_telemetry is always rendered: false, unless
+  # infra.overrides.enable_telemetry is true.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside. Azure DocumentDB backs
+  # up every cluster on its own at times it chooses, keeps the backups for
+  # point-in-time restore 35 days, 7 on a burstable tier (M10, M20, M25), and
+  # takes none on the Free tier; no setting changes the retention or the time,
+  # or turns the backups off:
+  #   - With none attached, the cluster keeps the service's backups.
+  #   - An attachment carrying no infra.role_arn, bound to
+  #     terraform/backup-native, keeps them where its infra.retention_days is
+  #     the tier's retention, and halts naming the attachment on any other;
+  #     infra.schedule halts naming it, since the service takes no backup
+  #     time, and so does infra.point_in_time_recovery false, since the
+  #     service keeps point-in-time restore across the window; on the Free
+  #     tier, which the service backs up not at all, the attachment halts.
+  #   - An attachment carrying infra.role_arn is AWS Backup's, whose
+  #     realizations refuse a host that is no Amazon RDS instance; this Recipe
+  #     configures nothing from it.
+  #   - Two attachments carrying no infra.role_arn halt naming both: a cluster
+  #     runs one automated backup.
+  # The mapping writes nothing for the backup: the cluster's backup has no
+  # setting. core/backup applies to components of type stateful-server and
+  # this Component is of type resource, so the build halts on such an
+  # attachment before it reaches this Recipe, naming the Feature's selector;
+  # the reading is what this Recipe keeps from an attachment that does reach
+  # it. A Recipe's locals cannot read its attachments, so the reading sits at
+  # the top of the mapping below.
+  valuesMapping: |
+    {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
+    {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}
+    {{- range $name, $attachment := (default dict .features) -}}
+    {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
+    {{- $in := default dict (optional $attachment "infra" dict) -}}
+    {{- if not (trim (toString (optional $in "role_arn" ""))) -}}
+    {{- if $backupNative -}}
+    {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Azure DocumentDB, which runs one automated backup on a cluster: remove one of the two" $backupNative $name $.context.instance_id) -}}
+    {{- end -}}
+    {{- $backupNative = $name -}}{{- $backupNativeInfra = $in -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if $backupNative -}}
+    {{- if eq .locals.tier "Free" -}}
+    {{- fail (printf "core/backup attachment %q on %q leaves its backup to Azure DocumentDB, which backs up no cluster on the Free tier: remove the attachment, or set infra.overrides.sku_name to a paid tier" $backupNative .context.instance_id) -}}
+    {{- end -}}
+    {{- with trim (toString (optional $backupNativeInfra "schedule" "")) -}}
+    {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Azure DocumentDB takes each backup at a time it chooses, which no setting moves: remove infra.schedule from the attachment" $backupNative $.context.instance_id .) -}}
+    {{- end -}}
+    {{- $keeps := 35 -}}{{- if has .locals.tier (list "M10" "M20" "M25") }}{{ $keeps = 7 }}{{ end -}}
+    {{- $retention := int (optional $backupNativeInfra "retention_days" 7) -}}
+    {{- if ne $retention $keeps -}}
+    {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and Azure DocumentDB keeps a cluster's backups %d days on tier %s, which no setting changes: set infra.retention_days to %d" $backupNative .context.instance_id $retention $keeps .locals.tier $keeps) -}}
+    {{- end -}}
+    {{- if eq (toString (optional $backupNativeInfra "point_in_time_recovery" "")) "false" -}}
+    {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to false, and Azure DocumentDB keeps point-in-time restore for every cluster it backs up, across the retention window, with no setting that turns it off: remove infra.point_in_time_recovery from the attachment, or set it to true" $backupNative .context.instance_id) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $prov := optional .features.password "provides" dict }}
+    {{- if not (and (kindIs "map" $prov) (optional $prov "name" "") (optional $prov "key" "")) }}
+    {{- fail (printf "the password slot of %q is filled by an attachment that publishes no module output, and the administrator's password is handed to the cluster as a reference to one: bind core/random-password to terraform/random-password in the Manifest" .context.instance_id) }}
+    {{- end }}
+    {{- $o := optional .infra "overrides" dict }}
+    name: "{{ .context.instance_id }}"
+    parent_id: "/subscriptions/${data.azurerm_client_config.current.subscription_id}/resourceGroups/{{ $o.resource_group_name }}"
+    location: "{{ $o.location }}"
+    administrator_login: "{{ .values.user }}"
+    administrator_login_password: "{{ printf "${%s.%s}" $prov.name $prov.key }}"
+    compute_tier: "{{ .locals.tier }}"
+    shard_count: {{ int (optional $o "shard_count" 1) }}
+    storage_size_gb: {{ int (trimSuffix "Gi" (toString .infra.storage.size)) }}
+    {{- with toString (optional .infra "engine_version" "") }}
+    server_version: "{{ . }}"
+    {{- end }}
+    ha_mode: {{ if .infra.ha.enabled }}ZoneRedundantPreferred{{ else }}Disabled{{ end }}
+    public_network_access: {{ optional $o "public_network_access" "Disabled" }}
+    {{- $t := optional $o "enable_telemetry" false }}
+    enable_telemetry: {{ and (kindIs "bool" $t) $t }}
+    {{- with optional $o "tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}
+
+  # Written once, beside the boundary's root configuration rather than in the
+  # module, and shared by every component of the boundary that declares the
+  # same file with the same bytes: another component bound to this Recipe, or
+  # one whose Recipe configures azurerm the same way under the same name, or
+  # reads the same data source. The same name with other bytes halts the
+  # build. The azurerm provider refuses to plan without its features block,
+  # and a vendored module carries no provider block of its own, so the module
+  # inherits this configuration; the provider reads its credentials and
+  # subscription from the environment Terraform runs in, and the
+  # azurerm_client_config data source reads that subscription back for
+  # parent_id. Terraform destroys the module's resources with it, so the
+  # files stay while any component declaring them does: remove the last of
+  # them from a Release only after destroying what their modules created,
+  # because with the provider file gone Terraform refuses to plan, asking for
+  # a provider block with the features argument. The azapi and random
+  # providers the module also declares are left to their default
+  # configuration, since no provider block names them.
+  boundary:
+    artifacts:
+      provider-azurerm.tf: |
+        provider "azurerm" {
+          features {}
+        }
+      client-config.tf: |
+        data "azurerm_client_config" "current" {}
