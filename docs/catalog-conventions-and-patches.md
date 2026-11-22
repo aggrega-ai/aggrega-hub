@@ -1213,10 +1213,11 @@ alternative.
 
 A cloud Recipe takes its name from the Component it realizes and the service it provisions:
 
-- **A product Component's Recipe takes the bare Component name** on each provider, one realization per provider that
-  stands the product up with nothing of its own already in place, as `recipe/helm/mariadb` does above.
-- **A neutral Component's Recipe is `<component>-<product>`.** A neutral Component names a concept several clouds sell
-  with the same pillars, so its Recipe says which product on which cloud: `postgres-aurora`, `postgres-alloydb`,
+- **A Component that names one product has its Recipe take the bare Component name** on each provider, as
+  `recipe/helm/mariadb` does above: one realization per provider, the one that provisions the product itself.
+- **A Component that several services realize has each Recipe named `<component>-<service>`.** An engine Component
+  (PostgreSQL, MySQL, Redis) or a neutral concept several clouds sell with the same pillars is realized by a different
+  service on each cloud, so the name says which: `postgres-aurora`, `postgres-alloydb`, `postgres-cloud-sql`,
   `redis-memorystore`, `mysql-flexible-server`.
 - **A generic compute realization names its service**, since one compute Component runs on several services of one
   cloud: `server-app-service`, `task-container-apps`, `task-cloud-run`, `function-cloud-run`.
@@ -2046,7 +2047,7 @@ A Recipe for a cloud target reads the most reusable source its target offers and
 source fails a test. Each target has its own preference:
 
 - **`arm`: the Azure Verified Module's Bicep resource module, through `bicep-module-oci`.** The registry serves it as
-  one compiled template, where its git repository is a monorepo of about 90 MB. The Recipe binds
+  one compiled template, where its git repository is the whole Verified Modules monorepo. The Recipe binds
   `enableTelemetry: false`. Where no Verified Module is available for the service, or its parameters cannot carry the
   Component's contract, the Recipe is a fragment the catalog writes, and its `description` names the test that
   failed: not official, not complete, or not maintained, or that the module's template does not pass the catalog's
@@ -2055,8 +2056,7 @@ source fails a test. Each target has its own preference:
   vendor's resource schema does not list, which the catalog's check refuses. A Recipe that pins a module by its git
   repository moves to the registry only in a version made for another reason, never in a version made only for that.
 - **`terraform`: a published module** from terraform-aws-modules, `Azure/avm-res-*`, or terraform-google-modules and
-  GoogleCloudPlatform, where it passes the tests of "A published Terraform module" (official or complete and
-  maintained, no registry module call in what loads), and `enable_telemetry = false` on a Verified Module. Otherwise a
+  GoogleCloudPlatform, where it passes the tests of "A published Terraform module", and `enable_telemetry = false` on a Verified Module. Otherwise a
   body the catalog writes, its `description` naming the failed test. `recipe/terraform/postgres-aurora`,
   `postgres-alloydb` and `postgres-flexible-server` source `terraform-aws-modules/rds-aurora`,
   `GoogleCloudPlatform/alloy-db` and the Verified PostgreSQL module. `recipe/terraform/mysql-flexible-server` is a body,
