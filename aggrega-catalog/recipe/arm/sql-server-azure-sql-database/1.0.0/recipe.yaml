@@ -36,9 +36,12 @@ metadata:
     another credential, the build halts naming the slot. host publishes an
     expression for the server's FQDN, or infra.overrides.host; port is 1433.
     A value or an infra.overrides key the service or the module cannot take
-    halts naming it; infra.overrides.sku_name sizes the database. The
-    database keeps the service's automated backups 7 days, and a core/backup
-    attachment halts: no FeatureRecipe for this capability binds it.
+    halts naming it, as do a storage size the SKU's tier does not take and
+    an administrator login the service keeps for a principal of its own;
+    infra.overrides.sku_name sizes the database. The database keeps the
+    service's automated backups 7 days unless a core/backup attachment sets
+    them, and such an attachment halts, naming the Feature, where no
+    FeatureRecipe for the arm capability realizes core/backup.
   maintainers:
     - name: Massimiliano Ferrero
       email: m.ferrero@cognitio.it
@@ -140,10 +143,12 @@ spec:
   #     takes no version; infra.port other than 1433; infra.compute.cpu and
   #     infra.compute.memory, since infra.overrides.sku_name sizes the
   #     database; infra.storage.type, since the service tier fixes the
-  #     storage; infra.ha.enabled on a SKU the service makes no database zone
-  #     redundant on; a database name the service refuses; a credential on the
-  #     password slot other than core/referenced-secret, or none; and any
-  #     infra.overrides key not listed above.
+  #     storage; infra.storage.size where the SKU's tier does not take it;
+  #     infra.ha.enabled on a SKU the service makes no database zone
+  #     redundant on; a database name the service refuses; values.user naming
+  #     a principal the service keeps; a credential on the password slot other
+  #     than core/referenced-secret, or none; and any infra.overrides key not
+  #     listed above.
   #   not read — infra.engine_version while it is 2022 and infra.port while it
   #     is 1433, the Component's defaults: the service runs its own engine
   #     and serves 1433, and a Recipe cannot tell a default from a value the
@@ -155,9 +160,10 @@ spec:
   # point-in-time restore 1 to 35 days, 1 to 7 on the Basic tier, 7 by
   # default; no setting turns them off. The mapping reads a core/backup
   # attachment among the component's attachments, as the comment above it
-  # says. Today no FeatureRecipe for the arm capability binds core/backup, so
-  # an attachment halts at the Manifest, naming the Feature, and the database
-  # keeps its backups 7 days.
+  # says. An attachment binds only where a FeatureRecipe for the arm
+  # capability realizes core/backup in the catalog the build reads; where none
+  # does, it halts at the Manifest, naming the Feature, and the database keeps
+  # its backups 7 days.
   #
   # The administrator's password is the module's administratorLoginPassword, a
   # secure parameter: the nested deployment receives a Key Vault reference
@@ -228,6 +234,18 @@ spec:
       {{- if or (eq $d "") (gt (len $d) 128) (regexMatch `[<>*%&:\\/?[:cntrl:]]` $d) (hasSuffix "." $d) (hasSuffix " " $d) (eq (lower $d) "master") -}}
       {{- fail (printf "values.database is %q, and Azure SQL Database takes a database name of 1 to 128 characters holding none of < > * %% & : \\ / ? or a control character, not ending in a period or a space, and other than master, the system database every logical server holds: set values.database in the Aggregate to such a name" $d) -}}
       {{- end -}}
+    # The names of the principals SQL Server keeps on every logical server and
+    # database, read off its documentation of the Database Engine's principals
+    # and of the roles of master in Azure SQL Database: the sa login and the
+    # public server role, the dbo, guest, INFORMATION_SCHEMA and sys users, and
+    # the dbmanager and loginmanager roles. The administrator login is named
+    # once, when the server is created, and this Recipe refuses each of these
+    # names for it, and an empty name, which names no login.
+    administrator_login: >-
+      {{- $u := toString .values.user -}}
+      {{- if or (eq $u "") (has (lower $u) (list "sa" "public" "dbo" "guest" "information_schema" "sys" "dbmanager" "loginmanager")) -}}
+      {{- fail (printf "values.user is %q, the logical server's administrator login, and SQL Server keeps sa, public, dbo, guest, INFORMATION_SCHEMA, sys, dbmanager and loginmanager for principals of its own on every logical server and database, while an empty name names no login: set values.user in the Aggregate to another name" $u) -}}
+      {{- end -}}
     engine_version_is_the_service: >-
       {{- if ne (toString .infra.engine_version) "2022" -}}
       {{- fail (printf "infra.engine_version is %q, and Azure SQL Database runs the service's own current database engine, which no setting chooses: remove infra.engine_version from the Release, or map this component to a realization that creates the server on the release it names" (toString .infra.engine_version)) -}}
@@ -244,12 +262,30 @@ spec:
       {{- end -}}
       {{- end -}}
     # The service takes the maximum data size in bytes; this Recipe passes
-    # whole gibibytes. Each SKU caps the size at its own largest, which the
-    # service checks when the template deploys.
+    # whole gibibytes. On a DTU SKU the service takes only the sizes its
+    # documentation of the CREATE DATABASE statement lists for the SKU's tier,
+    # read in whole gibibytes: 1 and 2 on Basic; 1, 2, 5, 10, 20, 30, 40, 50,
+    # 100, 150, 200 and 250 on S0 to S2; those and 300, 400, 500, 750 and 1024
+    # on S3 to S12 and P1 to P6; and those and every 256 from 1280 to 4096 on
+    # P11 and P15, which some regions cap at 1024. A vCore SKU caps the size at
+    # its own largest, which the service checks when the template deploys.
     storage: >-
       {{- $size := toString .infra.storage.size -}}
       {{- if not (and (regexMatch `^[0-9]+Gi$` $size) (ge (int (trimSuffix "Gi" $size)) 1)) -}}
       {{- fail (printf "infra.storage.size is %q, and this Recipe sets the database's maximum data size in whole gibibytes, from 1Gi: set infra.storage.size in the Release to such a size, such as 32Gi" $size) -}}
+      {{- end -}}
+      {{- $gi := int (trimSuffix "Gi" $size) -}}
+      {{- $s := .locals.sku -}}
+      {{- $low := list 1 2 5 10 20 30 40 50 100 150 200 250 -}}
+      {{- $high := concat $low (list 300 400 500 750 1024) -}}
+      {{- $sizes := list -}}
+      {{- if eq $s "Basic" -}}{{- $sizes = list 1 2 -}}
+      {{- else if regexMatch `^S[0-2]$` $s -}}{{- $sizes = $low -}}
+      {{- else if regexMatch `^P(11|15)$` $s -}}{{- $sizes = concat $high (list 1280 1536 1792 2048 2304 2560 2816 3072 3328 3584 3840 4096) -}}
+      {{- else if regexMatch `^[SP][0-9]+$` $s -}}{{- $sizes = $high -}}
+      {{- end -}}
+      {{- if and $sizes (not (has $gi $sizes)) -}}
+      {{- fail (printf "infra.storage.size is %q, and Azure SQL Database takes the maximum data size of a database on SKU %s as one of %s GiB: set infra.storage.size in the Release to one of them, such as %vGi" $size $s (join ", " $sizes) (last $sizes)) -}}
       {{- end -}}
       {{- with optional .infra.storage "type" "" -}}
       {{- fail (printf "infra.storage.type is %q, and Azure SQL Database chooses the database's storage by the SKU's service tier and takes no storage type: remove infra.storage.type from the Release" (toString .)) -}}
