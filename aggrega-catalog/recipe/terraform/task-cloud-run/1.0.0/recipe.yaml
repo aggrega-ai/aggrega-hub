@@ -1,0 +1,207 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: task-cloud-run
+  version: 1.0.0
+  description: >
+    The generic ephemeral compute primitive as one Cloud Run job running the
+    Release's image to completion, on the catalog's shared Cloud Run body.
+    Reach for it in a Google Cloud project with a VPC network; for
+    terraform/task-ecs or cloudformation/task-ecs in an AWS account,
+    terraform/task-container-apps in an Azure subscription, and helm/task on
+    Kubernetes, which also runs a task with no schedule once.
+
+    A scheduled task is started by a Cloud Scheduler job on its schedule,
+    read in UTC unless infra.overrides.time_zone names another time zone. A
+    task with no schedule carrying core/manual-trigger is deployed without
+    starting, and the operator starts each run with gcloud run jobs execute;
+    any other unscheduled task is refused by name, as this Recipe starts no
+    run when the configuration is applied.
+
+    The project, region, VPC network and service account are the operator's,
+    each required under infra.overrides; a subnet and network tags are
+    optional. Beside the job and its scheduler job, only a Secret Manager
+    secret and its version for each file the component is handed are
+    emitted: no service account, IAM binding, network or firewall rule.
+
+    Each env entry an inject block dictates becomes a container variable and
+    each file entry a file mounted alone from a secret volume; timeout
+    arrives by default as TASK_TIMEOUT, for the code to honour. Cloud Run
+    stops each attempt of the task at the job's task timeout, 10 minutes
+    unless infra.overrides.timeout sets another, whatever timeout says. The
+    job runs at the smallest whole-vCPU size meeting infra.compute; an
+    infra.overrides key this Recipe does not read halts.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/compute/task:1.0.1
+
+  # The module beside this Recipe is the fixed pass-through every container
+  # Recipe of this catalog carries byte for byte: its one input, config, goes
+  # to the service module the artifacts below import, and that module comes
+  # back out as its service output. entity.lock pins it.
+  #
+  # Google's Cloud Run module, GoogleCloudPlatform/cloud-run/google, at v0.34.2,
+  # the newest version its repository's tags carry, declares a Cloud Run job in
+  # its modules/job-exec directory, whose versions.tf declares hashicorp/google
+  # as ">= 6, < 8". Every Google body the catalog authors declares
+  # hashicorp/google "~> 8.8", and Terraform installs one provider version for a
+  # root configuration, so no version satisfies both: a root configuration
+  # holding that module beside an AlloyDB cluster or a Memorystore instance of
+  # this catalog fails to initialise. The module is therefore not sourced, and
+  # the job is the catalog's own Job body.
+  source: ./module
+
+  # This Recipe reads from infra.overrides:
+  #   project_id          - string (config.project_id), required
+  #   region              - string (config.location), required
+  #   private_network     - string (config.network), required
+  #   service_account     - string (config.service_account), required
+  #   subnetwork          - string (config.subnetwork)
+  #   network_tags        - []string (config.tags)
+  #   deletion_protection - bool (config.deletion_protection; default true)
+  #   time_zone           - string (config.time_zone; default UTC), with a schedule only
+  #   timeout             - string (config.timeout; default Cloud Run's 600s)
+  #
+  # Each is passed to the key of the body's config named in brackets, which
+  # CloudRunModule's Job body documents; network, subnetwork and tags set the
+  # job's one network interface, time_zone the Cloud Scheduler job's time zone
+  # and timeout the task's. The first seven are the keys
+  # terraform/server-cloud-run and terraform/worker-cloud-run read, under the
+  # same names and meanings, so an operator writes one set of overrides across
+  # the catalog's Cloud Run Recipes; time_zone and timeout are named for the
+  # arguments they set.
+  #
+  # project_id, region, private_network and service_account are required and
+  # none has a default: the project, the network and the identity the task runs
+  # as are provisioned outside this Release, no project-independent value exists
+  # for any of them, and this Recipe never chooses a network or an identity for
+  # the operator. private_network is the network's resource link,
+  # projects/<project>/global/networks/<name>; the job takes addresses from
+  # subnetwork, or from the subnet named as the network while subnetwork is
+  # unset. Egress is private ranges only: traffic to a private address, such as
+  # an AlloyDB instance's or a Memorystore instance's in that network, goes
+  # through it by Direct VPC egress, and other traffic leaves as it would with no
+  # network named. service_account is the email of the account the task runs
+  # as, which the task's code calls Google Cloud with, which reads each file's
+  # secret volume, and which the Cloud Scheduler job calls Cloud Run as to start
+  # a run; the operator grants it the Secret Manager Secret Accessor role on
+  # those secrets and leave to run the job, such as the Cloud Run Invoker role
+  # on it, and no IAM binding is emitted. network_tags are matched by the
+  # operator's egress firewall rules. deletion_protection is the provider's own
+  # guard, true unless the Release turns it off, under which Terraform refuses
+  # to destroy or replace the job.
+  #
+  # How a run starts. With values.schedule set, a Cloud Scheduler job in the
+  # same project and region starts an execution on it, reading it as a cron
+  # expression in time_zone, a time zone name of the tz database such as
+  # Europe/Rome, or in UTC, Cloud Scheduler's default, where time_zone is unset.
+  # The expression and the time zone are passed as they are written, and Cloud
+  # Scheduler judges them when Terraform applies. With no schedule, no scheduler
+  # job is rendered and Terraform creates the Cloud Run job without starting an
+  # execution, so time_zone names the time zone of nothing and is refused by
+  # name there: a task carrying core/manual-trigger, which a Manifest binds to
+  # terraform/manual-trigger, asked for exactly that, and the operator starts
+  # each run with gcloud run jobs execute <component> --region <region>
+  # --project <project_id>, which takes a role allowed to run the job. A
+  # scheduled job can be started that way too, attached or not. A task with no
+  # schedule and no core/manual-trigger attachment asks for a run when the
+  # Release deploys, which this Recipe does not start, so it is refused by name.
+  #
+  # The task timeout. Cloud Run stops an attempt of the task still running when
+  # its task timeout passes, and each retry may run as long again: timeout, a
+  # duration in seconds ending with s, such as 3600s, more than 0s and at most
+  # 604800s, the 168 hours Cloud Run allows a task, and Cloud Run's own default
+  # of 10 minutes where it is unset. It is independent of values.timeout, which
+  # reaches the container as a variable for the code to honour and sets no
+  # deadline of its own: an operator wanting Cloud Run to stop a run when the
+  # code's own timeout passes sets timeout to match it. Each execution runs one
+  # task, and no retry count is set, so Cloud Run retries a failed task as its
+  # default has it, three times.
+  #
+  # Files. Each file entry an edge's inject block dictates is mounted at its
+  # path, as CloudRunModule describes: one Secret Manager secret per file,
+  # replicated automatically in project_id, holding the content in one version,
+  # mounted as a secret volume at the file's directory with the file alone in
+  # it, so whatever the image holds in that directory is hidden. A file's
+  # content is held in the secret version and in Terraform state. No file, no
+  # secret.
+  #
+  # Every Component value and infra key is honoured, refused by name in
+  # CloudRunArguments#/mappings/JobArguments and the assertions below, or not
+  # read:
+  #   honoured — values.schedule as the Cloud Scheduler job's schedule;
+  #     values.timeout as the locals below say; infra.image (required);
+  #     infra.compute.cpu and infra.compute.memory as the size that entry
+  #     chooses; the overrides above; and env and file entries.
+  #   refused — a task with no schedule and no core/manual-trigger attachment;
+  #     any infra.overrides key not listed above; time_zone on a task with no
+  #     schedule; an override that is not of the form above; a compute
+  #     quantity that entry cannot read, and a pair larger than the largest
+  #     size; a component name that entry does not take for a job, which
+  #     includes one of 63 characters or more; an edge or the component's own
+  #     inject block injecting a
+  #     variable under a name Cloud Run sets in every job itself or refuses, or
+  #     under TASK_TIMEOUT while the timeout is delivered under that default
+  #     name; a file path Cloud Run cannot mount, two files in one directory
+  #     and a file longer than a secret version holds; and an edge's arg or
+  #     custom-mechanism entry.
+  #   not read — values.display_name and values.description, documentation
+  #     knobs no Cloud Run setting takes.
+  assertions:
+    overrides_known: >-
+      {{- $known := list "project_id" "region" "private_network" "service_account" "subnetwork" "network_tags" "deletion_protection" "time_zone" "timeout" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads project_id, region, private_network, service_account, subnetwork, network_tags, deletion_protection, time_zone and timeout from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # A run that happens once is not started by this Recipe, so it halts here.
+    # A task carrying core/manual-trigger asked for a run nothing starts until
+    # the operator does, so it is not refused for having no schedule. The
+    # attachment is found by its Feature's type, with any version it was
+    # authored with set aside. Nothing else reads it: a scheduled task renders
+    # alike with the attachment or without.
+    run_is_started: >-
+      {{- $s := trim (toString (optional .values "schedule" "")) -}}
+      {{- $manual := false -}}
+      {{- range $name, $attachment := optional . "features" dict -}}
+      {{- if eq (first (splitList ":" (toString $attachment.type))) "core/manual-trigger" }}{{ $manual = true }}{{ end -}}
+      {{- end -}}
+      {{- if and (not $s) (not $manual) -}}
+      {{- fail (printf "the component %q has no schedule and carries no core/manual-trigger attachment, so it runs once, and this realization starts no run when the configuration is applied: Terraform creates a Cloud Run job with no Cloud Scheduler job without executing it, so the run would never happen. Give the component a schedule in the Aggregate; or attach core/manual-trigger to it there, with the Manifest binding it to terraform/manual-trigger, to deploy the job alone for the operator to start each run with gcloud run jobs execute" .metadata.instance_id) -}}
+      {{- end -}}
+
+  # Target-expected names: the image is the Release's, so no upstream
+  # documentation names a spelling for the developer's timeout value. It is
+  # delivered under the name helm/task delivers it under, and only when the
+  # developer set it: a value set, even empty, renders its variable, and an
+  # unset value renders none. That name is a default: it is rendered only while
+  # no entry of the component's own inject block, in any mechanism, delivers the
+  # timeout, and an edge or that block delivering that name as well halts,
+  # naming which, rather than one value silently replacing the other. The
+  # schedule is not delivered as a variable: it becomes the Cloud Scheduler
+  # job's schedule. The component packages no upstream product, so no other
+  # local CloudRunArguments reads is declared: no default image, so the Release
+  # names the one it runs; no port, so the job's container is probed on none;
+  # no probe path, no GPU and no socket.
+  locals:
+    value_env: '{"values.timeout": "TASK_TIMEOUT"}'
+
+  artifacts:
+    # The Job body: the Cloud Run job, the Cloud Scheduler job starting it
+    # where a schedule is set, and the secrets holding its files.
+    service:
+      $import: CloudRunModule#/artifacts/Job
+
+  # The component publishes nothing across an edge, so nothing is emitted for
+  # one.
+  provides: {}
+
+  valuesMapping:
+    $import: CloudRunArguments#/mappings/JobArguments
