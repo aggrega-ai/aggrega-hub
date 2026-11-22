@@ -1,0 +1,556 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: function-azure-functions
+  version: 1.0.0
+  description: >
+    The generic event-driven compute primitive as one Azure Functions function
+    app running the Release's image, a whole function app image holding the
+    Functions host, on the operator's Elastic Premium or Dedicated plan,
+    rendered as Terraform for the azurerm provider by a module kept beside
+    this Recipe. The module Microsoft's Azure Verified Modules programme
+    publishes for App Service is not sourced, because it calls a module from
+    the Terraform registry. Reach for it where the operator runs such a plan;
+    for terraform/function-cloud-run on Google Cloud and
+    terraform/function-lambda in an AWS account.
+
+    The plan, resource group, region and host storage account are the
+    operator's, each required under infra.overrides, with one user-assigned
+    identity the host reaches its storage with; no access key is taken. Only
+    the app is emitted, with public network access off.
+
+    Each env entry an inject block dictates becomes an app setting; runtime
+    arrives by default as FUNCTION_RUNTIME. A name the platform sets or does
+    not take, and file, arg and other entries halt by name. These plans keep
+    an instance running, so infra.min_replicas 0, the Component's default,
+    halts: set at least 1.
+
+    Identities are read in the subscription Terraform runs against. It takes
+    hashicorp/azurerm ~> 5.14, so it goes in a terraform boundary apart from
+    terraform/postgres-flexible-server and terraform/azure-api-management.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/compute/function:1.0.0
+
+  # The function app is declared by the module beside this Recipe, with the
+  # azurerm provider's azurerm_linux_function_app resource.
+  #
+  # Microsoft's Azure Verified Modules programme publishes a module for App
+  # Service apps, function apps among them, Azure/avm-res-web-site/azurerm,
+  # MIT, at v0.25.0 its newest version. Its root, and its modules/slot
+  # directory, call Azure/avm-utl-interfaces/azure from the Terraform registry,
+  # a module terraform init downloads at whatever it then resolves, which
+  # neither the entity's lock nor Terraform's covers. The module is therefore
+  # not sourced.
+  #
+  # source names that directory, ./module, rather than rendering the body as
+  # artifacts, so that the Release's connections reach the app as arguments of
+  # its module block in the boundary's root configuration: a neighbour's
+  # Terraform reference, such as ${module.catalog-db.fqdn}, is evaluated
+  # there, where the neighbour's module is declared. Each file of the
+  # directory is pinned in entity.lock.
+  source: ./module
+
+  locals:
+    # The registry host infra.image names, the image's path beneath it, and
+    # that path split at its last colon into the image's name and its tag. The
+    # first segment of the image is a registry host when the image has more
+    # than one segment and the first holds a period or a colon or is
+    # localhost, as a container engine reads it; any other image is Docker
+    # Hub's, which App Service is given as index.docker.io. The azurerm
+    # provider takes the registry's address, the image's name and its tag
+    # apart and joins them with a slash and a colon, so a digest reference,
+    # name@sha256:<digest>, is passed as the name up to its last colon and the
+    # digest after it, and is joined back as written; an image with neither a
+    # tag nor a digest is passed with the tag latest, the one a container
+    # engine reads it as.
+    image_host: >-
+      {{- $parts := splitList "/" (toString (optional .infra "image" "")) -}}
+      {{- $first := first $parts -}}
+      {{- if and (gt (len $parts) 1) (or (contains "." $first) (contains ":" $first) (eq $first "localhost")) -}}
+      {{- if eq (lower $first) "docker.io" }}index.docker.io{{ else }}{{ $first }}{{ end -}}
+      {{- else }}index.docker.io{{ end -}}
+    image_path: >-
+      {{- $image := toString (optional .infra "image" "") -}}
+      {{- $parts := splitList "/" $image -}}
+      {{- $first := first $parts -}}
+      {{- if and (gt (len $parts) 1) (or (contains "." $first) (contains ":" $first) (eq $first "localhost")) -}}
+      {{- join "/" (rest $parts) -}}
+      {{- else }}{{ $image }}{{ end -}}
+    image_tag: >-
+      {{- $tag := regexFind ":[^:/]+$" .locals.image_path -}}
+      {{- if $tag }}{{ trimPrefix ":" $tag }}{{ else }}latest{{ end -}}
+    image_name: >-
+      {{- trimSuffix (regexFind ":[^:/]+$" .locals.image_path) .locals.image_path -}}
+
+  # This Recipe reads from infra.overrides:
+  #   resource_group_name         - string (resource_group_name), required
+  #   location                    - string (location), required
+  #   service_plan_id             - string (service_plan_id), required
+  #   storage_account_id          - string (the account's name, read from the
+  #                                 ID, as storage_account_name, with
+  #                                 storage_uses_managed_identity set true),
+  #                                 required
+  #   identity_ids                - []string (identity.identity_ids; its one
+  #                                 entry is the identity the host reaches its
+  #                                 storage with), required
+  #   virtual_network_subnet_id   - string (virtual_network_subnet_id)
+  #   registry_server             - string (the host of
+  #                                 site_config.application_stack.docker.registry_url)
+  #   registry_identity           - string (site_config.container_registry_use_managed_identity,
+  #                                 and the identity's client ID as
+  #                                 site_config.container_registry_managed_identity_client_id)
+  #   registry_username           - string (site_config.application_stack.docker.registry_username)
+  #   registry_password_secret_id - string (a Key Vault reference in
+  #                                 site_config.application_stack.docker.registry_password,
+  #                                 which the provider writes as the
+  #                                 DOCKER_REGISTRY_SERVER_PASSWORD app setting)
+  #   registry_password_identity  - string (key_vault_reference_identity_id)
+  #   registry_password           - refused: the password is read from Key Vault
+  #   storage_account_access_key  - refused: the host reaches its storage with
+  #                                 an identity
+  #   storage_key_vault_secret_id - refused: the host reaches its storage with
+  #                                 an identity
+  #
+  # resource_group_name, location, service_plan_id, virtual_network_subnet_id,
+  # identity_ids and the registry keys are the ones terraform/server-app-service
+  # reads for the same concepts, under the same names and meanings, so an
+  # operator writes one set of overrides across both. storage_account_id is
+  # named as the other operator pointers of the Azure Recipes are, a resource
+  # ID under a name ending in _id; arm/function-azure-functions reads it under
+  # the same name. timeout, which terraform/function-lambda reads, is not one:
+  # how long one execution may run is functionTimeout in the host.json the
+  # image holds.
+  #
+  # resource_group_name, location, service_plan_id and storage_account_id are
+  # required and none has a default: the resource group, the plan the app runs
+  # on and the storage account its host keeps its state in are provisioned
+  # outside this Release, no subscription-independent value exists for any of
+  # them, and this Recipe never chooses a plan, and with it the app's size, for
+  # the operator. service_plan_id is the plan's resource ID,
+  # /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Web/serverFarms/<name>,
+  # a Linux Elastic Premium plan or a Linux Dedicated (App Service) plan, the
+  # plans on which Azure Functions runs a whole function app image; location is
+  # the plan's region, which the app takes.
+  #
+  # Host storage. The Functions host keeps its state in a storage account, and
+  # cannot start without one. storage_account_id is the account's resource ID,
+  # /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Storage/storageAccounts/<name>,
+  # whose name, 3 to 24 lowercase letters and digits, the module reads from
+  # it. The host reaches the account with a managed identity and no secret:
+  # the provider writes the name as AzureWebJobsStorage__accountName, and the
+  # module writes AzureWebJobsStorage__credential, managedidentity, and
+  # AzureWebJobsStorage__clientId, the client ID of the one entry of
+  # identity_ids, which the module reads with the azurerm_user_assigned_identity
+  # data source in the subscription Terraform runs against. The name form
+  # reaches the account at Azure's standard storage host names. An access key
+  # or a connection string would be written into the rendered configuration,
+  # so storage_account_access_key and storage_key_vault_secret_id halt by name,
+  # and identity_ids holding no entry, or more than one, halts, naming the
+  # remedy. The operator grants that identity the Storage Blob Data Owner role
+  # on the account, Storage Table Data Contributor for the diagnostic events
+  # the host writes, and the queue roles its triggers need, as Microsoft's
+  # guidance on identity-based connections sets out; no role assignment is
+  # emitted. No Azure Files content share is configured, since Azure Files
+  # takes only an access key: Microsoft documents that an Elastic Premium app
+  # runs without one, with scaling that may then be limited, and that an app
+  # on a Dedicated plan does not depend on one.
+  #
+  # virtual_network_subnet_id is the resource ID of a subnet delegated to
+  # Microsoft.Web/serverFarms, which the app joins by regional virtual network
+  # integration; all its outbound traffic is then routed through it, so a
+  # database with private access in that network, and the private DNS zone
+  # its name resolves through, are reached from the app.
+  #
+  # identity_ids are the resource IDs of user-assigned managed identities that
+  # already exist; its one entry is the identity the host reaches its storage
+  # with, which the function's code may call Azure with as well. A private
+  # image is pulled from registry_server, the registry's host name, which is
+  # the host infra.image names: App Service pulls from one registry address,
+  # so a registry_server naming another host halts. It is pulled either with
+  # registry_identity, a user-assigned identity granted pull on the registry,
+  # whose client ID the module reads as it reads the storage identity's; or
+  # with registry_username and a password App Service reads from the Key Vault
+  # secret registry_password_secret_id names,
+  # https://<vault>.vault.azure.net/secrets/<name>, with or without a version,
+  # through a Key Vault reference it resolves with the user-assigned identity
+  # registry_password_identity names. That identity reads every Key Vault
+  # reference of the app. Each identity named for the registry is given to the
+  # app as well, since App Service uses only the app's own identities. A
+  # password written as text would be written into the rendered
+  # configuration, so it is taken only by that reference. The reference,
+  # @Microsoft.KeyVault(SecretUri=<secret ID>), is written into the docker
+  # block's registry_password, which the azurerm provider writes as the
+  # DOCKER_REGISTRY_SERVER_PASSWORD app setting and reads back from it. With
+  # no registry key set the image is pulled as a public one.
+  #
+  # Who invokes the function. Public network access is off, fixed in the
+  # module: the app's default host name answers no request from the internet,
+  # and a private endpoint the operator creates for the app, in a network its
+  # callers reach, is the way in for an HTTP trigger. Every other trigger, and
+  # every binding, is declared by the image's own function code and reaches
+  # its event source from the app. A wider ingress is not something this
+  # Recipe renders. Plain HTTP is redirected to HTTPS, which App Service
+  # terminates at its front ends, and a request reaches the container on
+  # infra.port, which the module writes as the WEBSITES_PORT app setting:
+  # Microsoft's function app images have the host listen on port 80 unless
+  # they set another, and infra.port takes a port from 1024, so the image's
+  # host listens on infra.port, 8080 unless the Release sets another. FTP is
+  # disabled, the FTP and Web Deploy endpoints refuse basic authentication,
+  # and WEBSITES_ENABLE_APP_SERVICE_STORAGE is false, as Microsoft directs for
+  # an app running a container, so no shared /home directory is mounted.
+  #
+  # The instance counts. An Elastic Premium or Dedicated plan keeps at least
+  # one instance of the app running, so the app never scales to zero, and
+  # infra.min_replicas at the Component's default of 0 halts, naming the
+  # remedy: set it to at least 1. The module reads the plan's SKU when
+  # Terraform plans. On an Elastic Premium plan, whose SKU names begin with
+  # EP, infra.min_replicas is the app's always ready instance count
+  # (site_config.elastic_instance_minimum), which Microsoft supports up to 20
+  # for one app and which also raises the plan's own minimum, and
+  # infra.max_replicas is the app's scale-out limit (site_config.app_scale_limit),
+  # within the plan's maximum burst; Always On is off there, as the provider
+  # documents for that plan. On a Dedicated plan neither is read: the app runs
+  # on each instance the plan runs, the plan's instance count, the operator's,
+  # sets the floor and the ceiling, and Always On is on, which a function app
+  # on that plan needs to keep its host running. A floor above the ceiling
+  # halts, and so does a floor above 20.
+  #
+  # The environment. Every env entry on the inject pipe, dictated by a
+  # connection's inject block, by the component's own inject block or by an
+  # attachment, becomes one app setting, under the name it was dictated as,
+  # its value written whole, and App Service hands each app setting to the
+  # container as a variable; APPLICATIONINSIGHTS_CONNECTION_STRING and
+  # APPINSIGHTS_INSTRUMENTATIONKEY are passed in site_config's
+  # application_insights_connection_string and application_insights_key,
+  # which the provider writes as those app settings. App Service takes an app
+  # setting name of letters, digits, periods and underscores alone. It sets
+  # WEBSITE_SITE_NAME, WEBSITE_RESOURCE_GROUP, WEBSITE_OWNER_NAME,
+  # REGION_NAME, WEBSITE_PLATFORM_VERSION, HOME, SERVER_PORT,
+  # WEBSITE_COMPUTE_MODE, WEBSITE_SKU, SITE_BITNESS, WEBSITE_HOSTNAME,
+  # WEBSITE_DEFAULT_HOSTNAME, WEBSITE_VOLUME_TYPE, WEBSITE_INSTANCE_ID and
+  # WEBSITE_ROLE_INSTANCE_ID itself, read-only, as its "Environment variables
+  # and app settings reference" lists. The module sets WEBSITES_PORT,
+  # WEBSITES_ENABLE_APP_SERVICE_STORAGE and the host's storage settings; and
+  # the azurerm provider sets FUNCTIONS_EXTENSION_VERSION, AzureWebJobsStorage
+  # and the settings beneath it, AzureWebJobsDashboard and the settings
+  # beneath it, DOCKER_REGISTRY_SERVER_URL, DOCKER_REGISTRY_SERVER_USERNAME,
+  # DOCKER_REGISTRY_SERVER_PASSWORD and WEBSITE_HEALTHCHECK_MAXPINGFAILURES
+  # from arguments of its own, and leaves WEBSITE_NODE_DEFAULT_VERSION,
+  # WEBSITE_HTTPLOGGING_RETENTION_DAYS and WEBSITE_VNET_ROUTE_ALL out of the
+  # app settings it reads back, so a variable of any of those names would
+  # collide or never settle. A variable under any of those names, compared
+  # without regard to case, AzureWebJobsStorage__ and AzureWebJobsDashboard__
+  # followed by anything among them, or under a name outside those characters,
+  # halts, naming who dictated it.
+  #
+  # Target-expected names: the image is the Release's, so no upstream
+  # documentation names a spelling for the developer's runtime value. It is
+  # delivered under the name the Kubernetes, AWS Lambda and Cloud Run
+  # realizations deliver it under, FUNCTION_RUNTIME, for the application's own
+  # code to read. That name is a default: it is rendered only while no entry of
+  # the component's own inject block, in any mechanism, delivers the runtime,
+  # and an edge or that block delivering that name as well, compared without
+  # regard to case, halts, naming which, rather than one value silently
+  # replacing the other.
+  #
+  # Files and other mechanisms. This realization delivers env entries alone,
+  # and every other entry on the pipe halts, naming the entry, its mechanism
+  # and who dictated it, so none is dropped: a file entry, because App Service
+  # gives a custom container no way to write a file's content into it; an arg
+  # entry, because no command line is rendered, and App Service passes a
+  # startup command to the container in place of the image's own; and any
+  # custom mechanism.
+  #
+  # DELIBERATE NEAR-DUPLICATE of the environment assembly every other
+  # target's container Recipes hold, in their own values mapping or in the
+  # shared arguments they import, and of terraform/server-app-service's, which
+  # holds the same app setting name rule, registry checks and placement checks,
+  # and of the reading of .context.self_inject terraform/function-lambda
+  # holds: the same reading of the inject pipe and of who dictated each entry,
+  # save the variables each target reserves and the mechanisms it delivers.
+  # The function app is not the App Service app's body, and no catalog kind
+  # composes part of a values mapping into another, so this Recipe holds its
+  # own; a change to one is made to all of them.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read:
+  #   honoured — values.runtime as above; infra.image (required), as the
+  #     image the app runs, the registry it is pulled from taken from its
+  #     first segment; infra.port, as WEBSITES_PORT;
+  #     infra.min_replicas from 1 and infra.max_replicas, on an Elastic
+  #     Premium plan, as above; the overrides above; and env entries.
+  #   refused — infra.image unset or naming no image beneath its host;
+  #     infra.min_replicas below 1, above infra.max_replicas
+  #     or above 20; a component name App Service does not take for an app; a
+  #     variable under a name the platform sets or reads itself or does not
+  #     take, or under FUNCTION_RUNTIME while the runtime is delivered under
+  #     that default name; a file, arg or custom-mechanism entry; a
+  #     registry_server other than the image's registry; identity_ids holding
+  #     other than one entry; an override that is not of the form above; and
+  #     any infra.overrides key not listed above.
+  #   not read — infra.compute.cpu and infra.compute.memory, since the plan's
+  #     SKU sizes every app on it, and a Recipe cannot tell the Component's
+  #     defaults from a value the Release wrote; infra.min_replicas and
+  #     infra.max_replicas on a Dedicated plan, as above;
+  #     infra.control_plane_present, as Azure Functions needs no control plane
+  #     of the operator's; infra.scaler, as the platform scales the app on its
+  #     triggers' own events and takes no event source to scale on; and
+  #     values.display_name and values.description, documentation knobs no
+  #     Azure setting takes.
+  assertions:
+    overrides_known: >-
+      {{- $known := list "resource_group_name" "location" "service_plan_id" "storage_account_id" "identity_ids" "virtual_network_subnet_id" "registry_server" "registry_identity" "registry_username" "registry_password_secret_id" "registry_password_identity" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "registry_password" -}}
+      {{- fail "infra.overrides.registry_password is set, and this Recipe takes a registry password only by reference, so that its value is never written into the rendered configuration: store it as a Key Vault secret and set infra.overrides.registry_password_secret_id to the secret's ID and infra.overrides.registry_password_identity to a user-assigned identity allowed to read it, then remove infra.overrides.registry_password" -}}
+      {{- end -}}
+      {{- if has $k (list "storage_account_access_key" "storage_key_vault_secret_id") -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe has the Functions host reach its storage account with a managed identity alone, so that no access key or connection string is written into the rendered configuration: remove infra.overrides.%s, and grant the identity infra.overrides.identity_ids holds access to the account infra.overrides.storage_account_id names" $k $k) -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads resource_group_name, location, service_plan_id, storage_account_id, identity_ids, virtual_network_subnet_id, registry_server, registry_identity, registry_username, registry_password_secret_id and registry_password_identity from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    placement_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "resource_group_name" "location" "service_plan_id" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "the component %q runs as a function app on the operator's own Elastic Premium or Dedicated plan, in the operator's resource group and the plan's region, and this Recipe never chooses any of them, but infra.overrides.%s carries none: set infra.overrides.resource_group_name, infra.overrides.location and infra.overrides.service_plan_id in the Release" $.metadata.instance_id $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if not (regexMatch `(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Web/serverFarms/[^/]+$` $o.service_plan_id) -}}
+      {{- fail (printf "infra.overrides.service_plan_id is %q, and this Recipe takes the plan the function app runs on as the plan's resource ID: set it to /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Web/serverFarms/<name>, a Linux Elastic Premium or Dedicated plan" $o.service_plan_id) -}}
+      {{- end -}}
+      {{- if hasKey $o "virtual_network_subnet_id" -}}
+      {{- $s := index $o "virtual_network_subnet_id" -}}
+      {{- if not (and (typeIs "string" $s) (regexMatch `(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Network/virtualNetworks/[^/]+/subnets/[^/]+$` $s)) -}}
+      {{- fail (printf "infra.overrides.virtual_network_subnet_id is %s, and this Recipe takes the subnet the function app joins by virtual network integration as the subnet's resource ID: set it to /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Network/virtualNetworks/<network>/subnets/<subnet>, a subnet delegated to Microsoft.Web/serverFarms, or remove it" (toJson $s)) -}}
+      {{- end -}}
+      {{- end -}}
+    # The storage account and the one identity the host reaches it with. A
+    # list of identities that is not a list of resource IDs is refused by the
+    # registry assertion below, which reads every identity key.
+    host_storage: >-
+      {{- $id := .metadata.instance_id -}}
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $sa := optional $o "storage_account_id" "" -}}
+      {{- if not (and (typeIs "string" $sa) $sa) -}}
+      {{- fail (printf "the component %q runs on Azure Functions, whose host keeps its state in a storage account and cannot start without one, and this Recipe never creates one, but infra.overrides.storage_account_id carries none: set it in the Release to the resource ID of the operator's storage account, /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Storage/storageAccounts/<name>" $id) -}}
+      {{- end -}}
+      {{- if not (regexMatch `^/(?i:subscriptions)/[^/]+/(?i:resourceGroups)/[^/]+/(?i:providers/Microsoft\.Storage/storageAccounts)/[a-z0-9]{3,24}$` $sa) -}}
+      {{- fail (printf "infra.overrides.storage_account_id of %q is %q, and this Recipe takes the host's storage account as the account's resource ID, whose last segment is the account's name of 3 to 24 lowercase letters and digits: set it to /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Storage/storageAccounts/<name>" $id $sa) -}}
+      {{- end -}}
+      {{- $ids := optional $o "identity_ids" list -}}
+      {{- if kindIs "slice" $ids -}}
+      {{- if eq (len $ids) 0 -}}
+      {{- fail (printf "the component %q has its Functions host reach its storage account with a user-assigned identity, the one entry of infra.overrides.identity_ids, and none is set: set infra.overrides.identity_ids in the Release to a list holding the resource ID of one existing user-assigned identity the operator has granted access to the account" $id) -}}
+      {{- end -}}
+      {{- if gt (len $ids) 1 -}}
+      {{- fail (printf "the component %q has its Functions host reach its storage account with the one entry of infra.overrides.identity_ids, and it holds %d entries, so which one reaches the account is not said: keep one, the user-assigned identity the operator has granted access to the account" $id (len $ids)) -}}
+      {{- end -}}
+      {{- end -}}
+    # The app is named after the component, and its name is also the first
+    # label of its default host name under azurewebsites.net, so it is unique
+    # across Azure; the rule Microsoft's naming rules for Azure resources state
+    # for an app is checked here, where the name is known.
+    app_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (regexMatch `^[A-Za-z0-9][-A-Za-z0-9]{0,58}[A-Za-z0-9]$` $n) -}}
+      {{- fail (printf "the component %q names its function app, and App Service takes an app name of 2 to 60 letters, digits and hyphens that begins and ends with a letter or a digit: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+    image_supplied: >-
+      {{- $id := .metadata.instance_id -}}
+      {{- if not (toString (optional .infra "image" "")) -}}
+      {{- fail (printf "the component %q has no image to run: the Release sets no infra.image, and this Recipe holds no default image, as the generic compute primitive packages no software; set infra.image in the Release to the function app image it runs" $id) -}}
+      {{- end -}}
+      {{- if not .locals.image_path -}}
+      {{- fail (printf "infra.image of %q is %q, and it names a registry host and no image beneath it: set infra.image in the Release to <registry>/<repository>:<tag>" $id (toString .infra.image)) -}}
+      {{- end -}}
+    # A function app running an image runs only on an Elastic Premium or a
+    # Dedicated plan, and each keeps at least one instance of it running.
+    replica_floor: >-
+      {{- $id := .metadata.instance_id -}}
+      {{- $min := int .infra.min_replicas -}}
+      {{- $max := int .infra.max_replicas -}}
+      {{- if lt $min 1 -}}
+      {{- fail (printf "infra.min_replicas of %q is %d, and a function app running an image runs only on an Elastic Premium or a Dedicated plan, each of which keeps at least one instance of it running, so it never scales to zero: set infra.min_replicas to at least 1 in the Release" $id $min) -}}
+      {{- end -}}
+      {{- if gt $min $max -}}
+      {{- fail (printf "infra.min_replicas of %q is %d and infra.max_replicas %d, and on an Elastic Premium plan the floor is the app's always ready instance count, which the app's scale-out limit the ceiling sets cannot be below: set infra.min_replicas in the Release to at most infra.max_replicas" $id $min $max) -}}
+      {{- end -}}
+      {{- if gt $min 20 -}}
+      {{- fail (printf "infra.min_replicas of %q is %d, and on an Elastic Premium plan the floor is the app's always ready instance count, which Microsoft supports up to 20 for one app: set infra.min_replicas in the Release to at most 20" $id $min) -}}
+      {{- end -}}
+    registry: >-
+      {{- $id := .metadata.instance_id -}}
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $uai := `(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.ManagedIdentity/userAssignedIdentities/[^/]+$` -}}
+      {{- if hasKey $o "identity_ids" -}}
+      {{- $s := index $o "identity_ids" -}}
+      {{- $ok := kindIs "slice" $s -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) (regexMatch $uai .)) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.identity_ids of %q is %s, and this Recipe reads it as a list of resource IDs of existing user-assigned managed identities, each /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<name>: set it in the Release to such a list" $id (toJson $s)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- range $k := list "registry_identity" "registry_password_identity" -}}
+      {{- if hasKey $o $k -}}
+      {{- $v := index $o $k -}}
+      {{- if not (and (typeIs "string" $v) (regexMatch $uai $v)) -}}
+      {{- fail (printf "infra.overrides.%s of %q is %s, and this Recipe reads it as the resource ID of an existing user-assigned managed identity, /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<name>: set it in the Release to that ID, or remove it" $k $id (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- range $k := list "registry_server" "registry_username" -}}
+      {{- if hasKey $o $k -}}
+      {{- $v := index $o $k -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "infra.overrides.%s of %q is %s, and this Recipe reads it as a string: set it in the Release to one, or remove it" $k $id (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "registry_password_secret_id" -}}
+      {{- $v := index $o "registry_password_secret_id" -}}
+      {{- if not (and (typeIs "string" $v) (regexMatch `^https://[a-z0-9-]+(\.[a-z0-9-]+)+/secrets/[A-Za-z0-9-]+(/[A-Za-z0-9]+)?$` $v)) -}}
+      {{- fail (printf "infra.overrides.registry_password_secret_id of %q is %s, and this Recipe reads it as the ID of the Key Vault secret holding the registry password, https://<vault>.vault.azure.net/secrets/<name>, with or without a version: set it in the Release to that ID, or remove it" $id (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $byPassword := list "registry_username" "registry_password_secret_id" "registry_password_identity" -}}
+      {{- $set := list -}}
+      {{- range $k := concat (list "registry_identity") $byPassword }}{{ if hasKey $o $k }}{{ $set = append $set $k }}{{ end }}{{ end -}}
+      {{- if and $set (not (hasKey $o "registry_server")) -}}
+      {{- fail (printf "infra.overrides.%s of %q is set, and it says how a private image is pulled from a registry, but infra.overrides.registry_server names none: set infra.overrides.registry_server in the Release to the registry's host name, or remove the registry keys" (first $set) $id) -}}
+      {{- end -}}
+      {{- if hasKey $o "registry_server" -}}
+      {{- $missing := list -}}
+      {{- range $k := $byPassword }}{{ if not (hasKey $o $k) }}{{ $missing = append $missing $k }}{{ end }}{{ end -}}
+      {{- if and (hasKey $o "registry_identity") (lt (len $missing) (len $byPassword)) -}}
+      {{- fail (printf "infra.overrides of %q sets registry_identity and a registry user name or password as well, and App Service pulls an image from a registry either with a managed identity or with a user name and password, never both: keep registry_identity alone, or registry_username, registry_password_secret_id and registry_password_identity together" $id) -}}
+      {{- end -}}
+      {{- if and (not (hasKey $o "registry_identity")) $missing -}}
+      {{- fail (printf "infra.overrides.registry_server of %q names a private registry, and this Recipe pulls from it either with registry_identity, or with registry_username, registry_password_secret_id and registry_password_identity together, but infra.overrides.%s is not set: set registry_identity, or the three keys together, in the Release" $id (first $missing)) -}}
+      {{- end -}}
+      {{- if ne (lower (toString $o.registry_server)) (lower .locals.image_host) -}}
+      {{- fail (printf "infra.overrides.registry_server of %q is %q, and infra.image names the registry %s, and App Service pulls the image from one registry address with the registry's credentials: set registry_server to %s, or infra.image to an image in %s" $id (toString $o.registry_server) .locals.image_host .locals.image_host (toString $o.registry_server)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The component publishes nothing across an edge, so nothing is emitted for
+  # one.
+  provides: {}
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own variable.
+  # The app is named after the component. Before an argument is written, the
+  # inject pipe is read as the comments above set out: every entry that is
+  # not an env entry halts, naming who dictated it, and every env entry
+  # becomes one app setting, under a name App Service takes and neither it,
+  # the provider nor the module sets or reads itself; the runtime joins them
+  # as FUNCTION_RUNTIME while it is delivered under that default name. The
+  # template reads the component's own inject block at .context.self_inject,
+  # which maps each name the developer wrote to values.<key> for an entry
+  # whose template reads that one own value.
+  valuesMapping: |
+    {{- $id := .context.instance_id }}
+    {{- $reserved := list "WEBSITE_SITE_NAME" "WEBSITE_RESOURCE_GROUP" "WEBSITE_OWNER_NAME" "REGION_NAME" "WEBSITE_PLATFORM_VERSION" "HOME" "SERVER_PORT" "WEBSITE_COMPUTE_MODE" "WEBSITE_SKU" "SITE_BITNESS" "WEBSITE_HOSTNAME" "WEBSITE_DEFAULT_HOSTNAME" "WEBSITE_VOLUME_TYPE" "WEBSITE_INSTANCE_ID" "WEBSITE_ROLE_INSTANCE_ID" "WEBSITES_PORT" "WEBSITES_ENABLE_APP_SERVICE_STORAGE" "FUNCTIONS_EXTENSION_VERSION" "AZUREWEBJOBSSTORAGE" "AZUREWEBJOBSDASHBOARD" "DOCKER_REGISTRY_SERVER_URL" "DOCKER_REGISTRY_SERVER_USERNAME" "DOCKER_REGISTRY_SERVER_PASSWORD" "WEBSITE_HEALTHCHECK_MAXPINGFAILURES" "WEBSITE_NODE_DEFAULT_VERSION" "WEBSITE_HTTPLOGGING_RETENTION_DAYS" "WEBSITE_VNET_ROUTE_ALL" }}
+    {{- $inject := default dict .context.inject }}
+    {{- $selfInject := default dict .context.self_inject }}
+    {{- range $mechanism, $entries := $inject }}
+    {{- if not (has $mechanism (list "all" "env")) }}
+    {{- range $name, $_ := $entries }}
+    {{- $by := "an attachment on the component" }}
+    {{- if hasKey (optional $selfInject $mechanism dict) $name }}{{ $by = "the component's own inject block" }}{{ end }}
+    {{- range $alias, $edge := $.context.uses }}
+    {{- if hasKey (optional (default dict $edge.inject) $mechanism dict) $name }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+    {{- end }}
+    {{- if eq $mechanism "file" }}
+    {{- fail (printf "the component %q is handed a file at %q by %s, and this realization delivers env entries only: App Service gives a custom container no way to write a file's content into it. Dictate the value as an env entry in that inject block instead" $id $name $by) }}
+    {{- end }}
+    {{- if eq $mechanism "arg" }}
+    {{- fail (printf "the component %q is handed the command-line argument %q by %s, and this realization renders no command line: App Service passes a startup command to the container in place of the image's own, which stays the image's. Dictate the value as an env entry in that inject block instead" $id $name $by) }}
+    {{- end }}
+    {{- fail (printf "the component %q is handed %q under the delivery mechanism %q by %s, and this realization delivers env entries only: dictate the value as an env entry in that inject block instead" $id $name $mechanism $by) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- $named := dict }}
+    {{- range $mechanism, $names := $selfInject }}
+    {{- range $name, $key := $names }}
+    {{- if $key }}{{ $_ := set $named (toString $key) true }}{{ end }}
+    {{- end }}
+    {{- end }}
+    {{- $runtimeByDefault := not (hasKey $named "values.runtime") }}
+    {{- $env := dict }}
+    {{- $ownEnv := optional $selfInject "env" dict }}
+    {{- range $k, $v := optional $inject "env" dict }}
+    {{- $by := "an attachment on the component" }}
+    {{- if hasKey $ownEnv $k }}{{ $by = "the component's own inject block" }}{{ end }}
+    {{- range $alias, $edge := $.context.uses }}
+    {{- if hasKey (optional (default dict $edge.inject) "env" dict) $k }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+    {{- end }}
+    {{- if and $runtimeByDefault (eq (upper $k) "FUNCTION_RUNTIME") }}
+    {{- fail (printf "the component %q delivers its developer value runtime to the container as FUNCTION_RUNTIME, and %s dictates the variable %q as well, the same name without regard to case, so one would silently replace the other: rename the variable in that inject block" $id $by $k) }}
+    {{- end }}
+    {{- if or (has (upper $k) $reserved) (hasPrefix "AZUREWEBJOBSSTORAGE__" (upper $k)) (hasPrefix "AZUREWEBJOBSDASHBOARD__" (upper $k)) }}
+    {{- fail (printf "the component %q is handed the variable %q by %s, and App Service, the azurerm provider or this Recipe sets or reads an app setting of that name itself, compared here without regard to case, so the two would collide: rename the variable where it is dictated" $id $k $by) }}
+    {{- end }}
+    {{- if not (regexMatch `^[A-Za-z0-9._]+$` $k) }}
+    {{- fail (printf "the component %q is handed the variable %q by %s, and App Service takes an app setting name of letters, digits, periods and underscores alone: rename the variable where it is dictated" $id $k $by) }}
+    {{- end }}
+    {{- $_ := set $env $k (toString $v) }}
+    {{- end }}
+    {{- if $runtimeByDefault }}{{ $_ := set $env "FUNCTION_RUNTIME" (toString .values.runtime) }}{{ end }}
+    {{- $o := .infra.overrides }}
+    {{- $identities := list }}
+    {{- range $v := $o.identity_ids }}{{ $identities = append $identities $v }}{{ end }}
+    {{- range $k := list "registry_identity" "registry_password_identity" }}{{ with optional $o $k "" }}{{ if not (has . $identities) }}{{ $identities = append $identities . }}{{ end }}{{ end }}{{ end }}
+    name: {{ toJson $id }}
+    resource_group_name: {{ toJson $o.resource_group_name }}
+    location: {{ toJson $o.location }}
+    service_plan_id: {{ toJson $o.service_plan_id }}
+    {{- with optional $o "virtual_network_subnet_id" "" }}
+    virtual_network_subnet_id: {{ toJson . }}
+    {{- end }}
+    storage_account_id: {{ toJson $o.storage_account_id }}
+    storage_identity: {{ toJson (first $o.identity_ids) }}
+    identity_ids: {{ toJson $identities }}
+    port: {{ int .infra.port }}
+    image_name: {{ toJson .locals.image_name }}
+    image_tag: {{ toJson .locals.image_tag }}
+    registry_url: {{ toJson (printf "https://%s" .locals.image_host) }}
+    environment: {{ toJson $env }}
+    min_replicas: {{ int .infra.min_replicas }}
+    max_replicas: {{ int .infra.max_replicas }}
+    {{- range $k := list "registry_identity" "registry_username" "registry_password_secret_id" "registry_password_identity" }}
+    {{- with optional $o $k "" }}
+    {{ $k }}: {{ toJson . }}
+    {{- end }}
+    {{- end }}
+
+  # Written once, beside the boundary's root configuration rather than in the
+  # module, and shared by every component of the boundary that declares this
+  # file with these bytes: another component bound to this Recipe, or one whose
+  # Recipe configures azurerm the same way under the same name, such as
+  # terraform/server-app-service and terraform/mysql-flexible-server. The same
+  # name with other bytes halts the build. The azurerm provider refuses to plan
+  # without its features block, and the module carries no provider block of its
+  # own, so it inherits this configuration; the provider reads its credentials
+  # and subscription from the environment Terraform runs in. Terraform destroys
+  # the module's resources with it, so the file stays while any component
+  # declaring it does: remove the last of them from a Release only after
+  # destroying what their modules created, because with the file gone Terraform
+  # refuses to plan, asking for a provider block with the features argument.
+  boundary:
+    artifacts:
+      provider-azurerm.tf: |
+        provider "azurerm" {
+          features {}
+        }
