@@ -2056,8 +2056,9 @@ source fails a test. Each target has its own preference:
   vendor's resource schema does not list, which the catalog's check refuses. A Recipe that pins a module by its git
   repository moves to the registry only in a version made for another reason, never in a version made only for that.
 - **`terraform`: a published module** from terraform-aws-modules, `Azure/avm-res-*`, or terraform-google-modules and
-  GoogleCloudPlatform, where it passes the tests of "A published Terraform module", and `enable_telemetry = false` on a Verified Module. Otherwise a
-  body the catalog writes, its `description` naming the failed test. `recipe/terraform/postgres-aurora`,
+  GoogleCloudPlatform, where it passes the tests of "A published Terraform module", and `enable_telemetry = false` on
+  a Verified Module. Otherwise a body the catalog writes, its `description` naming the failed test.
+  `recipe/terraform/postgres-aurora`,
   `postgres-alloydb` and `postgres-flexible-server` source `terraform-aws-modules/rds-aurora`,
   `GoogleCloudPlatform/alloy-db` and the Verified PostgreSQL module. `recipe/terraform/mysql-flexible-server` is a body,
   because the Verified MySQL module declares no database or configuration resource and so is not complete;
@@ -2502,8 +2503,9 @@ there. This is a convention whose enforcement is not implemented, because
 
 The same rule holds for Azure, with its own string. Every Terraform body the catalog
 authors for Azure declares `hashicorp/azurerm` in its `required_providers` block as
-**`~> 5.14`**, one string in every such body except as stated below for a shared body that re-versions a published one, carried by each body with a comment naming
-this section, for the reasons the AWS section gives. The major and minor are those of the
+**`~> 5.14`**, one string in every such body except as stated below for a shared body that
+re-versions a published one, carried by each body with a comment naming this section, for
+the reasons the AWS section gives. The major and minor are those of the
 provider's current release when the constraint is set, and never lower than the highest
 `hashicorp/azurerm` floor declared by a published Azure module a catalog Recipe sources
 whose constraint admits the catalog's major. A floor in another major is not compared: a
