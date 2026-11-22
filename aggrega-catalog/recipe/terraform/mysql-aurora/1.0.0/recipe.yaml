@@ -1,0 +1,433 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: mysql-aurora
+  version: 1.0.0
+  # The licence of the vendored module, the terraform-aws-modules project's
+  # Aurora module: the third-party code this Recipe pins and writes into the
+  # output. The Aurora cluster it provisions is a service the reader contracts
+  # for directly with AWS, under AWS's terms.
+  license: Apache-2.0
+  description: >
+    MySQL on Amazon Aurora, realized by the published Aurora module of the
+    terraform-aws-modules project, terraform-aws-modules/rds-aurora/aws at
+    v10.4.2, Apache-2.0, fetched from its git repository at that tag and
+    pinned by the commit it names in the entity.lock beside this Recipe.
+    Reach for it where the database runs on Aurora's cluster storage, which
+    grows as data is added and which every instance of the cluster shares;
+    reach for terraform/mysql-rds for one RDS instance with storage of a set
+    size. Aurora owns the password of the master user, admin, in AWS Secrets
+    Manager: root_password takes core/generated-secret, and any other
+    credential there or on user_password halts the build.
+
+    The cluster runs one instance, plus infra.ha.read_replicas reader
+    instances, at least one while infra.ha.enabled is true, which Aurora
+    fails over to. An attached core/backup configures the cluster's own
+    automated backups; one asking AWS Backup, through infra.role_arn, halts
+    the build.
+
+    host publishes a Terraform reference to the module's cluster_endpoint
+    output, which resolves for a consumer authored as a source: Recipe in the
+    same root configuration, and port the configured infra.port. Set
+    infra.overrides.host to publish the DNS name the operator points at the
+    cluster instead; a consumer in the same root then loses the ordering the
+    reference gave it: order the two with the boundaries' syncWave.
+    infra.overrides.subnet_group is required.
+
+    An engine version Aurora does not spell, an application user, init
+    scripts, a raw configuration file and a storage type other than aurora
+    or aurora-iopt1 halt the build naming the key; compute.cpu,
+    compute.memory, storage.size, charset and collation are not read.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/mysql:1.0.0
+
+  # The published module, at the tag the registry publishes as version
+  # 10.4.2. A registry version of a module is a tag of its git repository,
+  # and Terraform's dependency lock file records providers and no module, so
+  # the pin is taken here: `aggrega pin` resolves the tag to its commit and
+  # records that commit and the archive's digest in entity.lock, and every
+  # build vendors exactly those bytes.
+  #
+  # The source names the repository root, which is the module: the
+  # configuration Terraform loads from it is that root's own files, which
+  # declare no module call, so initialising it fetches providers and nothing
+  # else. The repository's modules/, examples/ and wrappers/ directories are
+  # vendored with it and never loaded, since nothing the root declares
+  # reaches them.
+  #
+  # The module declares hashicorp/aws >= 6.61 and Terraform >= 1.11.1 in its
+  # own terraform block and is vendored byte for byte, so this Recipe adds no
+  # provider constraint of its own; the catalog conventions' "One AWS
+  # provider constraint for every AWS body" section says how it composes with
+  # the catalog's authored AWS bodies.
+  #
+  # The tag is written out rather than read from infra.source_version: a
+  # source whose coordinates come from a template is pinned per Release
+  # instead of in this Recipe's own entity.lock, and this Recipe's pin is the
+  # one stated above.
+  source:
+    kind: git-repository
+    url: https://github.com/terraform-aws-modules/terraform-aws-rds-aurora.git
+    ref: v10.4.2
+
+  locals:
+    # The name the Release gives the cluster under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The instance class every instance of the cluster runs on:
+    # infra.overrides.instance_class, or db.t3.medium. terraform/mysql-rds
+    # defaults to db.t3.small, a size Aurora MySQL does not run, and
+    # db.t3.medium is the smallest of that burstable family it runs.
+    instance_class: '{{ optional (optional .infra "overrides" dict) "instance_class" "db.t3.medium" }}'
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # The FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Amazon Aurora automated backups"
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the module's cluster_endpoint output — the cluster endpoint, the bare
+  # hostname of whichever instance is the cluster's writer — through this
+  # component's module call, which the boundary's root configuration declares
+  # under .context.instance_id for a component declared in the Aggregate the
+  # Release deploys. Terraform resolves it at apply time, so it resolves only
+  # for a consumer authored as a source: Recipe in the same root
+  # configuration; a consumer on another target receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record or alias for it, so the operator points the name at the cluster
+  # outside the Release. A consumer in the same root configuration receives
+  # the name as well, and a name carries no reference for Terraform to order
+  # its module after this one by; a later syncWave on the consumer's boundary,
+  # sharing this boundary's directory, orders the two.
+  #
+  # port is the value the mapping below passes to the module, so it is known
+  # ahead of time and published as that value. user is the master user the
+  # mapping creates, as terraform/mysql-rds names it; database is the
+  # developer value the module creates.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.cluster_endpoint}{{ end }}"
+    port: "{{ .infra.port }}"
+    user: "admin"
+    database: "{{ .values.database }}"
+    protocol: "mysql"
+
+  # This Recipe reads from infra.overrides:
+  #   instance_class               - string (instances.<n>.instance_class of every instance; default "db.t3.medium")
+  #   subnet_group                 - string (db_subnet_group_name), required
+  #   cluster_parameter_group_name - string (cluster_parameter_group_name, an existing DB cluster parameter group)
+  #   vpc_security_groups          - []string (vpc_security_group_ids)
+  #   kms_key_id                   - string (kms_key_id)
+  #   deletion_protection          - bool (deletion_protection)
+  #   tags                         - map[string]string (tags)
+  #   host                         - string (published as provides.host; not passed to the module)
+  #
+  # Each is passed to the module input named in brackets. instance_class,
+  # subnet_group, vpc_security_groups, kms_key_id, deletion_protection, tags
+  # and host are the keys, under the same names, that
+  # terraform/mysql-rds-terraform-aws-modules reads, so a Release written for
+  # that Recipe carries them over unchanged; cluster_parameter_group_name
+  # is named by the module input it sets. The subnet group, the security
+  # groups, the cluster parameter group and the KMS key are the operator's,
+  # named here and never created: the module's own security group, DB subnet
+  # group and enhanced monitoring role are each left off below. subnet_group
+  # is the one that is required: without it the module names a DB subnet
+  # group after the cluster, which nothing creates, and this Recipe never
+  # chooses a network for the operator.
+  #
+  # The module's own defaults stand for every input this mapping leaves out.
+  # Two are worth knowing: it encrypts the cluster's storage whether or not
+  # kms_key_id is set, its storage_encrypted input being on by default, with
+  # the account's default key when none is named, so kms_key_id needs no
+  # companion key here; and while cluster_parameter_group_name is unset the
+  # cluster takes Aurora's default cluster parameter group for its engine.
+  #
+  # deletion_protection takes true or false, and any other value halts the
+  # build naming the key. Unset, the cluster is created without deletion
+  # protection, as Aurora creates it.
+  #
+  # multi_az and parameter_group, which terraform/mysql-rds-terraform-aws-modules
+  # reads, are not read here, and the assertion admitting the keys above
+  # refuses each by name: an Aurora cluster's availability is the number of
+  # instances it runs, which infra.ha sets below, and this Recipe names no DB
+  # parameter group for its instances, which take Aurora's default group for
+  # their engine, the cluster's own settings coming from
+  # cluster_parameter_group_name.
+  #
+  # host is a bare DNS name or IP literal. The assertion below refuses a value
+  # carrying a scheme, a path, a user, a port or whitespace, because a consumer
+  # composes its connection from host and port and would compose a broken one;
+  # the port is infra.port. A value carrying exactly one colon is a name or an
+  # IPv4 literal with a port; an IPv6 literal carries several and is accepted.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read:
+  #   honoured — values.database, infra.port, infra.engine_version,
+  #     infra.storage.type, infra.ha.enabled and infra.ha.read_replicas, as
+  #     the comment above the mapping says, a core/backup attachment, as the
+  #     same comment says, core/generated-secret on root_password, and the
+  #     overrides above.
+  #   refused — an infra.engine_version Aurora does not spell, values.user,
+  #     values.init_scripts, values.custom_config, an infra.storage.type
+  #     Aurora does not take, a deletion_protection that is not true or
+  #     false, a host that is not a bare name, any other credential on
+  #     root_password and any on user_password, and any other key under
+  #     infra.overrides, each as the comment above its assertion says; and,
+  #     as the comment above the mapping says, a second core/backup
+  #     attachment, a retention outside 1 to 35 days, a schedule naming other
+  #     than one time of every day, and infra.point_in_time_recovery false.
+  #     root_password left empty halts too, before this Recipe renders: the
+  #     Component declares the slot required.
+  #   not read — infra.compute.cpu and infra.compute.memory, whose Component
+  #     defaults would size a container: Aurora sizes each instance by its
+  #     instance class. infra.storage.size, whose default would size a volume:
+  #     Aurora's cluster storage grows as data is added and takes no size.
+  #     values.charset and values.collation, whose defaults would set the
+  #     server's character set: this Recipe sets no parameter group setting,
+  #     so the cluster takes its parameter group's. A Recipe cannot tell those
+  #     defaults from a value the Release wrote, so they are not read rather
+  #     than refused.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "instance_class" "subnet_group" "cluster_parameter_group_name" "vpc_security_groups" "kms_key_id" "deletion_protection" "tags" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "multi_az" -}}
+      {{- fail "infra.overrides.multi_az is set, and an Aurora DB cluster takes no Multi-AZ setting: its availability is the number of instances it runs, and Aurora fails over to a reader instance. Remove infra.overrides.multi_az from the Release, and set infra.ha.enabled to true for a reader, or infra.ha.read_replicas for more" -}}
+      {{- end -}}
+      {{- if eq $k "parameter_group" -}}
+      {{- fail "infra.overrides.parameter_group is set, and this Recipe names no DB parameter group for the cluster's instances, which take Aurora's default group for their engine: remove infra.overrides.parameter_group from the Release, and name a DB cluster parameter group in infra.overrides.cluster_parameter_group_name for the cluster's settings" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads instance_class, subnet_group, cluster_parameter_group_name, vpc_security_groups, kms_key_id, deletion_protection, tags and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    subnet_group_supplied: >-
+      {{- if not (optional (optional .infra "overrides" dict) "subnet_group" "") -}}
+      {{- fail (printf "this Release places its database in a DB subnet group that already exists in the target account, and the published Aurora module this Recipe sources would otherwise name a DB subnet group after the cluster, %q, which nothing creates, but infra.overrides.subnet_group carries none: set infra.overrides.subnet_group in the Release to the name of an existing DB subnet group" .metadata.instance_id) -}}
+      {{- end -}}
+    # Aurora takes true or false for a cluster's deletion protection, and the
+    # module's input is typed bool.
+    deletion_protection_is_bool: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "deletion_protection" -}}
+      {{- if not (kindIs "bool" $o.deletion_protection) -}}
+      {{- fail (printf "infra.overrides.deletion_protection is %q, and Aurora takes true or false for a DB cluster's deletion protection: set it to true or false in the Release, or remove it to create the cluster without deletion protection" (toString $o.deletion_protection)) -}}
+      {{- end -}}
+      {{- end -}}
+    # infra.engine_version is the cluster's engine_version, passed as written
+    # when it is spelt as Aurora MySQL spells a version:
+    # <MySQL major version>.mysql_aurora.<Aurora MySQL version>, such as
+    # 8.4.mysql_aurora.8.4.7 or 8.0.mysql_aurora.3.10.0, or a MySQL major
+    # version alone, such as 8.0. Aurora MySQL runs a MySQL 8.4-compatible
+    # version, the Component's default, beside its version 3, compatible with
+    # MySQL 8.0. AWS's RDS API reference states that 5.7 and 8.0 alone each
+    # select Aurora's default release of that version, and names no such
+    # spelling for 8.4; Aurora's documentation states that a cluster is
+    # created at any version Aurora currently offers, major or minor. So
+    # whether 8.4 alone selects a release is not settled by AWS's own
+    # references, and a Release names a full Aurora MySQL version, such as
+    # 8.4.mysql_aurora.8.4.7, to choose it exactly. Any other spelling, such
+    # as the 8.4.5 an RDS for MySQL instance takes, names no Aurora version
+    # and halts here naming the key; whether a well-spelt version is offered
+    # in the Region is the apply's to judge.
+    engine_version_aurora_takes: >-
+      {{- $v := toString .infra.engine_version -}}
+      {{- if not (or (regexMatch `^[0-9]+\.[0-9]+$` $v) (regexMatch `^[0-9]+\.[0-9]+\.mysql_aurora\.[0-9]+(\.[0-9]+)+$` $v)) -}}
+      {{- fail (printf "infra.engine_version is %q, and Aurora MySQL spells a version <MySQL major version>.mysql_aurora.<Aurora MySQL version>, such as 8.4.mysql_aurora.8.4.7 or 8.0.mysql_aurora.3.10.0, or takes a MySQL major version alone, such as 8.0, for its default release of it: set infra.engine_version in the Release to one of them" $v) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this database reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the port is infra.port` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # infra.storage.type is the cluster's storage configuration here, which
+    # Aurora offers as aurora, Aurora Standard, and aurora-iopt1, Aurora
+    # I/O-Optimized. An RDS volume type such as gp3 names neither, so it halts
+    # here naming the key.
+    storage_type_aurora_takes: >-
+      {{- with optional (optional .infra "storage" dict) "type" "" -}}
+      {{- if not (has (toString .) (list "aurora" "aurora-iopt1")) -}}
+      {{- fail (printf "infra.storage.type is %q, and on Amazon Aurora it is the cluster's storage configuration, aurora for Aurora Standard or aurora-iopt1 for Aurora I/O-Optimized: set infra.storage.type in the Release to one of them, or leave it unset for aurora" (toString .)) -}}
+      {{- end -}}
+      {{- end -}}
+    # Aurora creates only its master user, admin, which provides.user
+    # publishes, and runs no initialisation scripts and no configuration file
+    # of the reader's; its server settings come from the cluster's parameter
+    # group.
+    values_aurora_cannot_apply: >-
+      {{- if optional .values "user" "" -}}
+      {{- fail "values.user asks for an application user beside the administrator, and Aurora creates only the master user, admin, whose password it manages: remove values.user from the Aggregate and connect as admin, or create the user against the cluster once it exists" -}}
+      {{- end -}}
+      {{- if optional .values "init_scripts" "" -}}
+      {{- fail "values.init_scripts asks for scripts run when the database is first initialised, and an Aurora cluster runs none: remove values.init_scripts from the Aggregate and run them against the cluster once it exists, or map this component to a realization that initialises the database itself" -}}
+      {{- end -}}
+      {{- if optional .values "custom_config" "" -}}
+      {{- fail "values.custom_config asks for a server configuration file, and an Aurora cluster reads none: its server settings come from a DB cluster parameter group, which the Release names in infra.overrides.cluster_parameter_group_name; remove values.custom_config from the Aggregate" -}}
+      {{- end -}}
+    # Aurora generates the password of the master user, admin, and keeps it in
+    # AWS Secrets Manager, and creates no other user, so a credential attached
+    # to either slot would reach no byte of the output while the build reads
+    # as if it had set the password. The required root_password slot takes
+    # core/generated-secret, which says the service owns the password and
+    # renders nothing; any other credential there, and any on user_password,
+    # halts naming the slot and what filled it. The type is compared with any
+    # version set aside.
+    credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "user_password" -}}
+      {{- fail "a credential is attached to the user_password slot, and Amazon Aurora creates only the master user, admin, whose password it generates and keeps in AWS Secrets Manager: remove the attachment when deploying to this target, and create an application user against the cluster once it exists" -}}
+      {{- end -}}
+      {{- if hasKey $f "root_password" -}}
+      {{- $ty := toString (optional $f.root_password "type" "") -}}
+      {{- if ne (first (splitList ":" $ty)) "core/generated-secret" -}}
+      {{- fail (printf "the root_password slot is filled by %s, and Amazon Aurora generates the password of the master user, admin, itself and keeps it in AWS Secrets Manager, so the attachment would set nothing: attach core/generated-secret to the root_password slot instead, bound to terraform/generated-secret in the Manifest, which says the service owns the password" (default "an attachment of no type" $ty)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # cluster identifier is the component's name, as terraform/mysql-rds names
+  # its instance, and each instance is named after it, <name>-1,
+  # <name>-2 and so on. The master password is Aurora's:
+  # manage_master_user_password has Aurora generate it and keep it in AWS
+  # Secrets Manager, so no password reaches the rendered output.
+  #
+  # infra.storage.type is the module's storage_type, written only while the
+  # Release sets it, so a Release that names none runs Aurora Standard,
+  # Aurora's default.
+  #
+  # Instances. The cluster runs one instance, plus infra.ha.read_replicas
+  # more, and at least one more while infra.ha.enabled is true. Aurora makes
+  # one instance its writer and the others readers: a reader is the instance
+  # Aurora fails over to when the writer fails, and it serves reads meanwhile,
+  # so a reader is both what the Component's high availability and its read
+  # replicas ask for. Every instance runs on the same instance class and
+  # names no availability zone, so Aurora chooses one for each. An instance
+  # takes no port, storage, subnet group or engine version of its own: the
+  # module gives each the cluster's.
+  #
+  # A destroy keeps a final snapshot of the cluster, named after it,
+  # <name>-final, as the AWS provider requires a name for one: the module
+  # takes a final snapshot unless told to skip it, and Aurora keeps automated
+  # backups for at least a day, so the snapshot is always taken. A snapshot of
+  # that name left from an earlier cluster of the same name in the account
+  # and Region fails the destroy until the operator deletes or renames it.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside, and kept as the
+  # cluster's own automated backups, which this Recipe sets through the
+  # module inputs backup_retention_period and preferred_backup_window:
+  #   - With none attached, Aurora keeps automated backups for 7 days, in a
+  #     window it chooses.
+  #   - An attachment bound to terraform/backup-native configures them.
+  #     infra.retention_days is backup_retention_period, 1 to 35 days, the
+  #     range Aurora keeps, and a value outside it halts naming the
+  #     attachment. infra.schedule, where set, must name one minute and one
+  #     hour of every day, such as 30 2 * * *: Aurora takes its automated
+  #     backups in a daily window it reads in UTC, so that time opens
+  #     preferred_backup_window, 30 minutes long, the shortest window Aurora
+  #     takes, 02:30-03:00 here; any other expression halts naming it. Unset,
+  #     Aurora chooses the window.
+  #   - An attachment carrying infra.role_arn asks AWS Backup to back the
+  #     database up, and halts naming it: the catalog's AWS Backup
+  #     realization on terraform, terraform/backup-aws-backup, selects an
+  #     Amazon RDS DB instance by the name its Recipe declares as the local
+  #     db_identifier, and an Aurora DB cluster is no such instance, so this
+  #     Recipe declares none and that FeatureRecipe halts on it.
+  #   - Two attachments halt naming both: a cluster runs one automated backup.
+  #   - Point-in-time recovery is Aurora's for every moment of the retention
+  #     period, with no setting of its own, so left out or true,
+  #     infra.point_in_time_recovery is what the cluster gives, and false
+  #     halts naming it.
+  # A Recipe's locals cannot read its attachments, so the reading sits at the
+  # top of the template below. Both terraform Aurora Recipes of this catalog
+  # declare it word for word: a change to it is made to each of them.
+  valuesMapping: |
+    {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
+    {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}
+    {{- range $name, $attachment := (default dict .features) -}}
+    {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
+    {{- if $backupNative -}}
+    {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Amazon Aurora, which runs one automated backup on a cluster: remove one of the two" $backupNative $name $.context.instance_id) -}}
+    {{- end -}}
+    {{- $backupNative = $name -}}{{- $backupNativeInfra = default dict (optional $attachment "infra" dict) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- if eq (toString (optional $backupNativeInfra "point_in_time_recovery" "")) "false" -}}
+    {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to false, and Amazon Aurora keeps point-in-time recovery for every moment of the period it keeps automated backups for, with no setting that turns it off: remove infra.point_in_time_recovery from the attachment, or set it to true" $backupNative .context.instance_id) -}}
+    {{- end -}}
+    {{- $backupRetention := 7 -}}{{- $backupWindow := "" -}}
+    {{- if $backupNative -}}
+    {{- $backupRetention = int (optional $backupNativeInfra "retention_days" 7) -}}
+    {{- if or (lt $backupRetention 1) (gt $backupRetention 35) -}}
+    {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and Amazon Aurora keeps automated backups for 1 to 35 days: set infra.retention_days to 35 or fewer" $backupNative .context.instance_id $backupRetention) -}}
+    {{- end -}}
+    {{- with trim (toString (optional $backupNativeInfra "schedule" "")) -}}
+    {{- $f := regexSplit `\s+` . -1 -}}
+    {{- if not (and (eq (len $f) 5) (regexMatch `^[0-9]{1,2}$` (index $f 0)) (regexMatch `^[0-9]{1,2}$` (index $f 1)) (lt (atoi (index $f 0)) 60) (lt (atoi (index $f 1)) 24) (has (index $f 2) (list "*" "?")) (has (index $f 3) (list "*" "?")) (has (index $f 4) (list "*" "?"))) -}}
+    {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Amazon Aurora takes its automated backups in a daily window opening at a time of day it reads in UTC: write a schedule naming one minute and one hour of every day, such as 30 2 * * *, or remove infra.schedule to let Aurora choose the time" $backupNative $.context.instance_id .) -}}
+    {{- end -}}
+    {{- $start := add (mul (atoi (index $f 1)) 60) (atoi (index $f 0)) -}}
+    {{- $end := mod (add $start 30) 1440 -}}
+    {{- $backupWindow = printf "%02d:%02d-%02d:%02d" (div $start 60) (mod $start 60) (div $end 60) (mod $end 60) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $o := optional .infra "overrides" dict -}}
+    {{- $readers := int .infra.ha.read_replicas -}}
+    {{- if and .infra.ha.enabled (lt $readers 1) }}{{ $readers = 1 }}{{ end -}}
+    name: "{{ .context.instance_id }}"
+    engine: "aurora-mysql"
+    engine_version: "{{ .infra.engine_version }}"
+    database_name: "{{ .values.database }}"
+    master_username: "admin"
+    manage_master_user_password: true
+    port: "{{ .infra.port }}"
+    {{- with optional (optional .infra "storage" dict) "type" "" }}
+    storage_type: "{{ . }}"
+    {{- end }}
+    instances:
+      {{- range $i := until (add1 $readers | int) }}
+      "{{ add1 $i }}":
+        instance_class: "{{ $.locals.instance_class }}"
+      {{- end }}
+    backup_retention_period: {{ $backupRetention }}
+    {{- if $backupWindow }}
+    preferred_backup_window: "{{ $backupWindow }}"
+    {{- end }}
+    final_snapshot_identifier: "{{ .context.instance_id }}-final"
+    create_db_subnet_group: false
+    db_subnet_group_name: "{{ $o.subnet_group }}"
+    create_security_group: false
+    create_monitoring_role: false
+    {{- with optional $o "vpc_security_groups" "" }}
+    vpc_security_group_ids: {{ toJson . }}
+    {{- end }}
+    {{- with optional $o "cluster_parameter_group_name" "" }}
+    cluster_parameter_group_name: "{{ . }}"
+    {{- end }}
+    {{- with optional $o "kms_key_id" "" }}
+    kms_key_id: "{{ . }}"
+    {{- end }}
+    {{- if hasKey $o "deletion_protection" }}
+    deletion_protection: {{ $o.deletion_protection }}
+    {{- end }}
+    {{- with optional $o "tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}
