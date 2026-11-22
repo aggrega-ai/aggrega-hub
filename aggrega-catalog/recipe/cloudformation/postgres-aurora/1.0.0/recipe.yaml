@@ -1,0 +1,413 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: postgres-aurora
+  version: 1.0.0
+  description: >
+    PostgreSQL on Amazon Aurora, rendered as a CloudFormation fragment: an
+    AWS::RDS::DBCluster and its AWS::RDS::DBInstance resources, which the
+    cloudformation provider assembles into the boundary's stack. Reach for it
+    where the database runs on Aurora's cluster storage, which grows as data
+    is added and which every instance of the cluster shares; reach for
+    cloudformation/postgres-rds for one RDS instance with storage of a set
+    size. Aurora owns the master password, in AWS Secrets Manager: a
+    credential on the password slot other than core/generated-secret, or any
+    on app_user_password, halts the build.
+
+    The cluster runs one instance, plus infra.ha.read_replicas reader
+    instances, at least one while infra.ha.enabled is true, which Aurora fails
+    over to. An attached core/backup configures the cluster's own automated
+    backups; one asking AWS Backup, through infra.role_arn, halts the build.
+
+    host publishes a CloudFormation reference to the cluster's endpoint;
+    port publishes infra.port. Set infra.overrides.host in the Release to the
+    DNS name or IP literal the cluster is reached at, and host publishes that
+    name instead. The Recipe emits nothing for it, and a consumer in the same
+    stack then loses the ordering the reference gave it: order the two with
+    the boundaries' syncWave.
+
+    An encoding, a locale, init scripts, a raw configuration file and a
+    storage type other than aurora or aurora-iopt1 halt the build naming the
+    key; compute.cpu, compute.memory and storage.size are not read.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: cloudformation
+  implements: core/datastore/postgres:1.0.0
+
+  # The cluster's logical id, derived from this instance's own name so that two
+  # databases deployed into one stack describe two clusters rather than one. A
+  # logical id is unique within a CloudFormation template and admits only
+  # letters and digits, so the instance name's separators are read as word
+  # boundaries and each word is capitalised: instance orders-db names the
+  # cluster OrdersDb, and its instances OrdersDbInstance1, OrdersDbInstance2 and
+  # so on.
+  locals:
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+    # The name the Release gives the cluster under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The instance class every instance of the cluster runs on:
+    # infra.overrides.DBInstanceClass, or db.t3.medium. cloudformation/postgres-rds
+    # defaults to db.t3.small, a size Aurora PostgreSQL does not run, and
+    # db.t3.medium is the smallest of that burstable family it runs.
+    instance_class: '{{ optional (optional .infra "overrides" dict) "DBInstanceClass" "db.t3.medium" }}'
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # The FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Amazon Aurora automated backups"
+
+  # The String Pipe: the compiler pipes each of these strings verbatim into a
+  # consumer's injection context when it uses this database, and resolves none
+  # of them. host is a CloudFormation intrinsic function reference to the
+  # cluster's endpoint, the address of whichever instance is the cluster's
+  # writer, which CloudFormation resolves at stack creation time. The provider
+  # projects the matching provides block inside the fragment below into the
+  # assembled stack Outputs; this recipe-level provides is the value-pipe
+  # contract, the fragment provides is the Outputs source, and they carry the
+  # same values. user and database mirror the developer values.
+  #
+  # host reads locals.logical_id rather than repeating the derivation it holds.
+  # A node's locals resolve before its provides, so a provides template reads
+  # .locals and receives the resolved value.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name in
+  # both provides blocks instead of the reference. It is the operator's
+  # deterministic pointer: the compiler pipes it as text and looks nothing up,
+  # and this Recipe emits no DNS record or alias for it, so the operator points
+  # the name at the cluster outside the Release. A consumer in the same stack
+  # receives the name as well, and a name carries no reference for
+  # CloudFormation to create that consumer after this cluster by; a later
+  # syncWave on the consumer's boundary, sharing this boundary's directory,
+  # orders the two. A consumer in another stack imports the name through the
+  # same export it imports the reference through.
+  #
+  # port is the value the fragment sets on the cluster's Port property, so it
+  # is known ahead of time and published as that value in both blocks: a
+  # consumer on any target can use it.
+  #
+  # The metrics keys are published empty, here and not in the fragment's own
+  # provides, which carries only the outputs the stack exports: the cluster is
+  # a managed service with no pods to discover, and Aurora publishes its
+  # metrics to the cloud provider's own monitoring rather than to a Prometheus
+  # endpoint.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}!GetAtt {{ .locals.logical_id }}.Endpoint.Address{{ end }}"
+    port: "{{ .infra.port }}"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "postgres"
+    metrics_pod_selector: ""
+    metrics_pod_port: ""
+    metrics_path: ""
+
+  # This Recipe reads from infra.overrides:
+  #   DeletionPolicy              - string (the cluster's DeletionPolicy and UpdateReplacePolicy; default "Snapshot")
+  #   DBInstanceClass             - string (each instance's Properties.DBInstanceClass; default "db.t3.medium")
+  #   DBSubnetGroupName           - string (the cluster's Properties.DBSubnetGroupName)
+  #   VPCSecurityGroups           - []string (the cluster's Properties.VpcSecurityGroupIds)
+  #   DBClusterParameterGroupName - string (the cluster's Properties.DBClusterParameterGroupName)
+  #   StorageEncrypted            - bool (the cluster's Properties.StorageEncrypted)
+  #   KmsKeyId                    - string (the cluster's Properties.KmsKeyId; only beside StorageEncrypted true)
+  #   host                        - string (published as provides.host; renders nothing)
+  #
+  # The key names are the CloudFormation property names rather than a separate
+  # Aggrega spelling, because each is passed through to the resource unchanged
+  # and the property name is what a reader matches against the resource
+  # documentation. VPCSecurityGroups is the name cloudformation/postgres-rds
+  # reads for the security groups of its instance, kept here for the same
+  # groups although AWS::RDS::DBCluster spells the property
+  # VpcSecurityGroupIds, so a Release names them once for either Recipe. The
+  # subnet group, the security groups, the cluster parameter group and the KMS
+  # key are the operator's, named here and never created: each emits nothing
+  # while unset, and Aurora then applies its own default. host is no
+  # property of the resource but the address a consumer reaches the database
+  # at, under the name the catalog's referenced realization,
+  # helm/postgres-external, reads for the same address.
+  #
+  # DeletionPolicy is also written as the cluster's UpdateReplacePolicy, so a
+  # stack update replacing the cluster keeps the snapshot a deletion would
+  # keep. UpdateReplacePolicy takes no RetainExceptOnCreate, so that policy is
+  # written there as Retain. Each instance keeps CloudFormation's default
+  # policies: the data lives in the cluster's storage, not in an instance.
+  #
+  # KmsKeyId encrypts the cluster's storage with that key, and Aurora reads it
+  # only while StorageEncrypted is true, so KmsKeyId without StorageEncrypted
+  # true halts the build rather than being dropped. StorageEncrypted true with
+  # no KmsKeyId encrypts the storage with the default KMS key.
+  #
+  # MultiAZ and DBParameterGroupName, which cloudformation/postgres-rds reads,
+  # are not read here, and the assertion admitting the keys above refuses
+  # each by name: an Aurora cluster's availability is the number of instances
+  # it runs, which infra.ha sets below, and this Recipe names no DB parameter
+  # group for its instances, which take Aurora's default group for their
+  # engine, the cluster's own settings coming from DBClusterParameterGroupName.
+  #
+  # host is a bare DNS name or IP literal. The assertion below refuses a value
+  # carrying a scheme, a path, a user, a port or whitespace, because a consumer
+  # composes its connection from host and port and would compose a broken one;
+  # the port is infra.port. A value carrying exactly one colon is a name or an
+  # IPv4 literal with a port; an IPv6 literal carries several and is accepted.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read:
+  #   honoured — values.database, values.user, infra.port,
+  #     infra.engine_version, infra.storage.type, infra.ha.enabled and
+  #     infra.ha.read_replicas, as the comment above the fragment says, a
+  #     core/backup attachment, as the same comment says, the password slot
+  #     left empty or bound to core/generated-secret, and the overrides above.
+  #   refused — values.encoding, values.locale, values.init_scripts,
+  #     values.custom_config, an infra.storage.type Aurora does not take, any
+  #     other credential on the password slot and any on app_user_password,
+  #     infra.credentials supplied and any infra.credentials_secret, and any
+  #     other key under infra.overrides, each as the comment above its
+  #     assertion says, and a core/backup attachment carrying infra.role_arn,
+  #     as the comment above the fragment says.
+  #   not read — infra.compute.cpu and infra.compute.memory, whose Component
+  #     defaults would size a container: Aurora sizes each instance by its
+  #     instance class. infra.storage.size, whose default would size a volume:
+  #     Aurora's cluster storage grows as data is added and takes no size. A
+  #     Recipe cannot tell those defaults from a value the Release wrote, so
+  #     they are not read rather than refused. values.app_user and
+  #     infra.control_plane_present configure other realizations, as their
+  #     descriptions say. infra.credentials and infra.credentials_secret while
+  #     they hold the Component's defaults.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "DeletionPolicy" "DBInstanceClass" "DBSubnetGroupName" "VPCSecurityGroups" "DBClusterParameterGroupName" "StorageEncrypted" "KmsKeyId" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "MultiAZ" -}}
+      {{- fail "infra.overrides.MultiAZ is set, and an Aurora DB cluster takes no MultiAZ setting: its availability is the number of instances it runs, and Aurora fails over to a reader instance. Remove infra.overrides.MultiAZ from the Release, and set infra.ha.enabled to true for a reader, or infra.ha.read_replicas for more" -}}
+      {{- end -}}
+      {{- if eq $k "DBParameterGroupName" -}}
+      {{- fail "infra.overrides.DBParameterGroupName is set, and this Recipe names no DB parameter group for the cluster's instances, which take Aurora's default group for their engine: remove infra.overrides.DBParameterGroupName from the Release, and name a DB cluster parameter group in infra.overrides.DBClusterParameterGroupName for the cluster's settings" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads DeletionPolicy, DBInstanceClass, DBSubnetGroupName, VPCSecurityGroups, DBClusterParameterGroupName, StorageEncrypted, KmsKeyId and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # KmsKeyId names the key Aurora encrypts the cluster's storage with, and
+    # Aurora reads it only while StorageEncrypted is true.
+    kms_key_needs_encryption: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if and (optional $o "KmsKeyId" "") (ne (toString (optional $o "StorageEncrypted" "")) "true") -}}
+      {{- fail (printf "infra.overrides.KmsKeyId is %q, and Aurora encrypts the cluster's storage with that key only while storage encryption is on: set infra.overrides.StorageEncrypted to true beside it, or remove infra.overrides.KmsKeyId from the Release" (toString $o.KmsKeyId)) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this database reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the port is infra.port` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # infra.storage.type is the cluster's storage configuration here, which
+    # Aurora offers as aurora, Aurora Standard, and aurora-iopt1, Aurora
+    # I/O-Optimized. An RDS volume type such as gp3 names neither, and would
+    # fail the stack's creation, so it halts here naming the key.
+    storage_type_aurora_takes: >-
+      {{- with optional (optional .infra "storage" dict) "type" "" -}}
+      {{- if not (has (toString .) (list "aurora" "aurora-iopt1")) -}}
+      {{- fail (printf "infra.storage.type is %q, and on Amazon Aurora it is the cluster's storage configuration, aurora for Aurora Standard or aurora-iopt1 for Aurora I/O-Optimized: set infra.storage.type in the Release to one of them, or leave it unset for aurora" (toString .)) -}}
+      {{- end -}}
+      {{- end -}}
+    # Aurora creates the database itself and runs no initdb, no initialisation
+    # scripts and no configuration file of the reader's; its server settings
+    # come from the cluster's parameter group.
+    values_aurora_cannot_apply: >-
+      {{- if optional .values "encoding" "" -}}
+      {{- fail "values.encoding asks for the encoding initdb creates the database with, and an Aurora cluster takes no such setting when it is created: remove values.encoding from the Aggregate, or map this component to a realization that initialises the database itself" -}}
+      {{- end -}}
+      {{- if optional .values "locale" "" -}}
+      {{- fail "values.locale asks for the locale initdb creates the database with, and an Aurora cluster takes no such setting when it is created: remove values.locale from the Aggregate, or map this component to a realization that initialises the database itself" -}}
+      {{- end -}}
+      {{- if optional .values "init_scripts" "" -}}
+      {{- fail "values.init_scripts asks for scripts run when the database is first initialised, and an Aurora cluster runs none: remove values.init_scripts from the Aggregate and run them against the cluster once it exists, or map this component to a realization that initialises the database itself" -}}
+      {{- end -}}
+      {{- if optional .values "custom_config" "" -}}
+      {{- fail "values.custom_config asks for a server configuration file, and an Aurora cluster reads none: its server settings come from a DB cluster parameter group, which the Release names in infra.overrides.DBClusterParameterGroupName; remove values.custom_config from the Aggregate" -}}
+      {{- end -}}
+    # Aurora generates the master password and keeps it in AWS Secrets
+    # Manager, and creates no user but the master user values.user names, so a
+    # credential attached to either slot would reach no byte of the output
+    # while the build reads as if it had set the password. The password slot
+    # stays empty, or takes core/generated-secret, which says the service owns
+    # the password and renders nothing; any other credential there, and any on
+    # app_user_password, halts naming the slot and what filled it. The type is
+    # compared with any version set aside.
+    credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "app_user_password" -}}
+      {{- fail "a credential is attached to the app_user_password slot, and Amazon Aurora creates the one master user values.user names, whose password it generates and keeps in AWS Secrets Manager: remove the attachment when deploying to this target, or map this component to the synthesized helm Recipe, which creates the application role" -}}
+      {{- end -}}
+      {{- if hasKey $f "password" -}}
+      {{- $ty := toString (optional $f.password "type" "") -}}
+      {{- if ne (first (splitList ":" $ty)) "core/generated-secret" -}}
+      {{- fail (printf "the password slot is filled by %s, and Amazon Aurora generates this database's master password itself and keeps it in AWS Secrets Manager, so the attachment would set nothing: remove it from the password slot when deploying to this target, or attach core/generated-secret there, which says the service owns the password" (default "an attachment of no type" $ty)) -}}
+      {{- end -}}
+      {{- end -}}
+    # infra.credentials chooses who owns the database's credentials on the
+    # controller-driven realization, and infra.credentials_secret names the
+    # Kubernetes Secret it reads them from. Aurora generates the master
+    # password itself, keeps it in AWS Secrets Manager and reads no Secret, so
+    # supplied, or any Secret name, would reach no byte of the output while the
+    # build reads as if it had chosen who owns the password: each halts naming
+    # the key, and the Component's defaults, generated and empty, pass.
+    infra_credentials: >-
+      {{- if ne (toString .infra.credentials) "generated" -}}
+      {{- fail (printf "infra.credentials is %q, which chooses who owns the database's credentials on the controller-driven realization, and Amazon Aurora generates this database's master password itself and keeps it in AWS Secrets Manager: remove infra.credentials from the Release" (toString .infra.credentials)) -}}
+      {{- end -}}
+      {{- with .infra.credentials_secret -}}
+      {{- fail (printf "infra.credentials_secret is %q, which names the Kubernetes Secret the controller-driven realization reads the database owner's credentials from, and Amazon Aurora generates this database's master password itself and keeps it in AWS Secrets Manager, reading no Secret: remove infra.credentials_secret from the Release" .) -}}
+      {{- end -}}
+
+  # infra.storage.type is the cluster's StorageType, written only while the
+  # Release sets it, so a Release that names none runs Aurora Standard,
+  # Aurora's default.
+  #
+  # Instances. The cluster runs one instance, which Aurora makes its writer,
+  # plus infra.ha.read_replicas reader instances, and at least one reader
+  # while infra.ha.enabled is true: a reader is the instance Aurora fails over
+  # to when the writer fails, and it serves reads meanwhile, so a reader is
+  # both what the Component's high availability and its read replicas ask
+  # for. Every instance runs on the same instance class and names no
+  # availability zone, so Aurora chooses one for each. An instance takes no
+  # port, storage, subnet group or engine version of its own: each is the
+  # cluster's.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside, and kept as the
+  # cluster's own automated backups, which this Recipe sets through the
+  # properties BackupRetentionPeriod and PreferredBackupWindow:
+  #   - With none attached, Aurora keeps automated backups for 7 days, in a
+  #     window it chooses.
+  #   - An attachment carrying no infra.role_arn, bound to
+  #     cloudformation/backup-native, configures them. infra.retention_days is
+  #     BackupRetentionPeriod, 1 to 35 days, the range Aurora keeps, and a
+  #     value outside it halts naming the attachment. infra.schedule, where
+  #     set, must name one minute and one hour of every day, such as
+  #     30 2 * * *: Aurora takes its automated backups in a daily window it
+  #     reads in UTC, so that time opens PreferredBackupWindow, 30 minutes
+  #     long, the shortest window Aurora takes, 02:30-03:00 here; any other
+  #     expression halts naming it. Unset, Aurora chooses the window.
+  #   - An attachment carrying infra.role_arn asks AWS Backup to back the
+  #     database up, and halts naming it: the catalog's AWS Backup
+  #     realization on CloudFormation, cloudformation/backup-aws-backup,
+  #     selects an Amazon RDS DB instance by its DBInstanceArn, which an
+  #     Aurora DB cluster does not carry, so its selection would name nothing
+  #     the stack holds.
+  #   - Two attachments halt naming both: a cluster runs one automated backup.
+  #   - Point-in-time recovery is Aurora's for every moment of the retention
+  #     period, with no setting of its own, so left out or true,
+  #     infra.point_in_time_recovery is what the cluster gives, and false
+  #     halts naming it.
+  # A Recipe's locals cannot read its attachments, so the reading sits at the
+  # top of the template below. Both CloudFormation Aurora Recipes of this
+  # catalog declare it word for word: a change to it is made to each of them.
+  artifacts:
+    template.yaml: |
+      {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
+      {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}
+      {{- range $name, $attachment := (default dict .features) -}}
+      {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
+      {{- with trim (toString (optional (default dict (optional $attachment "infra" dict)) "role_arn" "")) -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.role_arn to %q, asking AWS Backup to back the database up, and the catalog's AWS Backup realization on CloudFormation selects an Amazon RDS DB instance, while this Recipe runs an Aurora DB cluster: remove infra.role_arn from the attachment and bind it in the Manifest to cloudformation/backup-native, which keeps the cluster's own automated backups" $name $.context.instance_id .) -}}
+      {{- end -}}
+      {{- if $backupNative -}}
+      {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Amazon Aurora, which runs one automated backup on a cluster: remove one of the two" $backupNative $name $.context.instance_id) -}}
+      {{- end -}}
+      {{- $backupNative = $name -}}{{- $backupNativeInfra = default dict (optional $attachment "infra" dict) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if eq (toString (optional $backupNativeInfra "point_in_time_recovery" "")) "false" -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to false, and Amazon Aurora keeps point-in-time recovery for every moment of the period it keeps automated backups for, with no setting that turns it off: remove infra.point_in_time_recovery from the attachment, or set it to true" $backupNative .context.instance_id) -}}
+      {{- end -}}
+      {{- $backupRetention := 7 -}}{{- $backupWindow := "" -}}
+      {{- if $backupNative -}}
+      {{- $backupRetention = int (optional $backupNativeInfra "retention_days" 7) -}}
+      {{- if or (lt $backupRetention 1) (gt $backupRetention 35) -}}
+      {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and Amazon Aurora keeps automated backups for 1 to 35 days: set infra.retention_days to 35 or fewer" $backupNative .context.instance_id $backupRetention) -}}
+      {{- end -}}
+      {{- with trim (toString (optional $backupNativeInfra "schedule" "")) -}}
+      {{- $f := regexSplit `\s+` . -1 -}}
+      {{- if not (and (eq (len $f) 5) (regexMatch `^[0-9]{1,2}$` (index $f 0)) (regexMatch `^[0-9]{1,2}$` (index $f 1)) (lt (atoi (index $f 0)) 60) (lt (atoi (index $f 1)) 24) (has (index $f 2) (list "*" "?")) (has (index $f 3) (list "*" "?")) (has (index $f 4) (list "*" "?"))) -}}
+      {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Amazon Aurora takes its automated backups in a daily window opening at a time of day it reads in UTC: write a schedule naming one minute and one hour of every day, such as 30 2 * * *, or remove infra.schedule to let Aurora choose the time" $backupNative $.context.instance_id .) -}}
+      {{- end -}}
+      {{- $start := add (mul (atoi (index $f 1)) 60) (atoi (index $f 0)) -}}
+      {{- $end := mod (add $start 30) 1440 -}}
+      {{- $backupWindow = printf "%02d:%02d-%02d:%02d" (div $start 60) (mod $start 60) (div $end 60) (mod $end 60) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $deletion := toString (optional $o "DeletionPolicy" "Snapshot") -}}
+      {{- $readers := int .infra.ha.read_replicas -}}
+      {{- if and .infra.ha.enabled (lt $readers 1) }}{{ $readers = 1 }}{{ end -}}
+      Resources:
+        {{ .locals.logical_id }}:
+          Type: AWS::RDS::DBCluster
+          DeletionPolicy: {{ $deletion }}
+          UpdateReplacePolicy: {{ if eq $deletion "RetainExceptOnCreate" }}Retain{{ else }}{{ $deletion }}{{ end }}
+          Properties:
+            Engine: aurora-postgresql
+            EngineVersion: "{{ .infra.engine_version }}"
+            Port: {{ .infra.port }}
+            DatabaseName: "{{ .values.database }}"
+            MasterUsername: "{{ .values.user }}"
+            ManageMasterUserPassword: true
+            {{- with optional (optional .infra "storage" dict) "type" "" }}
+            StorageType: "{{ . }}"
+            {{- end }}
+
+            ## ── Backup ─────────────────────────────────────────────
+            BackupRetentionPeriod: {{ $backupRetention }}
+            {{- if $backupWindow }}
+            PreferredBackupWindow: "{{ $backupWindow }}"
+            {{- end }}
+
+            ## ── The operator's network, parameter group and key ────
+            {{- with optional $o "DBSubnetGroupName" "" }}
+            DBSubnetGroupName: "{{ . }}"
+            {{- end }}
+            {{- with optional $o "VPCSecurityGroups" "" }}
+            VpcSecurityGroupIds: {{ toJson . }}
+            {{- end }}
+            {{- with optional $o "DBClusterParameterGroupName" "" }}
+            DBClusterParameterGroupName: "{{ . }}"
+            {{- end }}
+            {{- if eq (toString (optional $o "StorageEncrypted" "")) "true" }}
+            StorageEncrypted: true
+            {{- with optional $o "KmsKeyId" "" }}
+            KmsKeyId: "{{ . }}"
+            {{- end }}
+            {{- end }}
+        {{- range $i := until (add1 $readers | int) }}
+        {{ $.locals.logical_id }}Instance{{ add1 $i }}:
+          Type: AWS::RDS::DBInstance
+          Properties:
+            Engine: aurora-postgresql
+            DBClusterIdentifier: !Ref {{ $.locals.logical_id }}
+            DBInstanceClass: {{ $.locals.instance_class }}
+        {{- end }}
+
+      # Fragment provides: the provider projects each entry into the assembled
+      # stack Outputs and expands the short-form intrinsics to long form. Each
+      # output is named for this instance and the entry together, so two
+      # databases of the same type in one stack keep their connection
+      # identities apart. A cross-stack consumer imports the host entry; an
+      # intra-stack consumer receives it through the value-pipe above.
+      provides:
+        host: {{ if .locals.operator_host }}"{{ .locals.operator_host }}"{{ else }}!GetAtt {{ .locals.logical_id }}.Endpoint.Address{{ end }}
+        port: "{{ .infra.port }}"
+        user: "{{ .values.user }}"
+        database: "{{ .values.database }}"
+        protocol: postgres
