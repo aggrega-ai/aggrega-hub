@@ -1,0 +1,504 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: postgres-alloydb
+  version: 1.0.0
+  # The licence of the vendored module, the GoogleCloudPlatform project's
+  # AlloyDB module: the third-party code this Recipe pins and writes into the
+  # output. The AlloyDB cluster it provisions is a service the reader
+  # contracts for directly with Google Cloud, under Google Cloud's terms.
+  license: Apache-2.0
+  description: >
+    PostgreSQL on AlloyDB for PostgreSQL, as one cluster with a primary
+    instance reached at a private address in the operator's VPC network,
+    realized by Google's published AlloyDB module,
+    GoogleCloudPlatform/alloy-db/google at v9.0.1, Apache-2.0, fetched from
+    its git repository at that tag; entity.lock pins the tag's commit and
+    archive digest.
+
+    Reach for it where the database is an AlloyDB cluster in the operator's
+    Google Cloud project, reached over a VPC network with private services
+    access; reach for terraform/postgres-cloud-sql for a Cloud SQL instance.
+
+    The project, region and network are the operator's, named in
+    infra.overrides.project_id, region and private_network, and the Recipe
+    emits none of them. The cluster holds the one database AlloyDB creates,
+    postgres, so values.database names it and any other halts. The user
+    values.user names logs in with the password core/random-password draws on
+    the password slot, handed over as a Terraform reference; the slot left
+    empty, or any other credential, halts naming it.
+
+    host publishes a reference to the primary instance's private address, or
+    the DNS name in infra.overrides.host; port is 5432. An attached
+    core/backup sets the cluster's automated backups and its point-in-time
+    recovery window. An encoding, a locale, init scripts, a raw
+    configuration file, a storage type and another infra.port halt naming
+    the key; compute.cpu, compute.memory and storage.size are not read.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/postgres:1.0.0
+
+  # The published module, at the tag the registry publishes as version 9.0.1.
+  # A registry version of a module is a tag of its git repository, and
+  # Terraform's dependency lock file records providers and no module, so the
+  # pin is taken here: `aggrega pin` resolves the tag to its commit and
+  # records that commit and the archive's digest in entity.lock, and every
+  # build vendors exactly those bytes.
+  #
+  # The source names the repository root, which is the module: the
+  # configuration Terraform loads from it is that root's own files, which
+  # declare no module call, so initialising it fetches providers and nothing
+  # else. The repository's examples/, test/ and build/ directories are
+  # vendored with it and never loaded, since nothing the root declares
+  # reaches them.
+  #
+  # The module declares hashicorp/google ">= 7.23, < 9" and Terraform >= 1.3
+  # in its own terraform block and is vendored byte for byte, so this Recipe
+  # adds no provider constraint of its own; the catalog conventions' "One
+  # Google provider constraint for every Google body" section says how it
+  # composes with the catalog's authored Google bodies. Its files keep to the
+  # Terraform 1.5 language those bodies keep to. The boundary's root
+  # configuration declares no provider block for Google: the provider reads
+  # its credentials from the environment the plan runs in, and the module
+  # names the project and region on what it creates.
+  #
+  # The tag is written out rather than read from infra.source_version: a
+  # source whose coordinates come from a template is pinned per Release
+  # instead of in this Recipe's own entity.lock, and this Recipe's pin is the
+  # one stated above.
+  source:
+    kind: git-repository
+    url: https://github.com/GoogleCloudPlatform/terraform-google-alloy-db.git
+    ref: v9.0.1
+
+  locals:
+    # The name the Release gives the primary instance under
+    # infra.overrides.host, or empty while it gives none. Only a string is
+    # read here; any other value is refused by the assertion below rather
+    # than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The vCPUs of every instance of the cluster: infra.overrides.machine_cpu_count,
+    # or 2, the size the module gives an instance when none is named.
+    machine_cpu_count: '{{ optional (optional .infra "overrides" dict) "machine_cpu_count" 2 }}'
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # The FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "AlloyDB automated backups and continuous backup and recovery"
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the module's primary_instance_ip output — the primary instance's address
+  # in the VPC network, which takes reads and writes — through this
+  # component's module call, which the boundary's root configuration declares
+  # under .context.instance_id for a component declared in the Aggregate the
+  # Release deploys. Terraform resolves it at apply time, so it resolves only
+  # for a consumer authored as a source: Recipe in the same root
+  # configuration; a consumer on another target receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record for it, so the operator points the name at the instance
+  # outside the Release. A consumer in the same root configuration receives
+  # the name as well, and a name carries no reference for Terraform to order
+  # its module after this one by; a later syncWave on the consumer's
+  # boundary, sharing this boundary's directory, orders the two.
+  #
+  # port is 5432, where AlloyDB serves PostgreSQL. user is the initial user
+  # the cluster is created with, and database the one database the cluster
+  # holds, which the assertion below holds values.database to. The metrics
+  # keys are published empty: AlloyDB publishes its metrics to Cloud
+  # Monitoring rather than to a Prometheus endpoint.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.primary_instance_ip}{{ end }}"
+    port: "5432"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "postgres"
+    metrics_pod_selector: ""
+    metrics_pod_port: ""
+    metrics_path: ""
+
+  # This Recipe reads from infra.overrides:
+  #   project_id          - string (project_id), required
+  #   region              - string (location), required
+  #   private_network     - string (network_self_link), required
+  #   allocated_ip_range  - string (allocated_ip_range)
+  #   zone                - string (primary_instance.gce_zone), only while infra.ha.enabled is false
+  #   machine_cpu_count   - integer (primary_instance.machine_cpu_count, and the read pool's; default 2)
+  #   database_flags      - map[string]string (primary_instance.database_flags)
+  #   deletion_protection - bool (deletion_protection)
+  #   host                - string (published as provides.host; not passed to the module)
+  #
+  # Each is passed to the module input named in brackets. project_id,
+  # allocated_ip_range, zone, deletion_protection and host are the keys, under
+  # the same names, that terraform/postgres-cloud-sql reads for the same
+  # concepts, and region and private_network the names it and
+  # terraform/valkey-memorystore read for the project's region and network,
+  # so a Release written for Cloud SQL carries them over. machine_cpu_count
+  # is named by the module input it sets. database_flags is the name Cloud SQL
+  # reads for its server settings, taken here as AlloyDB takes them: a map of
+  # flag name to value, where Cloud SQL's is a list.
+  #
+  # project_id, region and private_network are required: they place the
+  # cluster in the operator's project and network, and this Recipe never
+  # chooses either. private_network is the network's resource link,
+  # projects/<project>/global/networks/<name>, and that network must already
+  # have private services access — an allocated IP range and a private
+  # connection to servicenetworking.googleapis.com — with the AlloyDB,
+  # Service Networking and Compute Engine APIs enabled in the project.
+  # AlloyDB places the cluster's instances in that range, and the module
+  # names the network in the cluster's network configuration; this Recipe
+  # emits none of it, because the connection is the network's and every
+  # Google service using private services access shares it.
+  #
+  # The module's own defaults stand for every input this mapping leaves out.
+  # Three are worth knowing: deletion_protection is true, so Terraform refuses
+  # to destroy the cluster until a Release sets it false; the cluster is
+  # encrypted with a Google-managed key; and its instances take no public
+  # address.
+  #
+  # tier, edition and user_labels, which terraform/postgres-cloud-sql reads,
+  # and the module's psc_enabled and psc_allowed_consumer_projects are not
+  # read, and the assertion admitting the keys above refuses each by name:
+  # AlloyDB sizes an instance by its vCPU count, which machine_cpu_count
+  # sets, and offers no edition; this Recipe sets no labels; and it reaches
+  # the cluster through private services access, never through Private
+  # Service Connect.
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # or not read:
+  #   honoured — values.database while it is postgres; values.user, as the
+  #     cluster's initial user; infra.engine_version, the major version;
+  #     infra.ha.enabled, as the primary instance's REGIONAL availability;
+  #     infra.ha.read_replicas, as the nodes of a read pool beside the
+  #     primary; the password slot bound to core/random-password; a
+  #     core/backup attachment, as the comment above the mapping says; and
+  #     the overrides above.
+  #   refused — any other values.database; values.encoding, values.locale,
+  #     values.init_scripts and values.custom_config; an infra.engine_version
+  #     AlloyDB does not run; infra.port other than 5432, the Component's
+  #     default; infra.storage.type; a machine_cpu_count the module does not
+  #     take; more than 20 read pool nodes; a zone beside infra.ha.enabled;
+  #     database_flags that are not a map; a deletion_protection that is not
+  #     true or false; a host that is not a bare name; the password slot
+  #     empty or filled by another credential; an attachment to
+  #     app_user_password; infra.credentials supplied and any
+  #     infra.credentials_secret; a component name AlloyDB does not take for
+  #     a cluster; any other key under infra.overrides; and, as the comment
+  #     above the mapping says, a second core/backup attachment, a retention
+  #     outside 1 to 365 days, a schedule AlloyDB cannot keep, and
+  #     point-in-time recovery asked for over more than 35 days.
+  #   not read — infra.port while it is 5432; infra.compute.cpu and
+  #     infra.compute.memory, whose Component defaults would size a
+  #     container: AlloyDB sizes each instance by machine_cpu_count.
+  #     infra.storage.size, whose default would size a volume: AlloyDB's
+  #     storage grows as data is added and takes no size. A Recipe cannot
+  #     tell those defaults from a value the Release wrote, so they are not
+  #     read rather than refused. values.app_user and
+  #     infra.control_plane_present configure other realizations, as their
+  #     descriptions say. infra.credentials and infra.credentials_secret
+  #     while they hold the Component's defaults.
+  #
+  # The user values.user names is the cluster's initial user, which AlloyDB
+  # creates with the cluster, and a consumer authenticates as it. Its password is the one
+  # core/random-password's terraform/random-password realization draws at
+  # apply time, handed over as a Terraform reference: no password is written
+  # into the rendered configuration, and the apply keeps it in the Terraform
+  # state. Neither AlloyDB nor the module draws one, and a cluster created
+  # with no initial user has a postgres user with no password, which cannot
+  # log in, so the slot left empty halts, and so does
+  # core/generated-secret, which says the service owns a password AlloyDB
+  # does not keep. Another credential either carries its value as text,
+  # which would be written into the configuration, or carries none the
+  # service could take, so it halts too.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "project_id" "region" "private_network" "allocated_ip_range" "zone" "machine_cpu_count" "database_flags" "deletion_protection" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "tier" -}}
+      {{- fail "infra.overrides.tier is set, and AlloyDB sizes an instance by its number of vCPUs, not by a machine tier: remove infra.overrides.tier from the Release, and set infra.overrides.machine_cpu_count instead, such as 4" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads project_id, region, private_network, allocated_ip_range, zone, machine_cpu_count, database_flags, deletion_protection and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    project_region_network_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "project_id" "region" "private_network" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release places its AlloyDB cluster in the operator's own Google Cloud project, region and VPC network, and this Recipe never chooses any of them, but infra.overrides.%s carries none: set infra.overrides.project_id, infra.overrides.region and infra.overrides.private_network in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+    private_network_is_a_link: >-
+      {{- $n := toString (optional (optional .infra "overrides" dict) "private_network" "") -}}
+      {{- if and $n (not (regexMatch `(^|/)projects/[^/]+/global/networks/[^/]+$` $n)) -}}
+      {{- fail (printf "infra.overrides.private_network is %q, and AlloyDB takes the VPC network a cluster gets its private addresses in as the network's resource link: set it to projects/<project>/global/networks/<name>" $n) -}}
+      {{- end -}}
+    # AlloyDB takes true or false for a cluster's deletion protection, and the
+    # module's input is typed bool.
+    deletion_protection_is_bool: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "deletion_protection" -}}
+      {{- if not (kindIs "bool" $o.deletion_protection) -}}
+      {{- fail (printf "infra.overrides.deletion_protection is %q, and it is passed to the module as a boolean: set it to true or false in the Release, or remove it to keep the module's default, true" (toString $o.deletion_protection)) -}}
+      {{- end -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this database reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the instance serves port 5432` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The cluster is named after the component, as the other managed Recipes
+    # name theirs, so the name is checked here, where it is known, against
+    # AlloyDB's rule for a cluster ID.
+    cluster_id_allowed: >-
+      {{- if not (regexMatch `^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$` .metadata.instance_id) -}}
+      {{- fail (printf "the component %q names its AlloyDB cluster, and a cluster ID is 1 to 63 lowercase letters, digits and hyphens, starting with a letter and ending with a letter or digit: rename the component in the Aggregate to such a name" .metadata.instance_id) -}}
+      {{- end -}}
+    # The PostgreSQL major versions AlloyDB runs, the list the module's own
+    # database_version validation admits; AlloyDB chooses the minor version
+    # it runs of each. The module refuses any other at plan time; this check
+    # repeats its list on purpose, so the build names the key instead. A
+    # version AlloyDB adds later is refused here until this list names it.
+    engine_version_offered: >-
+      {{- $v := toString .infra.engine_version -}}
+      {{- if not (has $v (list "14" "15" "16" "17" "18")) -}}
+      {{- fail (printf "infra.engine_version is %q, and AlloyDB runs the PostgreSQL major versions 14 to 18, named by the major version alone, and chooses the minor version itself: set infra.engine_version in the Release to one of them, such as 16" $v) -}}
+      {{- end -}}
+    port_is_the_service_port: >-
+      {{- if ne (int .infra.port) 5432 -}}
+      {{- fail (printf "infra.port is %v, and AlloyDB serves PostgreSQL on port 5432 alone, which this Recipe publishes as port: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+    # AlloyDB's storage grows with the data and has no type an operator
+    # chooses.
+    storage_type_not_taken: >-
+      {{- with optional (optional .infra "storage" dict) "type" "" -}}
+      {{- fail (printf "infra.storage.type is %q, and AlloyDB keeps a cluster's data in storage it manages, which takes no type: remove infra.storage.type from the Release" (toString .)) -}}
+      {{- end -}}
+    # The vCPU counts the module's own machine_cpu_count validation admits,
+    # repeated on purpose so the build names the key rather than the plan.
+    # Whether a count is offered in the operator's region is the apply's to
+    # judge.
+    machine_cpu_count_offered: >-
+      {{- $c := toString .locals.machine_cpu_count -}}
+      {{- if not (has $c (list "1" "2" "4" "8" "14" "16" "22" "24" "32" "44" "48" "64" "72" "88" "96" "128" "144" "192" "288")) -}}
+      {{- fail (printf "infra.overrides.machine_cpu_count is %q, and the module this Recipe sources takes an instance of 1, 2, 4, 8, 14, 16, 22, 24, 32, 44, 48, 64, 72, 88, 96, 128, 144, 192 or 288 vCPUs: set it to one of them, or leave it unset for 2" $c) -}}
+      {{- end -}}
+    # The read pool takes 1 to 20 nodes, the range the module's own
+    # validation admits, repeated on purpose so the build names the key.
+    read_pool_nodes: >-
+      {{- $n := int .infra.ha.read_replicas -}}
+      {{- if gt $n 20 -}}
+      {{- fail (printf "infra.ha.read_replicas is %d, and this Recipe runs the read replicas as the nodes of one AlloyDB read pool, which takes 1 to 20 nodes: set infra.ha.read_replicas to 20 or fewer" $n) -}}
+      {{- end -}}
+    # A zone places a ZONAL instance. A REGIONAL one runs in zones AlloyDB
+    # chooses, and the module leaves the zone off it, so a zone set beside
+    # infra.ha.enabled would reach no byte of the output.
+    zone_without_ha: >-
+      {{- if and .infra.ha.enabled (optional (optional .infra "overrides" dict) "zone" "") -}}
+      {{- fail "infra.overrides.zone is set while infra.ha.enabled is true, and a highly available AlloyDB primary instance runs in two zones AlloyDB chooses, taking no zone: remove infra.overrides.zone from the Release, or set infra.ha.enabled to false for an instance in that zone" -}}
+      {{- end -}}
+    database_flags_is_a_map: >-
+      {{- $f := optional (optional .infra "overrides" dict) "database_flags" dict -}}
+      {{- if not (kindIs "map" $f) -}}
+      {{- fail "infra.overrides.database_flags is not a map, and AlloyDB takes an instance's database flags as a map of flag name to value, such as max_connections: \"500\", where Cloud SQL takes a list: write infra.overrides.database_flags in the Release as such a map" -}}
+      {{- end -}}
+    # AlloyDB creates a cluster with the one database postgres, and the Google
+    # Cloud provider declares no AlloyDB database resource, so no other
+    # database exists until a client connected to the cluster creates it.
+    # values.database holds the name a consumer connects to, so it is held to
+    # postgres here: any other name, the Component's default appdb among
+    # them, halts rather than hand a consumer a database the cluster does not
+    # hold. AlloyDB runs no initdb, no initialisation scripts and no
+    # configuration file of the reader's; its server settings are database
+    # flags.
+    values_alloydb_cannot_apply: >-
+      {{- if ne (toString .values.database) "postgres" -}}
+      {{- fail (printf "values.database is %q, and an AlloyDB cluster holds the one database AlloyDB creates with it, postgres, which is the database a consumer connects to: set values.database to postgres in the Aggregate, or map this component to a realization that creates the database it names" (toString .values.database)) -}}
+      {{- end -}}
+      {{- if optional .values "encoding" "" -}}
+      {{- fail "values.encoding asks for the encoding the database is created with, and this Recipe creates no database: the cluster's own postgres database is the one a consumer connects to, created by AlloyDB with the cluster: remove values.encoding from the Aggregate, or map this component to a realization that initialises the database itself" -}}
+      {{- end -}}
+      {{- if optional .values "locale" "" -}}
+      {{- fail "values.locale asks for the locale the database is created with, and this Recipe creates no database: the cluster's own postgres database is the one a consumer connects to, created by AlloyDB with the cluster: remove values.locale from the Aggregate, or map this component to a realization that initialises the database itself" -}}
+      {{- end -}}
+      {{- if optional .values "init_scripts" "" -}}
+      {{- fail "values.init_scripts asks for scripts run when the database is first initialised, and an AlloyDB cluster runs none: remove values.init_scripts from the Aggregate and run them against the cluster once it exists, or map this component to a realization that initialises the database itself" -}}
+      {{- end -}}
+      {{- if optional .values "custom_config" "" -}}
+      {{- fail "values.custom_config asks for a server configuration file, and an AlloyDB instance reads none: its server settings are database flags, which the Release names in infra.overrides.database_flags; remove values.custom_config from the Aggregate" -}}
+      {{- end -}}
+    # The type is compared with any version set aside.
+    credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "app_user_password" -}}
+      {{- fail "a credential is attached to the app_user_password slot, and this Recipe creates the one user values.user names, the cluster's initial user: remove the attachment, or map this component to the synthesized helm Recipe, which creates the application role" -}}
+      {{- end -}}
+      {{- if not (hasKey $f "password") -}}
+      {{- fail (printf "the password slot of %q is empty, and neither AlloyDB nor the module this Recipe sources draws a password for the user values.user names: attach core/random-password to the password slot, which has Terraform draw one when it applies" .metadata.instance_id) -}}
+      {{- end -}}
+      {{- $ty := toString (optional $f.password "type" "") -}}
+      {{- if ne (first (splitList ":" $ty)) "core/random-password" -}}
+      {{- fail (printf "the password slot is filled by %s, and this Recipe hands AlloyDB the initial user's password as a Terraform reference to one drawn at apply time, which core/random-password publishes through terraform/random-password; AlloyDB keeps no password of its own, and another credential either carries its value as text, which would be written into the rendered configuration, or carries none the service could take: attach core/random-password to the password slot instead" (default "an attachment of no type" $ty)) -}}
+      {{- end -}}
+    # infra.credentials chooses who owns the database's credentials on the
+    # controller-driven realization, and infra.credentials_secret names the
+    # Kubernetes Secret it reads them from. Here the initial user's password
+    # comes from the password slot and AlloyDB reads no Secret, so supplied,
+    # or any Secret name, would reach no byte of the output while the build
+    # reads as if it had chosen who owns the password: each halts naming the
+    # key, and the Component's defaults, generated and empty, pass.
+    infra_credentials: >-
+      {{- if ne (toString .infra.credentials) "generated" -}}
+      {{- fail (printf "infra.credentials is %q, which chooses who owns the database's credentials on the controller-driven realization, and this Recipe hands AlloyDB the password of the user values.user names from the core/random-password attached to the password slot: remove infra.credentials from the Release" (toString .infra.credentials)) -}}
+      {{- end -}}
+      {{- with .infra.credentials_secret -}}
+      {{- fail (printf "infra.credentials_secret is %q, which names the Kubernetes Secret the controller-driven realization reads the database owner's credentials from, and AlloyDB reads no Secret: this Recipe hands it the password of the user values.user names from the core/random-password attached to the password slot: remove infra.credentials_secret from the Release" .) -}}
+      {{- end -}}
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # cluster is named after the component; its primary instance is named
+  # primary and its read pool read-pool, each unique within the cluster. The
+  # database version is passed in AlloyDB's spelling, POSTGRES_16.
+  #
+  # Instances. The primary instance runs REGIONAL, a standby in a second zone
+  # AlloyDB fails over to, while infra.ha.enabled is true, and ZONAL, in one
+  # zone, infra.overrides.zone or one AlloyDB chooses, while it is false.
+  # infra.ha.read_replicas above zero adds a read pool of that many nodes,
+  # each with the primary's vCPUs, which takes AlloyDB's default database
+  # flags; its address is not published, so a consumer reaches the primary.
+  #
+  # The initial user's password is the attachment's module output joined
+  # with a dot and wrapped in an interpolation, as terraform/random-password
+  # publishes it.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside. AlloyDB keeps two
+  # backups of a cluster, and this Recipe sets both through the module's
+  # inputs:
+  #   - Automated backups, automated_backup_policy, always on, kept for
+  #     infra.retention_days, 7 with none attached, as the Component states,
+  #     1 to 365 days, AlloyDB's limit of one year; a value outside it halts
+  #     naming the attachment. infra.schedule, where set, must start at
+  #     minute 0 of one or more hours of every day of the month, on every
+  #     day of the week or on the days it lists, such as 0 2 * * *,
+  #     0 2,14 * * * or 0 3 * * 1,4: AlloyDB starts an automated backup at
+  #     whole hours it reads in UTC, on the days of the week it is given, so
+  #     the hours become the policy's start times and the days its days of
+  #     the week; any other expression halts naming it. Unset, AlloyDB takes
+  #     one backup a day at a time it chooses.
+  #   - Continuous backup and recovery, AlloyDB's point-in-time recovery, on
+  #     unless the attachment sets infra.point_in_time_recovery to false,
+  #     which turns it off. Its recovery window is infra.retention_days, and
+  #     AlloyDB keeps a window of 1 to 35 days, so a longer retention keeps
+  #     the window at 35 days while the option is left out, and halts naming
+  #     the attachment while it is true, since a restore could not reach
+  #     every moment of the retention.
+  #   - An attachment carrying infra.role_arn is AWS Backup's: bound to
+  #     terraform/backup-native, that FeatureRecipe halts on it by name, and
+  #     terraform/backup-aws-backup refuses a host that is no Amazon RDS
+  #     instance.
+  #   - Two attachments halt naming both: a cluster keeps one backup policy.
+  # A Recipe's locals cannot read its attachments, so the reading sits at the
+  # top of the mapping below.
+  valuesMapping: |
+    {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
+    {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}
+    {{- range $name, $attachment := (default dict .features) -}}
+    {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
+    {{- if $backupNative -}}
+    {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to AlloyDB, which keeps one backup policy for a cluster: remove one of the two" $backupNative $name $.context.instance_id) -}}
+    {{- end -}}
+    {{- $backupNative = $name -}}{{- $backupNativeInfra = default dict (optional $attachment "infra" dict) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $backupRetention := int (optional $backupNativeInfra "retention_days" 7) -}}
+    {{- if or (lt $backupRetention 1) (gt $backupRetention 365) -}}
+    {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and AlloyDB keeps automated backups for 1 to 365 days: set infra.retention_days to a number in that range" $backupNative .context.instance_id $backupRetention) -}}
+    {{- end -}}
+    {{- $backupPitr := toString (optional $backupNativeInfra "point_in_time_recovery" "") -}}
+    {{- if and (eq $backupPitr "true") (gt $backupRetention 35) -}}
+    {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to true and keeps each backup for %d days, and AlloyDB's continuous backup and recovery reaches back 35 days at most, so a restore could not reach every moment of that retention: set infra.retention_days to 35 or fewer, or leave infra.point_in_time_recovery out to keep a 35-day recovery window beside the longer retention" $backupNative .context.instance_id $backupRetention) -}}
+    {{- end -}}
+    {{- $backupDays := list -}}{{- $backupTimes := list -}}
+    {{- with trim (toString (optional $backupNativeInfra "schedule" "")) -}}
+    {{- $f := regexSplit `\s+` . -1 -}}
+    {{- $ok := and (eq (len $f) 5) (eq (index $f 0) "0") (regexMatch `^[0-9]{1,2}(,[0-9]{1,2})*$` (index $f 1)) (has (index $f 2) (list "*" "?")) (has (index $f 3) (list "*" "?")) (regexMatch `^([*?]|[0-7](,[0-7])*)$` (index $f 4)) -}}
+    {{- if $ok -}}
+    {{- range $h := uniq (splitList "," (index $f 1)) -}}
+    {{- if ge (atoi $h) 24 }}{{ $ok = false }}{{ end -}}
+    {{- $backupTimes = append $backupTimes (printf "%02d:00:00:0" (atoi $h)) -}}
+    {{- end -}}
+    {{- $dow := splitList "," (index $f 4) -}}
+    {{- range $i, $day := list "MONDAY" "TUESDAY" "WEDNESDAY" "THURSDAY" "FRIDAY" "SATURDAY" -}}
+    {{- if or (has (index $f 4) (list "*" "?")) (has (toString (add1 $i)) $dow) }}{{ $backupDays = append $backupDays $day }}{{ end -}}
+    {{- end -}}
+    {{- if or (has (index $f 4) (list "*" "?")) (has "0" $dow) (has "7" $dow) }}{{ $backupDays = append $backupDays "SUNDAY" }}{{ end -}}
+    {{- end -}}
+    {{- if not $ok -}}
+    {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and AlloyDB starts an automated backup at minute 0 of whole hours it reads in UTC, on every day of the month and the days of the week it is given: write a schedule such as 0 2 * * * or 0 3 * * 1,4, or remove infra.schedule to let AlloyDB choose the time" $backupNative $.context.instance_id .) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $o := optional .infra "overrides" dict -}}
+    {{- $readNodes := int .infra.ha.read_replicas -}}
+    project_id: "{{ $o.project_id }}"
+    cluster_id: "{{ .context.instance_id }}"
+    location: "{{ $o.region }}"
+    database_version: "POSTGRES_{{ .infra.engine_version }}"
+    network_self_link: "{{ $o.private_network }}"
+    {{- with optional $o "allocated_ip_range" "" }}
+    allocated_ip_range: "{{ . }}"
+    {{- end }}
+    {{- $prov := optional .features.password "provides" dict }}
+    cluster_initial_user:
+      user: "{{ .values.user }}"
+      password: "{{ printf "${%s.%s}" $prov.name $prov.key }}"
+    primary_instance:
+      instance_id: "primary"
+      availability_type: "{{ if .infra.ha.enabled }}REGIONAL{{ else }}ZONAL{{ end }}"
+      {{- with optional $o "zone" "" }}
+      gce_zone: "{{ . }}"
+      {{- end }}
+      machine_cpu_count: {{ .locals.machine_cpu_count }}
+      {{- with optional $o "database_flags" "" }}
+      database_flags: {{ toJson . }}
+      {{- end }}
+    {{- if gt $readNodes 0 }}
+    read_pool_instance:
+      - instance_id: "read-pool"
+        node_count: {{ $readNodes }}
+        machine_cpu_count: {{ .locals.machine_cpu_count }}
+    {{- end }}
+    automated_backup_policy:
+      enabled: true
+      {{- if $backupTimes }}
+      weekly_schedule:
+        days_of_week: {{ toJson $backupDays }}
+        start_times: {{ toJson $backupTimes }}
+      {{- end }}
+      time_based_retention_count: "{{ mul $backupRetention 86400 }}s"
+    {{- if eq $backupPitr "false" }}
+    continuous_backup_enable: false
+    {{- else }}
+    continuous_backup_enable: true
+    continuous_backup_recovery_window_days: {{ min $backupRetention 35 }}
+    {{- end }}
+    {{- if hasKey $o "deletion_protection" }}
+    deletion_protection: {{ $o.deletion_protection }}
+    {{- end }}
