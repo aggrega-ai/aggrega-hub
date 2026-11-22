@@ -25,12 +25,17 @@ terraform {
 # The connection type is Redirect, the service's default: a client opens its
 # connection on port 1433 and then reaches the node hosting the database
 # directly, so it must be allowed to reach port 1433 across the whole subnet's
-# address range. TLS 1.2 is the oldest version a client may connect with. Backups are kept on geo-redundant storage,
-# the service's default, or on geo-zone-redundant storage while the instance
-# is zone redundant, since the service makes an instance zone redundant only
-# while its backups are kept on zone-redundant or geo-zone-redundant storage,
-# and geo-zone-redundant storage keeps the copy in the paired region that
-# geo-redundant storage gives.
+# address range. TLS 1.2 is the oldest version a client may connect with.
+# Backups are kept on geo-redundant storage, the service's default, or on
+# geo-zone-redundant storage while the instance is zone redundant, since the
+# service makes an instance zone redundant only while its backups are kept on
+# zone-redundant or geo-zone-redundant storage, and geo-zone-redundant storage
+# keeps the copy in the paired region that geo-redundant storage gives.
+#
+# collation is the instance's collation, its server collation. The provider
+# sets no collation on a managed database, and SQL Server, SQL Managed
+# Instance among its forms, gives a user database created without a collation
+# of its own the server collation.
 resource "azurerm_mssql_managed_instance" "this" {
   name                         = var.name
   resource_group_name          = var.resource_group_name
@@ -52,9 +57,9 @@ resource "azurerm_mssql_managed_instance" "this" {
   tags                         = var.tags
 }
 
-# The database the caller names. It takes the instance's collation, which
-# SQL Server gives a database created without one of its own, and keeps its
-# automated backups for point-in-time restore short_term_retention_days days.
+# The database the caller names, created with no collation of its own, so it
+# takes the instance's. It keeps its automated backups for point-in-time
+# restore short_term_retention_days days.
 resource "azurerm_mssql_managed_database" "this" {
   name                      = var.database_name
   managed_instance_id       = azurerm_mssql_managed_instance.this.id

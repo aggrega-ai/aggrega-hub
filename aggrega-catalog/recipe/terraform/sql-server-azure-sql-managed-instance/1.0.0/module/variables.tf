@@ -1,9 +1,9 @@
-# Every variable is named for the resource argument it sets, except subnet_id,
-# which sets the instance's subnet_id from the delegated subnet the caller
-# names; database_name, which names the database; and zone_redundant_enabled,
-# which also chooses the storage the instance's backups are kept on. collation,
-# zone_redundant_enabled, tags and short_term_retention_days have defaults; the
-# caller supplies every other one on every call.
+# Every variable is named for the resource argument it sets, except
+# database_name, which names the database. zone_redundant_enabled also chooses
+# the storage the instance's backups are kept on. subnet_id takes the subnet
+# the caller names as its delegated subnet. collation, zone_redundant_enabled,
+# tags and short_term_retention_days have defaults; the caller supplies every
+# other one on every call.
 
 variable "name" {
   type        = string
