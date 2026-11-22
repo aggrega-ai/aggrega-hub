@@ -1000,7 +1000,7 @@ Recipes' development credentials.
 ### Recipe/FeatureRecipe Provider Segment
 
 Domain 3 entities use the execution engine as the first path segment:
-`helm`, `terraform`, `cloudformation`, `compose`, `eval`.
+`helm`, `terraform`, `cloudformation`, `arm`, `compose`, `eval`.
 
 ### Per-version directory layout
 
@@ -1209,6 +1209,29 @@ holding a Recipe needs to know what the alternative is and when it wins. The
 Component's sentence names every realization; each Recipe's names itself and its
 alternative.
 
+#### Naming a cloud realization
+
+A cloud Recipe takes its name from the Component it realizes and the service it provisions:
+
+- **A product Component's Recipe takes the bare Component name** on each provider, one realization per provider that
+  stands the product up with nothing of its own already in place, as `recipe/helm/mariadb` does above.
+- **A neutral Component's Recipe is `<component>-<product>`.** A neutral Component names a concept several clouds sell
+  with the same pillars, so its Recipe says which product on which cloud: `postgres-aurora`, `postgres-alloydb`,
+  `redis-memorystore`, `mysql-flexible-server`.
+- **A generic compute realization names its service**, since one compute Component runs on several services of one
+  cloud: `server-app-service`, `task-container-apps`, `task-cloud-run`, `function-cloud-run`.
+- **No name carries a version, quality or temporal marker**, as "What a distinguisher must not be" sets out.
+
+The same rule names the Component of a cloud product: `core/<category>/<product>`, the vendor's product name
+lowercased and hyphenated, with the vendor prefix dropped unless that leaves a generic word. Four readings settle
+the doubtful cases:
+
+- an abbreviation the vendor uses as the product's name is the name (`sqs`, `sns`, `ecr`, `efs`, `gcs`);
+- a name that would collide with an existing Component naming a different product keeps its prefix
+  (`azure-documentdb` beside `core/datastore/documentdb`, the PostgreSQL DocumentDB engine);
+- a kept Google prefix is `google-cloud-`;
+- in doubt whether the remainder is generic, the prefix stays.
+
 ### Key casing: two registers with two owners
 
 An entity's YAML carries two kinds of key, and they follow different rules
@@ -1244,6 +1267,31 @@ Two boundaries on the rule:
 - **A library's `metadata.name` is outside it.** That name is an identity a
   consumer references rather than a data key, and it follows its own rule — see
   "Library-kind names are bare PascalCase" above.
+
+#### The key of a new Component and of a new `infra.overrides` key
+
+A new key follows the two registers above, and the rule below names the spelling for each case:
+
+- **A concept the catalog already names keeps its key**: `engine_version`, `port`, `compute.{cpu,memory}`,
+  `storage.{size,type}`, `ha.{enabled,read_replicas}`, `database`, `user`, `retention_days`, and in `provides` `host`,
+  `port`, `endpoint`, `protocol`.
+- **A neutral Component reuses the keys of its siblings**: a SQL Component takes the datastore family's.
+- **Any other `values`, `infra` or `provides` key of a new Component is the vendor's property name in snake_case**,
+  taken from the resource its first Recipe provisions (Cosmos DB `consistencyLevel` becomes `consistency_level`,
+  DynamoDB `BillingMode` becomes `billing_mode`). Where two clouds' Recipes realize one key, the Component's own
+  cloud's spelling wins.
+- **An `infra.overrides` key keeps the vendor's spelling of the field it sets**: a Terraform argument
+  (`resource_group_name`, `container_app_environment_id`) or a CloudFormation property
+  (`CustomEndpointCertificateArn`). A Recipe that wraps a published module keeps the module input's spelling where it
+  differs from the resource's argument. An `arm` Recipe reads its terraform sibling's key for a concept that sibling
+  already names and the same kind of value, so `arm/postgres-flexible-server` reads `delegated_subnet_id` for the
+  template's `delegatedSubnetResourceId`. A concept another Recipe of the same provider already reads under a name
+  keeps that name (`host`, `subnet_group`, `instance_class`), even where the vendor's field is spelt otherwise.
+  Across providers each provider's spelling stands, and a Component's `overrides` description says so.
+
+Two cases fall outside the rule and go to the catalog's maintainers before they land: a key no vendor field names (a
+catalog concept, such as a development default), and a key where two vendor spellings would collide on one
+Component.
 
 ### Prefer the compact constraint keyword
 
@@ -1969,8 +2017,8 @@ A Bicep module is published to an OCI registry as its compiled ARM template. A R
 `arm` capability that wraps one sources that published form with the `bicep-module-oci`
 source kind, naming the module by its registry path and the version as the registry records
 it. The Recipe binds `enableTelemetry: false` in its `valuesMapping:`, when the module
-declares that parameter, as Azure Verified Modules do. Which form the cloud catalog prefers, the published
-module or its git repository, is left to that catalog's own entries.
+declares that parameter, as Azure Verified Modules do. "Which source each cloud target prefers" below says
+when the catalog takes the published module and when it writes a fragment.
 
 #### A CloudFormation template
 
@@ -1991,6 +2039,36 @@ provider binds such a template's declared `Parameters` from the Recipe's
 `Transform`s its contributors declare in the assembled stack where the stack can
 carry them — as the provider page's "Values for a sourced template's parameters"
 and "Top-level sections in the assembled stack" set out.
+
+#### Which source each cloud target prefers
+
+A Recipe for a cloud target reads the most reusable source its target offers and writes its own only where that
+source fails a test. Each target has its own preference:
+
+- **`arm`: the Azure Verified Module's Bicep resource module, through `bicep-module-oci`.** The registry serves it as
+  one compiled template, where its git repository is a monorepo of about 90 MB. The Recipe binds
+  `enableTelemetry: false`. Where no Verified Module is available for the service, or its parameters cannot carry the
+  Component's contract, the Recipe is a fragment the catalog writes, and its `description` names the test that
+  failed: not official, not complete, or not maintained, or that the module's template does not pass the catalog's
+  template check. `recipe/arm/mysql-flexible-server` and `recipe/arm/task-container-apps` source Verified Modules;
+  `recipe/arm/server-app-service` is a fragment, because the web-site module's template declares a property the
+  vendor's resource schema does not list, which the catalog's check refuses. A Recipe that pins a module by its git
+  repository moves to the registry only in a version made for another reason, never in a version made only for that.
+- **`terraform`: a published module** from terraform-aws-modules, `Azure/avm-res-*`, or terraform-google-modules and
+  GoogleCloudPlatform, where it passes the tests of "A published Terraform module" (official or complete and
+  maintained, no registry module call in what loads), and `enable_telemetry = false` on a Verified Module. Otherwise a
+  body the catalog writes, its `description` naming the failed test. `recipe/terraform/postgres-aurora`,
+  `postgres-alloydb` and `postgres-flexible-server` source `terraform-aws-modules/rds-aurora`,
+  `GoogleCloudPlatform/alloy-db` and the Verified PostgreSQL module. `recipe/terraform/mysql-flexible-server` is a body,
+  because the Verified MySQL module declares no database or configuration resource and so is not complete;
+  `server-app-service` is one, because the Verified web-site module calls a registry module; and
+  `redis-memorystore` is one, as `valkey-memorystore` is.
+- **`cloudformation`: fragments**, as "A CloudFormation template" sets out. `recipe/cloudformation/postgres-aurora`
+  is one.
+
+Whichever source a Recipe reads, it provisions what the service needs and nothing the Release did not declare:
+the network, subnet, security group, cluster and identity it runs in are the operator's, named by pointer under
+`infra.overrides`. A capability the product lacks is refused by name, never supplied by an added module or sidecar.
 
 ### Target-expected names are the Recipe's translation
 
@@ -2354,7 +2432,7 @@ Every Terraform body the catalog authors for AWS — an `artifacts:` body, or a
 module a Recipe vendors — declares `hashicorp/aws` in its `required_providers`
 block, so the engine installs a provider whose resource schema the body was
 written against rather than whichever release is latest. The constraint is **one
-string, the same in every AWS body**, and it is a **range of the form
+string, the same in every AWS body**, **`~> 6.69`**, a **range of the form
 `~> <major>.<minor>`**, never an exact version: several AWS Recipes compose into
 one boundary's root configuration, Terraform installs one provider version that
 satisfies every module's constraint, and two exact pins that differ fail
@@ -2380,8 +2458,10 @@ keeps its publisher's own constraint: the terraform-aws-modules RDS module the
 ElastiCache module the `-elasticache` Recipes vendor `hashicorp/aws >= 5.93`, the
 OpenSearch module `recipe/terraform/opensearch-service` vendors
 `hashicorp/aws >= 6.51`, the MSK module `recipe/terraform/kafka-msk` vendors
-`hashicorp/aws >= 6.40`, and the s3-bucket module
-`recipe/terraform/s3-object-store-amazon-s3` vendors `hashicorp/aws >= 6.44`.
+`hashicorp/aws >= 6.40`, the s3-bucket module
+`recipe/terraform/s3-object-store-amazon-s3` vendors `hashicorp/aws >= 6.44`, and the
+rds-aurora module `recipe/terraform/postgres-aurora` and `mysql-aurora` vendor
+`hashicorp/aws >= 6.61`.
 The highest of those floors is why the constraint above may not drop below it — in
 a boundary holding both, Terraform installs one provider satisfying the catalog's
 range and every module's floor together.
@@ -2401,11 +2481,12 @@ resources and so need no `hashicorp/google-beta`.
 
 The Cloud SQL module the `-cloud-sql` Recipes vendor keeps its publisher's own
 constraint, `hashicorp/google` and `hashicorp/google-beta` `>= 7.22, < 9` and
-`hashicorp/random` `~> 3.1`, and so does the cloud-storage module that
-`recipe/terraform/s3-object-store-gcs` and `recipe/terraform/gcs` vendor, with
+`hashicorp/random` `~> 3.1`; the AlloyDB module `recipe/terraform/postgres-alloydb`
+vendors `hashicorp/google` `>= 7.23, < 9`. The cloud-storage module that
+`recipe/terraform/s3-object-store-gcs` and `recipe/terraform/gcs` vendor keeps its own too, with
 `hashicorp/google` `>= 6.37.0, < 9` and `hashicorp/random` `>= 2.1`. In a boundary
-holding a Cloud SQL instance, a Memorystore cache and a Cloud Storage bucket,
-Terraform installs one `hashicorp/google` satisfying `~> 8.8`, `>= 7.22, < 9` and
+holding a Cloud SQL instance, an AlloyDB cluster, a Memorystore cache and a Cloud Storage bucket,
+Terraform installs one `hashicorp/google` satisfying `~> 8.8`, `>= 7.22, < 9`, `>= 7.23, < 9` and
 `>= 6.37.0, < 9` together, a release from 8.8 below 9, one `hashicorp/google-beta`
 for the Cloud SQL module alone, and one `hashicorp/random` satisfying both modules'
 ranges. Moving the range is one change made to every Google body at once, and when
