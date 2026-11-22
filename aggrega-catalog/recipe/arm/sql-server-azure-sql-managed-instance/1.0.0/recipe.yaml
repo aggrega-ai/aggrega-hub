@@ -1,0 +1,454 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: sql-server-azure-sql-managed-instance
+  version: 1.0.0
+  # The values, attachments and infra.overrides keys this Recipe refuses are
+  # listed, with their reasons, in the comments above the assertions.
+  description: >
+    SQL Server on Azure SQL Managed Instance: one managed instance in the
+    operator's delegated subnet and the one database values.database names,
+    declared by an Azure Resource Manager template this Recipe writes. The
+    Azure Verified Module for the service, avm/res/sql/managed-instance at
+    0.5.1, is not used: it publishes no address, its outputs carrying the
+    instance's name and resource ID but not its fully qualified domain name,
+    so host would have nothing to point at.
+
+    Reach for it where the Release deploys an Azure Resource Manager template
+    and the database needs a whole SQL Server instance in the operator's
+    virtual network; reach for terraform/sql-server-azure-sql-managed-instance
+    where the Release deploys Terraform, and arm/sql-server-azure-sql-database
+    for a database on a logical server. The delegated subnet is the
+    operator's, required in infra.overrides.delegated_subnet_id; no network,
+    route table, network security group, identity or DNS zone is emitted, and
+    the instance's public endpoint stays off.
+
+    The administrator values.user names takes the password from the Key Vault
+    secret a core/referenced-secret attachment on the password slot names,
+    bound to arm/key-vault-secret, handed to the instance as a Key Vault
+    reference, so the template carries no password; with nothing attached, or
+    another credential, the build halts naming the slot. host publishes an
+    expression for the instance's FQDN, or infra.overrides.host; port is 1433.
+    infra.engine_version 2022 or 2025 sets the instance's update policy, and
+    any other halts naming it; infra.overrides.sku_name and
+    infra.overrides.vcores size the instance, infra.ha.enabled makes it zone
+    redundant, and a value or an infra.overrides key the service cannot take
+    halts naming it. The database keeps the service's automated backups 7
+    days unless a core/backup attachment sets them, and such an attachment
+    halts, naming the Feature, where no FeatureRecipe for the arm capability
+    realizes core/backup.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: arm
+  implements: core/datastore/sql-server:1.0.0
+
+  # The instance is declared by the fragment below: one nested deployment
+  # holding a Microsoft.Sql/managedInstances resource and its
+  # Microsoft.Sql/managedInstances/databases child, both at API version
+  # 2025-01-01, which the provider assembles into the boundary's template.
+  #
+  # Microsoft's Azure Verified Modules programme publishes a Bicep module for
+  # the service, avm/res/sql/managed-instance, MIT, at 0.5.1 its newest
+  # version. Its parameters carry everything this Recipe sets, but its outputs
+  # are the instance's name, resource ID, resource group, location and
+  # system-assigned identity, and not the fullyQualifiedDomainName the
+  # resource reports, so a nested deployment of the module gives host no
+  # output to point at. The module is therefore not sourced, and no module
+  # telemetry exists to turn off.
+  #
+  # The instance and its database sit in a nested deployment of their own,
+  # evaluated in its own scope, because the administrator's password reaches
+  # them as a Key Vault reference: Azure Resource Manager resolves such a
+  # reference only in a deployment's parameters, and a nested deployment's
+  # parameters may carry one, as a top-level resource's properties may not.
+  # The nested deployment passes the reference to its one parameter,
+  # administratorLoginPassword, a securestring, and the instance reads that
+  # parameter. The nested deployment publishes the instance's
+  # fullyQualifiedDomainName as its output of the same name, which host reads.
+  locals:
+    # The symbolic name of the nested deployment, folded from the instance id
+    # as the provider folds a sourced template's: ledger-db becomes LedgerDb.
+    symbol: '{{ capitalizedWords .context.instance_id }}'
+    # The SKU, infra.overrides.sku_name or GP_Gen5: the General Purpose tier
+    # on standard-series (Gen5) hardware. Only a string is read here; any
+    # other value is refused by the assertion below.
+    sku: '{{ $s := optional (optional .infra "overrides" dict) "sku_name" "GP_Gen5" }}{{ if typeIs "string" $s }}{{ $s }}{{ end }}'
+    # The update policy infra.engine_version names, in the service's spelling:
+    # SQLServer2022 for 2022, SQLServer2025 for 2025, and empty for any other,
+    # which the assertion below refuses.
+    database_format: '{{ get (dict "2022" "SQLServer2022" "2025" "SQLServer2025") (toString .infra.engine_version) }}'
+    # The name the Release gives the instance under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # A FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Azure SQL Managed Instance automated backups"
+
+  # This Recipe reads from infra.overrides:
+  #   delegated_subnet_id  - string (properties.subnetId of the instance), required
+  #   sku_name             - string (sku.name, with sku.tier the tier it names; default "GP_Gen5")
+  #   vcores               - integer (properties.vCores; default 4)
+  #   license_type         - string (properties.licenseType; default "LicenseIncluded")
+  #   location             - string (location of the instance and its database;
+  #                          the resource group's region while it is unset)
+  #   tags                 - map[string]string (tags of the instance)
+  #   host                 - string (published as provides.host; renders nothing)
+  # resource_group_name halts by name: the template deploys into the resource
+  # group it is deployed to, which no property of the instance names.
+  # enable_telemetry halts by name too: the template is this catalog's own,
+  # with no module telemetry to turn on or off. Any other key halts naming it.
+  #
+  # Each is the key terraform/sql-server-azure-sql-managed-instance reads for
+  # the same concept, under the same spelling, and that Recipe also reads
+  # resource_group_name, since Terraform names the group a resource is created
+  # in; the property each sets is given in brackets. delegated_subnet_id is
+  # the key the flexible-server Recipes read for the delegated subnet a
+  # managed database server is placed in, sku_name the key every Azure Recipe
+  # reads for the size class a service is provisioned at, and host the key
+  # every managed datastore Recipe reads for the address it publishes.
+  #
+  # delegated_subnet_id is required and has no default: the instance takes its
+  # address in a subnet of the operator's virtual network, delegated to
+  # Microsoft.Sql/managedInstances, with the route table and network security
+  # group the service requires associated with it, and this Recipe never
+  # chooses or creates any of them. It is the subnet's resource ID,
+  # /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Network/virtualNetworks/<network>/subnets/<subnet>.
+  # The instance is created in its virtual network's region, so location must
+  # name that region wherever it is not the region of the resource group the
+  # template is deployed to.
+  #
+  # sku_name names the tier and the hardware as the template reference for
+  # Microsoft.Sql/managedInstances spells them: GP_Gen5, GP_G8IM or GP_G8IH
+  # for General Purpose, BC_Gen5, BC_G8IM or BC_G8IH for Business Critical,
+  # on standard-series (Gen5), premium-series (G8IM) or memory-optimized
+  # premium-series (G8IH) hardware; sku.tier is GeneralPurpose or
+  # BusinessCritical, the tier the name's prefix names. vcores is one of the
+  # counts the same reference lists, 4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48,
+  # 56, 64, 80, 96 and 128; which of them a hardware and tier take, the
+  # service checks when the template deploys. license_type is LicenseIncluded,
+  # the price including a SQL Server licence, or BasePrice, the discounted
+  # price for a licence the operator brings.
+  #
+  # Every property this fragment leaves out takes the service's default. Two
+  # are worth knowing: the instance's time zone is UTC, and its maintenance
+  # window is the service's default. These are set: publicDataEndpointEnabled
+  # false, so the instance takes connections only on its endpoint inside the
+  # virtual network; proxyOverride Redirect, the service's default connection
+  # type, with which a client opens its connection on port 1433 and then
+  # reaches the node hosting the database directly, so it must be allowed to
+  # reach port 1433 across the whole subnet's address range;
+  # minimalTlsVersion 1.2; and requestedBackupStorageRedundancy, Geo, the
+  # service's default, or GeoZone while infra.ha.enabled is true, since the
+  # service makes an instance zone redundant only while its backups are kept
+  # on zone-redundant or geo-zone-redundant storage, and geo-zone-redundant
+  # storage keeps the copy in the paired region the default gives.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation and the
+  # template reference for its resources:
+  #   honoured — values.database, as the database the template creates;
+  #     values.user, as the administrator login; values.collation, as the
+  #     instance's collation and the database's; the password attachment, as
+  #     the administrator's password; infra.engine_version, 2022 or 2025, as
+  #     the instance's update policy (properties.databaseFormat, SQLServer2022
+  #     or SQLServer2025); infra.storage.size, as the instance's storage in
+  #     whole gibibytes; infra.ha.enabled, as the instance's zone redundancy;
+  #     a core/backup attachment, as the comment above the fragment says; and
+  #     the overrides above.
+  #   refused — infra.engine_version other than 2022 and 2025; infra.port
+  #     other than 1433; infra.compute.cpu and infra.compute.memory, since
+  #     infra.overrides.sku_name and infra.overrides.vcores size the instance;
+  #     infra.storage.type, since the service tier fixes the storage;
+  #     infra.storage.size outside what the service takes; a component name
+  #     the service refuses for the instance; a database name the service
+  #     refuses, a system database's among them; values.user naming a
+  #     principal SQL Server keeps; a credential on the password slot other
+  #     than core/referenced-secret, or none; and any infra.overrides key not
+  #     listed above.
+  #   not read — infra.port while it is 1433, the Component's default: the
+  #     instance serves 1433 on its endpoint inside the virtual network, and
+  #     a Recipe cannot tell a default from a value the Release wrote.
+  #
+  # The update policy. The service aligns an instance's databases with a
+  # SQL Server release through its update policy: SQL Server 2022, SQL Server
+  # 2025, or Always-up-to-date, which follows the service's newest engine
+  # features and names no release, so no year selects it and this Recipe does
+  # not offer it. Raising infra.engine_version from 2022 to 2025 on an
+  # instance that exists upgrades its databases' format, which the service
+  # never undoes; the service refuses the change back.
+  #
+  # Backup. Azure SQL Managed Instance backs up every database: a full backup
+  # each week, a differential one every 12 or 24 hours and a log backup about
+  # every 10 minutes, on a schedule the service sets, and keeps them for
+  # point-in-time restore 1 to 35 days, 7 by default; no setting turns them
+  # off. The fragment reads a core/backup attachment among the component's
+  # attachments, as the comment above it says. An attachment binds only where
+  # a FeatureRecipe for the arm capability realizes core/backup in the catalog
+  # the build reads; where none does, it halts at the Manifest, naming the
+  # Feature, and the database keeps its backups 7 days.
+  #
+  # The administrator's password is a Key Vault reference object in the
+  # nested deployment's administratorLoginPassword parameter, which Azure
+  # Resource Manager resolves while the template deploys, so no password is
+  # written into the template. The attachment on the password slot publishes
+  # the secret's resource ID in provides.name; the vault's ID is that ID
+  # without its /secrets/<name> tail, and secretName is the name. The service
+  # draws no password, so with nothing attached the build halts, and so it
+  # does on any credential other than core/referenced-secret: another carries
+  # its value as text, which would be written into the template, or carries
+  # none the service could take; core/random-password draws its password at
+  # apply time on the terraform capability, which no template here can read.
+  # The service takes a password of at least 16 characters holding three of
+  # upper-case letters, lower-case letters, digits and other characters; the
+  # build never sees the secret's value, so the secret the operator creates
+  # holds such a password. The assertions read the slot, but an assertion
+  # does not see what an attachment publishes; the fragment halts where the
+  # published ID is no Key Vault secret's.
+  assertions:
+    placement_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $s := optional $o "delegated_subnet_id" "" -}}
+      {{- if not (and (typeIs "string" $s) $s) -}}
+      {{- fail (printf "the component %q runs as a managed instance in a subnet of the operator's own virtual network, delegated to Microsoft.Sql/managedInstances, and this Recipe never chooses or creates one, but infra.overrides.delegated_subnet_id carries none: set it in the Release to the subnet's resource ID" $.metadata.instance_id) -}}
+      {{- end -}}
+      {{- if not (regexMatch `(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Network/virtualNetworks/[^/]+/subnets/[^/]+$` $s) -}}
+      {{- fail (printf "infra.overrides.delegated_subnet_id is %q, and the managed instance takes the subnet it is placed in as the subnet's resource ID: set it to /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Network/virtualNetworks/<network>/subnets/<subnet>, a subnet delegated to Microsoft.Sql/managedInstances" $s) -}}
+      {{- end -}}
+    overrides_known: >-
+      {{- $known := list "delegated_subnet_id" "sku_name" "vcores" "license_type" "location" "tags" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "resource_group_name" -}}
+      {{- fail "infra.overrides.resource_group_name is set, and this Recipe creates the managed instance in the resource group the template is deployed to, which no property of the instance names: remove infra.overrides.resource_group_name from the Release, and deploy the template to that resource group" -}}
+      {{- end -}}
+      {{- if eq $k "enable_telemetry" -}}
+      {{- fail "infra.overrides.enable_telemetry is set, and this Recipe declares the managed instance in a template of this catalog's own, which carries no telemetry to turn on or off: remove infra.overrides.enable_telemetry from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads delegated_subnet_id, sku_name, vcores, license_type, location, tags and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $skus := list "GP_Gen5" "GP_G8IM" "GP_G8IH" "BC_Gen5" "BC_G8IM" "BC_G8IH" -}}
+      {{- $s := optional $o "sku_name" "GP_Gen5" -}}
+      {{- if not (and (typeIs "string" $s) (has $s $skus)) -}}
+      {{- fail (printf "infra.overrides.sku_name is %v, and Azure SQL Managed Instance takes as its SKU the tier and the hardware, one of %s: set infra.overrides.sku_name to one, or remove it for GP_Gen5" $s (join ", " $skus)) -}}
+      {{- end -}}
+      {{- $counts := list 4 6 8 10 12 16 20 24 32 40 48 56 64 80 96 128 -}}
+      {{- $v := optional $o "vcores" 4 -}}
+      {{- if not (and (or (kindIs "int" $v) (kindIs "int64" $v) (and (kindIs "float64" $v) (eq (float64 (int $v)) $v))) (has (int $v) $counts)) -}}
+      {{- fail (printf "infra.overrides.vcores is %v, and Azure SQL Managed Instance takes as its vCores one of %s, as many as the hardware and tier allow: set infra.overrides.vcores to one, or remove it for 4" $v (join ", " $counts)) -}}
+      {{- end -}}
+      {{- $l := optional $o "license_type" "LicenseIncluded" -}}
+      {{- if not (and (typeIs "string" $l) (has $l (list "LicenseIncluded" "BasePrice"))) -}}
+      {{- fail (printf "infra.overrides.license_type is %v, and Azure SQL Managed Instance takes LicenseIncluded, a price including the SQL Server licence, or BasePrice, a discounted price for a licence the operator brings: set infra.overrides.license_type to one, or remove it for LicenseIncluded" $l) -}}
+      {{- end -}}
+      {{- range $k := list "location" -}}
+      {{- if hasKey $o $k -}}
+      {{- $x := index $o $k -}}
+      {{- if not (and (typeIs "string" $x) $x) -}}
+      {{- fail (printf "infra.overrides.%s is %s, and this Recipe reads it as a string: set it in the Release to one, or remove it" $k (toJson $x)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this database reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the instance serves port 1433` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The managed instance is named after the component, and its name is also
+    # the first label of the address the service gives it; the rule the
+    # service checks it against is checked here, where the name is known.
+    instance_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (regexMatch `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$` $n) -}}
+      {{- fail (printf "the component %q names its managed instance, and an instance name holds 1 to 63 lowercase letters, digits and hyphens, beginning and ending with a letter or a digit: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+    # The database names the service refuses: one over 128 characters, one
+    # holding < > * % & : \ / ? or a control character, one ending in a period
+    # or a space, and the system databases every instance holds, master,
+    # model, msdb and tempdb.
+    database_name: >-
+      {{- $d := toString .values.database -}}
+      {{- if or (eq $d "") (gt (len $d) 128) (regexMatch `[<>*%&:\\/?[:cntrl:]]` $d) (hasSuffix "." $d) (hasSuffix " " $d) (has (lower $d) (list "master" "model" "msdb" "tempdb")) -}}
+      {{- fail (printf "values.database is %q, and Azure SQL Managed Instance takes a database name of 1 to 128 characters holding none of < > * %% & : \\ / ? or a control character, not ending in a period or a space, and other than master, model, msdb and tempdb, the system databases every instance holds: set values.database in the Aggregate to such a name" $d) -}}
+      {{- end -}}
+    # The names of the principals SQL Server keeps, read off its documentation
+    # of the Database Engine's principals and of the roles Azure SQL keeps in
+    # master: the sa login and the public server role, the dbo, guest,
+    # INFORMATION_SCHEMA and sys users every database holds, and the dbmanager
+    # and loginmanager roles, which arm/sql-server-azure-sql-database refuses
+    # too; and serveradmin, the server role the service's own guide to
+    # creating an instance names as reserved for the administrator login. The
+    # administrator login is named once, when the instance is created, and
+    # this Recipe refuses each of these names for it, and an empty name, which
+    # names no login.
+    administrator_login: >-
+      {{- $u := toString .values.user -}}
+      {{- if or (eq $u "") (has (lower $u) (list "sa" "public" "dbo" "guest" "information_schema" "sys" "dbmanager" "loginmanager" "serveradmin")) -}}
+      {{- fail (printf "values.user is %q, the managed instance's administrator login, and SQL Server keeps sa, public, dbo, guest, INFORMATION_SCHEMA, sys, dbmanager, loginmanager and serveradmin for principals of its own, while an empty name names no login: set values.user in the Aggregate to another name" $u) -}}
+      {{- end -}}
+    engine_version_offered: >-
+      {{- if not .locals.database_format -}}
+      {{- fail (printf "infra.engine_version is %q, and Azure SQL Managed Instance aligns its databases with SQL Server 2022 or SQL Server 2025, the update policies that name a release, which this Recipe sets from it: set infra.engine_version in the Release to 2022 or 2025" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    port_is_the_service_port: >-
+      {{- if ne (int .infra.port) 1433 -}}
+      {{- fail (printf "infra.port is %v, and Azure SQL Managed Instance serves SQL Server on port 1433 on its endpoint inside the virtual network, which this Recipe publishes as port, and does not move it: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+    compute_not_taken: >-
+      {{- $c := optional .infra "compute" dict -}}
+      {{- range $k := list "cpu" "memory" -}}
+      {{- with optional $c $k "" -}}
+      {{- fail (printf "infra.compute.%s is %v, and Azure SQL Managed Instance sizes the instance by its SKU and its vCores, which this Recipe reads from infra.overrides.sku_name and infra.overrides.vcores, not by a CPU or memory figure: remove infra.compute.%s from the Release and set those two" $k . $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # The template reference for Microsoft.Sql/managedInstances takes the
+    # instance's storage from 32 to 32768 GB in steps of 32; the largest a
+    # hardware, tier and vCore count take, the service checks when the
+    # template deploys.
+    storage: >-
+      {{- $size := toString .infra.storage.size -}}
+      {{- $gi := regexFind `^[0-9]+` $size -}}
+      {{- if not (and (regexMatch `^[0-9]+Gi$` $size) (ge (int $gi) 32) (le (int $gi) 32768) (eq (mod (int $gi) 32) 0)) -}}
+      {{- fail (printf "infra.storage.size is %q, and Azure SQL Managed Instance takes the instance's storage in whole gibibytes from 32 to 32768, in steps of 32: set infra.storage.size in the Release to such a size, such as 32Gi" $size) -}}
+      {{- end -}}
+      {{- with optional .infra.storage "type" "" -}}
+      {{- fail (printf "infra.storage.type is %q, and Azure SQL Managed Instance chooses the instance's storage by its service tier and takes no storage type: remove infra.storage.type from the Release" (toString .)) -}}
+      {{- end -}}
+    credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if not (hasKey $f "password") -}}
+      {{- fail "the password slot is empty, and Azure SQL Managed Instance draws no password for the administrator values.user names: attach core/referenced-secret to the password slot, naming the Key Vault secret that holds it, and bind it to arm/key-vault-secret in the Manifest" -}}
+      {{- end -}}
+      {{- $ty := first (splitList ":" (toString (optional $f.password "type" ""))) -}}
+      {{- if ne $ty "core/referenced-secret" -}}
+      {{- fail (printf "the password slot is filled by %s, and this Recipe hands the managed instance its administrator's password as a Key Vault reference to a secret the attachment names, which core/referenced-secret publishes through arm/key-vault-secret; another credential either carries its value as text, which would be written into the template, or carries none the service could take: attach core/referenced-secret to the password slot, bound to arm/key-vault-secret in the Manifest" $ty) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. A consumer
+  # receives each as written. host reads the nested deployment this component
+  # becomes, whose symbolic name is the instance id folded into words, and
+  # names its fullyQualifiedDomainName output, the instance's name under
+  # database.windows.net, which resolves inside the virtual network; Azure
+  # Resource Manager evaluates the expression when the template deploys, so
+  # it resolves for a consumer in the same template, through the link for a
+  # consumer in another arm template, and as text on another target.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the expression. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record for it, so the operator points the name at the instance outside
+  # the Release. A client checking the instance's certificate needs a name the
+  # certificate carries, which is the instance's own name.
+  #
+  # port is 1433, where the instance serves SQL Server inside the virtual
+  # network. user and database are the developer values the template creates;
+  # protocol is sqlserver.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}[reference('{{ .locals.symbol }}').outputs.fullyQualifiedDomainName.value]{{ end }}"
+    port: "1433"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "sqlserver"
+
+  # The fragment the provider assembles into the boundary's template: one
+  # nested deployment, named after its symbolic name and the deployment it
+  # runs in, deployed incrementally and evaluated in its own scope, as the
+  # provider deploys a sourced template. Its template declares the instance,
+  # named after the component, and the database values.database names as the
+  # instance's child, deployed after it, each in location or the resource
+  # group's region; and it outputs the instance's fullyQualifiedDomainName.
+  #
+  # The instance's sku is sku_name with the tier its prefix names; its other
+  # properties are the ones the comments above name. The database takes
+  # values.collation as its collation, as the instance does, and carries an
+  # empty properties object while values.collation is unset, since the
+  # resource's schema requires the object.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside. The service backs up
+  # every database on a schedule it sets and keeps the backups for
+  # point-in-time restore 1 to 35 days, so no setting turns them off and no
+  # time reaches them:
+  #   - With none attached, the fragment writes no short-term retention policy
+  #     and the database keeps the service's default, 7 days.
+  #   - An attachment carrying no infra.role_arn sets the retentionDays of the
+  #     database's backupShortTermRetentionPolicies child, named default, from
+  #     infra.retention_days, and a value outside 1 to 35 halts naming the
+  #     attachment; infra.schedule halts naming it, since the service takes no
+  #     backup time. The service keeps point-in-time restore for every
+  #     database across that window, and no setting turns it off, so
+  #     infra.point_in_time_recovery left out or true is what it gives, and
+  #     false halts naming the attachment rather than being ignored.
+  #   - An attachment carrying infra.role_arn is AWS Backup's, whose
+  #     realizations refuse a host that is no Amazon RDS instance; this Recipe
+  #     configures nothing from it.
+  #   - Two attachments carrying no infra.role_arn halt naming both: a database
+  #     runs one automated backup.
+  artifacts:
+    managed-instance.yaml: |
+      {{- $id := .context.instance_id }}
+      {{- $backupNative := "" }}{{ $backupNativeInfra := dict }}
+      {{- range $name, $attachment := (default dict .features) }}
+      {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" }}
+      {{- $in := default dict (optional $attachment "infra" dict) }}
+      {{- if not (trim (toString (optional $in "role_arn" ""))) }}
+      {{- if $backupNative }}
+      {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Azure SQL Managed Instance, which runs one automated backup on a database: remove one of the two" $backupNative $name $id) }}
+      {{- end }}
+      {{- $backupNative = $name }}{{ $backupNativeInfra = $in }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- $backupRetention := 0 }}
+      {{- if $backupNative }}
+      {{- with trim (toString (optional $backupNativeInfra "schedule" "")) }}
+      {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Azure SQL Managed Instance takes each backup on a schedule it sets, which no setting moves: remove infra.schedule from the attachment" $backupNative $id .) }}
+      {{- end }}
+      {{- $backupRetention = int (optional $backupNativeInfra "retention_days" 7) }}
+      {{- if or (lt $backupRetention 1) (gt $backupRetention 35) }}
+      {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and Azure SQL Managed Instance keeps a database's backups for point-in-time restore 1 to 35 days, which this Recipe sets from it: set infra.retention_days to a number in that range" $backupNative $id $backupRetention) }}
+      {{- end }}
+      {{- if eq (toString (optional $backupNativeInfra "point_in_time_recovery" "")) "false" }}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to false, and Azure SQL Managed Instance keeps point-in-time restore for every database, across the retention window, with no setting that turns it off: remove infra.point_in_time_recovery from the attachment, or set it to true" $backupNative $id) }}
+      {{- end }}
+      {{- end }}
+      {{- $secret := toString .features.password.provides.name }}
+      {{- if not (regexMatch `(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.KeyVault/vaults/[^/]+/secrets/[^/]+$` $secret) }}
+      {{- fail (printf "the password slot of %q is filled by an attachment that publishes no Key Vault secret resource ID, and the administrator's password is handed to the managed instance as a reference to that secret: bind core/referenced-secret to arm/key-vault-secret in the Manifest" $id) }}
+      {{- end }}
+      {{- $o := default dict .infra.overrides }}
+      {{- $location := default "[resourceGroup().location]" (optional $o "location" "") }}
+      {{- $db := toString .values.database }}
+      {{- $quoted := printf "'%s', '%s'" $id (replace "'" "''" $db) }}
+      {{- $properties := dict "administratorLogin" (toString .values.user) "administratorLoginPassword" "[parameters('administratorLoginPassword')]" "subnetId" $o.delegated_subnet_id "licenseType" (optional $o "license_type" "LicenseIncluded") "vCores" (int (optional $o "vcores" 4)) "storageSizeInGB" (int (trimSuffix "Gi" (toString .infra.storage.size))) "databaseFormat" .locals.database_format "zoneRedundant" (eq (toString .infra.ha.enabled) "true") "requestedBackupStorageRedundancy" (ternary "GeoZone" "Geo" (eq (toString .infra.ha.enabled) "true")) "publicDataEndpointEnabled" false "proxyOverride" "Redirect" "minimalTlsVersion" "1.2" }}
+      {{- $dbProperties := dict }}
+      {{- with optional .values "collation" "" }}
+      {{- $_ := set $properties "collation" (toString .) }}
+      {{- $_ := set $dbProperties "collation" (toString .) }}
+      {{- end }}
+      {{- $instance := dict "type" "Microsoft.Sql/managedInstances" "apiVersion" "2025-01-01" "name" $id "location" $location "sku" (dict "name" .locals.sku "tier" (ternary "BusinessCritical" "GeneralPurpose" (hasPrefix "BC_" .locals.sku))) "properties" $properties }}
+      {{- with optional $o "tags" "" }}{{ $_ := set $instance "tags" . }}{{ end }}
+      {{- $database := dict "type" "Microsoft.Sql/managedInstances/databases" "apiVersion" "2025-01-01" "name" (printf "%s/%s" $id $db) "location" $location "dependsOn" (list (printf "[resourceId('Microsoft.Sql/managedInstances', '%s')]" $id)) "properties" $dbProperties }}
+      {{- $resources := list $instance $database }}
+      {{- if $backupNative }}
+      {{- $resources = append $resources (dict "type" "Microsoft.Sql/managedInstances/databases/backupShortTermRetentionPolicies" "apiVersion" "2025-01-01" "name" (printf "%s/%s/default" $id $db) "dependsOn" (list (printf "[resourceId('Microsoft.Sql/managedInstances/databases', %s)]" $quoted)) "properties" (dict "retentionDays" $backupRetention)) }}
+      {{- end }}
+      {{- $template := dict "$schema" "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#" "contentVersion" "1.0.0.0" "parameters" (dict "administratorLoginPassword" (dict "type" "securestring")) "resources" $resources "outputs" (dict "fullyQualifiedDomainName" (dict "type" "string" "value" (printf "[reference(resourceId('Microsoft.Sql/managedInstances', '%s'), '2025-01-01').fullyQualifiedDomainName]" $id))) }}
+      {{- $reference := dict "reference" (dict "keyVault" (dict "id" (regexReplaceAll `/secrets/[^/]+$` $secret "")) "secretName" (regexFind `[^/]+$` $secret)) }}
+      {{- /* the nested deployment */ -}}{{- $nested := dict "type" "Microsoft.Resources/deployments" "apiVersion" "2025-04-01" "name" (printf "[format('%s-{0}', uniqueString(deployment().name))]" .locals.symbol) "properties" (dict "mode" "Incremental" "expressionEvaluationOptions" (dict "scope" "inner") "parameters" (dict "administratorLoginPassword" $reference) "template" $template) }}
+      resources:
+        {{ .locals.symbol }}: {{ toJson $nested }}
