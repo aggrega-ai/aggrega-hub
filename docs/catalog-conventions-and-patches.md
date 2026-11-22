@@ -2803,10 +2803,11 @@ An `arg` entry and any custom mechanism are refused on every target.
 
 **Behaviours of the Container Apps entries.**
 
-- On Azure Resource Manager the shared parameters read every connection, so a
-  connection whose target publishes a `provides` key declared sensitive halts the
-  build there, naming the parameters. The route for such a credential is Key Vault,
-  named under `infra.overrides.secrets`.
+- On Azure Resource Manager a value declared sensitive halts the build, naming
+  the parameters, when an inject block, the component's own or a connection's,
+  delivers it into a variable. A connection whose target publishes such a `provides`
+  key that nothing delivers builds. The route for such a credential is Key Vault,
+  named under `infra.overrides.secrets`, with the delivery dropped.
 - A Container Apps job runs with a deadline on each execution, because Container
   Apps requires a replica timeout of every job: `infra.overrides.replica_timeout_in_seconds`,
   a whole number of seconds, 1 or more, where the Release sets it, and otherwise 30
@@ -6022,6 +6023,19 @@ value unset renders. `aggrega lint --pre-publish`, run on an entity, compares a
 proposed version with the previously published one by its own classification and
 halts on a smaller bump than that classification requires; where its answer and
 these rules differ, the case is unclear too.
+
+One such case is settled. The linter compares a Recipe's authored fields, so it
+reads as a removal, and asks for a major version, a `valuesMapping` moved from an
+inline template to a `{$import: <Library>#/mappings/<Entry>}` reference, an
+`artifacts` list moved to a map of `$import` entries, and a `source` moved
+between fetch forms (a git clone to the same module's OCI registry) at the same
+module version, because each changes the field's type or drops its keys. The
+catalog numbers a re-version that keeps its predecessor's contract (the same
+parameters, the same resources at the same addresses or logical IDs, and a
+`moved` block where an address changes) as a minor version all the same, and says
+in the release notes that the linter reads it as major and why. The ECS,
+Container Apps and Cloud Run compute Recipes that import the shared
+container-service libraries are numbered this way.
 
 A Plugin entity takes no part in this choice: its version is the compiler build
 that produced it (see "Registry repository segments" below).
