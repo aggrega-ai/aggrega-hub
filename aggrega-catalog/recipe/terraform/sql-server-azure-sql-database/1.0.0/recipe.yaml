@@ -1,0 +1,471 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: sql-server-azure-sql-database
+  version: 1.0.0
+  # The licence of the vendored module, the Azure Verified Modules programme's
+  # SQL server module: the third-party code this Recipe pins and writes into
+  # the output. The logical server and database it provisions are a service
+  # the reader contracts for directly with Microsoft, under Azure's terms.
+  license: MIT
+  # The values, attachments and infra.overrides keys this Recipe refuses are
+  # listed, with their reasons, in the comments above the assertions.
+  description: >
+    SQL Server on Azure SQL Database: one logical server and the one database
+    values.database names, realized by Microsoft's Azure Verified Modules
+    module Azure/avm-res-sql-server/azurerm at v0.3.0, MIT, fetched from its
+    git repository at that tag; entity.lock pins the tag's commit and archive
+    digest.
+
+    Reach for it where the database is an Azure SQL Database in the
+    operator's subscription and the Release deploys Terraform; reach for
+    arm/sql-server-azure-sql-database where it deploys an Azure Resource
+    Manager template. The module admits hashicorp/azurerm 4 alone, so this
+    Recipe goes in a terraform boundary apart from the Azure Recipes that
+    need azurerm 5, terraform/azure-api-management among them.
+
+    The resource group and region are the operator's, named in
+    infra.overrides. Public network access is off unless
+    infra.overrides.public_network_access_enabled is true; the private
+    endpoint or the firewall rules a client reaches the server through are
+    the operator's, and none is emitted. The module's usage telemetry to
+    Microsoft is off; infra.overrides.enable_telemetry: true turns it on.
+
+    The administrator values.user names takes the core/random-password
+    attachment on the password slot as a Terraform reference, or, with none
+    attached or core/generated-secret, a password the module draws at apply
+    time; either way the rendered files carry no password, and another
+    credential halts naming the slot. host publishes a reference to the
+    server's FQDN, or infra.overrides.host; port is 1433. A value or an
+    infra.overrides key the service or the module cannot take halts naming
+    it; infra.overrides.sku_name sizes the database. A core/backup attachment
+    bound to terraform/backup-native sets how long the service keeps the
+    database's backups.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/sql-server:1.0.0
+
+  # The published module, at the tag the registry publishes as version 0.3.0.
+  # A registry version of a module is a tag of its git repository, and the
+  # registry's own download for this version answers with a git source at the
+  # commit that tag names; Terraform's dependency lock file records providers
+  # and no module. So the pin is taken here: `aggrega pin` resolves the tag to
+  # its commit and records that commit and the archive's digest in entity.lock,
+  # and every build vendors exactly those bytes.
+  #
+  # The source names the repository root. The root's module calls are to its
+  # own ./modules/database and ./modules/elasticpool directories, which call
+  # none, so the configuration Terraform loads from it calls no registry module
+  # and initialising it fetches providers and nothing else. The repository's
+  # examples/ and tests/ directories are vendored with it and never loaded.
+  #
+  # The module declares hashicorp/azurerm "~> 4.26", Azure/azapi "~> 2.12" and
+  # hashicorp/random "~> 3.6" in its own required_providers, and Terraform
+  # ">= 1.9, < 2.0"; its database directory declares azurerm "~> 4.0" and azapi
+  # "~> 2.12", and its elastic pool directory those two and hashicorp/time
+  # "~> 0.13". It is vendored byte for byte, so this Recipe adds no provider
+  # constraint of its own. "~> 4.26" admits no azurerm 5 release, while the
+  # catalog's own Azure bodies declare "~> 5.14" and
+  # terraform/azure-api-management pins azurerm at exactly 5.9.0, so one root
+  # configuration cannot install a provider satisfying both: a Release places
+  # this database in a terraform boundary apart from those bodies. The
+  # Container Apps bodies of the generic compute Recipes admit azurerm 4 and 5
+  # alike, so they share its boundary. The pin moves when the module publishes
+  # a release admitting azurerm 5.
+  #
+  # The module carries two removed blocks, for random_uuid.telemetry and
+  # modtm_telemetry.telemetry, with destroy = false: a state that holds either
+  # resource forgets it without destroying it, and the module itself creates
+  # neither.
+  source:
+    kind: git-repository
+    url: https://github.com/Azure/terraform-azurerm-avm-res-sql-server.git
+    ref: v0.3.0
+
+  locals:
+    # The SKU, infra.overrides.sku_name or GP_Gen5_2: two vCores of the
+    # General Purpose tier on standard-series (Gen5) hardware, the size the
+    # service's own production preset provisions.
+    sku: '{{ $s := optional (optional .infra "overrides" dict) "sku_name" "GP_Gen5_2" }}{{ if typeIs "string" $s }}{{ $s }}{{ end }}'
+    # The name the Release gives the server under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # The FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Azure SQL Database automated backups"
+
+  # This Recipe reads from infra.overrides:
+  #   resource_group_name            - string (resource_group_name), required
+  #   location                       - string (location), required
+  #   sku_name                       - string (databases[<database>].sku_name; default "GP_Gen5_2")
+  #   public_network_access_enabled  - bool (public_network_access_enabled; default false)
+  #   enable_telemetry               - bool (enable_telemetry; false unless set to true here,
+  #                                    where the module's own default is true)
+  #   tags                           - map[string]string (tags)
+  #   host                           - string (published as provides.host; not passed to the module)
+  #
+  # Each is named by the module input it sets, given in brackets, save host,
+  # which every managed datastore Recipe reads for the address it publishes;
+  # sku_name is also the key every Azure Recipe reads for the size a service
+  # is provisioned at, and arm/sql-server-azure-sql-database reads each of
+  # them but resource_group_name under the same spelling. resource_group_name
+  # and location are required: they place the server in the operator's
+  # subscription, and this Recipe never chooses either.
+  #
+  # sku_name names the database's service objective as the service spells it:
+  # a vCore SKU such as GP_Gen5_2, GP_S_Gen5_1 (serverless), BC_Gen5_4 or
+  # HS_Gen5_2, or a DTU SKU such as Basic, S0 or P1. The provider checks the
+  # name when Terraform plans, and the service whether the region offers it.
+  #
+  # public_network_access_enabled. A logical server takes connections over its
+  # public endpoint, subject to the server's firewall rules, or over a private
+  # endpoint in a virtual network. Unset or false, the module's own default,
+  # public network access is off and a client reaches the server only through
+  # a private endpoint; true turns it on, and a client reaches it only where a
+  # firewall rule admits its address. This Recipe passes neither the module's
+  # private_endpoints nor its firewall_rules: each is the operator's, created
+  # for the server outside the Release, the way a virtual network's subnets
+  # and private DNS zones are.
+  #
+  # While enable_telemetry is true, the module's default, the module and its
+  # database and elastic pool directories each submit an empty Azure Resource
+  # Manager template to the subscription, in the server's region, under a
+  # name made of the module's telemetry identifier, its version and how it was
+  # fetched, which Microsoft counts as usage of the module; reading the
+  # subscription for it takes a data source of its own. This Recipe passes
+  # false unless infra.overrides.enable_telemetry is true, which leaves out
+  # those templates and the data source; any value that is not a boolean is
+  # refused below.
+  #
+  # Any other key under infra.overrides halts the build naming it, so a key
+  # misspelt, or meant for another Recipe, is never passed over unread.
+  #
+  # The module's own defaults stand for every input this mapping leaves out.
+  # These are worth knowing: TLS 1.2 is the oldest version a client may connect
+  # with, which the module fixes; the connection policy is the service's
+  # Default, which redirects a client inside Azure to the node hosting the
+  # database, on a port from 11000 to 11999, and proxies one outside Azure
+  # through 1433; transparent data encryption is on; the database's backups are
+  # kept on geo-redundant storage; and the server writes no audit log. The
+  # server's version is 12.0, the one value the service takes for a logical
+  # server, which the module requires.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation and the
+  # module's inputs:
+  #   honoured — values.database, as the database the module creates;
+  #     values.user, as the administrator login; values.collation, as the
+  #     database's collation; the password attachment, as the administrator's
+  #     password; infra.storage.size, as the database's maximum data size in
+  #     whole gibibytes; infra.ha.enabled, as the database's zone redundancy;
+  #     a core/backup attachment, as the comment above the mapping says; and
+  #     the overrides above.
+  #   refused — infra.engine_version other than the Component's default, 2022:
+  #     Azure SQL Database runs the service's own current database engine and
+  #     takes no version; infra.port other than 1433; infra.compute.cpu and
+  #     infra.compute.memory, since infra.overrides.sku_name sizes the
+  #     database; infra.storage.type, since the service tier fixes the
+  #     storage; infra.ha.enabled on a SKU the service makes no database zone
+  #     redundant on; a database name the service refuses; a credential on the
+  #     password slot other than those set out below; and any infra.overrides
+  #     key not listed above.
+  #   not read — infra.engine_version while it is 2022 and infra.port while it
+  #     is 1433, the Component's defaults: the service runs its own engine and
+  #     serves 1433, and a Recipe cannot tell a default from a value the
+  #     Release wrote.
+  #
+  # The administrator's password is the module's administrator_login_password:
+  # the password core/random-password's terraform/random-password realization
+  # draws at apply time, handed over as a Terraform reference. With nothing
+  # attached, or core/generated-secret, the mapping sets the module's
+  # generate_administrator_login_password, and the module draws a password of
+  # 128 characters with its own random_password resource at apply time and
+  # publishes it as its generated_administrator_login_password output, a
+  # credential the target generates. Either way no password is written into
+  # the rendered configuration, and the apply keeps it in the Terraform state,
+  # where an operator can read it. Another credential either carries its value
+  # as text, which would be written into the configuration, or carries none
+  # the service could take, so it halts. The service takes a password of 8 to
+  # 128 characters holding three of upper-case letters, lower-case letters,
+  # digits and other characters; core/random-password takes 8 to 128
+  # characters, and its terraform realization draws at least one upper-case
+  # letter, one lower-case letter and one digit in every password.
+  assertions:
+    placement_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "resource_group_name" "location" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release places its logical server in the operator's own Azure resource group and region, and this Recipe never chooses either, but infra.overrides.%s carries none: set infra.overrides.resource_group_name and infra.overrides.location in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_known: >-
+      {{- $known := list "resource_group_name" "location" "sku_name" "public_network_access_enabled" "enable_telemetry" "tags" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads resource_group_name, location, sku_name, public_network_access_enabled, enable_telemetry, tags and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $t := optional $o "enable_telemetry" false -}}
+      {{- if not (kindIs "bool" $t) -}}
+      {{- fail (printf "infra.overrides.enable_telemetry is %v, and it is passed to the module as a boolean: set it to true to turn the module's telemetry on, or to false or remove it to keep it off" $t) -}}
+      {{- end -}}
+      {{- $p := optional $o "public_network_access_enabled" false -}}
+      {{- if not (kindIs "bool" $p) -}}
+      {{- fail (printf "infra.overrides.public_network_access_enabled is %v, and it is passed to the module as a boolean: set it to true to turn the logical server's public network access on, or to false or remove it to keep it off" $p) -}}
+      {{- end -}}
+      {{- $s := optional $o "sku_name" "GP_Gen5_2" -}}
+      {{- if not (and (typeIs "string" $s) (regexMatch `^[A-Za-z0-9_]+$` (toString $s))) -}}
+      {{- fail (printf "infra.overrides.sku_name is %v, and the database's SKU is the service objective's name, letters, digits and underscores, such as GP_Gen5_2, GP_S_Gen5_1, BC_Gen5_4, HS_Gen5_2, Basic, S0 or P1: set infra.overrides.sku_name to one, or remove it for GP_Gen5_2" $s) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this database reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the server serves port 1433` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The logical server is named after the component, and its name is also
+    # the first label of the address the service gives it under
+    # database.windows.net, so it is unique across Azure; the rule the service
+    # checks it against is checked here, where the name is known.
+    server_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (regexMatch `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$` $n) -}}
+      {{- fail (printf "the component %q names its logical server, and a server name holds 1 to 63 lowercase letters, digits and hyphens, beginning and ending with a letter or a digit: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+    # The database names the service refuses: one over 128 characters, one
+    # holding < > * % & : \ / ? or a control character, one ending in a period
+    # or a space, and master, the system database every logical server holds.
+    database_name: >-
+      {{- $d := toString .values.database -}}
+      {{- if or (eq $d "") (gt (len $d) 128) (regexMatch `[<>*%&:\\/?[:cntrl:]]` $d) (hasSuffix "." $d) (hasSuffix " " $d) (eq (lower $d) "master") -}}
+      {{- fail (printf "values.database is %q, and Azure SQL Database takes a database name of 1 to 128 characters holding none of < > * %% & : \\ / ? or a control character, not ending in a period or a space, and other than master, the system database every logical server holds: set values.database in the Aggregate to such a name" $d) -}}
+      {{- end -}}
+    engine_version_is_the_service: >-
+      {{- if ne (toString .infra.engine_version) "2022" -}}
+      {{- fail (printf "infra.engine_version is %q, and Azure SQL Database runs the service's own current database engine, which no setting chooses: remove infra.engine_version from the Release, or map this component to a realization that creates the server on the release it names" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    port_is_the_service_port: >-
+      {{- if ne (int .infra.port) 1433 -}}
+      {{- fail (printf "infra.port is %v, and Azure SQL Database serves SQL Server on port 1433, which this Recipe publishes as port, and does not move it: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+    compute_not_taken: >-
+      {{- $c := optional .infra "compute" dict -}}
+      {{- range $k := list "cpu" "memory" -}}
+      {{- with optional $c $k "" -}}
+      {{- fail (printf "infra.compute.%s is %v, and Azure SQL Database sizes the database by its SKU, which this Recipe reads from infra.overrides.sku_name, not by a CPU or memory figure: remove infra.compute.%s from the Release and set infra.overrides.sku_name" $k . $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # The module takes the maximum data size in whole gigabytes, which the
+    # service reads as gibibytes. Each SKU caps the size at its own largest,
+    # which the service checks when Terraform applies.
+    storage: >-
+      {{- $size := toString .infra.storage.size -}}
+      {{- if not (and (regexMatch `^[0-9]+Gi$` $size) (ge (int (trimSuffix "Gi" $size)) 1)) -}}
+      {{- fail (printf "infra.storage.size is %q, and this Recipe sets the database's maximum data size in whole gibibytes, from 1Gi: set infra.storage.size in the Release to such a size, such as 32Gi" $size) -}}
+      {{- end -}}
+      {{- with optional .infra.storage "type" "" -}}
+      {{- fail (printf "infra.storage.type is %q, and Azure SQL Database chooses the database's storage by the SKU's service tier and takes no storage type: remove infra.storage.type from the Release" (toString .)) -}}
+      {{- end -}}
+    # Zone redundancy, read off the service's reliability documentation: the
+    # Basic and Standard tiers take none; General Purpose takes it on
+    # standard-series (Gen5) hardware alone; Hyperscale takes it only with
+    # zone-redundant backup storage and a high-availability replica, which no
+    # key of this Recipe sets. Premium and Business Critical take it.
+    sku_and_ha: >-
+      {{- $s := .locals.sku -}}
+      {{- if .infra.ha.enabled -}}
+      {{- if or (eq $s "Basic") (eq $s "Standard") (regexMatch `^S[0-9]+$` $s) -}}
+      {{- fail (printf "infra.ha.enabled is true, and infra.overrides.sku_name is %s, of the Basic or Standard tier, which Azure SQL Database makes no database zone redundant on: set infra.overrides.sku_name to a General Purpose, Business Critical or Premium SKU, such as GP_Gen5_2, or infra.ha.enabled to false" $s) -}}
+      {{- end -}}
+      {{- if and (hasPrefix "GP_" $s) (not (regexMatch `^GP_(S_)?Gen5_` $s)) -}}
+      {{- fail (printf "infra.ha.enabled is true, and infra.overrides.sku_name is %s, General Purpose on hardware other than standard-series (Gen5), which Azure SQL Database makes no database zone redundant on: set infra.overrides.sku_name to a Gen5 SKU, such as GP_Gen5_2, or infra.ha.enabled to false" $s) -}}
+      {{- end -}}
+      {{- if hasPrefix "HS_" $s -}}
+      {{- fail (printf "infra.ha.enabled is true, and infra.overrides.sku_name is %s, of the Hyperscale tier, which Azure SQL Database makes zone redundant only with zone-redundant backup storage and a high-availability replica, and this Recipe sets neither: set infra.overrides.sku_name to a General Purpose, Business Critical or Premium SKU, or infra.ha.enabled to false" $s) -}}
+      {{- end -}}
+      {{- end -}}
+    credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "password" -}}
+      {{- $ty := first (splitList ":" (toString (optional $f.password "type" ""))) -}}
+      {{- if not (has $ty (list "core/random-password" "core/generated-secret")) -}}
+      {{- fail (printf "the password slot is filled by %s, and this Recipe hands the logical server its administrator's password as a Terraform reference to one drawn at apply time, which core/random-password publishes through terraform/random-password, or has the module draw one when core/generated-secret or nothing is attached; another credential either carries its value as text, which would be written into the rendered configuration, or carries none the service could take: attach core/random-password to the password slot instead, or remove the attachment" (toString (optional $f.password "type" "an attachment of no type"))) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the fully_qualified_domain_name attribute of the server the module
+  # publishes whole as its resource output — the server's name under
+  # database.windows.net — through this component's module call, which the
+  # boundary's root configuration declares under .context.instance_id for a
+  # component declared in the Aggregate the Release deploys. The module marks
+  # that output sensitive, because the server it carries holds the
+  # administrator's password, and the name alone is not: nonsensitive() takes
+  # the mark off the one attribute, so a consumer's configuration carries it
+  # as the plain name it is. Terraform resolves it at apply time, so it
+  # resolves only for a consumer authored as a source: Recipe in the same root
+  # configuration; a consumer on another target receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record for it, so the operator points the name at the server outside
+  # the Release. A consumer in the same root configuration receives the name as
+  # well, and a name carries no reference for Terraform to order its module
+  # after this one by; a later syncWave on the consumer's boundary, sharing
+  # this boundary's directory, orders the two.
+  #
+  # port is 1433, where the service serves SQL Server. user and database are
+  # the developer values the module creates; protocol is sqlserver.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${nonsensitive(module.{{ .context.instance_id }}.resource.fully_qualified_domain_name)}{{ end }}"
+    port: "1433"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "sqlserver"
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # logical server is named after the component, as the other managed Recipes
+  # name theirs; server_version is 12.0, the one version the service takes.
+  #
+  # The database is the module's one databases entry, keyed by its name; its
+  # maximum data size is infra.storage.size in whole gigabytes.
+  #
+  # The administrator's password is the attachment's module output joined with
+  # a dot and wrapped in an interpolation, as terraform/random-password
+  # publishes it; with no such attachment the module draws one.
+  #
+  # enable_telemetry is always rendered: false, unless
+  # infra.overrides.enable_telemetry is true.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside. Azure SQL Database
+  # backs up every database: a full backup each week, a differential one
+  # every 12 or 24 hours and a log backup about every 10 minutes, at times the
+  # service chooses, and keeps them for point-in-time restore 1 to 35 days, 1
+  # to 7 on the Basic tier, 7 by default; no setting turns them off and no
+  # time reaches them:
+  #   - With none attached, the mapping passes no short-term retention policy
+  #     and the database keeps the service's default, 7 days.
+  #   - An attachment carrying no infra.role_arn, bound to
+  #     terraform/backup-native, sets the policy's retention_days from
+  #     infra.retention_days, and a value outside the tier's range halts naming
+  #     the attachment; infra.schedule halts naming it, since the service takes
+  #     no backup time. The policy's backup_interval_in_hours, how often a
+  #     differential backup is taken, is 24 on a DTU SKU and 12 on a vCore SKU,
+  #     the service's default for each, where the module would otherwise write
+  #     12 for both. The service keeps point-in-time restore for every database
+  #     across that window, and no setting turns it off, so
+  #     infra.point_in_time_recovery left out or true is what it gives, and
+  #     false halts naming the attachment rather than being ignored.
+  #   - An attachment carrying infra.role_arn is AWS Backup's, whose
+  #     realizations refuse a host that is no Amazon RDS instance; this Recipe
+  #     configures nothing from it.
+  #   - Two attachments carrying no infra.role_arn halt naming both: a database
+  #     runs one automated backup.
+  # A Recipe's locals cannot read its attachments, so the reading sits at the
+  # top of the mapping below.
+  valuesMapping: |
+    {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
+    {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}
+    {{- range $name, $attachment := (default dict .features) -}}
+    {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
+    {{- $in := default dict (optional $attachment "infra" dict) -}}
+    {{- if not (trim (toString (optional $in "role_arn" ""))) -}}
+    {{- if $backupNative -}}
+    {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Azure SQL Database, which runs one automated backup on a database: remove one of the two" $backupNative $name $.context.instance_id) -}}
+    {{- end -}}
+    {{- $backupNative = $name -}}{{- $backupNativeInfra = $in -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $dtu := or (has .locals.sku (list "Basic" "Standard" "Premium")) (regexMatch `^[SP][0-9]+$` .locals.sku) -}}
+    {{- $backupRetention := 0 -}}
+    {{- if $backupNative -}}
+    {{- with trim (toString (optional $backupNativeInfra "schedule" "")) -}}
+    {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Azure SQL Database takes each backup at a time it chooses, which no setting moves: remove infra.schedule from the attachment" $backupNative $.context.instance_id .) -}}
+    {{- end -}}
+    {{- $backupRetention = int (optional $backupNativeInfra "retention_days" 7) -}}
+    {{- $most := 35 -}}{{- if eq .locals.sku "Basic" }}{{ $most = 7 }}{{ end -}}
+    {{- if or (lt $backupRetention 1) (gt $backupRetention $most) -}}
+    {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and Azure SQL Database keeps a database's backups for point-in-time restore 1 to %d days on SKU %s, which this Recipe sets from it: set infra.retention_days to a number in that range" $backupNative .context.instance_id $backupRetention $most .locals.sku) -}}
+    {{- end -}}
+    {{- if eq (toString (optional $backupNativeInfra "point_in_time_recovery" "")) "false" -}}
+    {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to false, and Azure SQL Database keeps point-in-time restore for every database, across the retention window, with no setting that turns it off: remove infra.point_in_time_recovery from the attachment, or set it to true" $backupNative .context.instance_id) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $pw := optional (default dict .features) "password" dict }}
+    {{- $random := eq (first (splitList ":" (toString (optional $pw "type" "")))) "core/random-password" }}
+    {{- $prov := optional $pw "provides" dict }}
+    {{- if and $random (not (and (kindIs "map" $prov) (optional $prov "name" "") (optional $prov "key" ""))) }}
+    {{- fail (printf "the password slot of %q is filled by an attachment that publishes no module output, and the administrator's password is handed to the logical server as a reference to one: bind core/random-password to terraform/random-password in the Manifest" .context.instance_id) }}
+    {{- end }}
+    {{- $o := optional .infra "overrides" dict }}
+    name: "{{ .context.instance_id }}"
+    resource_group_name: "{{ $o.resource_group_name }}"
+    location: "{{ $o.location }}"
+    server_version: "12.0"
+    administrator_login: "{{ .values.user }}"
+    {{- if $random }}
+    administrator_login_password: "{{ printf "${%s.%s}" $prov.name $prov.key }}"
+    {{- else }}
+    generate_administrator_login_password: true
+    {{- end }}
+    public_network_access_enabled: {{ $p := optional $o "public_network_access_enabled" false }}{{ and (kindIs "bool" $p) $p }}
+    databases:
+      "{{ .values.database }}":
+        name: "{{ .values.database }}"
+        sku_name: "{{ .locals.sku }}"
+        max_size_gb: {{ int (trimSuffix "Gi" (toString .infra.storage.size)) }}
+        zone_redundant: {{ if .infra.ha.enabled }}true{{ else }}false{{ end }}
+        {{- with optional .values "collation" "" }}
+        collation: "{{ . }}"
+        {{- end }}
+        {{- if $backupNative }}
+        short_term_retention_policy:
+          retention_days: {{ $backupRetention }}
+          backup_interval_in_hours: {{ if $dtu }}24{{ else }}12{{ end }}
+        {{- end }}
+    {{- $t := optional $o "enable_telemetry" false }}
+    enable_telemetry: {{ and (kindIs "bool" $t) $t }}
+    {{- with optional $o "tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}
+
+  # Written once, beside the boundary's root configuration rather than in the
+  # module, and shared by every component of the boundary that declares this
+  # file with these bytes: another component bound to this Recipe, or one whose
+  # Recipe configures azurerm the same way under the same name. The same name
+  # with other bytes halts the build. The azurerm provider refuses to plan
+  # without its features block, and a vendored module carries no provider block
+  # of its own, so the module inherits this configuration; the provider reads
+  # its credentials and subscription from the environment Terraform runs in.
+  # Terraform destroys the module's resources with it, so the file stays while
+  # any component declaring it does: remove the last of them from a Release
+  # only after destroying what their modules created, because with the file
+  # gone Terraform refuses to plan, asking for a provider block with the
+  # features argument. The azapi, random and time providers the module also
+  # declares are left to their default configuration, since no provider block
+  # names them.
+  boundary:
+    artifacts:
+      provider-azurerm.tf: |
+        provider "azurerm" {
+          features {}
+        }
