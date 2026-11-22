@@ -1,0 +1,400 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: azure-documentdb
+  version: 1.0.0
+  # The values, attachments and infra.overrides keys this Recipe refuses are
+  # listed, with their reasons, in the comments above the assertions.
+  description: >
+    Azure DocumentDB: one cluster, declared by an Azure Resource Manager
+    template this Recipe writes. The Azure Verified Module for the service,
+    avm/res/document-db/mongo-cluster at 0.4.3, is not used: its template
+    fails the catalog's check against the Azure Resource Manager schemas, its
+    user submodule writing location and identityProvider.properties on a
+    Microsoft.DocumentDB/mongoClusters/users resource, whose schema lists
+    neither.
+
+    Reach for it where the Release deploys an Azure Resource Manager template
+    and the cluster lives in the operator's subscription; reach for
+    terraform/azure-documentdb where the Release deploys Terraform. Public
+    network access is off unless infra.overrides.public_network_access is
+    Enabled; the private endpoint or the firewall rules a client reaches the
+    cluster through are the operator's, and none is emitted.
+
+    The administrator values.user names takes the password from the Key Vault
+    secret a core/referenced-secret attachment on the password slot names,
+    bound to arm/key-vault-secret, handed to the cluster as a Key Vault
+    reference, so the template carries no password; with nothing attached, or
+    another credential, the build halts naming the slot. host publishes an
+    expression for the cluster's name under mongocluster.cosmos.azure.com, or
+    infra.overrides.host; port is 10260; endpoint is the mongodb+srv://
+    address on host, carrying the login and no password.
+    infra.engine_version sets the MongoDB server version, the service's
+    newest unless set; infra.overrides.sku_name sets the cluster tier, M30
+    unless set, and infra.overrides.shard_count the number of shards, 1
+    unless set. A value or an infra.overrides key the service cannot take
+    halts naming it, as do a storage size, a shard count or high availability
+    the cluster tier does not take.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: arm
+  implements: core/datastore/azure-documentdb:1.0.0
+
+  # The cluster is declared by the fragment below: one nested deployment
+  # holding a Microsoft.DocumentDB/mongoClusters resource at API version
+  # 2025-09-01, which the provider assembles into the boundary's template.
+  #
+  # Microsoft's Azure Verified Modules programme publishes a Bicep module for
+  # the service, avm/res/document-db/mongo-cluster, MIT, at 0.4.3 its newest
+  # version. Its template declares, beside the cluster, a user submodule
+  # whose Microsoft.DocumentDB/mongoClusters/users resource carries location
+  # and identityProvider.properties, which the resource's schema at
+  # 2025-09-01 lists neither of, so the catalog's check of every rendered
+  # template against the Azure Resource Manager schemas refuses the module
+  # wherever it is deployed, whether or not the submodule creates a user. The
+  # module is therefore not sourced, and no module telemetry exists to turn
+  # off.
+  #
+  # The cluster sits in a nested deployment of its own, evaluated in its own
+  # scope, because the administrator's password reaches it as a Key Vault
+  # reference: Azure Resource Manager resolves such a reference only in a
+  # deployment's parameters, and a nested deployment's parameters may carry
+  # one, as a top-level resource's properties may not. The nested deployment
+  # passes the reference to its one parameter, administratorLoginPassword, a
+  # securestring, and the cluster reads that parameter. The nested deployment
+  # publishes the cluster's name as its output name, which host and endpoint
+  # read.
+  locals:
+    # The symbolic name of the nested deployment, folded from the instance id
+    # as the provider folds a sourced template's: catalog-docs becomes
+    # CatalogDocs.
+    symbol: '{{ capitalizedWords .context.instance_id }}'
+    # The cluster tier, infra.overrides.sku_name or M30: two vCores and 8 GiB
+    # of memory per shard, the smallest tier the service gives a standby and
+    # more than one shard.
+    tier: '{{ $s := optional (optional .infra "overrides" dict) "sku_name" "M30" }}{{ if typeIs "string" $s }}{{ $s }}{{ end }}'
+    # The name the Release gives the cluster under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The login as it stands in the user part of a URI: every byte but a
+    # letter, a digit, - . _ and ~ percent-encoded.
+    user_in_uri: '{{ replace "+" "%20" (urlquery (toString .values.user)) }}'
+    # The options Microsoft's documentation gives a client in the cluster's
+    # mongodb+srv:// connection string.
+    uri_options: "tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false&maxIdleTimeMS=120000"
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # A FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Azure DocumentDB automated backups"
+
+  # This Recipe reads from infra.overrides:
+  #   sku_name               - string (properties.compute.tier, the cluster tier; default "M30")
+  #   shard_count            - integer (properties.sharding.shardCount; default 1)
+  #   public_network_access  - "Enabled" or "Disabled" (properties.publicNetworkAccess;
+  #                            default "Disabled")
+  #   location               - string (location; default the resource group's region)
+  #   tags                   - map[string]string (tags)
+  #   host                   - string (published as provides.host and in provides.endpoint;
+  #                            not written into the template)
+  # resource_group_name halts by name, as any key not listed does: the
+  # template deploys into the resource group it is deployed to, which no
+  # property of the cluster names. enable_telemetry halts by name too: the
+  # template is this catalog's own, which carries no telemetry to turn on or
+  # off.
+  #
+  # Each is the key terraform/azure-documentdb reads for the same concept,
+  # under the same spelling, and that Recipe also reads resource_group_name,
+  # since Terraform names the group a resource is created in, and
+  # enable_telemetry, since it sources a module that reports usage; the
+  # resource property each sets is given in brackets. sku_name is the key
+  # every Azure Recipe reads for the size class a service is provisioned at,
+  # public_network_access the key the Azure Recipes read for an Enabled or
+  # Disabled switch of public access, and host the key every managed
+  # datastore Recipe reads for the address it publishes.
+  #
+  # sku_name names the cluster tier as the service spells it: M10, M20 or M25
+  # (burstable), M30, M40, M50, M60, M80 or M200, or Free. The service checks
+  # the name, and whether the region offers it, when the template deploys.
+  #
+  # public_network_access. A cluster takes connections over its public
+  # endpoint, subject to the cluster's firewall rules, or over a private
+  # endpoint in a virtual network. Unset or Disabled, public network access is
+  # off and a client reaches the cluster only through a private endpoint;
+  # Enabled turns it on, and a client reaches it only where a firewall rule
+  # admits its address, since the service blocks every client until one
+  # does. This Recipe writes neither a private endpoint nor a firewall rule:
+  # each is the operator's, created for the cluster outside the Release, the
+  # way a virtual network's subnets and private DNS zones are.
+  #
+  # The template sets these cluster properties beside the ones the keys
+  # above set: administrator, the login values.user names and the password
+  # the Key Vault reference resolves to; storage.sizeGb, each shard's disk
+  # size; highAvailability.targetMode, ZoneRedundantPreferred, a standby in
+  # another zone where the region has the capacity and in the same zone
+  # otherwise, while infra.ha.enabled is true, and Disabled while it is false;
+  # and serverVersion, while infra.engine_version is set. The service's own
+  # defaults stand for every property the template leaves out: the cluster is
+  # created new, takes the logins the service authenticates itself, runs the
+  # service's newest server version while infra.engine_version is unset, and
+  # keeps its data on the storage the service gives a new cluster, Premium
+  # SSD.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation and the
+  # resource's schema:
+  #   honoured — values.user, as the administrator login;
+  #     infra.engine_version, as the server version; the password attachment,
+  #     as the administrator's password; infra.storage.size, as each shard's
+  #     disk size in whole gibibytes; infra.ha.enabled, as each shard's
+  #     standby; and the overrides above.
+  #   refused — infra.engine_version other than 5.0, 6.0, 7.0 or 8.0, the
+  #     versions the service runs; infra.storage.size outside what the
+  #     cluster tier takes; infra.ha.enabled and more than one shard on a tier
+  #     the service gives neither; a cluster name the service refuses; an
+  #     empty values.user; a credential on the password slot other than
+  #     core/referenced-secret, or none; and any infra.overrides key not
+  #     listed above.
+  #   not read — none.
+  #
+  # Backup. Azure DocumentDB backs up every cluster on its own, keeps the
+  # backups 35 days, 7 on a burstable tier (M10, M20, M25), for point-in-time
+  # restore, and takes none on the Free tier; no setting changes the
+  # retention or the time, or turns the backups off. The fragment reads a
+  # core/backup attachment among the component's attachments, as the comment
+  # above it says. core/backup applies to components of type stateful-server
+  # and this Component is of type resource, so the build halts on such an
+  # attachment before it reaches this Recipe, naming the Feature's selector;
+  # the reading is what this Recipe keeps from an attachment that does reach
+  # it, and the cluster keeps the service's backups either way.
+  #
+  # The administrator's password reaches the cluster as the
+  # nested deployment's administratorLoginPassword, a securestring parameter
+  # that receives a Key Vault reference object, which Azure Resource Manager
+  # resolves while the template deploys, so no password is written into the
+  # template. The attachment on the password slot publishes the secret's
+  # resource ID in provides.name; the vault's ID is that ID without its
+  # /secrets/<name> tail, and secretName is the name. The service draws no
+  # password, so with nothing attached the build halts, and so it does on any
+  # credential other than core/referenced-secret: another carries its value
+  # as text, which would be written into the template, or carries none the
+  # service could take; core/random-password draws its password at apply time
+  # on the terraform capability, which no template here can read. The build
+  # never sees the secret's value, so the secret the operator creates holds a
+  # password the service takes. The assertions read the slot, but an
+  # assertion does not see what an attachment publishes; the fragment halts
+  # where the published ID is no Key Vault secret's.
+  assertions:
+    overrides_known: >-
+      {{- $known := list "sku_name" "shard_count" "public_network_access" "location" "tags" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "resource_group_name" -}}
+      {{- fail "infra.overrides.resource_group_name is set, and this Recipe creates the cluster in the resource group the template is deployed to, which no property of the cluster names: remove infra.overrides.resource_group_name from the Release, and deploy the template to that resource group" -}}
+      {{- end -}}
+      {{- if eq $k "enable_telemetry" -}}
+      {{- fail "infra.overrides.enable_telemetry is set, and this Recipe declares the cluster in a template of this catalog's own, which carries no telemetry to turn on or off: remove infra.overrides.enable_telemetry from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads sku_name, shard_count, public_network_access, location, tags and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $p := optional $o "public_network_access" "Disabled" -}}
+      {{- if not (has $p (list "Enabled" "Disabled")) -}}
+      {{- fail (printf "infra.overrides.public_network_access is %v, and it switches the cluster's public network access as the service spells it: set it to Enabled to turn it on, or to Disabled or remove it to keep it off" $p) -}}
+      {{- end -}}
+      {{- $s := optional $o "sku_name" "M30" -}}
+      {{- if not (and (typeIs "string" $s) (regexMatch `^(Free|M[0-9]+)$` (toString $s))) -}}
+      {{- fail (printf "infra.overrides.sku_name is %v, and the cluster tier is the name the service gives it, such as M10, M30, M50 or Free: set infra.overrides.sku_name to one, or remove it for M30" $s) -}}
+      {{- end -}}
+      {{- $n := optional $o "shard_count" 1 -}}
+      {{- if not (and (or (kindIs "int" $n) (kindIs "int64" $n) (and (kindIs "float64" $n) (eq (float64 (int $n)) $n))) (ge (int $n) 1) (le (int $n) 10)) -}}
+      {{- fail (printf "infra.overrides.shard_count is %v, and Azure DocumentDB takes 1 to 10 physical shards in a cluster: set infra.overrides.shard_count to a whole number in that range, or remove it for 1" $n) -}}
+      {{- end -}}
+      {{- $l := optional $o "location" "" -}}
+      {{- if not (typeIs "string" $l) -}}
+      {{- fail (printf "infra.overrides.location is %v, and it names the one Azure region the cluster is created in: set it to a region's name, such as westeurope, or remove it for the resource group's region" $l) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (regexMatch `[/@\s:]` $h) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the name a consumer of this cluster looks its service record up under, given as a DNS name alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the service record names the nodes and their port` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The cluster is named after the component, and its name is also the first
+    # label of the address the service gives it under
+    # mongocluster.cosmos.azure.com, so it is unique across Azure; the rule the
+    # resource's schema gives a cluster name, 3 to 40 lowercase letters and
+    # digits in runs a single hyphen joins, is checked here, where the name is
+    # known.
+    cluster_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (and (regexMatch `^[a-z0-9]+(-[a-z0-9]+)*$` $n) (ge (len $n) 3) (le (len $n) 40)) -}}
+      {{- fail (printf "the component %q names its cluster, and a cluster name holds 3 to 40 lowercase letters, digits and hyphens, beginning and ending with a letter or a digit, with no two hyphens together: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+    administrator_login: >-
+      {{- if eq (toString .values.user) "" -}}
+      {{- fail "values.user is empty, and it names the cluster's administrator login, which an empty name does not: set values.user in the Aggregate to a name" -}}
+      {{- end -}}
+    # The server versions an Azure DocumentDB cluster runs, as the azurerm
+    # provider's own cluster resource lists them.
+    engine_version_offered: >-
+      {{- with toString (optional .infra "engine_version" "") -}}
+      {{- if not (has . (list "5.0" "6.0" "7.0" "8.0")) -}}
+      {{- fail (printf "infra.engine_version is %q, and an Azure DocumentDB cluster runs MongoDB server version 5.0, 6.0, 7.0 or 8.0: set infra.engine_version in the Release to one, or remove it for the service's newest" .) -}}
+      {{- end -}}
+      {{- end -}}
+    # Storage sizes, read off the service's documentation: 32 GiB to 32 TiB
+    # per shard; 32, 64 or 128 GiB on the burstable tiers M10, M20 and M25;
+    # at most 32 GiB on the Free tier.
+    storage: >-
+      {{- $size := toString .infra.storage.size -}}
+      {{- if not (regexMatch `^[0-9]+Gi$` $size) -}}
+      {{- fail (printf "infra.storage.size is %q, and this Recipe sets each shard's disk size in whole gibibytes: set infra.storage.size in the Release to such a size, such as 128Gi" $size) -}}
+      {{- end -}}
+      {{- $gi := int (trimSuffix "Gi" $size) -}}
+      {{- if or (lt $gi 32) (gt $gi 32768) -}}
+      {{- fail (printf "infra.storage.size is %q, and Azure DocumentDB gives each shard 32 GiB to 32 TiB of storage: set infra.storage.size in the Release to a size from 32Gi to 32768Gi" $size) -}}
+      {{- end -}}
+      {{- if and (has .locals.tier (list "M10" "M20" "M25")) (not (has $gi (list 32 64 128))) -}}
+      {{- fail (printf "infra.storage.size is %q, and Azure DocumentDB takes 32, 64 or 128 GiB of storage on the burstable tier %s: set infra.storage.size in the Release to 32Gi, 64Gi or 128Gi, or infra.overrides.sku_name to M30 or above" $size .locals.tier) -}}
+      {{- end -}}
+      {{- if and (eq .locals.tier "Free") (gt $gi 32) -}}
+      {{- fail (printf "infra.storage.size is %q, and Azure DocumentDB gives a Free tier cluster at most 32 GiB of storage: set infra.storage.size in the Release to 32Gi, or infra.overrides.sku_name to a paid tier" $size) -}}
+      {{- end -}}
+    # The service's limits by tier: the Free tier and the burstable tiers M10,
+    # M20 and M25 keep no standby, which M30 and above do, and a burstable
+    # tier holds one physical shard.
+    tier_limits: >-
+      {{- $t := .locals.tier -}}
+      {{- if and .infra.ha.enabled (has $t (list "Free" "M10" "M20" "M25")) -}}
+      {{- fail (printf "infra.ha.enabled is true, and infra.overrides.sku_name is %s, a tier Azure DocumentDB gives no standby, which M30 and above do: set infra.overrides.sku_name to M30 or above, or infra.ha.enabled to false" $t) -}}
+      {{- end -}}
+      {{- $n := optional (optional .infra "overrides" dict) "shard_count" 1 -}}
+      {{- if and (has $t (list "M10" "M20" "M25")) (gt (int $n) 1) -}}
+      {{- fail (printf "infra.overrides.shard_count is %v, and infra.overrides.sku_name is %s, a burstable tier Azure DocumentDB runs on one physical shard alone: remove infra.overrides.shard_count, or set infra.overrides.sku_name to M30 or above" $n $t) -}}
+      {{- end -}}
+    credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if not (hasKey $f "password") -}}
+      {{- fail "the password slot is empty, and Azure DocumentDB draws no password for the administrator values.user names: attach core/referenced-secret to the password slot, naming the Key Vault secret that holds it, and bind it to arm/key-vault-secret in the Manifest" -}}
+      {{- end -}}
+      {{- $ty := first (splitList ":" (toString (optional $f.password "type" ""))) -}}
+      {{- if ne $ty "core/referenced-secret" -}}
+      {{- fail (printf "the password slot is filled by %s, and this Recipe hands the cluster its administrator's password as a Key Vault reference to a secret the attachment names, which core/referenced-secret publishes through arm/key-vault-secret; another credential either carries its value as text, which would be written into the template, or carries none the service could take: attach core/referenced-secret to the password slot, bound to arm/key-vault-secret in the Manifest" $ty) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. A consumer
+  # receives each as written. The service gives a cluster the name
+  # <cluster>.mongocluster.cosmos.azure.com, under which a mongodb+srv://
+  # client looks up the service record listing the cluster's nodes and their
+  # port, 10260, as Microsoft's documentation of the cluster's connection
+  # string and of its private endpoints gives it. host reads the name output
+  # of the nested deployment this component becomes, whose symbolic name is
+  # the instance id folded into words, and joins the service's domain to it.
+  # Azure Resource Manager evaluates the expression when the template
+  # deploys, after the cluster exists, so it resolves for a consumer in the
+  # same template, through the link for a consumer in another arm template,
+  # and as text on another target.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the expression, and endpoint is built on it. It is the
+  # operator's deterministic pointer: the compiler pipes it as text and looks
+  # nothing up, and this Recipe emits no DNS record for it. A MongoDB driver
+  # looks the service record up under the name and accepts only nodes whose
+  # names end in the domain the name sits in, so the name is one under which
+  # the operator's DNS answers the cluster's service record, such as the
+  # cluster's own name resolved through a private DNS zone.
+  #
+  # port is 10260. user is the administrator login. endpoint is the cluster's
+  # connection string as the service publishes it, mongodb+srv://<user>@<host>,
+  # with the login percent-encoded and no password, and the options
+  # Microsoft's documentation gives a client.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}[format('{0}.mongocluster.cosmos.azure.com', reference('{{ .locals.symbol }}').outputs.name.value)]{{ end }}"
+    port: "10260"
+    user: "{{ .values.user }}"
+    endpoint: "{{ if .locals.operator_host }}mongodb+srv://{{ .locals.user_in_uri }}@{{ .locals.operator_host }}/?{{ .locals.uri_options }}{{ else }}[format('mongodb+srv://{{ .locals.user_in_uri }}@{0}.mongocluster.cosmos.azure.com/?{{ .locals.uri_options }}', reference('{{ .locals.symbol }}').outputs.name.value)]{{ end }}"
+
+  # The fragment the provider assembles into the boundary's template: one
+  # nested deployment, named after its symbolic name and the deployment it
+  # runs in, deployed incrementally and evaluated in its own scope, as the
+  # provider deploys a sourced template. Its template declares the cluster,
+  # named after the component, in location or the resource group's region,
+  # with the properties the comments above name, and outputs the cluster's
+  # name.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside. The service backs up
+  # every cluster at times it chooses and keeps the backups for point-in-time
+  # restore 35 days, 7 on a burstable tier, with no setting for either:
+  #   - With none attached, the cluster keeps the service's backups.
+  #   - An attachment carrying no infra.role_arn keeps them where its
+  #     infra.retention_days is the tier's retention, and halts naming the
+  #     attachment on any other; infra.schedule halts naming it, since the
+  #     service takes no backup time, and so does infra.point_in_time_recovery
+  #     false, since the service keeps point-in-time restore across the
+  #     window; on the Free tier, which the service backs up not at all, the
+  #     attachment halts.
+  #   - An attachment carrying infra.role_arn is AWS Backup's, whose
+  #     realizations refuse a host that is no Amazon RDS instance; this Recipe
+  #     configures nothing from it.
+  #   - Two attachments carrying no infra.role_arn halt naming both: a cluster
+  #     runs one automated backup.
+  # The fragment writes nothing for the backup: the cluster's backup has no
+  # setting.
+  artifacts:
+    cluster.yaml: |
+      {{- $id := .context.instance_id }}
+      {{- $backupNative := "" }}{{ $backupNativeInfra := dict }}
+      {{- range $name, $attachment := (default dict .features) }}
+      {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" }}
+      {{- $in := default dict (optional $attachment "infra" dict) }}
+      {{- if not (trim (toString (optional $in "role_arn" ""))) }}
+      {{- if $backupNative }}
+      {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Azure DocumentDB, which runs one automated backup on a cluster: remove one of the two" $backupNative $name $id) }}
+      {{- end }}
+      {{- $backupNative = $name }}{{ $backupNativeInfra = $in }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- if $backupNative }}
+      {{- if eq .locals.tier "Free" }}
+      {{- fail (printf "core/backup attachment %q on %q leaves its backup to Azure DocumentDB, which backs up no cluster on the Free tier: remove the attachment, or set infra.overrides.sku_name to a paid tier" $backupNative $id) }}
+      {{- end }}
+      {{- with trim (toString (optional $backupNativeInfra "schedule" "")) }}
+      {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Azure DocumentDB takes each backup at a time it chooses, which no setting moves: remove infra.schedule from the attachment" $backupNative $id .) }}
+      {{- end }}
+      {{- $keeps := 35 }}{{ if has .locals.tier (list "M10" "M20" "M25") }}{{ $keeps = 7 }}{{ end }}
+      {{- $retention := int (optional $backupNativeInfra "retention_days" 7) }}
+      {{- if ne $retention $keeps }}
+      {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and Azure DocumentDB keeps a cluster's backups %d days on tier %s, which no setting changes: set infra.retention_days to %d" $backupNative $id $retention $keeps .locals.tier $keeps) }}
+      {{- end }}
+      {{- if eq (toString (optional $backupNativeInfra "point_in_time_recovery" "")) "false" }}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to false, and Azure DocumentDB keeps point-in-time restore for every cluster it backs up, across the retention window, with no setting that turns it off: remove infra.point_in_time_recovery from the attachment, or set it to true" $backupNative $id) }}
+      {{- end }}
+      {{- end }}
+      {{- $secret := toString .features.password.provides.name }}
+      {{- if not (regexMatch `(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.KeyVault/vaults/[^/]+/secrets/[^/]+$` $secret) }}
+      {{- fail (printf "the password slot of %q is filled by an attachment that publishes no Key Vault secret resource ID, and the administrator's password is handed to the cluster as a reference to that secret: bind core/referenced-secret to arm/key-vault-secret in the Manifest" $id) }}
+      {{- end }}
+      {{- $o := default dict .infra.overrides }}
+      {{- $properties := dict "administrator" (dict "userName" (toString .values.user) "password" "[parameters('administratorLoginPassword')]") "compute" (dict "tier" .locals.tier) "sharding" (dict "shardCount" (int (optional $o "shard_count" 1))) "storage" (dict "sizeGb" (int (trimSuffix "Gi" (toString .infra.storage.size)))) "highAvailability" (dict "targetMode" (ternary "ZoneRedundantPreferred" "Disabled" (eq (toString .infra.ha.enabled) "true"))) "publicNetworkAccess" (optional $o "public_network_access" "Disabled") }}
+      {{- with toString (optional .infra "engine_version" "") }}{{ $_ := set $properties "serverVersion" . }}{{ end }}
+      {{- $cluster := dict "type" "Microsoft.DocumentDB/mongoClusters" "apiVersion" "2025-09-01" "name" $id "location" (default "[resourceGroup().location]" (optional $o "location" "")) "properties" $properties }}
+      {{- with optional $o "tags" "" }}{{ $_ := set $cluster "tags" . }}{{ end }}
+      {{- $template := dict "$schema" "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#" "contentVersion" "1.0.0.0" "parameters" (dict "administratorLoginPassword" (dict "type" "securestring")) "resources" (list $cluster) "outputs" (dict "name" (dict "type" "string" "value" $id)) }}
+      {{- $reference := dict "reference" (dict "keyVault" (dict "id" (regexReplaceAll `/secrets/[^/]+$` $secret "")) "secretName" (regexFind `[^/]+$` $secret)) }}
+      {{- $nested := dict "type" "Microsoft.Resources/deployments" "apiVersion" "2025-04-01" "name" (printf "[format('%s-{0}', uniqueString(deployment().name))]" .locals.symbol) "properties" (dict "mode" "Incremental" "expressionEvaluationOptions" (dict "scope" "inner") "parameters" (dict "administratorLoginPassword" $reference) "template" $template) }}
+      resources:
+        {{ .locals.symbol }}: {{ toJson $nested }}
