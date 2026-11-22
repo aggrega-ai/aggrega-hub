@@ -10,9 +10,9 @@
 # the Key Vault secret the registry password is read from;
 # registry_password_identity, which sets key_vault_reference_identity_id; and
 # min_replicas and max_replicas, which set elastic_instance_minimum and
-# app_scale_limit on an Elastic Premium plan. virtual_network_subnet_id and
-# the registry variables have defaults; the caller supplies every other one on
-# every call.
+# app_scale_limit on an Elastic Premium plan. virtual_network_subnet_id,
+# environment and the registry variables have defaults; the caller supplies
+# every other one on every call.
 
 variable "name" {
   type        = string
