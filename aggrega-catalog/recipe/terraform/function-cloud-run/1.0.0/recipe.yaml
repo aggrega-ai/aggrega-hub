@@ -1,0 +1,184 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: function-cloud-run
+  version: 1.0.0
+  description: >
+    The generic event-driven compute primitive as one Cloud Run service
+    running the Release's image, which Cloud Run scales between
+    infra.min_replicas and infra.max_replicas instances, to none at all while
+    idle at the Component's floor of 0, on the catalog's shared Cloud Run
+    body. Reach for it in a Google Cloud project with a VPC network; for
+    terraform/function-lambda or cloudformation/function-lambda in an AWS
+    account, and helm/function-knative or helm/function-keda on Kubernetes.
+
+    The container answers requests on infra.port, which Cloud Run hands it as
+    PORT. Its ingress is internal: VPC networks in the project, and Eventarc,
+    Pub/Sub, Cloud Scheduler, Cloud Tasks and Workflows in the same project
+    or VPC Service Controls perimeter, reach it; the internet does not. No
+    trigger and no invoker binding is emitted: what invokes it, and the
+    Cloud Run Invoker role of the identity it calls with, are the operator's.
+
+    The project, region, VPC network and service account are the operator's,
+    each required under infra.overrides; a subnet and network tags are
+    optional. Beside the service, only a Secret Manager secret and its
+    version for each file the component is handed are emitted.
+
+    Each env entry an inject block dictates becomes a container variable and
+    each file entry a file mounted alone from a secret volume; runtime
+    arrives by default as FUNCTION_RUNTIME. The container runs at the
+    smallest whole-vCPU size meeting infra.compute; a floor above the
+    ceiling and an infra.overrides key this Recipe does not read halt.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/compute/function:1.0.0
+
+  # The module beside this Recipe is the fixed pass-through every container
+  # Recipe of this catalog carries byte for byte: its one input, config, goes
+  # to the service module the artifacts below import, and that module comes
+  # back out as its service output. entity.lock pins it.
+  #
+  # Google's Cloud Run module, GoogleCloudPlatform/cloud-run/google, at v0.34.2,
+  # the newest version its repository's tags carry, declares a Cloud Run service
+  # in its v2 directory, whose versions.tf declares hashicorp/google and
+  # hashicorp/google-beta as ">= 6, < 8". Every Google body the catalog authors
+  # declares hashicorp/google "~> 8.8", and Terraform installs one provider
+  # version for a root configuration, so no version satisfies both: a root
+  # configuration holding that module beside an AlloyDB cluster or a
+  # Memorystore instance of this catalog fails to initialise. The module is
+  # therefore not sourced, and the service is the catalog's own Service body.
+  source: ./module
+
+  # This Recipe reads from infra.overrides:
+  #   project_id          - string (config.project_id), required
+  #   region              - string (config.location), required
+  #   private_network     - string (config.network), required
+  #   service_account     - string (config.service_account), required
+  #   subnetwork          - string (config.subnetwork)
+  #   network_tags        - []string (config.tags)
+  #   deletion_protection - bool (config.deletion_protection; default true)
+  #
+  # Each is passed to the key of the body's config named in brackets, which
+  # CloudRunModule's Service body documents; network, subnetwork and tags set
+  # the service's one network interface. These are the keys
+  # terraform/server-cloud-run, terraform/worker-cloud-run and
+  # terraform/task-cloud-run read, under the same names and meanings, so an
+  # operator writes one set of overrides across the catalog's Cloud Run
+  # Recipes.
+  #
+  # project_id, region, private_network and service_account are required and
+  # none has a default: the project, the network and the identity the function
+  # runs as are provisioned outside this Release, no project-independent value
+  # exists for any of them, and this Recipe never chooses a network or an
+  # identity for the operator. private_network is the network's resource link,
+  # projects/<project>/global/networks/<name>; the service takes addresses from
+  # subnetwork, or from the subnet named as the network while subnetwork is
+  # unset. Egress is private ranges only: traffic to a private address, such as
+  # an AlloyDB instance's or a Memorystore instance's in that network, goes
+  # through it by Direct VPC egress, and other traffic leaves as it would with
+  # no network named. service_account is the email of the account the function
+  # runs as, which its code calls Google Cloud with, and which reads each file's
+  # secret volume, so the operator grants it the Secret Manager Secret Accessor
+  # role on those secrets; no IAM binding is emitted. network_tags are matched
+  # by the operator's egress firewall rules. deletion_protection is the
+  # provider's own guard, true unless the Release turns it off, under which
+  # Terraform refuses to destroy or replace the service.
+  #
+  # The instance counts. Cloud Run scales the service automatically, its
+  # default, which the Service body leaves in place for a Component declaring
+  # infra.min_replicas: infra.min_replicas is the revision's minimum instance
+  # count and infra.max_replicas its maximum. At the Component's floor of 0 an
+  # idle function holds no instance, and Cloud Run starts one when a request
+  # arrives, so the first request after an idle spell waits for the container
+  # to start; a floor above 0 keeps that many instances running. A floor above
+  # the ceiling is refused by name in CloudRunArguments#/mappings/ServiceArguments,
+  # as Cloud Run refuses it. The ceiling counts against the project's Cloud Run
+  # instance quota in the region, which only a deploy shows.
+  #
+  # Who invokes the function. The service's ingress is internal, fixed in the
+  # body: Cloud Run admits requests from VPC networks in the service's project,
+  # from the Shared VPC network the service sends traffic to and from an
+  # internal Application Load Balancer, and, through the service's default
+  # run.app URL, from Eventarc, Pub/Sub subscriptions, Cloud Scheduler, Cloud
+  # Tasks and Workflows in the same project or VPC Service Controls perimeter,
+  # and refuses the internet. On top of that, Cloud Run checks every request for
+  # the Cloud Run Invoker role, and this Recipe grants it to nobody. What invokes
+  # the function, such as an Eventarc trigger or a Pub/Sub push subscription,
+  # is the operator's, with an identity the operator grants the Cloud Run
+  # Invoker role on the service; nothing here creates a trigger or a
+  # subscription. No request timeout is set, so Cloud Run's default stands, and
+  # each instance takes requests at Cloud Run's default concurrency.
+  #
+  # Files. Each file entry an edge's inject block dictates is mounted at its
+  # path, as CloudRunModule describes: one Secret Manager secret per file,
+  # replicated automatically in project_id, holding the content in one version,
+  # mounted as a secret volume at the file's directory with the file alone in
+  # it, so whatever the image holds in that directory is hidden. A file's
+  # content is held in the secret version and in Terraform state. No file, no
+  # secret.
+  #
+  # Every Component value and infra key is honoured, refused by name in
+  # CloudRunArguments#/mappings/ServiceArguments and the assertion below, or not
+  # read:
+  #   honoured — values.runtime as the locals below say; infra.image
+  #     (required); infra.port as the container's port, which Cloud Run also
+  #     hands the container as PORT; infra.compute.cpu and infra.compute.memory
+  #     as the size that entry chooses; infra.min_replicas and
+  #     infra.max_replicas as above; the overrides above; and env and file
+  #     entries.
+  #   refused — any infra.overrides key not listed above; an override that is
+  #     not of the form above; infra.min_replicas above infra.max_replicas; a
+  #     compute quantity that entry cannot read, and a pair larger than the
+  #     largest size; a component name Cloud Run does not take for a service;
+  #     an edge or the component's own inject block injecting a variable under a
+  #     name Cloud Run sets in every service itself or refuses, or under
+  #     FUNCTION_RUNTIME while the runtime is delivered under that default name;
+  #     a file path Cloud Run cannot mount, two files in one directory and a
+  #     file longer than a secret version holds; and an edge's arg or
+  #     custom-mechanism entry.
+  #   not read — values.display_name and values.description, documentation
+  #     knobs no Cloud Run setting takes; infra.control_plane_present, as Cloud
+  #     Run needs no control plane of the operator's; and infra.scaler, as
+  #     Cloud Run scales on the requests reaching the service and takes no
+  #     event source to scale on.
+  assertions:
+    overrides_known: >-
+      {{- $known := list "project_id" "region" "private_network" "service_account" "subnetwork" "network_tags" "deletion_protection" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads project_id, region, private_network, service_account, subnetwork, network_tags and deletion_protection from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # Target-expected names: the image is the Release's, so no upstream
+  # documentation names a spelling for the developer's runtime value. It is
+  # delivered under the name the Kubernetes and AWS Lambda realizations deliver
+  # it under, for the application's own code to read. That name is a default:
+  # it is rendered only while no entry of the component's own inject block, in
+  # any mechanism, delivers the runtime, and an edge or that block delivering
+  # that name as well halts, naming which, rather than one value silently
+  # replacing the other. The component packages no upstream product, so no
+  # other local CloudRunArguments reads is declared: no default image, so the
+  # Release names the one it runs; the port is infra.port; and no probe, so
+  # Cloud Run's default startup probe applies, no GPU and no socket.
+  locals:
+    value_env: '{"values.runtime": "FUNCTION_RUNTIME"}'
+
+  artifacts:
+    # The Service body, scaling automatically for this Component: the service
+    # and the secrets holding its files.
+    service:
+      $import: CloudRunModule#/artifacts/Service
+
+  # The component publishes nothing across an edge, so nothing is emitted for
+  # one.
+  provides: {}
+
+  valuesMapping:
+    $import: CloudRunArguments#/mappings/ServiceArguments
