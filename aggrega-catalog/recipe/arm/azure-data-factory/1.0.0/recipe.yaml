@@ -25,9 +25,11 @@ metadata:
     the factory's pipelines it runs by name, and is written whole on every
     deploy, so a change made in Data Factory Studio is written over; one
     removed from values.pipelines stays in the factory, since the template
-    deploys incrementally. Every string of a definition reaches Data
-    Factory as written, one that Azure Resource Manager would read as an
-    expression included.
+    deploys incrementally. Every string of a definition, the keys of its
+    maps among them, reaches Data Factory as written, one that Azure
+    Resource Manager would read as an expression included; a key named
+    copy, which Resource Manager reads as a copy instruction, is written
+    as the expression [string('copy')], which gives that name.
 
     The factory publishes nothing. A component name, an infra.overrides key
     the Recipe does not take, or a value given in a form it does not take
@@ -60,20 +62,31 @@ spec:
     # The symbolic name of the nested deployment, folded from the instance id
     # as the provider folds a sourced template's: ingest becomes Ingest.
     symbol: '{{ capitalizedWords .context.instance_id }}'
-    # values.pipelines and values.global_parameters, as JSON text, with each
-    # string value that opens with [ and closes with ] written with one more
-    # [ in front. Azure Resource Manager reads such a string as an expression
-    # wherever the template holds it, and reads [[ at its start as one [, so
+    # values.pipelines (a list of each pipeline's name and definition, in the
+    # order of the names) and values.global_parameters, as JSON text, with
+    # each string, value or key, that opens with [ and closes with ] written
+    # with one more [ in front, and each key named copy written as the
+    # expression [string('copy')]. Azure Resource Manager reads such a string
+    # as an expression wherever the template holds it, a property name
+    # included (Bicep compiles the key '[resourceGroup().location]' to
+    # "[[resourceGroup().location]"), and reads [[ at its start as one [, so
     # the string reaches Data Factory as the Aggregate wrote it: a stored
-    # procedure named [dbo].[load_orders] stays that name. A key is left as
-    # written, since Resource Manager reads no key as an expression. The
-    # first replacement marks each such string, keys among them, where it
-    # opens; the second takes the mark off each one a colon follows, a key;
-    # the third writes [ for the mark.
+    # procedure named [dbo].[load_orders] stays that name, and so does a key
+    # [env]. A property named copy is read as a copy instruction, which
+    # Bicep avoids by writing the name as [string('copy')] whatever its case.
+    # The first replacement marks each string that opens with [ and closes
+    # with ]; the second writes a key named copy as the expression; the
+    # third writes [ for the mark. A pipeline's name is a value of its
+    # entry, so the second replacement leaves it as written.
     values_text: >-
-      {{- $j := toJson (dict "pipelines" (default dict .values.pipelines) "global_parameters" (default dict .values.global_parameters)) -}}
+      {{- $p := default dict .values.pipelines -}}
+      {{- $l := list -}}
+      {{- range $n := (sortAlpha (keys $p)) -}}
+      {{- $l = append $l (dict "name" $n "definition" (get $p $n)) -}}
+      {{- end -}}
+      {{- $j := toJson (dict "pipelines" $l "global_parameters" (default dict .values.global_parameters)) -}}
       {{- $j = regexReplaceAll `([\[{,:]|^)"(\[(?:[^"\\]|\\.)*\])"` $j "${1}\"\x00${2}\"" -}}
-      {{- $j = regexReplaceAll `"\x00((?:[^"\\]|\\.)*)":` $j "\"${1}\":" -}}
+      {{- $j = regexReplaceAll `([{,])"((?i:copy))":` $j "${1}\"\x00string('${2}')]\":" -}}
       {{- replace "\x00" "[" $j -}}
 
   # This Recipe reads from infra.overrides:
@@ -117,11 +130,11 @@ spec:
   # through private endpoints alone, the operator's, created outside the
   # Release with their private DNS zones.
   #
-  # The template sets the factory's properties whole on every deploy: its
+  # The template sets these properties of the factory on every deploy: its
   # global parameters from values.global_parameters, its public network
-  # access, and nothing else. A Git configuration or a Microsoft Purview
-  # account set on the factory outside the Release is therefore not kept,
-  # and neither is offered here; nor is a customer-managed key, which
+  # access, and nothing else. It names no Git configuration and no Microsoft
+  # Purview account, and neither is offered here; nor is a customer-managed
+  # key, which
   # Microsoft documents as configured only on an empty factory, which this
   # one is not once its pipelines deploy, and as never removed once set.
   # The service's own defaults stand for the rest: activities run on the
@@ -253,10 +266,13 @@ spec:
       {{- end }}
       {{- $resources := list $factory }}
       {{- $activities := list }}
-      {{- range $name, $def := $v.pipelines }}
+      {{- range $entry := $v.pipelines }}
+      {{- $name := $entry.name }}
+      {{- $def := $entry.definition }}
       {{- $references := lower (toJson (get (get $.values.pipelines $name) "activities")) }}
       {{- $after := list $factoryId }}
-      {{- range $other, $_ := $v.pipelines }}
+      {{- range $otherEntry := $v.pipelines }}
+      {{- $other := $otherEntry.name }}
       {{- if and (ne $other $name) (contains (lower (printf "\"referenceName\":%s,\"type\":\"PipelineReference\"" (toJson $other))) $references) }}
       {{- $after = append $after (printf "[resourceId('Microsoft.DataFactory/factories/pipelines', '%s', '%s')]" $id (replace "'" "''" $other)) }}
       {{- end }}
