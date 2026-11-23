@@ -1,0 +1,304 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: azure-key-vault
+  version: 1.0.0
+  # The values and infra.overrides keys this Recipe refuses are listed, with
+  # their reasons, in the comments above the assertions.
+  description: >
+    Azure Key Vault: one vault authorizing access to its contents with Azure
+    role-based access control, rendered as Terraform for the azurerm
+    provider by a module kept beside this Recipe, not by Microsoft's Azure
+    Verified Modules module Azure/avm-res-keyvault-vault/azurerm, whose root
+    calls a module from the Terraform registry.
+
+    Reach for it where the Release deploys Terraform; reach for
+    arm/azure-key-vault where it deploys an Azure Resource Manager
+    template. It needs hashicorp/azurerm 5.14 or later, so it goes in a
+    boundary apart from Recipes whose modules admit azurerm 4 alone.
+    infra.overrides names the operator's resource group and region. The
+    vault is standard unless infra.overrides.sku_name is premium, keeps
+    deleted contents 90 days unless infra.overrides.soft_delete_retention_days
+    names 7 to 90, and has purge protection unless
+    infra.overrides.purge_protection_enabled is false. Public network access
+    is on unless infra.overrides.public_network_access_enabled is false;
+    the private endpoint is the operator's.
+
+    host is a reference to the DNS name in the URI the provider reports, or
+    infra.overrides.host; endpoint is that URI, or one built on
+    infra.overrides.host. A vault name the service refuses halts naming the
+    component; any infra.overrides key not listed, and enable_telemetry,
+    halt naming the key, as do resource_group_name and location left out,
+    and resource_group_name, location, sku_name,
+    soft_delete_retention_days, purge_protection_enabled,
+    public_network_access_enabled and host given in a form they do not take.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/security/azure-key-vault:1.0.0
+
+  # The module beside this Recipe, module/main.tf and module/variables.tf,
+  # declares the vault as an azurerm_key_vault, and nothing else beside the
+  # azurerm_client_config data source it reads the tenant from. `aggrega pin`
+  # records the digest of each file in entity.lock, and every build reads
+  # exactly those bytes.
+  #
+  # Microsoft's Azure Verified Modules programme publishes a Terraform module
+  # for the service, Azure/avm-res-keyvault-vault/azurerm, MIT, at v0.13.1 its
+  # newest version. Its root configuration calls the registry module
+  # Azure/avm-utl-interfaces/azure, whatever the caller passes, so
+  # initialising a configuration that sources it fetches a module from the
+  # Terraform registry, which the catalog's sourced modules do not do. The
+  # module is therefore not sourced, and no module telemetry exists to turn
+  # off.
+  #
+  # The module declares hashicorp/azurerm "~> 5.14", the catalog's one Azure
+  # provider constraint, so a Release places this vault in a terraform
+  # boundary whose bodies install azurerm 5, apart from any module admitting
+  # azurerm 4 alone.
+  source: ./module
+
+  locals:
+    # The name the Release gives the vault under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   resource_group_name            - string (resource_group_name), required
+  #   location                       - string (location), required
+  #   sku_name                       - string (sku_name: standard or premium; default standard)
+  #   soft_delete_retention_days     - integer (soft_delete_retention_days: 7 to 90; default 90)
+  #   purge_protection_enabled       - bool (purge_protection_enabled; default true)
+  #   public_network_access_enabled  - bool (public_network_access_enabled; default true)
+  #   tags                           - map[string]string (tags of the vault)
+  #   host                           - string (published as provides.host and in provides.endpoint;
+  #                                    not passed to the module)
+  # enable_telemetry halts by name: the module is this catalog's own, with no
+  # telemetry to turn on or off. Any other key halts naming it. No key names
+  # the tenant: the provider requires the vault's tenant_id, and the module
+  # reads it from the azurerm_client_config data source, the tenant of the
+  # identity Terraform runs as, when Terraform plans; the build reads none.
+  #
+  # Each is named by the resource argument it sets, given in brackets, save
+  # host, which every managed Recipe reads for the address it publishes.
+  # arm/azure-key-vault reads each of them but resource_group_name under the
+  # same spelling: its template deploys into the group it is deployed to.
+  # resource_group_name and location are required: they place the vault in
+  # the operator's subscription, and this Recipe never chooses either. The
+  # vault takes the resource group by its name, so nothing is composed from
+  # the subscription Terraform runs against.
+  #
+  # sku_name. Microsoft offers a vault in two tiers, spelt as the service
+  # spells them: standard, unless set, which protects keys in software; and
+  # premium, which can also hold keys protected by hardware security modules.
+  # Both hold secrets and certificates alike. The provider takes these two
+  # alone, and any other value halts below by name.
+  #
+  # soft_delete_retention_days. Soft delete is always on: the service turns
+  # it on by default for a new vault, once on it cannot be turned off, and
+  # the provider sets it on every vault it creates. A deleted vault, or a deleted secret,
+  # key or certificate, stays recoverable for this many days, 90 unless set,
+  # and the service purges it after that. Microsoft documents 7 to 90 days,
+  # and documents that the period is fixed when the vault is created and
+  # cannot be changed afterwards; the provider refuses a change when it
+  # applies.
+  #
+  # purge_protection_enabled. Unset or true, the vault has purge protection:
+  # a deleted vault or object cannot be purged before its retention period
+  # ends, only recovered. Microsoft documents that enabling it is
+  # irreversible, and that most Azure services integrating with Key Vault,
+  # such as Storage, require it; the provider refuses to turn it off when it
+  # applies. With it on, destroying the vault leaves it deleted for its
+  # retention period, its name taken; with it off, the provider purges the
+  # vault and its contents when Terraform destroys it, under the default
+  # features block below. Creating the vault while a deleted vault of the same
+  # name is retained, the provider recovers the deleted one, its default too.
+  #
+  # public_network_access_enabled. A vault is reached over its public
+  # endpoint or over a private endpoint in a virtual network. Unset or true,
+  # the provider's own default, public network access is on; false turns it
+  # off, and the vault takes requests through a private endpoint alone, apart
+  # from the trusted Microsoft services a network rule set lets through. This
+  # Recipe emits no private endpoint: it is the operator's, created for the
+  # vault outside the Release, the way a virtual network's subnets and private
+  # DNS zones are.
+  #
+  # The module writes no network rule set: the provider sends none when it
+  # creates the vault, so with public network access on the public endpoint
+  # takes requests from every network, each still authorized through
+  # Microsoft Entra ID, and after that the provider leaves the vault's rule
+  # set as it finds it, so IP and virtual network rules the operator makes
+  # outside the Release stay. It declares no access policy either, and the
+  # provider leaves the vault's access policies as it finds them; a vault
+  # authorizing with role-based access control ignores them in any case.
+  #
+  # The module sets these beside the arguments the keys above set:
+  # rbac_authorization_enabled true, so the vault authorizes reads and writes
+  # of its contents with Azure role-based access control;
+  # enabled_for_template_deployment true, so Azure Resource Manager may read
+  # its secrets while deploying a template, which a Key Vault reference needs;
+  # and enabled_for_deployment and enabled_for_disk_encryption false, so
+  # neither virtual machines nor Azure Disk Encryption read the vault on a
+  # grant of its own. The service's own defaults stand for every argument the
+  # module leaves out: no secret, key, certificate, access policy, role
+  # assignment, private endpoint, diagnostic setting or lock.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation and the
+  # provider's resource schema:
+  #   honoured — the overrides above. The Component declares no values.
+  #   refused — a vault name the service refuses; an
+  #     infra.overrides.resource_group_name or location left out or given as
+  #     anything but a string; sku_name given as anything but standard or
+  #     premium; soft_delete_retention_days as anything but a whole number
+  #     from 7 to 90; purge_protection_enabled and
+  #     public_network_access_enabled as anything but a boolean; host as
+  #     anything but a bare DNS name; enable_telemetry; and any
+  #     infra.overrides key not listed above.
+  #   not read — none.
+  #
+  # Credentials. The vault keeps no key of its own: every request to it is
+  # authenticated with Microsoft Entra ID and authorized by the role
+  # assignments the operator makes, so nothing is published but its address.
+  # Backup. Microsoft documents no backup of a whole vault, only of each
+  # secret, key or certificate on demand, so this Recipe configures none.
+  assertions:
+    # A placement key set to something other than a string is refused with
+    # what the key names, apart from a key left out.
+    placement_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $names := dict "resource_group_name" "the operator's resource group the vault is created in, by its name, such as example-rg" "location" "the one Azure region the vault is created in, such as westeurope" -}}
+      {{- range $k := list "resource_group_name" "location" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (typeIs "string" $v) -}}
+      {{- fail (printf "infra.overrides.%s is %v, and it names %s, as a string: set infra.overrides.%s in the Release to such a name" $k $v (get $names $k) $k) -}}
+      {{- end -}}
+      {{- if not $v -}}
+      {{- fail (printf "this Release places its Key Vault in the operator's own Azure resource group and region, and this Recipe never chooses either, but infra.overrides.%s carries none: set infra.overrides.resource_group_name and infra.overrides.location in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_known: >-
+      {{- $known := list "resource_group_name" "location" "sku_name" "soft_delete_retention_days" "purge_protection_enabled" "public_network_access_enabled" "tags" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "enable_telemetry" -}}
+      {{- fail "infra.overrides.enable_telemetry is set, and this Recipe declares the Key Vault in a module of this catalog's own, which carries no telemetry to turn on or off: remove infra.overrides.enable_telemetry from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads resource_group_name, location, sku_name, soft_delete_retention_days, purge_protection_enabled, public_network_access_enabled, tags and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $s := optional $o "sku_name" "standard" -}}
+      {{- if not (has $s (list "standard" "premium")) -}}
+      {{- fail (printf "infra.overrides.sku_name is %v, and Microsoft offers a Key Vault in the tiers standard and premium, spelt in lower case, which the provider takes alone: set infra.overrides.sku_name to one of them, or remove it for standard" $s) -}}
+      {{- end -}}
+      {{- $d := optional $o "soft_delete_retention_days" 90 -}}
+      {{- $whole := or (kindIs "int" $d) (kindIs "int64" $d) (and (kindIs "float64" $d) (eq (float64 (int $d)) $d)) -}}
+      {{- if not (and $whole (ge (int $d) 7) (le (int $d) 90)) -}}
+      {{- fail (printf "infra.overrides.soft_delete_retention_days is %v, and Microsoft documents a Key Vault keeping deleted contents for 7 to 90 days: set infra.overrides.soft_delete_retention_days to a whole number in that range, or remove it for 90" $d) -}}
+      {{- end -}}
+      {{- $pp := optional $o "purge_protection_enabled" true -}}
+      {{- if not (kindIs "bool" $pp) -}}
+      {{- fail (printf "infra.overrides.purge_protection_enabled is %v, and it switches the vault's purge protection as a boolean: set it to false to create the vault without it, or to true or remove it to keep it on" $pp) -}}
+      {{- end -}}
+      {{- $p := optional $o "public_network_access_enabled" true -}}
+      {{- if not (kindIs "bool" $p) -}}
+      {{- fail (printf "infra.overrides.public_network_access_enabled is %v, and it switches the vault's public network access as a boolean: set it to false to turn it off, or to true or remove it to keep it on" $p) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (regexMatch `[/@\s:]` $h) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the DNS name a client of this vault reaches it at, given alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the vault takes requests over HTTPS on port 443, and endpoint is built on the name` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The vault is named after the component, and its name is also the first
+    # label of the address the service gives it, so it is unique across Azure.
+    # Microsoft's documentation of Azure resource names gives a Key Vault name
+    # 3 to 24 letters, digits and hyphens, starting with a letter, ending with
+    # a letter or digit, and holding no two hyphens in a row, the rule the
+    # provider's own validation holds too; it is checked here, where the name
+    # is known.
+    vault_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if or (not (regexMatch `^[A-Za-z][A-Za-z0-9-]{1,22}[A-Za-z0-9]$` $n)) (contains "--" $n) -}}
+      {{- fail (printf "the component %q names its Key Vault, and Microsoft documents a vault name as 3 to 24 letters, digits and hyphens, starting with a letter, ending with a letter or digit, with no two hyphens in a row: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. The
+  # provider reports the vault's URI, the address a client calls the vault
+  # at, as the service gives it: https://<vault>.vault.azure.net/ in the
+  # public cloud, under its cloud's own domain elsewhere. The module
+  # publishes it as its endpoint output, and its host output takes the DNS
+  # name between https:// and the path. Each provides key reads the module
+  # output of the same name from this component's module call, which the
+  # boundary's root configuration declares under .context.instance_id for a
+  # component declared in the Aggregate the Release deploys. Terraform
+  # resolves it at apply time, after the vault exists, so it resolves only
+  # for a consumer authored as a source: Recipe in the same root
+  # configuration; a consumer on another target receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference, and endpoint is https://<name>/. It is the
+  # operator's deterministic pointer: the compiler pipes it as text and looks
+  # nothing up, and this Recipe emits no DNS record for it, so the operator
+  # points the name at the vault outside the Release. A client checking the
+  # vault's certificate needs a name the certificate carries: the vault's own
+  # name under vault.azure.net, resolving to a private endpoint through the
+  # operator's private DNS zone where one is linked. A consumer in the same
+  # root configuration receives the name as well, and a name carries no
+  # reference for Terraform to order its module after this one by; a later
+  # syncWave on the consumer's boundary, sharing this boundary's directory,
+  # orders the two.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.host}{{ end }}"
+    endpoint: "{{ if .locals.operator_host }}https://{{ .locals.operator_host }}/{{ else }}${module.{{ .context.instance_id }}.endpoint}{{ end }}"
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own variable. The
+  # vault is named after the component, as the other managed Recipes name
+  # theirs.
+  valuesMapping: |
+    {{- $o := .infra.overrides }}
+    name: "{{ .context.instance_id }}"
+    resource_group_name: "{{ $o.resource_group_name }}"
+    location: "{{ $o.location }}"
+    sku_name: "{{ optional $o "sku_name" "standard" }}"
+    soft_delete_retention_days: {{ int (optional $o "soft_delete_retention_days" 90) }}
+    purge_protection_enabled: {{ if optional $o "purge_protection_enabled" true }}true{{ else }}false{{ end }}
+    public_network_access_enabled: {{ if optional $o "public_network_access_enabled" true }}true{{ else }}false{{ end }}
+    {{- with optional $o "tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}
+
+  # Written once, beside the boundary's root configuration rather than in the
+  # module, and shared by every component of the boundary that declares this
+  # file with these bytes: another component bound to this Recipe, or one whose
+  # Recipe configures azurerm the same way under the same name. The same name
+  # with other bytes halts the build. The azurerm provider refuses to plan
+  # without its features block, and the module carries no provider block of
+  # its own, so it inherits this configuration; the provider reads its
+  # credentials and subscription from the environment Terraform runs in. Its
+  # features block left empty keeps the provider's Key Vault defaults: a
+  # vault Terraform destroys is purged unless purge protection keeps it, and
+  # a deleted vault of the name being created is recovered. Terraform
+  # destroys the module's resources with it, so the file stays while any
+  # component declaring it does: remove the last of them from a Release only
+  # after destroying what their modules created, because with the file gone
+  # Terraform refuses to plan, asking for a provider block with the features
+  # argument.
+  boundary:
+    artifacts:
+      provider-azurerm.tf: |
+        provider "azurerm" {
+          features {}
+        }
