@@ -1,0 +1,519 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: azure-databricks
+  version: 1.0.0
+  # The licence of the vendored module, the Azure Verified Modules programme's
+  # Databricks workspace module: the third-party code this Recipe pins and
+  # writes into the output. The workspace it provisions is a service the
+  # reader contracts for directly with Microsoft, under Azure's terms.
+  license: MIT
+  # The infra.overrides keys this Recipe refuses are listed, with their
+  # reasons, in the comments above the assertions.
+  description: >
+    Azure Databricks: one workspace, realized by Microsoft's Azure Verified
+    Modules module Azure/avm-res-databricks-workspace/azurerm at v0.6.0,
+    MIT, its tag's commit pinned in entity.lock.
+
+    Reach for it where the Release deploys Terraform; reach for
+    arm/azure-databricks where it deploys an Azure Resource Manager
+    template. The module admits hashicorp/azurerm 4 alone, so this Recipe
+    goes in a boundary apart from the Azure Recipes that need azurerm 5.
+    infra.overrides names the operator's resource group and region. The
+    workspace runs on the premium tier unless infra.overrides.sku_name names
+    trial; with secure cluster connectivity, its clusters taking no public
+    IP address, unless infra.overrides.custom_parameters.no_public_ip is
+    false; and in a network Azure Databricks creates unless
+    custom_parameters names the operator's network, its two subnets and
+    their network security group associations. Public network access is on
+    unless infra.overrides.public_network_access_enabled is false. The module's telemetry is off unless
+    infra.overrides.enable_telemetry is true.
+
+    Azure creates the managed resource group
+    databricks-rg-<component>-<resource group>, or the one
+    infra.overrides.managed_resource_group_name names, outside the
+    configuration, holding the workspace storage account, an access
+    connector, the clusters' machines and, unless the operator's network is
+    named, the network Azure Databricks creates and its NAT gateway;
+    terraform destroy leaves the storage account and the connector there.
+    host is a reference to the workspace's name the service reports,
+    endpoint https:// and that name. A key the service or the module cannot
+    take halts naming it, as does infra.overrides.host.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/bigdata/azure-databricks:1.0.0
+
+  # The published module, at the tag the registry publishes as version 0.6.0.
+  # A registry version of a module is a tag of its git repository, and the
+  # registry's own download for this version answers with a git source at the
+  # commit that tag names; Terraform's dependency lock file records providers
+  # and no module. So the pin is taken here: `aggrega pin` resolves the tag to
+  # its commit and records that commit and the archive's digest in entity.lock,
+  # and every build vendors exactly those bytes.
+  #
+  # The source names the repository root. The root calls no module, so the
+  # configuration Terraform loads from it calls no registry module and
+  # initialising it fetches providers and nothing else. The repository's
+  # examples/ and tests/ directories are vendored with it and never loaded.
+  #
+  # The module declares hashicorp/azurerm ">= 4.12, < 5.0.0", Azure/azapi
+  # "~> 2.12" and hashicorp/random "~> 3.5" in its own required_providers,
+  # and Terraform ">= 1.11, < 2.0". It creates the workspace as an
+  # azapi_resource of type Microsoft.Databricks/workspaces at API version
+  # 2026-01-01, a classic workspace (computeMode Hybrid), reading the
+  # resource group through the azurerm provider's azurerm_resource_group data
+  # source and the subscription through the azapi provider's
+  # azapi_client_config. It is vendored byte for byte, so this Recipe adds no
+  # provider constraint of its own. "< 5.0.0" admits no azurerm 5 release, so
+  # a Release places this workspace in a terraform boundary whose bodies
+  # install azurerm 4.
+  source:
+    kind: git-repository
+    url: https://github.com/Azure/terraform-azurerm-avm-res-databricks-workspace.git
+    ref: v0.6.0
+
+  locals:
+    # The tier, infra.overrides.sku_name or premium. Only a string is read
+    # here; any other value is refused by the assertion below.
+    sku: '{{ $s := optional (optional .infra "overrides" dict) "sku_name" "premium" }}{{ if typeIs "string" $s }}{{ $s }}{{ end }}'
+    # The managed resource group's name: infra.overrides.managed_resource_group_name,
+    # or databricks-rg-<component>-<infra.overrides.resource_group_name>. Only
+    # strings are read here; any other value is refused by the assertions
+    # below.
+    managed_resource_group: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $m := optional $o "managed_resource_group_name" "" -}}
+      {{- $g := optional $o "resource_group_name" "" -}}
+      {{- if and (typeIs "string" $m) $m -}}
+      {{ $m }}
+      {{- else if typeIs "string" $g -}}
+      databricks-rg-{{ .context.instance_id }}-{{ $g }}
+      {{- end -}}
+
+  # This Recipe reads from infra.overrides:
+  #   resource_group_name                   - string (resource_group_name), required
+  #   location                              - string (location), required
+  #   sku_name                              - string (sku, premium or trial; default premium)
+  #   managed_resource_group_name           - string (managed_resource_group_name, which the
+  #                                           module composes into the group's ID in the
+  #                                           subscription Terraform runs against; default
+  #                                           databricks-rg-<component>-<resource_group_name>)
+  #   custom_parameters                     - object of these fields and no other
+  #                                           (custom_parameters):
+  #     virtual_network_id                  - string (custom_parameters.virtual_network_id)
+  #     private_subnet_name                 - string (custom_parameters.private_subnet_name)
+  #     public_subnet_name                  - string (custom_parameters.public_subnet_name)
+  #     no_public_ip                        - bool (custom_parameters.no_public_ip; default true)
+  #     private_subnet_network_security_group_association_id
+  #                                         - string (custom_parameters.
+  #                                           private_subnet_network_security_group_association_id)
+  #     public_subnet_network_security_group_association_id
+  #                                         - string (custom_parameters.
+  #                                           public_subnet_network_security_group_association_id)
+  #   public_network_access_enabled         - bool (public_network_access_enabled; default true)
+  #   network_security_group_rules_required - string (network_security_group_rules_required,
+  #                                           AllRules or NoAzureDatabricksRules; default AllRules)
+  #   enable_telemetry                      - bool (enable_telemetry; false unless set to true here,
+  #                                           where the module's own default is true)
+  #   tags                                  - map[string]string (tags)
+  # host halts by name, as any key not listed does: the workspace answers
+  # only at the name the service gives it.
+  #
+  # Each is named by the module input it sets, given in brackets, save
+  # sku_name, which every Azure Recipe reads for the tier a service is
+  # provisioned at. arm/azure-databricks reads each of them but
+  # resource_group_name under the same spelling: its template deploys into
+  # the group it is deployed to. resource_group_name and location are
+  # required: they place the workspace in the operator's subscription, and
+  # this Recipe never chooses either. The module takes the resource group by
+  # its name, so nothing is composed from the subscription here.
+  #
+  # sku_name. Microsoft's end-of-life notice for Standard tier workspaces
+  # states that every new workspace is created on the Premium tier, and its
+  # sign-up page offers trial, Premium with 14 days of free usage. The module
+  # takes premium, standard or trial; standard and any other value halt
+  # below. Unset, the workspace runs on premium, where the module takes no
+  # default and requires the input.
+  #
+  # managed_resource_group_name. Azure Resource Manager requires a workspace
+  # to name its managed resource group, by ID, and Azure Databricks creates
+  # that group in the workspace's subscription when the workspace is created,
+  # outside the configuration: Terraform never declares or tracks it. In it
+  # Azure keeps the workspace storage account, whose name begins with
+  # dbstorage and which holds the workspace's system data and file system
+  # root, an access connector with a managed identity reaching that account,
+  # and, while clusters run, their virtual machines, disks, IP addresses and
+  # network interfaces; without custom_parameters.virtual_network_id it also
+  # holds the virtual network Azure Databricks creates for the clusters and
+  # the NAT gateway that carries their outbound traffic while they take no
+  # public IP address. Microsoft documents that the group is not modifiable
+  # and is protected by a deny assignment that blocks role assignments on it.
+  # Deleting the workspace removes the clusters' machines, disks and network
+  # but keeps the storage account and the access connector, converting the
+  # group into an ordinary resource group the operator then owns, unless the
+  # deletion is forced (az databricks workspace delete --force-deletion);
+  # terraform destroy, which deletes the workspace through the azapi
+  # provider, does not force it. The module composes the name into the
+  # group's ID in the subscription the azapi provider runs against, which is
+  # the workspace's, and Azure takes a resource group name of 1 to 90
+  # letters, digits, underscores, hyphens, periods and parentheses, not
+  # ending in a period, which the assertions below check, of the name given
+  # and of the default alike. Unset, the group is
+  # databricks-rg-<component>-<resource_group_name>, the module's own default,
+  # which arm/azure-databricks gives it too; this Recipe writes it out.
+  #
+  # custom_parameters. Unset, the workspace's clusters run in a virtual
+  # network Azure Databricks creates in the managed resource group. With
+  # virtual_network_id, they run in the operator's network instead, which
+  # Microsoft requires to sit in the workspace's region and subscription and
+  # to hold two subnets dedicated to the workspace, named by
+  # private_subnet_name and public_subnet_name, each delegated to
+  # Microsoft.Databricks/workspaces with a network security group attached;
+  # a subnet serves one workspace alone. The network, its subnets, their
+  # delegation, their network security groups and the associations between
+  # them are the operator's, created outside the Release, and this Recipe
+  # creates none of them. Azure Databricks writes the inbound and outbound
+  # rules it requires into those network security groups itself, through
+  # the delegation, outside the configuration. The service takes both subnet
+  # names with a network and neither without one, as the azurerm provider's
+  # workspace resource checks
+  # (internal/services/databricks/databricks_workspace_resource.go, v4.81.0),
+  # each name follows Azure's subnet name rules, 1 to 80 letters, digits,
+  # underscores, periods and hyphens, beginning with a letter or digit and
+  # ending with a letter, digit or underscore, and the module's own
+  # validation requires both association IDs beside a network; all are
+  # checked below. An association's ID is its subnet's, and the module reads
+  # the two only in that validation: given as references to the operator's
+  # associations in a configuration of the operator's own, they would order
+  # the workspace after them, and given here as text they order nothing.
+  #
+  # no_public_ip. With secure cluster connectivity the clusters take no
+  # public IP address and open the connection to the control plane
+  # themselves. Microsoft documents that the workspace resource enables it
+  # when enableNoPublicIp is not given, from API version 2024-05-01, and
+  # recommends it; the module writes false unless told otherwise, so this
+  # Recipe passes true unless no_public_ip is false. In the network Azure
+  # Databricks creates, the service adds the NAT gateway above, billed to
+  # the operator; in the operator's network, outbound traffic needs a path
+  # of the operator's, such as the NAT gateway on both subnets Microsoft
+  # recommends. Microsoft documents that it plans to require secure cluster
+  # connectivity for every classic workspace; false is admitted while the
+  # service takes it.
+  #
+  # public_network_access_enabled. Unset or true, the module's default and
+  # the service's, users and clients reach the workspace over the internet;
+  # false turns it off, and the workspace takes requests through private
+  # endpoints alone. Microsoft lists the operator's network, secure cluster
+  # connectivity and the Premium tier as prerequisites of Private Link, and
+  # its Private Link concepts give NoAzureDatabricksRules as the rule set of
+  # a workspace with public access disabled, the combination with AllRules
+  # being one the azurerm provider's workspace resource refuses; so false
+  # halts below without virtual_network_id, with no_public_ip false, or
+  # without network_security_group_rules_required NoAzureDatabricksRules.
+  # This Recipe passes no private_endpoints: the private endpoints,
+  # databricks_ui_api for the workspace and browser_authentication for
+  # single sign-on, and the private DNS zone privatelink.azuredatabricks.net
+  # are the operator's, created outside the Release; with them, the
+  # workspace's own name resolves to a private address.
+  #
+  # network_security_group_rules_required. AllRules, written unless set,
+  # keeps the outbound rule to the AzureDatabricks service tag in the
+  # subnets' network security groups, where the module leaves the property
+  # out unless given; NoAzureDatabricksRules removes it, for clusters that
+  # reach the control plane through the operator's back-end private
+  # endpoint, which Microsoft's Private Link concepts list with the
+  # operator's network and secure cluster connectivity as prerequisites, so
+  # it halts below without virtual_network_id or with no_public_ip false.
+  # The schema of the workspace resource documents NoAzureServiceRules as
+  # for internal use only, and it halts below with any other value.
+  #
+  # While enable_telemetry is true, the module's default, the module submits
+  # an empty Azure Resource Manager template to the subscription, in the
+  # workspace's region, which Microsoft counts as usage of the module. This
+  # Recipe passes false unless infra.overrides.enable_telemetry is true; any
+  # value that is not a boolean is refused below.
+  #
+  # Any other key under infra.overrides halts the build naming it, so a key
+  # misspelt, or meant for another Recipe, is never passed over unread.
+  #
+  # The module's own defaults stand for every input this mapping leaves out.
+  # These are worth knowing: a classic workspace (compute_mode Hybrid); the
+  # workspace storage account on Standard_GRS, under a name the service
+  # generates; the service's own address prefix for the network Azure
+  # Databricks creates; no customer-managed key or infrastructure
+  # encryption; and no private endpoint, role assignment, diagnostic
+  # setting, lock, storage firewall, access connector, virtual network
+  # peering, default catalog setting, compliance profile or Azure Machine
+  # Learning link.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation and the
+  # module's inputs:
+  #   honoured — the overrides above. The Component declares no values.
+  #   refused — a workspace name Azure refuses; an
+  #     infra.overrides.resource_group_name or location left out or given as
+  #     anything but a string; and any infra.overrides key or
+  #     custom_parameters field not listed above, or a value of one the
+  #     service or the module cannot take, or a combination of them the
+  #     service or the module refuses.
+  #   not read — none.
+  #
+  # Credentials. The workspace takes Microsoft Entra ID tokens and tokens
+  # Azure Databricks issues, and nothing here creates or delivers one; a
+  # consumer authenticates as its own identity, which the operator admits to
+  # the workspace. Backup. Microsoft documents that the control plane keeps
+  # the workspace's objects in databases replicated across the region's
+  # availability zones, and that its disaster recovery copies them to a
+  # second workspace, which is the operator's; this Recipe configures none.
+  assertions:
+    # A placement key set to something other than a string is refused with
+    # what the key names, apart from a key left out.
+    placement_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $names := dict "resource_group_name" "the operator's resource group the workspace is created in, by its name, such as example-rg" "location" "the one Azure region the workspace is created in, such as westeurope" -}}
+      {{- range $k := list "resource_group_name" "location" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (typeIs "string" $v) -}}
+      {{- fail (printf "infra.overrides.%s is %v, and it names %s, as a string: set infra.overrides.%s in the Release to such a name" $k $v (get $names $k) $k) -}}
+      {{- end -}}
+      {{- if not $v -}}
+      {{- fail (printf "this Release places its Azure Databricks workspace in the operator's own Azure resource group and region, and this Recipe never chooses either, but infra.overrides.%s carries none: set infra.overrides.resource_group_name and infra.overrides.location in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_known: >-
+      {{- $known := list "resource_group_name" "location" "sku_name" "managed_resource_group_name" "custom_parameters" "public_network_access_enabled" "network_security_group_rules_required" "enable_telemetry" "tags" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "host" -}}
+      {{- fail "infra.overrides.host is set, and Azure Databricks serves the workspace at the name it gives it, adb-<workspace id>.<n>.azuredatabricks.net, which Private Link resolves to a private address under the same name; an account's custom URL names all its workspaces and needs the workspace's ID beside it, which this Component does not publish: remove infra.overrides.host from the Release, and read the host the workspace publishes" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads resource_group_name, location, sku_name, managed_resource_group_name, custom_parameters, public_network_access_enabled, network_security_group_rules_required, enable_telemetry and tags from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $t := optional $o "enable_telemetry" false -}}
+      {{- if not (kindIs "bool" $t) -}}
+      {{- fail (printf "infra.overrides.enable_telemetry is %v, and it is passed to the module as a boolean: set it to true to turn the module's telemetry on, or to false or remove it to keep it off" $t) -}}
+      {{- end -}}
+      {{- $p := optional $o "public_network_access_enabled" true -}}
+      {{- if not (kindIs "bool" $p) -}}
+      {{- fail (printf "infra.overrides.public_network_access_enabled is %v, and it switches the workspace's public network access as a boolean: set it to false to turn it off, or to true or remove it to keep it on" $p) -}}
+      {{- end -}}
+      {{- $r := optional $o "network_security_group_rules_required" "AllRules" -}}
+      {{- if not (has $r (list "AllRules" "NoAzureDatabricksRules")) -}}
+      {{- fail (printf "infra.overrides.network_security_group_rules_required is %v, and Azure Databricks takes AllRules or NoAzureDatabricksRules, spelt so, the workspace resource's schema giving NoAzureServiceRules as for internal use only: set it to one of them, or remove it for AllRules" $r) -}}
+      {{- end -}}
+    # Microsoft's end-of-life notice for Standard tier workspaces states that
+    # every new workspace is created on the Premium tier; trial is Premium
+    # with 14 days of free usage.
+    sku: >-
+      {{- $s := optional (optional .infra "overrides" dict) "sku_name" "premium" -}}
+      {{- if not (has $s (list "premium" "trial")) -}}
+      {{- fail (printf "infra.overrides.sku_name is %v, and Azure Databricks creates a new workspace on the premium tier or on trial, Premium with 14 days of free usage, and none on standard, as Microsoft's end-of-life notice for Standard tier workspaces states: set infra.overrides.sku_name to premium or trial, or remove it for premium" $s) -}}
+      {{- end -}}
+    # Azure's resource group name rules: 1 to 90 letters, digits,
+    # underscores, hyphens, periods and parentheses, not ending in a period.
+    # Unset, the name is derived from the component's and the resource
+    # group's, and the derived name is held to the same rules.
+    managed_resource_group_name: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $rule := `^[\p{L}\p{Nd}_.()-]{0,89}[\p{L}\p{Nd}_()-]$` -}}
+      {{- if hasKey $o "managed_resource_group_name" -}}
+      {{- $m := get $o "managed_resource_group_name" -}}
+      {{- $ok := typeIs "string" $m -}}
+      {{- if $ok }}{{ $ok = regexMatch $rule $m }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.managed_resource_group_name is %v, and it names the resource group Azure Databricks creates for the workspace, which Azure takes as 1 to 90 letters, digits, underscores, hyphens, periods and parentheses, not ending in a period: set it to such a name, or remove it for databricks-rg-<component>-<resource group>" $m) -}}
+      {{- end -}}
+      {{- else if and (typeIs "string" (optional $o "resource_group_name" "")) (optional $o "resource_group_name" "") (not (regexMatch $rule .locals.managed_resource_group)) -}}
+      {{- fail (printf "infra.overrides.managed_resource_group_name is not set, and the name this Recipe gives the managed resource group, %s, is %d characters long where Azure takes a resource group name of 1 to 90: set infra.overrides.managed_resource_group_name in the Release to a name of at most 90 letters, digits, underscores, hyphens, periods and parentheses" .locals.managed_resource_group (len .locals.managed_resource_group)) -}}
+      {{- end -}}
+    # The fields of custom_parameters, each in the shape the service and the
+    # module take: the network and the subnet associations by their resource
+    # IDs, which Azure Resource Manager reads without regard to case; each
+    # subnet by a name Azure's subnet name rules admit; no_public_ip as a
+    # boolean. The service takes both subnet names with a network and neither
+    # without one, and the module requires both associations beside a
+    # network.
+    custom_parameters: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "custom_parameters" -}}
+      {{- $cp := get $o "custom_parameters" -}}
+      {{- $fields := "virtual_network_id, private_subnet_name, public_subnet_name, no_public_ip, private_subnet_network_security_group_association_id and public_subnet_network_security_group_association_id" -}}
+      {{- if not (kindIs "map" $cp) -}}
+      {{- fail (printf "infra.overrides.custom_parameters is %v, and it is an object of the fields %s: set it in the Release to such an object, or remove it" $cp $fields) -}}
+      {{- end -}}
+      {{- $known := list "virtual_network_id" "private_subnet_name" "public_subnet_name" "no_public_ip" "private_subnet_network_security_group_association_id" "public_subnet_network_security_group_association_id" -}}
+      {{- range $k, $_ := $cp -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.custom_parameters.%s is set, and this Recipe reads %s from infra.overrides.custom_parameters and no other field: correct its spelling, or remove custom_parameters.%s from the Release" $k $fields $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $cp "virtual_network_id" -}}
+      {{- $v := get $cp "virtual_network_id" -}}
+      {{- $ok := typeIs "string" $v -}}
+      {{- if $ok }}{{ $ok = regexMatch `(?i)^/subscriptions/[^/]+/resourcegroups/[^/]+/providers/microsoft\.network/virtualnetworks/[^/]+$` $v }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.custom_parameters.virtual_network_id is %v, and it names the operator's virtual network by its resource ID, /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Network/virtualNetworks/<network>: set it to such an ID, or remove it for the network Azure Databricks creates" $v) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- range $k := list "private_subnet_name" "public_subnet_name" -}}
+      {{- if hasKey $cp $k -}}
+      {{- $v := get $cp $k -}}
+      {{- $ok := typeIs "string" $v -}}
+      {{- if $ok }}{{ $ok = regexMatch `^[A-Za-z0-9]([A-Za-z0-9_.-]{0,78}[A-Za-z0-9_])?$` $v }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.custom_parameters.%s is %v, and it names a subnet of the operator's network, which Azure takes as 1 to 80 letters, digits, underscores, periods and hyphens, beginning with a letter or digit and ending with a letter, digit or underscore: set it to such a name" $k $v) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- range $k := list "private_subnet_network_security_group_association_id" "public_subnet_network_security_group_association_id" -}}
+      {{- if hasKey $cp $k -}}
+      {{- $v := get $cp $k -}}
+      {{- $ok := typeIs "string" $v -}}
+      {{- if $ok }}{{ $ok = regexMatch `(?i)^/subscriptions/[^/]+/resourcegroups/[^/]+/providers/microsoft\.network/virtualnetworks/[^/]+/subnets/[^/]+$` $v }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.custom_parameters.%s is %v, and it names the operator's network security group association of a workspace subnet, whose ID is the subnet's, /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Network/virtualNetworks/<network>/subnets/<subnet>: set it to such an ID" $k $v) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $n := optional $cp "no_public_ip" true -}}
+      {{- if not (kindIs "bool" $n) -}}
+      {{- fail (printf "infra.overrides.custom_parameters.no_public_ip is %v, and it switches secure cluster connectivity as a boolean: set it to false to give the clusters public IP addresses, or to true or remove it to give them none" $n) -}}
+      {{- end -}}
+      {{- if hasKey $cp "virtual_network_id" -}}
+      {{- range $k := list "private_subnet_name" "public_subnet_name" -}}
+      {{- if not (hasKey $cp $k) -}}
+      {{- fail (printf "infra.overrides.custom_parameters.virtual_network_id names the operator's network, and custom_parameters.%s is not set: Azure Databricks runs a workspace in the operator's network on two subnets dedicated to it, named by private_subnet_name and public_subnet_name: set both in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- range $k := list "private_subnet_network_security_group_association_id" "public_subnet_network_security_group_association_id" -}}
+      {{- if not (hasKey $cp $k) -}}
+      {{- fail (printf "infra.overrides.custom_parameters.virtual_network_id names the operator's network, and custom_parameters.%s is not set: the module requires the network security group association of each workspace subnet beside a network, by the subnet's ID: set both associations in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- else -}}
+      {{- range $k := list "private_subnet_name" "public_subnet_name" -}}
+      {{- if hasKey $cp $k -}}
+      {{- fail (printf "infra.overrides.custom_parameters.%s is set, and custom_parameters.virtual_network_id names no network for the subnet to belong to, so the workspace runs in a network Azure Databricks creates: set virtual_network_id to the operator's network in the Release, or remove custom_parameters.%s" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+    # Private Link: Microsoft lists the operator's network, secure cluster
+    # connectivity and the Premium tier as its prerequisites, and gives
+    # NoAzureDatabricksRules as the rule set of a workspace with public
+    # access disabled; the azurerm provider's workspace resource refuses
+    # AllRules with public access disabled. The tier is premium or trial,
+    # Premium either way, by the sku assertion.
+    private_link: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $cp := optional $o "custom_parameters" dict -}}
+      {{- if not (kindIs "map" $cp) }}{{ $cp = dict }}{{ end -}}
+      {{- $closed := eq (toString (optional $o "public_network_access_enabled" true)) "false" -}}
+      {{- $backend := eq (toString (optional $o "network_security_group_rules_required" "AllRules")) "NoAzureDatabricksRules" -}}
+      {{- $why := "" -}}
+      {{- if $closed }}{{ $why = "infra.overrides.public_network_access_enabled is false" }}{{ else if $backend }}{{ $why = "infra.overrides.network_security_group_rules_required is NoAzureDatabricksRules" }}{{ end -}}
+      {{- if $why -}}
+      {{- if not (hasKey $cp "virtual_network_id") -}}
+      {{- fail (printf "%s, which takes the workspace onto Private Link, and Microsoft lists the operator's own network among Private Link's prerequisites: set infra.overrides.custom_parameters.virtual_network_id and its two subnets in the Release" $why) -}}
+      {{- end -}}
+      {{- if eq (toString (optional $cp "no_public_ip" true)) "false" -}}
+      {{- fail (printf "%s, which takes the workspace onto Private Link, and Microsoft lists secure cluster connectivity among Private Link's prerequisites, which infra.overrides.custom_parameters.no_public_ip false turns off: set no_public_ip to true, or remove it" $why) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if and $closed (not $backend) -}}
+      {{- fail "infra.overrides.public_network_access_enabled is false, and a workspace with public access disabled takes the rule set NoAzureDatabricksRules, which Microsoft's Private Link concepts give for it, while AllRules beside it is a combination the azurerm provider's workspace resource refuses: set infra.overrides.network_security_group_rules_required to NoAzureDatabricksRules in the Release" -}}
+      {{- end -}}
+    # The workspace is named after the component. Azure's resource name rules
+    # give a Databricks workspace 3 to 64 letters, digits, underscores and
+    # hyphens, narrower than the module's own validation, which admits one or
+    # two; it is checked here, where the name is known.
+    workspace_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (regexMatch `^[A-Za-z0-9_-]{3,64}$` $n) -}}
+      {{- fail (printf "the component %q names its Azure Databricks workspace, and Azure takes a workspace name of 3 to 64 letters, digits, underscores and hyphens: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. The
+  # service gives the workspace a name of its own when it creates it,
+  # adb-<workspace id>.<n>.azuredatabricks.net in the public cloud, and the
+  # workspace resource reports it as its read-only workspaceUrl, which the
+  # module exports from the azapi resource and publishes as its
+  # databricks_workspace_url output, a host name with no scheme. host reads
+  # that output; endpoint is https:// followed by it. Each reads this
+  # component's module call, which the boundary's root configuration
+  # declares under .context.instance_id for a component declared in the
+  # Aggregate the Release deploys. Terraform resolves it at apply time, so it
+  # resolves only for a consumer authored as a source: Recipe in the same
+  # root configuration; a consumer on another target receives it as text.
+  #
+  # No infra.overrides.host: the workspace's web application and REST API
+  # answer at that name, and Private Link resolves the same name to a
+  # private address. An account's custom URL, which Microsoft offers in
+  # preview, reaches every workspace of the account and selects one by its
+  # workspace ID, which this Component does not publish.
+  provides:
+    host: "${module.{{ .context.instance_id }}.databricks_workspace_url}"
+    endpoint: "https://${module.{{ .context.instance_id }}.databricks_workspace_url}"
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input. The
+  # workspace is named after the component, as the other managed Recipes name
+  # theirs.
+  #
+  # enable_telemetry is always rendered: false, unless
+  # infra.overrides.enable_telemetry is true.
+  valuesMapping: |
+    {{- $o := optional .infra "overrides" dict }}
+    {{- $cp := optional $o "custom_parameters" dict }}
+    {{- if not (kindIs "map" $cp) }}{{ $cp = dict }}{{ end }}
+    name: "{{ .context.instance_id }}"
+    resource_group_name: {{ toJson $o.resource_group_name }}
+    location: {{ toJson $o.location }}
+    sku: "{{ .locals.sku }}"
+    managed_resource_group_name: {{ toJson .locals.managed_resource_group }}
+    public_network_access_enabled: {{ if eq (toString (optional $o "public_network_access_enabled" true)) "false" }}false{{ else }}true{{ end }}
+    network_security_group_rules_required: "{{ optional $o "network_security_group_rules_required" "AllRules" }}"
+    custom_parameters:
+      no_public_ip: {{ if eq (toString (optional $cp "no_public_ip" true)) "false" }}false{{ else }}true{{ end }}
+      {{- range $k := list "virtual_network_id" "private_subnet_name" "public_subnet_name" "private_subnet_network_security_group_association_id" "public_subnet_network_security_group_association_id" }}
+      {{- with optional $cp $k "" }}
+      {{ $k }}: {{ toJson . }}
+      {{- end }}
+      {{- end }}
+    {{- $t := optional $o "enable_telemetry" false }}
+    enable_telemetry: {{ and (kindIs "bool" $t) $t }}
+    {{- with optional $o "tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}
+
+  # Written once, beside the boundary's root configuration rather than in the
+  # module, and shared by every component of the boundary that declares the
+  # same file with the same bytes: another component bound to this Recipe, or
+  # one whose Recipe configures azurerm the same way under the same name. The
+  # same name with other bytes halts the build. The azurerm provider refuses
+  # to plan without its features block, and a vendored module carries no
+  # provider block of its own, so the module inherits this configuration; the
+  # provider reads its credentials and subscription from the environment
+  # Terraform runs in. Terraform destroys the module's resources with it, so
+  # the file stays while any component declaring it does: remove the last of
+  # them from a Release only after destroying what their modules created,
+  # because with the provider file gone Terraform refuses to plan, asking for
+  # a provider block with the features argument. The azapi provider, which
+  # creates the workspace, and the random provider the module also declares
+  # are left to their default configuration, since no provider block names
+  # them; azapi reads the same environment.
+  boundary:
+    artifacts:
+      provider-azurerm.tf: |
+        provider "azurerm" {
+          features {}
+        }
