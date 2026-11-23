@@ -1,0 +1,385 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: dns-record-azure-dns
+  version: 1.0.0
+  # The values and infra.overrides keys this Recipe refuses are listed, with
+  # their reasons, in the comments above the assertions.
+  description: >
+    Azure DNS: one record set written into a public DNS zone the operator
+    already holds, rendered as Terraform for the azurerm provider by a
+    module kept beside this Recipe, not by Microsoft's Azure Verified
+    Modules module Azure/avm-res-network-dnszone/azurerm, which creates the
+    zone its records go into.
+
+    Reach for it where the Release deploys Terraform; reach for
+    arm/dns-record-azure-dns where it deploys an Azure Resource Manager
+    template. It needs hashicorp/azurerm 5.14 or later, so it goes in a
+    boundary apart from Recipes whose modules admit azurerm 4 alone.
+    infra.overrides names the zone and its resource group, and the module
+    creates nothing for either. The record set takes A, AAAA, CAA, CNAME,
+    MX, NS, PTR, SRV or TXT records, with infra.overrides.tags as its
+    metadata; a record set of the same name and type already in the zone
+    halts the apply until it is imported.
+
+    host is a reference to the name the provider reports for the record
+    set, without its trailing dot. A name outside the zone, any other type,
+    an alias record, a time to live of 0, a CNAME at the apex or with more
+    than one record, an NS record set at the apex or under a wildcard, an
+    SRV name without its service and protocol, a record not in its type's
+    form, TXT longer than the service takes, enable_telemetry and any
+    infra.overrides key not listed halt naming what to fix, as do zone_name
+    and resource_group_name left out or in a form they do not take.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/network/dns-record:1.0.0
+
+  # The module beside this Recipe, module/main.tf and module/variables.tf,
+  # declares the record set as one of the provider's record resources,
+  # azurerm_dns_<type>_record for the type values.type names, and nothing
+  # else. `aggrega pin` records the digest of each file in entity.lock, and
+  # every build reads exactly those bytes.
+  #
+  # Microsoft's Azure Verified Modules programme publishes a Terraform module
+  # for the service, Azure/avm-res-network-dnszone/azurerm, MIT, at v0.3.0 its
+  # newest version. Its root configuration declares an azurerm_dns_zone
+  # whatever the caller passes, and writes the record sets it is given into
+  # that zone, so applying it creates or takes over the zone, which here is
+  # the operator's. The module is therefore not sourced, and no module
+  # telemetry exists to turn off.
+  #
+  # The module declares hashicorp/azurerm "~> 5.14", the catalog's one Azure
+  # provider constraint, so a Release places this record set in a terraform
+  # boundary whose bodies install azurerm 5, apart from any module admitting
+  # azurerm 4 alone.
+  source: ./module
+
+  locals:
+    # infra.overrides.zone_name, or empty while it gives none or anything but
+    # a string, which the assertions refuse.
+    zone: '{{ $z := optional (optional .infra "overrides" dict) "zone_name" "" }}{{ if typeIs "string" $z }}{{ $z }}{{ end }}'
+    # values.name without its trailing dot.
+    fqdn: '{{ trimSuffix "." .values.name }}'
+    # The record set's name relative to the zone, as Azure DNS names it: @
+    # for the zone's apex, the labels before the zone's name for a name below
+    # it, compared without regard to letter case, as DNS compares names.
+    # Empty while values.name is not in the zone, which the assertions refuse.
+    relative: '{{ $n := .locals.fqdn }}{{ $z := .locals.zone }}{{ if $z }}{{ if eq (lower $n) (lower $z) }}@{{ else if hasSuffix (printf ".%s" (lower $z)) (lower $n) }}{{ trunc (int (sub (len $n) (add (len $z) 1))) $n }}{{ end }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   zone_name            - string (zone_name: the operator's zone), required
+  #   resource_group_name  - string (resource_group_name: the zone's resource
+  #                          group), required
+  #   tags                 - map[string]string (tags, which the provider writes
+  #                          as the record set's metadata)
+  # enable_telemetry halts by name: the module is this catalog's own, with no
+  # telemetry to turn on or off. Any other key halts naming it, location and
+  # host among them: a record set has no region of its own, and the name it is
+  # reached at is values.name.
+  #
+  # Each is named by the resource argument it sets, given in brackets.
+  # arm/dns-record-azure-dns reads zone_name and tags under the same spelling,
+  # and refuses resource_group_name: its template deploys into the group it is
+  # deployed to. tags is the key every Azure Recipe reads for the labels it
+  # writes: Azure DNS keeps no tags on a record set, and Microsoft documents its
+  # metadata, name-value pairs on the record set, as their counterpart, which
+  # the provider writes a record resource's tags as.
+  #
+  # zone_name and resource_group_name. The zone is the operator's: a public
+  # Azure DNS zone created outside the Release, named with its resource group
+  # here, and this Recipe never creates either. Each record resource names
+  # them as its parent, so Terraform writes the record set into the zone and
+  # neither creates nor changes the zone. Microsoft documents a zone's name as
+  # 2 to 34 labels of letters, digits, underscores and hyphens, separated by
+  # periods; another form halts below. A private DNS zone is a resource of
+  # another type, which this Recipe does not write into.
+  #
+  # The Component's values, each read for the record set:
+  #   name. Azure DNS names a record set relative to its zone: @ at the zone's
+  #     apex, www for www.example.com in the zone example.com. The relative
+  #     name is taken from values.name by removing the zone's name, compared
+  #     without regard to letter case, and passed as the resource's name; a
+  #     name outside the zone halts below. A leftmost * label makes a wildcard
+  #     record set, which Microsoft documents for every type but NS and SOA.
+  #   type. The resource is azurerm_dns_<type>_record. Azure DNS takes A,
+  #     AAAA, CAA, CNAME, MX, NS, PTR, SOA, SRV and TXT record sets in a public
+  #     zone, and the provider has a resource for each. The zone keeps one SOA
+  #     record set of its own, which Microsoft documents as created and
+  #     deleted with the zone and never separately, so SOA halts below with
+  #     every type outside that list, the obsolete SPF type among them, which
+  #     Microsoft documents as not supported. ALIAS halts by name: Azure DNS
+  #     keeps an alias as an A, AAAA or CNAME record set whose
+  #     target_resource_id names an Azure resource, and the Component offers no
+  #     alias record.
+  #   ttl. The resource's ttl. Microsoft documents 1 to 2,147,483,647 seconds,
+  #     so 0, which the Component admits, halts below.
+  #   records. Each entry becomes one record of the record set, read in its
+  #     type's form:
+  #       A      an IPv4 address in dotted decimal, in records;
+  #       AAAA   an IPv6 address, in records;
+  #       CNAME  one domain name, as the resource's record;
+  #       NS     a domain name, in records;
+  #       PTR    a domain name, in records;
+  #       MX     a preference and a domain name, as a record block's
+  #              preference and exchange;
+  #       SRV    a priority, a weight, a port and a domain name, as a record
+  #              block's priority, weight, port and target;
+  #       CAA    flags, a tag and a value, the value's double quotes removed,
+  #              as a record block's flags, tag and value;
+  #       TXT    the text, as a record block's value, which the provider
+  #              divides into strings of 254 bytes when it is longer. It
+  #              divides by bytes, so a text longer than 254 bytes holding a
+  #              character outside ASCII, which the provider could cut in two,
+  #              halts below.
+  #     A domain name is passed without its trailing dot, as Azure DNS writes
+  #     the names it reports, and the single dot of an SRV target meaning no
+  #     service stays as written. The preference of MX and the priority,
+  #     weight and port of SRV are 16-bit fields in the DNS standard, 0 to
+  #     65535, and CAA flags an integer Microsoft documents from 0 to 255.
+  #     Microsoft documents the CAA tags issue, issuewild and iodef for Azure
+  #     DNS; the provider takes contactemail too, which halts below with every
+  #     other tag. The provider keeps the records of A, AAAA, PTR, MX, SRV, CAA
+  #     and TXT record sets as sets, so an entry given twice is written once.
+  #
+  # The module sets nothing on the record set beside what these keys set. The
+  # service's own limits stand for what the build cannot see: Microsoft
+  # documents 20 records in a record set, 400 in a TXT record set, by default,
+  # a limit Azure support raises on request, and a CNAME record set as the one
+  # record set of its name. The provider refuses to create a record set that
+  # already exists in the zone, asking for it to be imported, so a record set
+  # made outside the Release is never replaced unseen; once Terraform manages
+  # it, a change of values.name or values.type replaces it.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation and the
+  # provider's resource schemas:
+  #   honoured — values.name, values.type, values.ttl and values.records; and
+  #     the overrides above.
+  #   refused — infra.overrides.zone_name or resource_group_name left out or
+  #     given as anything but a string, and a zone_name not a zone's name; a
+  #     values.name outside the zone; a values.type other than A, AAAA, CAA,
+  #     CNAME, MX, NS, PTR, SRV and TXT, ALIAS by name; values.ttl 0; a CNAME
+  #     at the zone's apex or with more than one record; an NS record set at
+  #     the zone's apex or under a wildcard; an SRV record set whose name does
+  #     not begin with its service and protocol; an entry of values.records not
+  #     in its type's form; a TXT text longer than 254 bytes holding a
+  #     character outside ASCII; TXT records holding more than 4,096
+  #     characters together; enable_telemetry and any infra.overrides key not
+  #     listed above.
+  #   not read — none.
+  #
+  # Backup. A record set is configuration of the zone; Microsoft documents no
+  # backup of a record set, and this Recipe configures none.
+  assertions:
+    # A placement key set to something other than a string is refused with
+    # what the key names, apart from a key left out.
+    placement_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $names := dict "zone_name" "the operator's Azure DNS zone the record set is written into, such as example.com" "resource_group_name" "the resource group holding that zone, by its name, such as example-rg" -}}
+      {{- range $k := list "zone_name" "resource_group_name" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (typeIs "string" $v) -}}
+      {{- fail (printf "infra.overrides.%s is %v, and it names %s, as a string: set infra.overrides.%s in the Release to such a name" $k $v (get $names $k) $k) -}}
+      {{- end -}}
+      {{- if not $v -}}
+      {{- fail (printf "this Release writes a DNS record set into the operator's own Azure DNS zone, and this Recipe never creates the zone or its resource group, but infra.overrides.%s carries none: set infra.overrides.zone_name and infra.overrides.resource_group_name in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # Microsoft's naming rules for Azure resources give a DNS zone's name 2 to
+    # 34 labels, each of letters, digits, underscores and hyphens, separated
+    # by periods.
+    zone_name_form: >-
+      {{- $z := .locals.zone -}}
+      {{- if $z -}}
+      {{- $ok := regexMatch `^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$` $z -}}
+      {{- if $ok }}{{ $labels := splitList "." $z }}{{ $ok = le (len $labels) 34 }}{{ range $labels }}{{ if gt (len .) 63 }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.zone_name is %s, and it names the operator's Azure DNS zone, which Microsoft documents as 2 to 34 labels of letters, digits, underscores and hyphens, separated by periods: set it in the Release to the zone's name, such as example.com, with no trailing dot" $z) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_known: >-
+      {{- $known := list "zone_name" "resource_group_name" "tags" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "enable_telemetry" -}}
+      {{- fail "infra.overrides.enable_telemetry is set, and this Recipe declares the record set in a module of this catalog's own, which carries no telemetry to turn on or off: remove infra.overrides.enable_telemetry from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads zone_name, resource_group_name and tags from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    name_in_zone: >-
+      {{- if and .locals.zone (not .locals.relative) -}}
+      {{- fail (printf "values.name is %s, and it is not in the zone %s that infra.overrides.zone_name names, while Azure DNS writes a record set under its name relative to its zone: set values.name in the Aggregate to the zone's name or a name ending in .%s, or name the zone that holds it in infra.overrides.zone_name" .values.name .locals.zone .locals.zone) -}}
+      {{- end -}}
+    # The record types Azure DNS takes in a public zone, less the zone's own
+    # SOA record set; ALIAS by name.
+    type_offered: >-
+      {{- $t := .values.type -}}
+      {{- if eq $t "ALIAS" -}}
+      {{- fail "values.type is ALIAS, and this Recipe writes no alias record: Azure DNS keeps one as an A, AAAA or CNAME record set taking its value from an Azure resource, which the Component does not offer: write the record's data under type A, AAAA or CNAME in the Aggregate" -}}
+      {{- end -}}
+      {{- if not (has $t (list "A" "AAAA" "CAA" "CNAME" "MX" "NS" "PTR" "SRV" "TXT")) -}}
+      {{- fail (printf "values.type is %s, and this Recipe writes the record types Azure DNS takes in a public zone, A, AAAA, CAA, CNAME, MX, NS, PTR, SRV and TXT, the zone keeping its SOA record set itself: set values.type to one of them in the Aggregate" $t) -}}
+      {{- end -}}
+    # Microsoft documents a record set's TTL in Azure DNS as 1 to
+    # 2,147,483,647 seconds; the Component holds the upper bound.
+    ttl_taken: >-
+      {{- if eq (int .values.ttl) 0 -}}
+      {{- fail "values.ttl is 0, and Microsoft documents a record set's time to live in Azure DNS as 1 to 2147483647 seconds: set values.ttl to 1 or more in the Aggregate" -}}
+      {{- end -}}
+    # What Microsoft documents a record set's name may hold for its type: no
+    # CNAME at the zone's apex, which holds the zone's NS and SOA record sets;
+    # the apex's NS record set created with the zone, its Azure DNS name
+    # servers neither removed nor changed; wildcard record sets of every type
+    # but NS and SOA; and an SRV record set's name beginning with the service
+    # and the protocol, each prefixed with an underscore.
+    name_takes_type: >-
+      {{- $t := .values.type -}}
+      {{- $r := .locals.relative -}}
+      {{- if and (eq $t "CNAME") (eq $r "@") -}}
+      {{- fail (printf "values.name %s is the zone's apex, and Microsoft documents that Azure DNS takes no CNAME record set there, since the apex holds the zone's NS and SOA record sets: give the apex A or AAAA records in the Aggregate, or a name below it the CNAME" .values.name) -}}
+      {{- end -}}
+      {{- if and (eq $t "NS") (eq $r "@") -}}
+      {{- fail (printf "values.name %s is the zone's apex, and Azure DNS creates the apex's NS record set with the zone, holding the zone's own name servers, which Microsoft documents may be neither removed nor changed: write NS records in the Aggregate for a child zone below the apex" .values.name) -}}
+      {{- end -}}
+      {{- if and (eq $t "NS") (or (eq $r "*") (hasPrefix "*." $r)) -}}
+      {{- fail (printf "values.name %s is a wildcard, and Microsoft documents that Azure DNS takes wildcard record sets of every type but NS and SOA: name the child zone the NS records delegate in the Aggregate, with no * label" .values.name) -}}
+      {{- end -}}
+      {{- if and (eq $t "SRV") (not (regexMatch `^_[^.]+\._[^.]+(\.|$)` $r)) -}}
+      {{- fail (printf "values.name %s does not begin with a service and a protocol, and Microsoft documents that an SRV record set's name in Azure DNS carries both, each prefixed with an underscore, such as _sip._tcp.example.com: set values.name to such a name in the Aggregate" .values.name) -}}
+      {{- end -}}
+    # Each entry in its type's form; the comment above the assertions gives
+    # each form. The TXT length is Microsoft's 4,096 characters across a TXT
+    # record set, and a TXT text the provider divides by bytes holds ASCII
+    # alone.
+    records_form: >-
+      {{- $t := .values.type -}}
+      {{- $records := .values.records -}}
+      {{- if and (eq $t "CNAME") (gt (len $records) 1) -}}
+      {{- fail (printf "values.records holds %d entries for a CNAME record, and Microsoft documents that a CNAME record set holds a single record: give values.records one entry in the Aggregate" (len $records)) -}}
+      {{- end -}}
+      {{- $octet := `(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])` -}}
+      {{- $v4 := printf `%s(\.%s){3}` $octet $octet -}}
+      {{- $h := `[0-9A-Fa-f]{1,4}` -}}
+      {{- $v6 := printf `^((%[1]s:){7}%[1]s|(%[1]s:){1,7}:|(%[1]s:){1,6}:%[1]s|(%[1]s:){1,5}(:%[1]s){1,2}|(%[1]s:){1,4}(:%[1]s){1,3}|(%[1]s:){1,3}(:%[1]s){1,4}|(%[1]s:){1,2}(:%[1]s){1,5}|%[1]s:(:%[1]s){1,6}|:((:%[1]s){1,7}|:)|(%[1]s:){6}%[2]s|::(%[1]s:){0,5}%[2]s|(%[1]s:){1}:(%[1]s:){0,4}%[2]s|(%[1]s:){2}:(%[1]s:){0,3}%[2]s|(%[1]s:){3}:(%[1]s:){0,2}%[2]s|(%[1]s:){4}:(%[1]s:){0,1}%[2]s|(%[1]s:){5}:%[2]s)$` $h $v4 -}}
+      {{- $chars := 0 -}}
+      {{- range $i, $e := $records -}}
+      {{- if eq $t "A" -}}
+      {{- if not (regexMatch (printf "^%s$" $v4) $e) -}}
+      {{- fail (printf "values.records[%d] is %q, and an A record holds one IPv4 address in dotted decimal, such as 192.0.2.10, which Azure DNS writes as the record's ipv4Address: correct it in the Aggregate" $i $e) -}}
+      {{- end -}}
+      {{- else if eq $t "AAAA" -}}
+      {{- if not (regexMatch $v6 $e) -}}
+      {{- fail (printf "values.records[%d] is %q, and an AAAA record holds one IPv6 address, such as 2001:db8::10, which Azure DNS writes as the record's ipv6Address: correct it in the Aggregate" $i $e) -}}
+      {{- end -}}
+      {{- else if has $t (list "CNAME" "NS" "PTR") -}}
+      {{- if not (regexMatch `^\S+$` $e) -}}
+      {{- fail (printf "values.records[%d] is %q, and a %s record holds one domain name, with no space in it: correct it in the Aggregate" $i $e $t) -}}
+      {{- end -}}
+      {{- else if eq $t "MX" -}}
+      {{- if not (and (regexMatch `^[0-9]{1,5}\s+\S+$` $e) (le (atoi (regexReplaceAll `\s.*$` $e "")) 65535)) -}}
+      {{- fail (printf "values.records[%d] is %q, and an MX record is a preference from 0 to 65535 and a mail server's domain name, such as 10 mail.example.com, which Azure DNS writes as the record's preference and exchange: correct it in the Aggregate" $i $e) -}}
+      {{- end -}}
+      {{- else if eq $t "SRV" -}}
+      {{- $ok := regexMatch `^[0-9]{1,5}\s+[0-9]{1,5}\s+[0-9]{1,5}\s+\S+$` $e -}}
+      {{- if $ok -}}{{- range $n := (slice (regexSplit `\s+` $e -1) 0 3) -}}{{- if gt (atoi $n) 65535 }}{{ $ok = false }}{{ end -}}{{- end -}}{{- end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "values.records[%d] is %q, and an SRV record is a priority, a weight and a port, each from 0 to 65535, and a target's domain name, such as 10 5 5060 sip.example.com, which Azure DNS writes as the record's priority, weight, port and target: correct it in the Aggregate" $i $e) -}}
+      {{- end -}}
+      {{- else if eq $t "CAA" -}}
+      {{- $ok := regexMatch `^[0-9]{1,3}\s+(issue|issuewild|iodef)\s+\S` $e -}}
+      {{- if $ok }}{{ $ok = le (atoi (regexReplaceAll `\s.*$` $e "")) 255 }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "values.records[%d] is %q, and Microsoft documents a CAA record in Azure DNS as flags from 0 to 255, a tag of issue, issuewild or iodef, and a value, such as 0 issue letsencrypt.org: correct it in the Aggregate" $i $e) -}}
+      {{- end -}}
+      {{- else if eq $t "TXT" -}}
+      {{- if and (gt (len $e) 254) (not (regexMatch `^[\x00-\x7F]*$` $e)) -}}
+      {{- fail (printf "values.records[%d] is a text of %d bytes holding a character outside ASCII, and the azurerm provider divides a TXT text longer than 254 bytes every 254 bytes, which can cut such a character in two: shorten the text to 254 bytes in the Aggregate, or write it in ASCII, or reach for arm/dns-record-azure-dns, which divides it between characters" $i (len $e)) -}}
+      {{- end -}}
+      {{- $chars = add $chars (len (splitList "" $e)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if gt (int $chars) 4096 -}}
+      {{- fail (printf "values.records holds %d characters of text across its TXT records, and Microsoft documents that Azure DNS takes 4096 characters at most across a TXT record set: shorten the text in the Aggregate" (int $chars)) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret this string. The provider
+  # reports the record set's fully qualified name as the service gives it, with
+  # its trailing dot, api.example.com. for the record set api in the zone
+  # example.com, as the resource's fqdn. The module publishes it without the
+  # dot as its host output, and host reads that output from this component's
+  # module call, which the boundary's root configuration declares under
+  # .context.instance_id. Terraform resolves it at apply time, after the record
+  # set exists, so it resolves only for a consumer authored as a source: Recipe
+  # in the same root configuration, which Terraform applies after the record
+  # set; a consumer on another target receives it as text.
+  provides:
+    host: "${module.{{ .context.instance_id }}.host}"
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own variable.
+  # Only the record variable the type reads is written; the others keep their
+  # empty defaults.
+  valuesMapping: |
+    {{- $o := .infra.overrides }}
+    {{- $v := .values }}
+    {{- $t := $v.type }}
+    {{- $plain := list }}
+    {{- $blocks := list }}
+    {{- range $e := $v.records }}
+    {{- $f := regexSplit `\s+` $e -1 }}
+    {{- $name := last $f }}
+    {{- if and (gt (len $name) 1) (hasSuffix "." $name) }}{{ $name = trimSuffix "." $name }}{{ end }}
+    {{- if has $t (list "A" "AAAA" "TXT") }}{{ $plain = append $plain $e }}
+    {{- else if has $t (list "CNAME" "NS" "PTR") }}{{ $plain = append $plain $name }}
+    {{- else if eq $t "MX" }}{{ $blocks = append $blocks (dict "preference" (atoi (index $f 0)) "exchange" $name) }}
+    {{- else if eq $t "SRV" }}{{ $blocks = append $blocks (dict "priority" (atoi (index $f 0)) "weight" (atoi (index $f 1)) "port" (atoi (index $f 2)) "target" $name) }}
+    {{- else }}
+    {{- $value := regexReplaceAll `^[0-9]+\s+\S+\s+` $e "" }}
+    {{- if and (ge (len $value) 2) (hasPrefix "\"" $value) (hasSuffix "\"" $value) }}{{ $value = trimSuffix "\"" (trimPrefix "\"" $value) }}{{ end }}
+    {{- $blocks = append $blocks (dict "flags" (atoi (index $f 0)) "tag" (index $f 1) "value" $value) }}
+    {{- end }}
+    {{- end }}
+    name: {{ toJson .locals.relative }}
+    zone_name: {{ toJson $o.zone_name }}
+    resource_group_name: {{ toJson $o.resource_group_name }}
+    type: {{ toJson $t }}
+    ttl: {{ int $v.ttl }}
+    {{- if $plain }}
+    records: {{ toJson $plain }}
+    {{- else if eq $t "MX" }}
+    mx_records: {{ toJson $blocks }}
+    {{- else if eq $t "SRV" }}
+    srv_records: {{ toJson $blocks }}
+    {{- else }}
+    caa_records: {{ toJson $blocks }}
+    {{- end }}
+    {{- with optional $o "tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}
+
+  # Written once, beside the boundary's root configuration rather than in the
+  # module, and shared by every component of the boundary that declares this
+  # file with these bytes: another component bound to this Recipe, or one whose
+  # Recipe configures azurerm the same way under the same name. The same name
+  # with other bytes halts the build. The azurerm provider refuses to plan
+  # without its features block, and the module carries no provider block of
+  # its own, so it inherits this configuration; the provider reads its
+  # credentials and subscription from the environment Terraform runs in. No
+  # feature it holds touches a DNS record set. Terraform destroys the module's
+  # resources with it, so the file stays while any component declaring it
+  # does: remove the last of them from a Release only after destroying what
+  # their modules created, because with the file gone Terraform refuses to
+  # plan, asking for a provider block with the features argument.
+  boundary:
+    artifacts:
+      provider-azurerm.tf: |
+        provider "azurerm" {
+          features {}
+        }
