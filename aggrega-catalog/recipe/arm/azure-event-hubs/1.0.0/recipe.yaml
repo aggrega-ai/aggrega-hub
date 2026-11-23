@@ -1,0 +1,349 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: azure-event-hubs
+  version: 1.0.0
+  # The values and infra.overrides keys this Recipe refuses are listed, with
+  # their reasons, in the comments above the assertions.
+  description: >
+    Azure Event Hubs: one namespace, with the event hubs values.eventhubs
+    declares, declared by an Azure Resource Manager template this Recipe
+    writes, not by Microsoft's Azure Verified Modules module
+    avm/res/event-hub/namespace, whose outputs at 0.15.3 carry no address
+    of the namespace.
+
+    Reach for it where the Release deploys an Azure Resource Manager
+    template; reach for terraform/azure-event-hubs where it deploys
+    Terraform. The namespace runs on the Standard tier unless
+    infra.overrides.sku_name names Premium, on one throughput or
+    processing unit unless infra.overrides.sku_capacity names more. Public
+    network access is on unless
+    infra.overrides.public_network_access_enabled is false; the private
+    endpoint is the operator's. Each event hub keeps its events one day.
+
+    Shared access signature authentication is off, so the namespace takes
+    Microsoft Entra ID alone; the role assignment granting a consumer
+    access is the operator's. host is an expression for the DNS name in
+    the endpoint the service reports, or infra.overrides.host; endpoint is
+    that URL and bootstrap_servers that name with port 9093, each built on
+    infra.overrides.host while it is set. A value or an infra.overrides key
+    the service cannot take halts naming it, as do the Basic tier, which
+    serves no Kafka endpoint, and more event hubs or partitions than the
+    tier takes.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: arm
+  implements: core/messaging/azure-event-hubs:1.0.0
+
+  # The namespace is declared by the fragment below: one nested deployment
+  # holding a Microsoft.EventHub/namespaces resource and a
+  # Microsoft.EventHub/namespaces/eventhubs child for each event hub, all at
+  # API version 2026-01-01, which the provider assembles into the boundary's
+  # template.
+  #
+  # Microsoft's Azure Verified Modules programme publishes a Bicep module for
+  # the service, avm/res/event-hub/namespace, MIT, at 0.15.3 its newest
+  # version. Its parameters carry everything this Recipe sets, but its outputs
+  # are the namespace's name, resource ID, resource group, location, identity,
+  # private endpoints, event hub resource IDs, and its keys and connection
+  # strings, and not the serviceBusEndpoint the namespace reports, so a
+  # nested deployment of the module gives host no output to point at. The
+  # module is therefore not sourced, and no module telemetry exists to turn
+  # off.
+  #
+  # The namespace and its event hubs sit in a nested deployment of their own,
+  # evaluated in its own scope, whose template lists its resources in order
+  # rather than by symbolic name, so no symbolic name is derived from an event
+  # hub's name, which may hold periods a symbolic name does not admit. The
+  # nested deployment publishes the namespace's serviceBusEndpoint as its
+  # output of the same name, which host, endpoint and bootstrap_servers read,
+  # once every event hub exists.
+  locals:
+    # The symbolic name of the nested deployment, folded from the instance id
+    # as the provider folds a sourced template's: orders-events becomes
+    # OrdersEvents.
+    symbol: '{{ capitalizedWords .context.instance_id }}'
+    # The tier, infra.overrides.sku_name or Standard. Only a string is read
+    # here; any other value is refused by the assertion below.
+    sku: '{{ $s := optional (optional .infra "overrides" dict) "sku_name" "Standard" }}{{ if typeIs "string" $s }}{{ $s }}{{ end }}'
+    # Each event hub's partition count, values.eventhubs.<name>.partition_count
+    # or 2, the default of Microsoft's Verified Module for an event hub, as a
+    # JSON object from name to count, which the assertions and the fragment
+    # read.
+    partitions: '{{ $m := dict }}{{ range $name, $h := (default dict .values.eventhubs) }}{{ $_ := set $m $name (int (optional $h "partition_count" 2)) }}{{ end }}{{ toJson $m }}'
+    # The name the Release gives the namespace under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   sku_name                       - string (sku.name and sku.tier, Standard or Premium;
+  #                                    default Standard)
+  #   sku_capacity                   - integer (sku.capacity: throughput units, 1 to 40, on
+  #                                    Standard; processing units, 1, 2, 4, 6, 8, 10, 12
+  #                                    or 16, on Premium; default 1)
+  #   public_network_access_enabled  - bool (properties.publicNetworkAccess, Enabled or
+  #                                    Disabled; default true)
+  #   location                       - string (location; default the resource group's region)
+  #   tags                           - map[string]string (tags of the namespace)
+  #   host                           - string (published as provides.host and in provides.endpoint
+  #                                    and provides.bootstrap_servers; not written into the template)
+  # resource_group_name halts by name: the template deploys into the resource
+  # group it is deployed to, which no property of the namespace names.
+  # enable_telemetry halts by name too: the template is this catalog's own,
+  # with no module telemetry to turn on or off. Any other key halts naming it.
+  #
+  # Each is the key terraform/azure-event-hubs reads for the same concept,
+  # under the same spelling, and that Recipe also reads resource_group_name,
+  # since Terraform names the group a resource is created in; the property
+  # each sets is given in brackets. sku_name is the key every Azure Recipe
+  # reads for the tier a service is provisioned at, sku_capacity the key for
+  # the units it is provisioned with, public_network_access_enabled the key
+  # for a boolean switch of public access, and host the key every managed
+  # Recipe reads for the address it publishes.
+  #
+  # sku_name. Microsoft documents the tiers in its quotas and limits for the
+  # service: Basic, Standard, Premium, with resources isolated per tenant, and
+  # Dedicated, a cluster of the reader's own, which this Recipe does not
+  # offer. Microsoft documents that the Basic tier serves no Kafka endpoint,
+  # which this Recipe publishes in bootstrap_servers, so Basic halts below by
+  # name. Unset, the namespace runs on Standard, the lowest tier serving every
+  # key the Component publishes; any other spelling halts below.
+  #
+  # sku_capacity. Microsoft documents that a Standard namespace takes up to 40
+  # throughput units and a Premium namespace 1, 2, 4, 6, 8, 10, 12 or 16
+  # processing units. Unset, the namespace runs on one; another number halts
+  # below. Auto-inflate is off, so the units stay as set.
+  #
+  # The event hubs. Microsoft documents what each tier takes: on Standard, up
+  # to 10 event hubs in a namespace and 32 partitions in each; on Premium, 100
+  # partitions in each, and 100 event hubs and 200 partitions across the
+  # namespace for each processing unit. An event hub's partition count is 2
+  # unless values.eventhubs.<name>.partition_count sets it, and a count or a
+  # number of event hubs beyond the tier's halts below, naming it. Microsoft
+  # documents that an event hub's partition count on Standard never changes
+  # once it is created, and on Premium only grows, so the service refuses a
+  # template that lowers it, or changes it on Standard, when it deploys.
+  #
+  # public_network_access_enabled. A namespace takes requests over its public
+  # endpoint, from every network unless IP rules restrict it, or over a
+  # private endpoint in a virtual network, which Microsoft offers on Standard
+  # and above. Unset or true, public network access is Enabled, the service's
+  # default, and since this Recipe writes no network rule set the public
+  # endpoint takes requests from every network, each still authenticated with
+  # Microsoft Entra ID; false writes Disabled, and the namespace takes
+  # requests through a private endpoint alone. This Recipe emits no private
+  # endpoint: it is the operator's, created for the namespace outside the
+  # Release, the way a virtual network's subnets and private DNS zones are.
+  #
+  # The template sets these namespace properties beside the ones the keys
+  # above set: disableLocalAuth true, so the contract that no key reaches a
+  # consumer stands in the template itself; minimumTlsVersion 1.2; and
+  # isAutoInflateEnabled false. Each event hub takes messageRetentionInDays 1,
+  # the default of Microsoft's Verified Module and a retention every tier
+  # takes, which terraform/azure-event-hubs also writes, and no key changes.
+  # The service's own defaults stand for every property the template leaves
+  # out: the Kafka endpoint, which Microsoft documents as enabled on its own
+  # on a namespace of every tier but Basic; zone redundancy, which Microsoft
+  # documents as automatic in a region with availability zones; and no
+  # managed identity, customer-managed key, network rule set, private
+  # endpoint, consumer group beyond $Default, Capture, authorization rule,
+  # geo-replication or disaster recovery pairing.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation and the
+  # template reference for its resources:
+  #   honoured — values.eventhubs, as the namespace's event hubs, each with
+  #     its partition_count; and the overrides above.
+  #   refused — a namespace name the service or its template schema refuses;
+  #     two event hubs whose names differ only in case; the Basic tier; more
+  #     event hubs, more partitions in an event hub or, on Premium, more
+  #     partitions across the namespace than the tier takes; and any
+  #     infra.overrides key not listed above, or a value of one the service
+  #     cannot take. An event hub name and a partition count outside what the
+  #     service takes on any tier are refused by the Component's own schema
+  #     before this Recipe renders.
+  #   not read — none.
+  #
+  # Backup. Microsoft documents Event Hubs as no long-term store; its guidance
+  # on backup and restore names each event hub's retention and Capture rather
+  # than a backup, so this Recipe configures none.
+  assertions:
+    overrides_known: >-
+      {{- $known := list "sku_name" "sku_capacity" "public_network_access_enabled" "location" "tags" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "resource_group_name" -}}
+      {{- fail "infra.overrides.resource_group_name is set, and this Recipe creates the Event Hubs namespace in the resource group the template is deployed to, which no property of the namespace names: remove infra.overrides.resource_group_name from the Release, and deploy the template to that resource group" -}}
+      {{- end -}}
+      {{- if eq $k "enable_telemetry" -}}
+      {{- fail "infra.overrides.enable_telemetry is set, and this Recipe declares the Event Hubs namespace in a template of this catalog's own, which carries no telemetry to turn on or off: remove infra.overrides.enable_telemetry from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads sku_name, sku_capacity, public_network_access_enabled, location, tags and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $p := optional $o "public_network_access_enabled" true -}}
+      {{- if not (kindIs "bool" $p) -}}
+      {{- fail (printf "infra.overrides.public_network_access_enabled is %v, and it switches the namespace's public network access as a boolean: set it to false to disable it, or to true or remove it to keep it enabled" $p) -}}
+      {{- end -}}
+      {{- $l := optional $o "location" "" -}}
+      {{- if not (typeIs "string" $l) -}}
+      {{- fail (printf "infra.overrides.location is %v, and it names the one Azure region the namespace is created in: set it to a region's name, such as westeurope, or remove it for the resource group's region" $l) -}}
+      {{- end -}}
+    # The tiers and their units, read off Microsoft's quotas and limits for
+    # the service and its scalability guide: Standard and Premium, spelt so,
+    # with Basic refused for the Kafka endpoint it does not serve; up to 40
+    # throughput units on Standard; 1, 2, 4, 6, 8, 10, 12 or 16 processing
+    # units on Premium.
+    sku: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $s := optional $o "sku_name" "Standard" -}}
+      {{- if eq (toString $s) "Basic" -}}
+      {{- fail "infra.overrides.sku_name is Basic, a tier Microsoft documents as serving no Kafka endpoint, which this Recipe publishes in bootstrap_servers: set infra.overrides.sku_name to Standard or Premium, or remove it for Standard" -}}
+      {{- end -}}
+      {{- if not (has $s (list "Standard" "Premium")) -}}
+      {{- fail (printf "infra.overrides.sku_name is %v, and this Recipe provisions an Event Hubs namespace on the Standard or the Premium tier, spelt so: set infra.overrides.sku_name to one of them, or remove it for Standard" $s) -}}
+      {{- end -}}
+      {{- $c := optional $o "sku_capacity" 1 -}}
+      {{- $whole := or (kindIs "int" $c) (kindIs "int64" $c) (and (kindIs "float64" $c) (eq (float64 (int $c)) $c)) -}}
+      {{- if eq $s "Standard" -}}
+      {{- if not (and $whole (ge (int $c) 1) (le (int $c) 40)) -}}
+      {{- fail (printf "infra.overrides.sku_capacity is %v, and Microsoft documents a Standard Event Hubs namespace as taking 1 to 40 throughput units: set infra.overrides.sku_capacity to a whole number in that range, or remove it for one" $c) -}}
+      {{- end -}}
+      {{- else if not (and $whole (has (int $c) (list 1 2 4 6 8 10 12 16))) -}}
+      {{- fail (printf "infra.overrides.sku_capacity is %v, and Microsoft documents a Premium Event Hubs namespace as taking 1, 2, 4, 6, 8, 10, 12 or 16 processing units: set infra.overrides.sku_capacity to one of them, or remove it for one" $c) -}}
+      {{- end -}}
+    # What each tier takes, read off Microsoft's quotas and limits for the
+    # service: on Standard, 10 event hubs in a namespace and 32 partitions in
+    # each; on Premium, 100 partitions in each, and 100 event hubs and 200
+    # partitions across the namespace for each processing unit.
+    eventhub_limits: >-
+      {{- $s := .locals.sku -}}
+      {{- $parts := fromJson .locals.partitions -}}
+      {{- $n := len $parts -}}
+      {{- if eq $s "Standard" -}}
+      {{- if gt $n 10 -}}
+      {{- fail (printf "values.eventhubs declares %d event hubs, and Microsoft documents a Standard Event Hubs namespace as holding 10: declare at most 10 in the Aggregate, or set infra.overrides.sku_name to Premium in the Release" $n) -}}
+      {{- end -}}
+      {{- range $name, $p := $parts -}}
+      {{- if gt (int $p) 32 -}}
+      {{- fail (printf "values.eventhubs.%s.partition_count is %d, and Microsoft documents an event hub on the Standard tier as taking 32 partitions at most: set partition_count to 32 or fewer in the Aggregate, or infra.overrides.sku_name to Premium in the Release" $name (int $p)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- else if eq $s "Premium" -}}
+      {{- $pu := int (optional (optional .infra "overrides" dict) "sku_capacity" 1) -}}
+      {{- if gt $n (mul 100 $pu) -}}
+      {{- fail (printf "values.eventhubs declares %d event hubs, and Microsoft documents a Premium Event Hubs namespace as holding 100 for each processing unit, %d on the %d infra.overrides.sku_capacity gives: declare fewer in the Aggregate, or raise infra.overrides.sku_capacity in the Release" $n (mul 100 $pu) $pu) -}}
+      {{- end -}}
+      {{- $total := 0 -}}
+      {{- range $name, $p := $parts -}}
+      {{- if gt (int $p) 100 -}}
+      {{- fail (printf "values.eventhubs.%s.partition_count is %d, and Microsoft documents an event hub on the Premium tier as taking 100 partitions at most: set partition_count to 100 or fewer in the Aggregate" $name (int $p)) -}}
+      {{- end -}}
+      {{- $total = add $total (int $p) -}}
+      {{- end -}}
+      {{- if gt $total (mul 200 $pu) -}}
+      {{- fail (printf "values.eventhubs asks for %d partitions across its event hubs, and Microsoft documents a Premium Event Hubs namespace as taking 200 for each processing unit, %d on the %d infra.overrides.sku_capacity gives: ask for fewer in the Aggregate, or raise infra.overrides.sku_capacity in the Release" $total (mul 200 $pu) $pu) -}}
+      {{- end -}}
+      {{- end -}}
+    # Microsoft documents that Azure resource names are case-insensitive
+    # unless noted, and its naming rules note nothing else for an event hub,
+    # so two event hubs whose names differ only in case name one.
+    eventhub_name_shared: >-
+      {{- $seen := dict -}}
+      {{- range $name, $_ := (default dict .values.eventhubs) -}}
+      {{- if hasKey $seen (lower $name) -}}
+      {{- fail (printf "values.eventhubs.%s and values.eventhubs.%s name one event hub, since Azure resource names are case-insensitive: rename one of them in the Aggregate" (get $seen (lower $name)) $name) -}}
+      {{- end -}}
+      {{- $_ := set $seen (lower $name) $name -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (regexMatch `[/@\s:]` $h) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the DNS name a consumer of this namespace reaches it at, given alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the namespace answers HTTPS on port 443 and Kafka on 9093, and endpoint and bootstrap_servers are built on the name` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The namespace is named after the component, and its name is also the
+    # first label of the address the service gives it under
+    # servicebus.windows.net, so it is unique across Azure. Microsoft's naming
+    # rules give a namespace name 6 to 50 letters, digits and hyphens,
+    # beginning with a letter and ending with a letter or a digit, and the
+    # schema Microsoft publishes for the resource's template,
+    # ^[a-zA-Z][a-zA-Z0-9-]{6,50}[a-zA-Z0-9]$ within 50 characters, admits 8
+    # to 50 of them; the narrower rule, which the template is checked
+    # against, is checked here, where the name is known.
+    namespace_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (regexMatch `^[A-Za-z][A-Za-z0-9-]{6,48}[A-Za-z0-9]$` $n) -}}
+      {{- fail (printf "the component %q names its Event Hubs namespace, and the template schema Microsoft publishes for a namespace takes a name of 8 to 50 letters, digits and hyphens, beginning with a letter and ending with a letter or a digit: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. A consumer
+  # receives each as written. The service reports the namespace's endpoint as
+  # https://<namespace>.servicebus.windows.net:443/ in the public cloud, under
+  # its cloud's own domain elsewhere, and the nested deployment publishes it
+  # as its serviceBusEndpoint output. host reads that output from the
+  # nested deployment this component becomes and takes the DNS name between
+  # https:// and the port, so it holds whichever domain the service's cloud
+  # gives: the fully qualified namespace an Event Hubs client library
+  # connects to.
+  # endpoint is the output as the service reports it. bootstrap_servers joins
+  # host and 9093, the port of the namespace's Kafka endpoint, in one
+  # expression. Azure Resource Manager evaluates each expression when the
+  # template deploys, after the namespace and its event hubs exist, so it
+  # resolves for a consumer in the same template, through the link for a
+  # consumer in another arm template, and as text on another target.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the expression, endpoint is https://<name>:443/ and
+  # bootstrap_servers <name>:9093. It is the operator's deterministic pointer:
+  # the compiler pipes it as text and looks nothing up, and this Recipe emits
+  # no DNS record for it, so the operator points the name at the namespace
+  # outside the Release. A client checking the namespace's certificate needs a
+  # name the certificate carries, which is the namespace's own name under
+  # servicebus.windows.net or the private link name that resolves to it.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}[split(split(reference('{{ .locals.symbol }}').outputs.serviceBusEndpoint.value, '/')[2], ':')[0]]{{ end }}"
+    endpoint: "{{ if .locals.operator_host }}https://{{ .locals.operator_host }}:443/{{ else }}[reference('{{ .locals.symbol }}').outputs.serviceBusEndpoint.value]{{ end }}"
+    bootstrap_servers: "{{ if .locals.operator_host }}{{ .locals.operator_host }}:9093{{ else }}[format('{0}:9093', split(split(reference('{{ .locals.symbol }}').outputs.serviceBusEndpoint.value, '/')[2], ':')[0])]{{ end }}"
+
+  # The fragment the provider assembles into the boundary's template: one
+  # nested deployment, named after its symbolic name and the deployment it
+  # runs in, deployed incrementally and evaluated in its own scope, as the
+  # provider deploys a sourced template. Its template declares the namespace,
+  # named after the component, in location or the resource group's region,
+  # with the sku and properties the comments above name, and each event hub
+  # as a child resource declared within it, in the order of the names, each
+  # deployed after the namespace. A child declared within its parent carries
+  # its own name alone, which the resource's schema holds to 256 characters,
+  # the length an event hub's name takes, where one declared beside its
+  # parent would carry the namespace's name before its own. The template
+  # outputs the namespace's serviceBusEndpoint, which Azure Resource Manager
+  # reads once every resource of the template exists.
+  artifacts:
+    event-hubs.yaml: |
+      {{- $id := .context.instance_id }}
+      {{- $o := default dict .infra.overrides }}
+      {{- $location := default "[resourceGroup().location]" (optional $o "location" "") }}
+      {{- $properties := dict "disableLocalAuth" true "minimumTlsVersion" "1.2" "isAutoInflateEnabled" false "publicNetworkAccess" (ternary "Enabled" "Disabled" (optional $o "public_network_access_enabled" true)) }}
+      {{- $namespace := dict "type" "Microsoft.EventHub/namespaces" "apiVersion" "2026-01-01" "name" $id "location" $location "sku" (dict "name" .locals.sku "tier" .locals.sku "capacity" (int (optional $o "sku_capacity" 1))) "properties" $properties }}
+      {{- with optional $o "tags" "" }}{{ $_ := set $namespace "tags" . }}{{ end }}
+      {{- $eventhubs := list }}
+      {{- range $name, $p := (fromJson .locals.partitions) }}
+      {{- $eventhubs = append $eventhubs (dict "type" "eventhubs" "apiVersion" "2026-01-01" "name" $name "dependsOn" (list (printf "[resourceId('Microsoft.EventHub/namespaces', '%s')]" $id)) "properties" (dict "partitionCount" (int $p) "messageRetentionInDays" 1)) }}
+      {{- end }}
+      {{- if $eventhubs }}{{ $_ := set $namespace "resources" $eventhubs }}{{ end }}
+      {{- $template := dict "$schema" "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#" "contentVersion" "1.0.0.0" "resources" (list $namespace) "outputs" (dict "serviceBusEndpoint" (dict "type" "string" "value" (printf "[reference(resourceId('Microsoft.EventHub/namespaces', '%s'), '2026-01-01').serviceBusEndpoint]" $id))) }}
+      {{- $nested := dict "type" "Microsoft.Resources/deployments" "apiVersion" "2025-04-01" "name" (printf "[format('%s-{0}', uniqueString(deployment().name))]" .locals.symbol) "properties" (dict "mode" "Incremental" "expressionEvaluationOptions" (dict "scope" "inner") "template" $template) }}
+      resources:
+        {{ .locals.symbol }}: {{ toJson $nested }}
