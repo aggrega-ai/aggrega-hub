@@ -1,0 +1,293 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: azure-blob-storage
+  version: 1.0.0
+  # The values and infra.overrides keys this Recipe refuses are listed, with
+  # their reasons, in the comments above the assertions.
+  description: >
+    Azure Blob Storage: one standard general-purpose v2 storage account,
+    with the containers values.containers declares, declared by an Azure
+    Resource Manager template this Recipe writes, not by Microsoft's Azure
+    Verified Modules module avm/res/storage/storage-account, whose template
+    at 0.33.2 fails the catalog's check against the Azure Resource Manager
+    schemas.
+
+    Reach for it where the Release deploys an Azure Resource Manager
+    template; reach for terraform/azure-blob-storage where it deploys
+    Terraform. The account is locally redundant unless
+    infra.overrides.sku_name names another standard SKU, and new blobs go
+    to the Hot tier unless infra.overrides.access_tier names Cool or Cold.
+    Public network access is Enabled, from every network, unless
+    infra.overrides.public_network_access says otherwise; network rules
+    and the private endpoint are the operator's. Deleted blobs and
+    containers are kept seven days.
+
+    Shared Key authorization is off, so the account takes Microsoft Entra
+    ID alone; the role assignment granting a consumer access is the
+    operator's. host is an expression for the DNS name in the blob
+    endpoint the service reports, or infra.overrides.host; endpoint is
+    that URL, or one built on infra.overrides.host; dfs_endpoint is the
+    Data Lake Storage endpoint the service reports. An account name, SKU,
+    access tier, public network access value or infra.overrides key the
+    Recipe does not take halts naming it, as do resource_group_name,
+    enable_telemetry, and location and host given in a form they do not
+    take.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: arm
+  implements: core/storage/azure-blob-storage:1.0.0
+
+  # The account is declared by the fragment below: one nested deployment
+  # holding a Microsoft.Storage/storageAccounts resource, its
+  # Microsoft.Storage/storageAccounts/blobServices resource and a containers
+  # child of the blob service for each container, all at API version
+  # 2026-09-01, which the provider assembles into the boundary's template.
+  #
+  # Microsoft's Azure Verified Modules programme publishes a Bicep module for
+  # the service, avm/res/storage/storage-account, MIT, at 0.33.2 its newest
+  # version. Its parameters carry everything this Recipe sets, but its
+  # compiled template declares, in the nested deployments of its table
+  # service and object replication policy, a table with no properties and a
+  # parameter passed in neither the {"value": ...} nor the Key Vault
+  # reference form, each of which the catalog's check of every rendered
+  # template against the Azure Resource Manager schemas reports, whatever
+  # the parameters a Recipe passes. The module is therefore not sourced, and
+  # no module telemetry exists to turn off.
+  #
+  # The account and its children sit in a nested deployment of their own,
+  # evaluated in its own scope, whose template lists its resources in order
+  # rather than by symbolic name. The nested deployment publishes the
+  # account's primaryEndpoints as its output of the same name, which host,
+  # endpoint and dfs_endpoint read, once every container exists.
+  locals:
+    # The symbolic name of the nested deployment, folded from the instance id
+    # as the provider folds a sourced template's: ordersdata becomes
+    # Ordersdata.
+    symbol: '{{ capitalizedWords .context.instance_id }}'
+    # The SKU, infra.overrides.sku_name or Standard_LRS; the access tier,
+    # infra.overrides.access_tier or Hot; and public network access,
+    # infra.overrides.public_network_access or Enabled. Only a string is
+    # read for each; any other value is refused by the assertion below.
+    sku: '{{ $s := optional (optional .infra "overrides" dict) "sku_name" "Standard_LRS" }}{{ if typeIs "string" $s }}{{ $s }}{{ end }}'
+    access_tier: '{{ $s := optional (optional .infra "overrides" dict) "access_tier" "Hot" }}{{ if typeIs "string" $s }}{{ $s }}{{ end }}'
+    public_network_access: '{{ $s := optional (optional .infra "overrides" dict) "public_network_access" "Enabled" }}{{ if typeIs "string" $s }}{{ $s }}{{ end }}'
+    # The name the Release gives the blob service under infra.overrides.host,
+    # or empty while it gives none. Only a string is read here; any other
+    # value is refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # This Recipe reads from infra.overrides:
+  #   sku_name               - string (sku.name: Standard_LRS, Standard_ZRS, Standard_GRS,
+  #                            Standard_GZRS, Standard_RAGRS or Standard_RAGZRS;
+  #                            default Standard_LRS)
+  #   access_tier            - string (properties.accessTier: Hot, Cool or Cold; default Hot)
+  #   public_network_access  - string (properties.publicNetworkAccess: Enabled, Disabled
+  #                            or SecuredByPerimeter; default Enabled)
+  #   location               - string (location; default the resource group's region)
+  #   tags                   - map[string]string (tags of the account)
+  #   host                   - string (published as provides.host and in provides.endpoint;
+  #                            not written into the template)
+  # resource_group_name halts by name: the template deploys into the resource
+  # group it is deployed to, which no property of the account names.
+  # enable_telemetry halts by name too: the template is this catalog's own,
+  # with no module telemetry to turn on or off. Any other key halts naming it.
+  #
+  # Each is the key terraform/azure-blob-storage reads for the same concept,
+  # under the same spelling, and that Recipe also reads resource_group_name,
+  # since Terraform names the group a resource is created in; the property
+  # each sets is given in brackets. sku_name is the key every Azure Recipe
+  # reads for what a service is provisioned at, public_network_access the key
+  # for an Enabled or Disabled string of public access, and host the key every
+  # managed Recipe reads for the address it publishes.
+  #
+  # sku_name. Microsoft documents a standard general-purpose v2 account, the
+  # kind this Recipe creates, as locally redundant (LRS), zone-redundant
+  # (ZRS), geo-redundant (GRS) or geo-zone-redundant (GZRS), each geo option
+  # also with read access in the secondary region (RA-GRS, RA-GZRS); the
+  # Standard_ SKU of each is taken, and any other halts below: neither the
+  # premium nor the V2 SKUs name a standard general-purpose v2 account.
+  # Unset, the account is Standard_LRS, Microsoft's lowest-cost redundancy,
+  # which needs neither the availability zones zone redundancy replicates
+  # across nor the paired region geo redundancy copies to; Microsoft
+  # recommends zone or geo redundancy where more durability is wanted, and
+  # documents each as available in the regions that have what it needs.
+  #
+  # access_tier. Microsoft documents an account's default access tier, the
+  # online tier a new blob is created in unless the client names one, as
+  # Hot, Cool or Cold, and the archive tier as no default. Unset, it is Hot,
+  # the service's own default; any other value halts below.
+  #
+  # public_network_access. An account takes requests over its public
+  # endpoint or over a private endpoint in a virtual network. Unset or
+  # Enabled, public network access is on, and the template writes the
+  # service's default network rule set, allowing every network, so each
+  # request is still authenticated with Microsoft Entra ID; Disabled turns it
+  # off, and the account takes requests through a private endpoint alone;
+  # SecuredByPerimeter leaves public access to the access rules of the
+  # network security perimeter the operator associates with the account.
+  # This Recipe emits no private endpoint, perimeter or IP or virtual network
+  # rule: each is the operator's, created outside the Release, the way a
+  # virtual network's subnets and private DNS zones are. The network rule set
+  # is a property of the account, so each time Azure Resource Manager applies
+  # this template it writes the rule set again over rules made outside it.
+  #
+  # The template sets these account properties beside the ones the keys above
+  # set: kind StorageV2; isHnsEnabled from values.is_hns_enabled;
+  # allowSharedKeyAccess false, so the contract that no key reaches a
+  # consumer stands in the template itself; allowBlobPublicAccess false, so
+  # no container takes an anonymous request; allowCrossTenantReplication
+  # false; isLocalUserEnabled false; minimumTlsVersion TLS1_2; and
+  # supportsHttpsTrafficOnly true. The blob service keeps a deleted blob and
+  # a deleted container seven days, the retention Microsoft recommends at
+  # least, and each container takes publicAccess None. The service's own
+  # defaults stand for every property the template leaves out: encryption at
+  # rest with Microsoft-managed keys; and no managed identity,
+  # customer-managed key, blob versioning, change feed, point-in-time
+  # restore, lifecycle rule, SFTP, NFS, file share, queue, table, private
+  # endpoint, role assignment, diagnostic setting or lock. Microsoft
+  # documents that blob soft delete blocks the Data Lake Storage endpoint of
+  # an account without the hierarchical namespace, so with
+  # values.is_hns_enabled false a client reaches the account at endpoint.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation and the
+  # template reference for its resources:
+  #   honoured — values.containers, as the account's containers;
+  #     values.is_hns_enabled, as its hierarchical namespace; and the
+  #     overrides above.
+  #   refused — an account name the service refuses; a SKU, an access tier
+  #     or a public network access value outside those listed above;
+  #     infra.overrides.resource_group_name; enable_telemetry; location given
+  #     as anything but a string, and host as anything but a bare DNS name;
+  #     and any infra.overrides key not listed above. A container name the
+  #     service refuses is refused by the Component's own schema before this
+  #     Recipe renders.
+  #   not read — none.
+  #
+  # Credentials. With Shared Key authorization off, the account's keys
+  # authorize no request; the template lists no key and outputs none, and
+  # nothing reads them. Backup. Microsoft's Azure Backup protects blobs
+  # through a Backup vault and a backup instance created apart from the
+  # account, so this Recipe configures none.
+  assertions:
+    overrides_known: >-
+      {{- $known := list "sku_name" "access_tier" "public_network_access" "location" "tags" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "resource_group_name" -}}
+      {{- fail "infra.overrides.resource_group_name is set, and this Recipe creates the storage account in the resource group the template is deployed to, which no property of the account names: remove infra.overrides.resource_group_name from the Release, and deploy the template to that resource group" -}}
+      {{- end -}}
+      {{- if eq $k "enable_telemetry" -}}
+      {{- fail "infra.overrides.enable_telemetry is set, and this Recipe declares the storage account in a template of this catalog's own, which carries no telemetry to turn on or off: remove infra.overrides.enable_telemetry from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads sku_name, access_tier, public_network_access, location, tags and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $s := optional $o "sku_name" "Standard_LRS" -}}
+      {{- if not (has $s (list "Standard_LRS" "Standard_ZRS" "Standard_GRS" "Standard_GZRS" "Standard_RAGRS" "Standard_RAGZRS")) -}}
+      {{- fail (printf "infra.overrides.sku_name is %v, and this Recipe creates a standard general-purpose v2 account, which Microsoft offers as Standard_LRS, Standard_ZRS, Standard_GRS, Standard_GZRS, Standard_RAGRS or Standard_RAGZRS: set infra.overrides.sku_name to one of them, or remove it for Standard_LRS" $s) -}}
+      {{- end -}}
+      {{- $t := optional $o "access_tier" "Hot" -}}
+      {{- if not (has $t (list "Hot" "Cool" "Cold")) -}}
+      {{- fail (printf "infra.overrides.access_tier is %v, and Microsoft documents an account's default access tier as Hot, Cool or Cold: set infra.overrides.access_tier to one of them, or remove it for Hot" $t) -}}
+      {{- end -}}
+      {{- $p := optional $o "public_network_access" "Enabled" -}}
+      {{- if not (has $p (list "Enabled" "Disabled" "SecuredByPerimeter")) -}}
+      {{- fail (printf "infra.overrides.public_network_access is %v, and the account takes Enabled, Disabled or SecuredByPerimeter: set it to Disabled to turn off access from every network, or remove it to keep it Enabled" $p) -}}
+      {{- end -}}
+      {{- $l := optional $o "location" "" -}}
+      {{- if not (typeIs "string" $l) -}}
+      {{- fail (printf "infra.overrides.location is %v, and it names the one Azure region the account is created in: set it to a region's name, such as westeurope, or remove it for the resource group's region" $l) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (regexMatch `[/@\s:]` $h) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the DNS name a client of this account's blob service reaches it at, given alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the blob service answers HTTPS on port 443, and endpoint is built on the name` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The account is named after the component, and its name is also the
+    # first label of every address the service gives it under
+    # core.windows.net, so it is unique across Azure. Microsoft documents a
+    # storage account name as 3 to 24 lowercase letters and digits, the rule
+    # the template schema for the resource holds too; it is checked here,
+    # where the name is known.
+    account_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (regexMatch `^[a-z0-9]{3,24}$` $n) -}}
+      {{- fail (printf "the component %q names its storage account, and Microsoft documents a storage account name as 3 to 24 lowercase letters and digits, with no hyphen: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. A consumer
+  # receives each as written. The service reports the account's endpoints in
+  # primaryEndpoints: blob as https://<account>.blob.core.windows.net/ and dfs
+  # as https://<account>.dfs.core.windows.net/ in the public cloud, under its
+  # cloud's own domain elsewhere, and the nested deployment publishes them as
+  # its primaryEndpoints output. host reads blob from that output and takes
+  # the DNS name between https:// and the closing slash, so it holds whichever
+  # domain the service's cloud gives; endpoint is blob as the service reports
+  # it, and dfs_endpoint is dfs. Azure Resource Manager evaluates each
+  # expression when the template deploys, after the account and its containers
+  # exist, so it resolves for a consumer in the same template, through the
+  # link for a consumer in another arm template, and as text on another
+  # target.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the expression, and endpoint is https://<name>/. It is the
+  # operator's deterministic pointer: the compiler pipes it as text and looks
+  # nothing up, and this Recipe emits no DNS record for it, so the operator
+  # points the name at the account's blob service outside the Release. A
+  # client checking the service's certificate needs a name the certificate
+  # carries, which is the account's own name under blob.core.windows.net or
+  # the private link name that resolves to it. The name is the blob
+  # service's, so dfs_endpoint stays the expression.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}[split(reference('{{ .locals.symbol }}').outputs.primaryEndpoints.value.blob, '/')[2]]{{ end }}"
+    endpoint: "{{ if .locals.operator_host }}https://{{ .locals.operator_host }}/{{ else }}[reference('{{ .locals.symbol }}').outputs.primaryEndpoints.value.blob]{{ end }}"
+    dfs_endpoint: "[reference('{{ .locals.symbol }}').outputs.primaryEndpoints.value.dfs]"
+
+  # The fragment the provider assembles into the boundary's template: one
+  # nested deployment, named after its symbolic name and the deployment it
+  # runs in, deployed incrementally and evaluated in its own scope, as the
+  # provider deploys a sourced template. Its template declares the account,
+  # named after the component, in location or the resource group's region,
+  # with the sku and properties the comments above name; beside it, the
+  # account's blob service, named <account>/default as the service requires,
+  # deployed after the account; and each container as a child declared
+  # within the blob service, in the order of the names, each deployed after
+  # the blob service. A child declared within its parent carries its own
+  # name alone, which the resource's schema holds to 63 characters, the
+  # length a container's name takes, and the schema lists such children on a
+  # blob service declared beside its account, not within it. The template
+  # outputs the account's primaryEndpoints, which Azure Resource Manager
+  # reads once every resource of the template exists.
+  artifacts:
+    blob-storage.yaml: |
+      {{- $id := .context.instance_id }}
+      {{- $o := default dict .infra.overrides }}
+      {{- $location := default "[resourceGroup().location]" (optional $o "location" "") }}
+      {{- $network := dict "bypass" "AzureServices" "defaultAction" "Allow" }}
+      {{- $properties := dict "accessTier" .locals.access_tier "isHnsEnabled" (default false .values.is_hns_enabled) "allowSharedKeyAccess" false "allowBlobPublicAccess" false "allowCrossTenantReplication" false "isLocalUserEnabled" false "minimumTlsVersion" "TLS1_2" "supportsHttpsTrafficOnly" true "publicNetworkAccess" .locals.public_network_access "networkAcls" $network }}
+      {{- $account := dict "type" "Microsoft.Storage/storageAccounts" "apiVersion" "2026-09-01" "name" $id "location" $location "kind" "StorageV2" "sku" (dict "name" .locals.sku) "properties" $properties }}
+      {{- with optional $o "tags" "" }}{{ $_ := set $account "tags" . }}{{ end }}
+      {{- $containers := list }}
+      {{- range $name, $_ := (default dict .values.containers) }}
+      {{- $containers = append $containers (dict "type" "containers" "apiVersion" "2026-09-01" "name" $name "dependsOn" (list (printf "[resourceId('Microsoft.Storage/storageAccounts/blobServices', '%s', 'default')]" $id)) "properties" (dict "publicAccess" "None")) }}
+      {{- end }}
+      {{- $retention := dict "enabled" true "days" 7 }}
+      {{- $blob := dict "type" "Microsoft.Storage/storageAccounts/blobServices" "apiVersion" "2026-09-01" "name" (printf "%s/default" $id) "dependsOn" (list (printf "[resourceId('Microsoft.Storage/storageAccounts', '%s')]" $id)) "properties" (dict "deleteRetentionPolicy" $retention "containerDeleteRetentionPolicy" $retention) }}
+      {{- if $containers }}{{ $_ := set $blob "resources" $containers }}{{ end }}
+      {{- $template := dict "$schema" "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#" "contentVersion" "1.0.0.0" "resources" (list $account $blob) "outputs" (dict "primaryEndpoints" (dict "type" "object" "value" (printf "[reference(resourceId('Microsoft.Storage/storageAccounts', '%s'), '2026-09-01').primaryEndpoints]" $id))) }}
+      {{- $nested := dict "type" "Microsoft.Resources/deployments" "apiVersion" "2025-04-01" "name" (printf "[format('%s-{0}', uniqueString(deployment().name))]" .locals.symbol) "properties" (dict "mode" "Incremental" "expressionEvaluationOptions" (dict "scope" "inner") "template" $template) }}
+      resources:
+        {{ .locals.symbol }}: {{ toJson $nested }}
