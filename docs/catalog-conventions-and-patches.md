@@ -1214,7 +1214,7 @@ alternative.
 A cloud Recipe takes its name from the Component it realizes and the service it provisions:
 
 - **A Component that names one product has its Recipe take the bare Component name** on each provider, as
-  `recipe/helm/mariadb` does above: one realization per provider, the one that provisions the product itself.
+  `recipe/terraform/gcs` does: one realization per provider, the one that provisions the product itself.
 - **A Component that several services realize has each Recipe named `<component>-<service>`.** An engine Component
   (PostgreSQL, MySQL, Redis) or a neutral concept several clouds sell with the same pillars is realized by a different
   service on each cloud, so the name says which: `postgres-aurora`, `postgres-alloydb`, `postgres-cloud-sql`,
@@ -1224,7 +1224,7 @@ A cloud Recipe takes its name from the Component it realizes and the service it 
 - **No name carries a version, quality or temporal marker**, as "What a distinguisher must not be" sets out.
 
 The same rule names the Component of a cloud product: `core/<category>/<product>`, the vendor's product name
-lowercased and hyphenated, with the vendor prefix dropped unless that leaves a generic word. Four readings settle
+lowercased and hyphenated, with the vendor prefix dropped unless that leaves a generic word. These readings settle
 the doubtful cases:
 
 - an abbreviation the vendor uses as the product's name is the name (`sqs`, `sns`, `ecr`, `efs`, `gcs`);
@@ -1290,7 +1290,7 @@ A new key follows the two registers above, and the rule below names the spelling
   keeps that name (`host`, `subnet_group`, `instance_class`), even where the vendor's field is spelt otherwise.
   Across providers each provider's spelling stands, and a Component's `overrides` description says so.
 
-Two cases fall outside the rule and go to the catalog's maintainers before they land: a key no vendor field names (a
+These cases fall outside the rule and go to the catalog's maintainers before they land: a key no vendor field names (a
 catalog concept, such as a development default), and a key where two vendor spellings would collide on one
 Component.
 
@@ -2055,13 +2055,17 @@ source fails a test. Each target has its own preference:
   `recipe/arm/server-app-service` is a fragment, because the web-site module's template declares a property the
   vendor's resource schema does not list, which the catalog's check refuses. A Recipe that pins a module by its git
   repository moves to the registry only in a version made for another reason, never in a version made only for that.
+  A catalog-written template, the route `arm/server-app-service` and `arm/function-azure-functions` take, is outside
+  the arm provider's sensitive-mapping rule, which applies to a values mapping: a delivered value is written into the
+  template as delivered. That is a cost of the route, and a credential travels by a Key Vault reference instead.
 - **`terraform`: a published module** from terraform-aws-modules, `Azure/avm-res-*`, or terraform-google-modules and
   GoogleCloudPlatform, where it passes the tests of "A published Terraform module", and `enable_telemetry = false` on
-  a Verified Module. Otherwise a body the catalog writes, its `description` naming the failed test.
-  `recipe/terraform/postgres-aurora`,
-  `postgres-alloydb` and `postgres-flexible-server` source `terraform-aws-modules/rds-aurora`,
-  `GoogleCloudPlatform/alloy-db` and the Verified PostgreSQL module. `recipe/terraform/mysql-flexible-server` is a body,
-  because the Verified MySQL module declares no database or configuration resource and so is not complete;
+  a Verified Module, which a Recipe may let the Release turn on through `infra.overrides.enable_telemetry: true`, as
+  `terraform/postgres-flexible-server` 1.1.0 does. Otherwise a body the catalog writes, its `description` naming the
+  failed test. `recipe/terraform/postgres-aurora`, `postgres-alloydb` and `postgres-flexible-server` source
+  `terraform-aws-modules/rds-aurora`, `GoogleCloudPlatform/alloy-db` and the Verified PostgreSQL module.
+  `recipe/terraform/mysql-flexible-server` is a body, because the Verified MySQL module declares no database or
+  configuration resource and so is not complete;
   `server-app-service` is one, because the Verified web-site module calls a registry module; and
   `redis-memorystore` is one, as `valkey-memorystore` is.
 - **`cloudformation`: fragments**, as "A CloudFormation template" sets out. `recipe/cloudformation/postgres-aurora`
@@ -2559,8 +2563,9 @@ teaches how an author works with them.
 **Fixtures.** A fixture is a workspace of its own at `proofs/<target>/<group>/`,
 the target one of `arm`, `cloudformation`, `terraform-aws`, `terraform-azurerm`,
 `terraform-google` and `terraform-cloudflare`, the group naming what it proves.
-A `baseline` fixture holds one instance of the newest version of each cloud Recipe
-for its target, with a FeatureRecipe attached where a Recipe's slot asks for one.
+A `baseline` fixture holds one instance of a cloud Recipe for its target, with a FeatureRecipe
+attached where a Recipe's slot asks for one. The newest version of each cloud Recipe sits in the
+baseline or in a group fixture such as `managed-engines`.
 A fixture holds:
 
 - `.aggrega-config.yaml`, whose `workspace.catalog_dirs` names `./catalog` first
@@ -6025,7 +6030,7 @@ halts on a smaller bump than that classification requires; where its answer and
 these rules differ, the case is unclear too.
 
 One such case is settled. The linter compares a Recipe's authored fields, so it
-reads as a removal, and asks for a major version, a `valuesMapping` moved from an
+reads each of these as a removal and asks for a major version: a `valuesMapping` moved from an
 inline template to a `{$import: <Library>#/mappings/<Entry>}` reference, an
 `artifacts` list moved to a map of `$import` entries, and a `source` moved
 between fetch forms (a git clone to the same module's OCI registry) at the same
