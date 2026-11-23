@@ -47,8 +47,6 @@ resource "azurerm_cdn_frontdoor_origin_group" "this" {
   cdn_frontdoor_profile_id = azurerm_cdn_frontdoor_profile.this.id
   session_affinity_enabled = false
 
-  restore_traffic_time_to_healed_or_new_endpoint_in_minutes = 10
-
   load_balancing {
     sample_size                        = 4
     successful_samples_required        = 3
