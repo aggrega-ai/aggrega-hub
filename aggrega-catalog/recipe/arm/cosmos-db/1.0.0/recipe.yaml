@@ -1,0 +1,422 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: cosmos-db
+  version: 1.0.0
+  # The licence of the vendored module, the Azure Verified Modules programme's
+  # Azure Cosmos DB account module: the third-party template this Recipe pins
+  # and wraps in the output. The account it provisions is a service the
+  # reader contracts for directly with Microsoft, under Azure's terms.
+  license: MIT
+  # The values, attachments and infra.overrides keys this Recipe refuses are
+  # listed, with their reasons, in the comments above the assertions.
+  description: >
+    Azure Cosmos DB for NoSQL: one account, the database values.database
+    names and the containers values.containers declares, deployed from an
+    Azure Resource Manager template through Microsoft's Azure Verified
+    Modules module avm/res/document-db/database-account at 0.21.2, MIT,
+    fetched from mcr.microsoft.com and pinned by digest in entity.lock.
+
+    Reach for it where the Release deploys an Azure Resource Manager template
+    and the account lives in the operator's subscription; reach for
+    terraform/cosmos-db where the Release deploys Terraform. Public network
+    access is off unless infra.overrides.public_network_access_enabled is
+    true, which opens the account's public endpoint to every network, since
+    this Recipe sets no IP or virtual network rule; the private endpoint a
+    client reaches the account through while it is off is the operator's,
+    and none is emitted. The module deploys a telemetry resource by default,
+    reporting to Microsoft; this Recipe turns it off.
+
+    The account's keys are off, so it takes requests authenticated with
+    Microsoft Entra ID alone, and no key is written into the template or
+    published; the role assignment granting a consumer's identity access to
+    the account's data is the operator's, and none is emitted. host publishes
+    an expression for the account's DNS name, read from the endpoint the
+    service reports, or infra.overrides.host; port is 443; endpoint is the
+    URL the service reports, or one built on infra.overrides.host. Each
+    container takes 400 RU/s of its own, unless infra.overrides.throughput
+    gives the database that many RU/s to share among its containers. A value
+    or an infra.overrides key the service or the module cannot take halts
+    naming it, as do more than 25 containers sharing the database's
+    throughput and a partition key of more than three paths. The account
+    keeps the module's continuous backup, at its 30-day tier, unless a
+    core/backup attachment sets it, and such an attachment halts, naming the
+    Feature, where no FeatureRecipe for the arm capability realizes
+    core/backup.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: arm
+  implements: core/datastore/cosmos-db:1.0.0
+
+  # The module's compiled template, as the Azure Verified Modules programme
+  # publishes it to its registry at version 0.21.2, the module Bicep names
+  # br/public:avm/res/document-db/database-account:0.21.2. `aggrega pin`
+  # records the digests of its manifest and of its template layer in
+  # entity.lock, and every build reads exactly those bytes. The provider reads
+  # the template, main.json, and wraps it as one nested deployment. The
+  # template declares Microsoft.DocumentDB/databaseAccounts and its
+  # sqlDatabases and sqlDatabases/containers at API version
+  # 2026-04-01-preview, the database and each container in one of the
+  # module's own nested deployments, and passes the catalog's check of every
+  # rendered template against the Azure Resource Manager schemas.
+  source:
+    kind: bicep-module-oci
+    url: oci://mcr.microsoft.com/bicep/avm/res/document-db/database-account
+    version: 0.21.2
+
+  locals:
+    # The name the Release gives the account under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The symbolic name of the nested deployment this component becomes, the
+    # instance id folded into words, which the expressions in provides read.
+    symbol: '{{ capitalizedWords .context.instance_id }}'
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # A FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Azure Cosmos DB automated backups"
+
+  # This Recipe reads from infra.overrides:
+  #   throughput                     - integer (sqlDatabases[0].throughput, the RU/s the
+  #                                    database shares among its containers; unset, each
+  #                                    container takes 400 RU/s of its own)
+  #   public_network_access_enabled  - bool (networkRestrictions.publicNetworkAccess,
+  #                                    Enabled or Disabled; default false)
+  #   location                       - string (location; the module's default is the resource group's)
+  #   tags                           - map[string]string (tags)
+  #   enable_telemetry               - false alone (enableTelemetry, always false)
+  #   host                           - string (published as provides.host and in provides.endpoint;
+  #                                    not passed to the module)
+  # resource_group_name halts by name, as any key not listed does: the
+  # template deploys into the resource group it is deployed to, which no
+  # parameter of the module names. enable_telemetry: true halts by name, since
+  # telemetry is always off.
+  #
+  # Each is the key terraform/cosmos-db reads for the same concept, under the
+  # same spelling, and that Recipe also reads resource_group_name, since
+  # Terraform names the group a resource is created in; the module parameter
+  # each sets is given in brackets. public_network_access_enabled is the key
+  # every Azure Recipe reads for a boolean switch of public access, and host
+  # the key every managed datastore Recipe reads for the address it publishes.
+  #
+  # throughput. A container's throughput is its own, dedicated to it, or
+  # shared among the containers of a database that carries throughput of its
+  # own. Unset, the database carries none and each container takes 400 RU/s
+  # of its own, the module's default for a container and the service's
+  # minimum. Set, the database carries that many RU/s and its containers
+  # share them, taking none of their own. Microsoft's documentation of
+  # creating a database through the service's API takes manual throughput of
+  # at least 400 RU/s in steps of 100, which the assertions below check, and
+  # gives a shared throughput database 25 containers at most, as its service
+  # limits do, so more containers halt beside throughput. The service does
+  # not move a container between dedicated and shared throughput, so setting
+  # or removing throughput on a deployed database takes new containers.
+  #
+  # public_network_access_enabled. An account takes requests over its public
+  # endpoint, subject to its IP and virtual network rules, or over a private
+  # endpoint in a virtual network. Unset or false, public network access is
+  # Disabled and a client reaches the account only through a private
+  # endpoint; true enables it, and since this Recipe passes no IP rule and no
+  # virtual network rule, the public endpoint then takes requests from every
+  # network, each still authenticated with Microsoft Entra ID. This Recipe
+  # emits no private endpoint: it is the operator's, created for the account
+  # outside the Release, the way a virtual network's subnets and private DNS
+  # zones are.
+  #
+  # The module deploys a telemetry resource while its enableTelemetry parameter
+  # is true, its default: it reports the module and its version to Microsoft.
+  # Every Recipe that wraps a module of the Azure Verified Modules programme
+  # binds enableTelemetry to false, so the template deploys no telemetry. The
+  # module passes false to its own nested deployments on its own.
+  #
+  # The module's own defaults stand for every parameter this mapping leaves
+  # out. These are worth knowing: the account is provisioned, not serverless,
+  # with burst capacity on, no free tier, no analytical store, one region
+  # with automatic failover on, TLS 1.2 at least, and no managed identity,
+  # customer-managed key, CORS rule, private endpoint, role assignment,
+  # diagnostic setting or lock. These are replaced: zoneRedundant, whose
+  # default is true, by infra.ha.enabled; and publicNetworkAccess, which the
+  # module's networkRestrictions default leaves Disabled, by
+  # infra.overrides.public_network_access_enabled. disableLocalAuthentication
+  # and disableKeyBasedMetadataWriteAccess are written as true, their
+  # defaults, so the contract that no key reaches a consumer stands in the
+  # template itself.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation and the
+  # module's parameters:
+  #   honoured — values.database, as the account's one database;
+  #     values.containers, as its containers, each with its partition key;
+  #     values.consistency_level, as the account's default consistency
+  #     level; infra.ha.enabled, as the region's zone redundancy; a
+  #     core/backup attachment, as the comment above the mapping says; and
+  #     the overrides above.
+  #   refused — a database or container name longer than the service takes;
+  #     a partition key path the service refuses, or more than three paths;
+  #     more than 25 containers beside infra.overrides.throughput; an account
+  #     name the service refuses; and any infra.overrides key not listed
+  #     above.
+  #   not read — none.
+  #
+  # A partition key of one path takes the Hash kind; of two or three, the
+  # MultiHash kind, a hierarchical key, which the module and the service give
+  # up to three paths. Each key takes version 2, which takes partition key
+  # values up to 2,048 bytes long where version 1 takes 101, and which a
+  # MultiHash key requires. Microsoft's documentation of the service's API
+  # gives each path the form /AccountNumber, with no wildcard and no trailing
+  # slash.
+  #
+  # values.consistency_level BoundedStaleness takes the module's own bounds,
+  # 100,000 versions and 300 seconds, written into the mapping so that
+  # terraform/cosmos-db writes the same: the smallest bounds Microsoft's
+  # documentation gives an account of more than one region, and above the
+  # smallest it gives one of a single region, 10 versions and 5 seconds.
+  #
+  # Backup. Azure Cosmos DB backs up every account, in one of two modes:
+  # continuous, keeping every change for point-in-time restore across 7, 30
+  # or 35 days, and periodic, taking a full backup at an interval, every 4
+  # hours by default, and keeping each for 8 to 720 hours. The module writes
+  # continuous backup at its 30-day tier unless told otherwise. The mapping
+  # reads a core/backup attachment among the component's attachments, as the
+  # comment above it says. An attachment binds only where a FeatureRecipe for
+  # the arm capability realizes core/backup in the catalog the build reads;
+  # where none does, it halts at the Manifest, naming the Feature, and the
+  # account keeps its continuous backup, 30 days.
+  #
+  # Credentials. The module's key and connection string outputs carry the
+  # account's keys, which work for nothing while local authentication is off;
+  # nothing reads them.
+  assertions:
+    overrides_known: >-
+      {{- $known := list "throughput" "public_network_access_enabled" "location" "tags" "enable_telemetry" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "resource_group_name" -}}
+      {{- fail "infra.overrides.resource_group_name is set, and this Recipe creates the Azure Cosmos DB account in the resource group the template is deployed to, which no parameter of the template names: remove infra.overrides.resource_group_name from the Release, and deploy the template to that resource group" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads throughput, public_network_access_enabled, location, tags, enable_telemetry and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $t := optional $o "enable_telemetry" false -}}
+      {{- if not (and (kindIs "bool" $t) (not $t)) -}}
+      {{- fail (printf "infra.overrides.enable_telemetry is %v, and this Recipe turns the module's telemetry off in every template it writes, which no override turns on: remove infra.overrides.enable_telemetry from the Release, or set it to false" $t) -}}
+      {{- end -}}
+      {{- $p := optional $o "public_network_access_enabled" false -}}
+      {{- if not (kindIs "bool" $p) -}}
+      {{- fail (printf "infra.overrides.public_network_access_enabled is %v, and it switches the account's public network access as a boolean: set it to true to enable it, or to false or remove it to keep it disabled" $p) -}}
+      {{- end -}}
+      {{- if hasKey $o "throughput" -}}
+      {{- $n := get $o "throughput" -}}
+      {{- if not (and (or (kindIs "int" $n) (kindIs "int64" $n) (and (kindIs "float64" $n) (eq (float64 (int $n)) $n))) (ge (int $n) 400) (eq (mod (int $n) 100) 0)) -}}
+      {{- fail (printf "infra.overrides.throughput is %v, and Azure Cosmos DB takes a database's manual throughput as a whole number of RU/s, at least 400, in steps of 100: set infra.overrides.throughput to such a number, such as 400 or 1000, or remove it to give each container 400 RU/s of its own" $n) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $l := optional $o "location" "" -}}
+      {{- if not (typeIs "string" $l) -}}
+      {{- fail (printf "infra.overrides.location is %v, and it names the one Azure region the account is created in: set it to a region's name, such as westeurope, or remove it for the resource group's region" $l) -}}
+      {{- end -}}
+    # A database sharing its throughput takes 25 containers at most, as
+    # Microsoft's documentation of the service's limits and of creating a
+    # database gives it.
+    shared_throughput_containers: >-
+      {{- $n := len (default dict .values.containers) -}}
+      {{- if and (hasKey (optional .infra "overrides" dict) "throughput") (gt $n 25) -}}
+      {{- fail (printf "values.containers declares %d containers, and infra.overrides.throughput gives the database throughput its containers share, which Azure Cosmos DB gives 25 containers at most: declare 25 containers or fewer in the Aggregate, or remove infra.overrides.throughput from the Release so that each container takes 400 RU/s of its own" $n) -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (regexMatch `[/@\s:]` $h) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the DNS name a consumer of this account reaches it at, given alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the account answers HTTPS on port 443, and endpoint is built on the name` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The account is named after the component, and its name is also the first
+    # label of the address the service gives it under documents.azure.com, so
+    # it is unique across Azure; the rule Microsoft's documentation of Azure
+    # resource names gives an account name, 3 to 44 lowercase letters, digits
+    # and hyphens, beginning with a letter or a digit, is checked here, where
+    # the name is known.
+    account_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (regexMatch `^[a-z0-9][a-z0-9-]{2,43}$` $n) -}}
+      {{- fail (printf "the component %q names its Azure Cosmos DB account, and an account name holds 3 to 44 lowercase letters, digits and hyphens, beginning with a letter or a digit: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+    # Names and partition keys, read off Microsoft's documentation of the
+    # service's limits and of its API: a database or container name of up to
+    # 255 characters; a partition key path of the form /AccountNumber, with no
+    # wildcard and no trailing slash; up to three paths in a hierarchical key.
+    names_and_keys: >-
+      {{- $d := toString .values.database -}}
+      {{- if or (lt (len $d) 1) (gt (len $d) 255) -}}
+      {{- fail (printf "values.database is %d characters long, and Azure Cosmos DB takes a database name of 1 to 255 characters: set values.database in the Aggregate to such a name" (len $d)) -}}
+      {{- end -}}
+      {{- range $name, $c := (default dict .values.containers) -}}
+      {{- if gt (len $name) 255 -}}
+      {{- fail (printf "values.containers names a container of %d characters, and Azure Cosmos DB takes a container name of 1 to 255 characters: rename it in the Aggregate" (len $name)) -}}
+      {{- end -}}
+      {{- $paths := default list (get $c "partition_key_paths") -}}
+      {{- if gt (len $paths) 3 -}}
+      {{- fail (printf "values.containers.%s.partition_key_paths holds %d paths, and Azure Cosmos DB gives a hierarchical partition key up to three: keep three paths or fewer" $name (len $paths)) -}}
+      {{- end -}}
+      {{- range $p := $paths -}}
+      {{- if not (regexMatch `^/[^*]*[^/*]$` (toString $p)) -}}
+      {{- fail (printf "values.containers.%s.partition_key_paths holds %q, and Azure Cosmos DB takes a partition key path beginning with /, such as /tenantId, with no wildcard and no trailing slash: correct the path in the Aggregate" $name (toString $p)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. A consumer
+  # receives each as written. The service reports the account's endpoint as
+  # https://<account>.documents.azure.com:443/ in the public cloud, under its
+  # cloud's own domain elsewhere, and the module publishes it as its endpoint
+  # output. host reads that output from the nested deployment this component
+  # becomes and takes the DNS name between https:// and the port, so it holds
+  # whichever domain the service's cloud gives; endpoint is the output as the
+  # service reports it, the URL a client library takes. Azure Resource Manager
+  # evaluates each expression when the template deploys, after the account
+  # exists, so it resolves for a consumer in the same template, through the
+  # link for a consumer in another arm template, and as text on another
+  # target.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the expression, and endpoint is https://<name>:443/. It is the
+  # operator's deterministic pointer: the compiler pipes it as text and looks
+  # nothing up, and this Recipe emits no DNS record for it, so the operator
+  # points the name at the account outside the Release. A client checking the
+  # account's certificate needs a name the certificate carries, which is the
+  # account's own name under documents.azure.com or the private link name
+  # that resolves to it.
+  #
+  # port is 443, the port of the account's endpoint, over HTTPS. database is
+  # values.database.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}[split(split(reference('{{ .locals.symbol }}').outputs.endpoint.value, '/')[2], ':')[0]]{{ end }}"
+    port: "443"
+    endpoint: "{{ if .locals.operator_host }}https://{{ .locals.operator_host }}:443/{{ else }}[reference('{{ .locals.symbol }}').outputs.endpoint.value]{{ end }}"
+    database: "{{ .values.database }}"
+
+  # Each key binds the module parameter of the same name. The account is named
+  # after the component, as the other managed Recipes name theirs.
+  #
+  # The database is the module's one sqlDatabases entry, and each container
+  # one of its containers, in the order of their names. A container takes
+  # throughput 400 while the database carries none; otherwise it takes none,
+  # and the module leaves it sharing the database's.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside. The service backs up
+  # the account continuously, keeping every change for point-in-time restore,
+  # or periodically, keeping each full backup for a retention it is given:
+  #   - With none attached, the mapping writes no backup policy and the
+  #     account keeps the module's, continuous backup at its 30-day tier.
+  #   - An attachment carrying no infra.role_arn, with
+  #     infra.point_in_time_recovery left out or true, sets continuous backup
+  #     at the tier infra.retention_days names, 7 or 30; the service's 35-day
+  #     tier is one the module does not take, and any other number halts
+  #     naming the attachment. The Feature's own retention, 7 days, is the
+  #     tier the service keeps at no charge for backup storage.
+  #   - With infra.point_in_time_recovery false, it sets periodic backup:
+  #     a full backup every 240 minutes, the service's default interval,
+  #     each kept infra.retention_days days, 1 to 30, the service keeping
+  #     each for 720 hours at most, on geo-redundant storage, the service's
+  #     default; any other number halts naming the attachment. Microsoft
+  #     documents moving an account from periodic to continuous backup as
+  #     one-way, so periodic backup applies to an account created with it.
+  #   - infra.schedule halts naming the attachment in either mode: the
+  #     service backs up continuously or at an interval it counts from the
+  #     last backup, and takes no time of day.
+  #   - An attachment carrying infra.role_arn is AWS Backup's, whose
+  #     realizations refuse a host that is no Amazon RDS instance; this Recipe
+  #     configures nothing from it.
+  #   - Two attachments carrying no infra.role_arn halt naming both: an account
+  #     runs one backup policy.
+  # A Recipe's locals cannot read its attachments, so the reading sits at the
+  # top of the mapping below.
+  valuesMapping: |
+    {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
+    {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}
+    {{- range $name, $attachment := (default dict .features) -}}
+    {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
+    {{- $in := default dict (optional $attachment "infra" dict) -}}
+    {{- if not (trim (toString (optional $in "role_arn" ""))) -}}
+    {{- if $backupNative -}}
+    {{- fail (printf "core/backup attachments %q and %q on %q both set its backup policy, and an Azure Cosmos DB account runs one: remove one of the two" $backupNative $name $.context.instance_id) -}}
+    {{- end -}}
+    {{- $backupNative = $name -}}{{- $backupNativeInfra = $in -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $backupPeriodic := false -}}{{- $backupRetention := 0 -}}
+    {{- if $backupNative -}}
+    {{- with trim (toString (optional $backupNativeInfra "schedule" "")) -}}
+    {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Azure Cosmos DB backs an account up continuously, or at an interval it counts from the last backup, at no time of day a setting names: remove infra.schedule from the attachment" $backupNative $.context.instance_id .) -}}
+    {{- end -}}
+    {{- $backupRetention = int (optional $backupNativeInfra "retention_days" 7) -}}
+    {{- $backupPeriodic = eq (toString (optional $backupNativeInfra "point_in_time_recovery" "")) "false" -}}
+    {{- if $backupPeriodic -}}
+    {{- if or (lt $backupRetention 1) (gt $backupRetention 30) -}}
+    {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days with infra.point_in_time_recovery false, which sets periodic backup, and Azure Cosmos DB keeps a periodic backup 720 hours at most, which this Recipe sets from it: set infra.retention_days to a number from 1 to 30" $backupNative .context.instance_id $backupRetention) -}}
+    {{- end -}}
+    {{- else if not (has $backupRetention (list 7 30)) -}}
+    {{- fail (printf "core/backup attachment %q on %q keeps backups for %d days in infra.retention_days, which sets continuous backup, and Azure Cosmos DB keeps a continuous backup at a tier of 7, 30 or 35 days, of which the module this Recipe deploys takes 7 and 30: set infra.retention_days to 7 or 30, or infra.point_in_time_recovery to false for periodic backup, kept 1 to 30 days" $backupNative .context.instance_id $backupRetention) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $o := optional .infra "overrides" dict }}
+    {{- $shared := hasKey $o "throughput" }}
+    name: "{{ .context.instance_id }}"
+    {{- with optional $o "location" "" }}
+    location: "{{ . }}"
+    {{- end }}
+    zoneRedundant: {{ if .infra.ha.enabled }}true{{ else }}false{{ end }}
+    defaultConsistencyLevel: "{{ .values.consistency_level }}"
+    {{- if eq (toString .values.consistency_level) "BoundedStaleness" }}
+    maxStalenessPrefix: 100000
+    maxIntervalInSeconds: 300
+    {{- end }}
+    disableLocalAuthentication: true
+    disableKeyBasedMetadataWriteAccess: true
+    networkRestrictions:
+      publicNetworkAccess: {{ if optional $o "public_network_access_enabled" false }}Enabled{{ else }}Disabled{{ end }}
+    sqlDatabases:
+      - name: {{ toJson (toString .values.database) }}
+        {{- if $shared }}
+        throughput: {{ int (get $o "throughput") }}
+        {{- end }}
+        containers:
+        {{- range $name, $c := (default dict .values.containers) }}
+        {{- $paths := default list (get $c "partition_key_paths") }}
+          - name: {{ toJson $name }}
+            paths: {{ toJson $paths }}
+            kind: {{ if gt (len $paths) 1 }}MultiHash{{ else }}Hash{{ end }}
+            version: 2
+            {{- if not $shared }}
+            throughput: 400
+            {{- end }}
+        {{- else }} []
+        {{- end }}
+    {{- if $backupNative }}
+    {{- if $backupPeriodic }}
+    backupPolicyType: Periodic
+    backupIntervalInMinutes: 240
+    backupRetentionIntervalInHours: {{ mul $backupRetention 24 }}
+    backupStorageRedundancy: Geo
+    {{- else }}
+    backupPolicyType: Continuous
+    backupPolicyContinuousTier: Continuous{{ $backupRetention }}Days
+    {{- end }}
+    {{- end }}
+    {{- with optional $o "tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}
+    enableTelemetry: false
