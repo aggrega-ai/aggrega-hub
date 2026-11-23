@@ -26,10 +26,14 @@ metadata:
     under infra.overrides, and no realization creates or changes it. A
     consumer reads the record's name as host.
 
-    An alias record, a name the DNS service answers with the address of a
-    cloud resource it looks up, is not offered: type ALIAS halts the build on
-    every realization. Each Recipe's description says which record types and
-    names its service takes, and which it refuses by name.
+    The record types offered are A, AAAA, CAA, CNAME, MX, NS, PTR, SRV and
+    TXT. An alias record, a record whose answers the DNS service fills in by
+    looking up another name or a resource in its cloud, is not offered. The
+    Component itself halts the build, naming what to fix, on type ALIAS or
+    any other type, a record not in its type's form, a CNAME with more than
+    one record, a wildcard NS record set and a name longer than the DNS
+    standard allows, whichever Recipe binds. Each Recipe's description says
+    what else its service refuses.
   labels:
     component.aggrega.ai/type: resource
     component.aggrega.ai/category: network
@@ -63,7 +67,9 @@ spec:
           # Labels of letters, digits, hyphens and underscores, as DNS host
           # names and service labels such as _sip._tcp use, each of 1 to 63
           # characters, the leftmost one * for a wildcard, with or without
-          # the trailing dot; 253 characters at most without it.
+          # the trailing dot. maxLength counts the trailing dot when it is
+          # written; the name_length assertion below holds the DNS
+          # standard's 253 characters without it.
           pattern: "^(\\*\\.)?([A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?\\.)*[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?\\.?$"
           maxLength: 254
           description: >
@@ -71,16 +77,18 @@ spec:
             inside the zone the Release names; a trailing dot may be written
             or left out. The zone's own name places the record at the zone's
             apex. A leftmost label * makes it a wildcard record, answering for
-            every name below it that holds no record of its own. A realization
-            halts the build, naming this key, on a name outside the zone or one
-            its service does not take for the type.
+            every name below it that holds no record of its own; NS takes
+            none. A name longer than 253 characters without its trailing dot,
+            the DNS standard's limit, or a wildcard NS record set halts the
+            build, naming this key, as does, on each realization, a name
+            outside the zone or one its service does not take for the type.
         type:
           type: string
           description: >
             The record type, in upper case: A, AAAA, CNAME, MX, TXT, SRV, CAA,
-            NS or PTR. A realization writes a type its service takes and halts
-            the build, naming the type, on any other. ALIAS halts on every
-            realization, since an alias record is not offered.
+            NS or PTR. Any other type halts the build, naming it, ALIAS among
+            them, since an alias record is not offered; a realization whose
+            service lacks one of these types halts on it by name.
         ttl:
           type: integer
           min: 0
@@ -102,14 +110,16 @@ spec:
             192.0.2.10; an IPv6 address for AAAA; a domain name for CNAME, NS
             and PTR, and one entry alone for CNAME; the preference and the mail
             server for MX, such as 10 mail.example.com; the priority, weight,
-            port and target for SRV, such as 10 5 5060 sip.example.com; and the
-            flags, tag and value for CAA, such as 0 issue letsencrypt.org, the
-            value in double quotes or not. A TXT entry is the text itself,
-            without the quotation marks a zone file writes around it, and a
-            realization divides a long text into strings of the length its
-            service takes. A domain name in an entry may end in a dot or not.
-            A realization halts the build, naming this key, on an entry it
-            cannot read in its type's form or its service refuses.
+            port and target for SRV, such as 10 5 5060 sip.example.com, the
+            numbers of both from 0 to 65535; and the flags from 0 to 255, a tag
+            of letters and digits and the value for CAA, such as 0 issue
+            letsencrypt.org, the value in double quotes or not. A TXT entry is
+            the text itself, without the quotation marks a zone file writes
+            around it, and a realization divides a long text into strings of
+            the length its service takes. A domain name in an entry may end in
+            a dot or not. An entry not in its type's form, or a second entry
+            for CNAME, halts the build, naming this key, as does, on each
+            realization, an entry its service refuses.
     infra:
       # Operational Sizing — filled by the Operator in the Release. Developer
       # never sees this.
@@ -135,3 +145,77 @@ spec:
           resolves to the name its DNS service reports for the record once
           the record exists, so a consumer reads this rather than repeating
           values.name.
+
+  # What the DNS standard and every service realizing this Component hold
+  # alike, read from values alone, so each holds whichever Recipe renders the
+  # record and halts before anything renders. What one service refuses
+  # beyond these is that service's Recipes' own.
+  assertions:
+    # The DNS standard writes a domain name in at most 255 octets, which is
+    # 253 characters in the text form without the trailing dot.
+    name_length: >-
+      {{- $n := trimSuffix "." .values.name -}}
+      {{- if gt (len $n) 253 -}}
+      {{- fail (printf "values.name is %d characters long without its trailing dot, and the DNS standard writes a domain name in 253 characters at most: shorten values.name in the Aggregate" (len $n)) -}}
+      {{- end -}}
+    # The record types this Component offers, ALIAS by name.
+    type_offered: >-
+      {{- $t := .values.type -}}
+      {{- if eq $t "ALIAS" -}}
+      {{- fail "values.type is ALIAS, and this Component offers no alias record, a record whose answers the DNS service fills in by looking up another name or a resource in its cloud: write the record's data under type A, AAAA or CNAME in the Aggregate" -}}
+      {{- end -}}
+      {{- if not (has $t (list "A" "AAAA" "CAA" "CNAME" "MX" "NS" "PTR" "SRV" "TXT")) -}}
+      {{- fail (printf "values.type is %s, and this Component offers the record types A, AAAA, CAA, CNAME, MX, NS, PTR, SRV and TXT, written in upper case: set values.type to one of them in the Aggregate" $t) -}}
+      {{- end -}}
+    # NS records delegate one named child zone, and no service realizing
+    # this Component takes them under a wildcard.
+    wildcard_takes_type: >-
+      {{- if and (eq .values.type "NS") (hasPrefix "*." .values.name) -}}
+      {{- fail (printf "values.name %s is a wildcard, and a wildcard NS record set is not offered, since NS records delegate one named child zone: name the child zone the NS records delegate in the Aggregate, with no * label" .values.name) -}}
+      {{- end -}}
+    # Each entry in its type's form, as the DNS standard writes the type's
+    # data: an IPv4 address for A and an IPv6 address for AAAA; one domain
+    # name for CNAME, NS and PTR, and a single record for CNAME; the 16-bit
+    # preference of MX and priority, weight and port of SRV, 0 to 65535; and
+    # the 8-bit flags of CAA, 0 to 255, its tag of letters and digits.
+    records_form: >-
+      {{- $t := .values.type -}}
+      {{- $records := .values.records -}}
+      {{- if and (eq $t "CNAME") (gt (len $records) 1) -}}
+      {{- fail (printf "values.records holds %d entries for a CNAME record, and the DNS standard gives a name holding a CNAME record that one record alone: give values.records one entry in the Aggregate" (len $records)) -}}
+      {{- end -}}
+      {{- $octet := `(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])` -}}
+      {{- $v4 := printf `%s(\.%s){3}` $octet $octet -}}
+      {{- $h := `[0-9A-Fa-f]{1,4}` -}}
+      {{- $v6 := printf `^((%[1]s:){7}%[1]s|(%[1]s:){1,7}:|(%[1]s:){1,6}:%[1]s|(%[1]s:){1,5}(:%[1]s){1,2}|(%[1]s:){1,4}(:%[1]s){1,3}|(%[1]s:){1,3}(:%[1]s){1,4}|(%[1]s:){1,2}(:%[1]s){1,5}|%[1]s:(:%[1]s){1,6}|:((:%[1]s){1,7}|:)|(%[1]s:){6}%[2]s|::(%[1]s:){0,5}%[2]s|(%[1]s:){1}:(%[1]s:){0,4}%[2]s|(%[1]s:){2}:(%[1]s:){0,3}%[2]s|(%[1]s:){3}:(%[1]s:){0,2}%[2]s|(%[1]s:){4}:(%[1]s:){0,1}%[2]s|(%[1]s:){5}:%[2]s)$` $h $v4 -}}
+      {{- range $i, $e := $records -}}
+      {{- if eq $t "A" -}}
+      {{- if not (regexMatch (printf "^%s$" $v4) $e) -}}
+      {{- fail (printf "values.records[%d] is %q, and an A record holds one IPv4 address in dotted decimal, such as 192.0.2.10: correct it in the Aggregate" $i $e) -}}
+      {{- end -}}
+      {{- else if eq $t "AAAA" -}}
+      {{- if not (regexMatch $v6 $e) -}}
+      {{- fail (printf "values.records[%d] is %q, and an AAAA record holds one IPv6 address, such as 2001:db8::10: correct it in the Aggregate" $i $e) -}}
+      {{- end -}}
+      {{- else if has $t (list "CNAME" "NS" "PTR") -}}
+      {{- if not (regexMatch `^\S+$` $e) -}}
+      {{- fail (printf "values.records[%d] is %q, and a %s record holds one domain name, with no space in it: correct it in the Aggregate" $i $e $t) -}}
+      {{- end -}}
+      {{- else if eq $t "MX" -}}
+      {{- if not (and (regexMatch `^[0-9]{1,5}\s+\S+$` $e) (le (atoi (regexReplaceAll `\s.*$` $e "")) 65535)) -}}
+      {{- fail (printf "values.records[%d] is %q, and an MX record is a preference from 0 to 65535 and a mail server's domain name, such as 10 mail.example.com: correct it in the Aggregate" $i $e) -}}
+      {{- end -}}
+      {{- else if eq $t "SRV" -}}
+      {{- $ok := regexMatch `^[0-9]{1,5}\s+[0-9]{1,5}\s+[0-9]{1,5}\s+\S+$` $e -}}
+      {{- if $ok -}}{{- range $n := (slice (regexSplit `\s+` $e -1) 0 3) -}}{{- if gt (atoi $n) 65535 }}{{ $ok = false }}{{ end -}}{{- end -}}{{- end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "values.records[%d] is %q, and an SRV record is a priority, a weight and a port, each from 0 to 65535, and a target's domain name, such as 10 5 5060 sip.example.com: correct it in the Aggregate" $i $e) -}}
+      {{- end -}}
+      {{- else if eq $t "CAA" -}}
+      {{- $ok := regexMatch `^[0-9]{1,3}\s+[A-Za-z0-9]+\s+\S` $e -}}
+      {{- if $ok }}{{ $ok = le (atoi (regexReplaceAll `\s.*$` $e "")) 255 }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "values.records[%d] is %q, and a CAA record is flags from 0 to 255, a tag of letters and digits and a value, such as 0 issue letsencrypt.org: correct it in the Aggregate" $i $e) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
