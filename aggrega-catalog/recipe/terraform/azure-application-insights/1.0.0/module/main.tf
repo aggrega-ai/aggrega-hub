@@ -15,9 +15,13 @@ terraform {
   }
 }
 
-# One workspace-based Application Insights component, and nothing else: no
-# Log Analytics workspace, role assignment, private link scope, diagnostic
-# setting or resource group, each of which belongs to the operator.
+# One workspace-based Application Insights component, and nothing else that
+# this module declares: no Log Analytics workspace, role assignment, private
+# link scope, diagnostic setting or resource group, each of which belongs to
+# the operator. Azure itself creates an alert rule, Failure Anomalies -
+# <component name>, and an action group, Application Insights Smart
+# Detection, beside the component; Terraform does not track them and
+# destroy leaves them behind.
 #
 # The component stores its telemetry in the operator's workspace that
 # workspace_id names, and the service masks the client IP address of the
