@@ -1,0 +1,438 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: mysql-flexible-server
+  version: 1.0.1
+  description: >
+    MySQL on Azure Database for MySQL flexible server, one server with private
+    access in a delegated subnet of the operator's virtual network and the
+    database values.database names, rendered as Terraform for the azurerm
+    provider by a module kept beside this Recipe. The module Microsoft's Azure
+    Verified Modules programme publishes for the service is not sourced,
+    because it is not complete: it declares no database, so no character set
+    or collation, and no server parameter.
+
+    Reach for it where the database is a flexible server in the operator's
+    Azure subscription; reach for the RDS Recipes on AWS,
+    terraform/mysql-cloud-sql on Google Cloud, and the helm or compose Recipes
+    for a container. It needs hashicorp/azurerm 5.14 or later, so it goes in a
+    terraform boundary apart from terraform/postgres-flexible-server and
+    terraform/azure-api-management.
+
+    The resource group, region, delegated subnet and private DNS zone are the
+    operator's, named in infra.overrides, and none is emitted. values.user
+    names the server's administrator login and must be set; its password is
+    the core/random-password attachment on root_password, handed over as a
+    Terraform reference, so the rendered files carry no password, and another
+    credential halts naming the slot.
+
+    host publishes a reference to the server's FQDN, or infra.overrides.host;
+    port is 3306. Init scripts, a configuration file, a credential on
+    user_password, replicas, another port, a disk type, a storage size the
+    service does not offer and an infra.overrides key this Recipe does not
+    read halt naming the key; compute is not read, because
+    infra.overrides.sku_name sizes the server.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/datastore/mysql:1.0.0
+
+  # The server is declared by the module beside this Recipe, with the azurerm
+  # provider's azurerm_mysql_flexible_server, azurerm_mysql_flexible_database
+  # and azurerm_mysql_flexible_server_configuration resources.
+  #
+  # Microsoft's Azure Verified Modules programme publishes a module for this
+  # service, Azure/avm-res-dbformysql-flexibleserver/azurerm, MIT, at v0.1.9
+  # its newest version. It calls no module, but it declares the server alone:
+  # no database, so neither values.database nor the character set and
+  # collation this Component carries reach the server, and no server
+  # parameter, so the settings a raw configuration file would carry have
+  # nowhere to go. Refusing those would be this catalog's refusal rather than
+  # the service's, so the module is not sourced.
+  #
+  # source names that directory, ./module, rather than rendering the body as
+  # artifacts: a consumer in the same root configuration reads the server's
+  # address as the module's fqdn output, and that reference resolves in the
+  # boundary's root configuration, where this Recipe's valuesMapping becomes
+  # the arguments of its module block. Each file of the directory is pinned in
+  # entity.lock.
+  source: ./module
+
+  locals:
+    # The service's spelling of the MySQL version infra.engine_version begins
+    # with: 8.4 for 8.4 or 8.4.3, 8.0.21 for any 8.0, 5.7 for 5.7, and empty
+    # for any other, which the assertion below refuses. The service runs the
+    # newest minor version of the major version it is given.
+    version: '{{ get (dict "5.7" "5.7" "8.0" "8.0.21" "8.4" "8.4") (regexFind `^[0-9]+\.[0-9]+` (toString .infra.engine_version)) }}'
+    # The SKU, infra.overrides.sku_name or GP_Standard_D2ds_v4: two vCores of
+    # the General Purpose tier. The Burstable tier takes no high availability.
+    sku: '{{ optional (optional .infra "overrides" dict) "sku_name" "GP_Standard_D2ds_v4" }}'
+    # The name the Release gives the server under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # The FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Azure Database for MySQL flexible server automated backups"
+
+  # This Recipe reads from infra.overrides:
+  #   resource_group_name   - string (resource_group_name of the server, the
+  #                           database and each server parameter), required
+  #   location              - string (location), required
+  #   delegated_subnet_id   - string (delegated_subnet_id), required
+  #   private_dns_zone_id   - string (private_dns_zone_id), required
+  #   sku_name              - string (sku_name; default "GP_Standard_D2ds_v4")
+  #   zone                  - string (zone)
+  #   server_configuration  - map[string]{name: string, config: string} (one
+  #                           azurerm_mysql_flexible_server_configuration each,
+  #                           name and value)
+  #   tags                  - map[string]string (tags of the server)
+  #   host                  - string (published as provides.host; renders nothing)
+  #
+  # Each is named as terraform/postgres-flexible-server names the same
+  # concept for the same service family; every name but server_configuration
+  # and host is also the server argument it sets, and host is the key every
+  # managed datastore Recipe reads for the address it publishes.
+  # resource_group_name, location, delegated_subnet_id and private_dns_zone_id
+  # are required: they place the server in the operator's subscription and
+  # network, and this Recipe never chooses any of them. The server takes
+  # private access in delegated_subnet_id, a subnet's resource ID, whose subnet
+  # is delegated to Microsoft.DBforMySQL/flexibleServers; its name resolves
+  # through private_dns_zone_id, the resource ID of a private DNS zone whose
+  # name ends in .mysql.database.azure.com, linked to every virtual network a
+  # client resolves the server from. This Recipe emits neither: the subnet
+  # serves every flexible server placed in it, and the zone every server
+  # resolving through it.
+  #
+  # server_configuration carries the server parameters a raw configuration
+  # file would, one entry per parameter, as
+  # {<key>: {name: <parameter>, config: <value>}}, the shape
+  # terraform/postgres-flexible-server takes.
+  #
+  # enable_telemetry, which terraform/postgres-flexible-server reads, is not
+  # read here: the body is this catalog's, with no module telemetry to turn on
+  # or off, so the key halts by name like any other this Recipe does not read.
+  #
+  # The provider's own defaults stand for every argument the module leaves
+  # out. Three are worth knowing: the service picks the maintenance window;
+  # backups are kept in storage redundant within the region, not in the paired
+  # region; and data at rest is encrypted with a key Microsoft manages.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read, each measured against the service's own documentation:
+  #   honoured — values.database, as the database the module creates;
+  #     values.charset and values.collation, as its default character set and
+  #     collation; values.user, as the administrator login; the root_password
+  #     attachment, as the administrator's password; infra.engine_version (the
+  #     major versions 5.7, 8.0 and 8.4 the provider takes; the service lists
+  #     5.7 as retired, running on in Extended Support, which it charges for);
+  #     infra.storage.size, as the storage the server is created with, 20 to
+  #     16384 GiB (see the storage note below);
+  #     infra.ha.enabled, as zone-redundant high availability; a core/backup
+  #     attachment, as the comment above the mapping says; and the overrides
+  #     above.
+  #   refused — values.init_scripts; values.custom_config; values.user unset,
+  #     or a name the service refuses as the login; an attachment to
+  #     user_password; a credential on root_password other than
+  #     core/random-password; infra.port other than 3306;
+  #     infra.storage.type, since the service takes no disk type;
+  #     infra.ha.enabled on a Burstable SKU; infra.ha.read_replicas above
+  #     zero; and any infra.overrides key not listed above.
+  #   not read — infra.port while it is 3306; infra.compute.cpu and
+  #     infra.compute.memory, whose Component defaults would size a container:
+  #     the service sizes the server by infra.overrides.sku_name, and a Recipe
+  #     cannot tell those defaults from a value the Release wrote, so the
+  #     Component's descriptions say so instead.
+  #
+  # Storage auto-grow is on for every server: the service grows the storage
+  # as it fills, which keeps a full server from turning read-only, and it
+  # keeps auto-grow on for a server with high availability, where it cannot be
+  # turned off. Storage the service has grown cannot be shrunk, so the module
+  # does not read the size back: infra.storage.size is the size the server is
+  # created with, and raising it in the Release once the server exists changes
+  # nothing on the server, which the service grows instead.
+  #
+  # The service keeps the server's superuser account, azure_superuser, to
+  # itself, and creates one administrator login, named here by values.user, so
+  # values.user is required: with it unset there is no login to name, and
+  # root, which the Component means by leaving it out, is a name the provider
+  # refuses for that login. azurerm declares no resource for a further MySQL
+  # user, so the application user the Component's user_password slot is for is
+  # not created, and a credential on that slot halts.
+  #
+  # The administrator's password is the module's administrator_password: the
+  # password core/random-password's terraform/random-password realization draws
+  # at apply time, handed over as a Terraform reference, so no password is
+  # written into the rendered configuration; the apply keeps it in the
+  # Terraform state, where an operator can read it. Neither the service nor the
+  # module draws one. core/generated-secret states the service owns the
+  # credential, which it does not, and another credential either carries its
+  # value as text, which would be written into the configuration, or carries
+  # none the service could take, so both halt. The service takes 8 to 128
+  # characters holding three of upper-case letters, lower-case letters, digits
+  # and other characters; terraform/random-password draws at least one
+  # upper-case letter, one lower-case letter and one digit in every password,
+  # and core/random-password takes 8 to 128 characters.
+  assertions:
+    placement_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "resource_group_name" "location" "delegated_subnet_id" "private_dns_zone_id" -}}
+      {{- $v := optional $o $k "" -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "this Release places its flexible server in the operator's own Azure resource group, region, delegated subnet and private DNS zone, and this Recipe never chooses any of them, but infra.overrides.%s carries none: set infra.overrides.resource_group_name, infra.overrides.location, infra.overrides.delegated_subnet_id and infra.overrides.private_dns_zone_id in the Release" $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if not (regexMatch `(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Network/virtualNetworks/[^/]+/subnets/[^/]+$` $o.delegated_subnet_id) -}}
+      {{- fail (printf "infra.overrides.delegated_subnet_id is %q, and the flexible server takes the subnet it is placed in as the subnet's resource ID: set it to /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Network/virtualNetworks/<network>/subnets/<subnet>, a subnet delegated to Microsoft.DBforMySQL/flexibleServers" $o.delegated_subnet_id) -}}
+      {{- end -}}
+      {{- if not (regexMatch `(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Network/privateDnsZones/[^/]+\.mysql\.database\.azure\.com$` $o.private_dns_zone_id) -}}
+      {{- fail (printf "infra.overrides.private_dns_zone_id is %q, and a flexible server with private access resolves through a private DNS zone whose name ends in .mysql.database.azure.com, given as the zone's resource ID: set it to /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Network/privateDnsZones/<name>.mysql.database.azure.com" $o.private_dns_zone_id) -}}
+      {{- end -}}
+    overrides_known: >-
+      {{- $known := list "resource_group_name" "location" "delegated_subnet_id" "private_dns_zone_id" "sku_name" "zone" "server_configuration" "tags" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "enable_telemetry" -}}
+      {{- fail "infra.overrides.enable_telemetry is set, and this Recipe declares the server with a module of this catalog's own, which carries no telemetry to turn on or off: remove infra.overrides.enable_telemetry from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads resource_group_name, location, delegated_subnet_id, private_dns_zone_id, sku_name, zone, server_configuration, tags and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $sc := optional $o "server_configuration" "" -}}
+      {{- if not (eq (toString $sc) "") -}}
+      {{- if not (kindIs "map" $sc) -}}
+      {{- fail (printf "infra.overrides.server_configuration is %v, and this Recipe takes the server's parameters as a map, one entry per parameter: write it as {<key>: {name: <parameter>, config: <value>}}" $sc) -}}
+      {{- end -}}
+      {{- range $k, $e := $sc -}}
+      {{- if not (and (kindIs "map" $e) (typeIs "string" (optional $e "name" 0)) (typeIs "string" (optional $e "config" 0)) (eq (len $e) 2)) -}}
+      {{- fail (printf "infra.overrides.server_configuration.%s is %v, and each entry names one server parameter and its value as strings: write it as {name: <parameter>, config: <value>}" $k (toJson $e)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this database reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the server serves port 3306` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The server is named after the component, and its name is also the first
+    # label of the address the service gives it under mysql.database.azure.com,
+    # so it is unique across Azure; the rule the provider checks it against is
+    # checked here, where the name is known.
+    server_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (and (ge (len $n) 3) (le (len $n) 63) (regexMatch `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` $n)) -}}
+      {{- fail (printf "the component %q names its flexible server, and a server name holds 3 to 63 lowercase letters, digits and hyphens, beginning and ending with a letter or a digit: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+    # The MySQL major versions the azurerm provider takes for a server, each of
+    # which the service lists; its 9.5 is an innovation release it previews and
+    # removes after 30 days, which the provider does not take. A version the
+    # provider adds later is refused here until this Recipe names it.
+    engine_version_offered: >-
+      {{- if not .locals.version -}}
+      {{- fail (printf "infra.engine_version is %q, and the azurerm provider takes MySQL 5.7, 8.0 and 8.4 for an Azure Database for MySQL flexible server, which this Recipe reads off the major version the value begins with: set infra.engine_version in the Release to one of them, such as 8.4" (toString .infra.engine_version)) -}}
+      {{- end -}}
+    port_is_the_service_port: >-
+      {{- if ne (int .infra.port) 3306 -}}
+      {{- fail (printf "infra.port is %v, and Azure Database for MySQL flexible server serves MySQL on port 3306, which this Recipe publishes as port, and takes no other: remove infra.port from the Release" .infra.port) -}}
+      {{- end -}}
+    # The storage sizes the azurerm provider takes for a flexible server, in
+    # whole GiB.
+    storage: >-
+      {{- $size := toString .infra.storage.size -}}
+      {{- $gib := regexFind `^[0-9]+` $size -}}
+      {{- if not (and (regexMatch `^[0-9]+Gi$` $size) (ge (int $gib) 20) (le (int $gib) 16384)) -}}
+      {{- fail (printf "infra.storage.size is %q, and a flexible server's storage is provisioned in whole GiB from 20 to 16384; the Component's default sizes a container's volume: set infra.storage.size in the Release to such a size, such as 20Gi" $size) -}}
+      {{- end -}}
+      {{- with optional .infra.storage "type" "" -}}
+      {{- fail (printf "infra.storage.type is %q, and Azure Database for MySQL flexible server provisions its own storage and takes no disk type: remove infra.storage.type from the Release" .) -}}
+      {{- end -}}
+    ha_replicas: >-
+      {{- if not (regexMatch `^(B|GP|MO)_Standard_[A-Za-z0-9_]+$` .locals.sku) -}}
+      {{- fail (printf "infra.overrides.sku_name is %q, and a flexible server's SKU is its tier and compute size, B_Standard_, GP_Standard_ or MO_Standard_ followed by the size, such as GP_Standard_D2ds_v4: set infra.overrides.sku_name to one, or remove it for that default" .locals.sku) -}}
+      {{- end -}}
+      {{- if and .infra.ha.enabled (hasPrefix "B_" .locals.sku) -}}
+      {{- fail (printf "infra.ha.enabled is true, and infra.overrides.sku_name is %s, a Burstable SKU, which Azure Database for MySQL flexible server gives no high availability: set infra.overrides.sku_name to a General Purpose or Business Critical SKU, such as GP_Standard_D2ds_v4, or infra.ha.enabled to false" .locals.sku) -}}
+      {{- end -}}
+      {{- if gt (int .infra.ha.read_replicas) 0 -}}
+      {{- fail (printf "infra.ha.read_replicas is %v, and this Recipe provisions one server; a read replica is a server of its own: set infra.ha.read_replicas to 0" .infra.ha.read_replicas) -}}
+      {{- end -}}
+    # The service runs no initialisation scripts and reads no configuration
+    # file of the reader's; its server settings are server parameters. The
+    # administrator logins the service refuses are refused here first, where
+    # the build can name the key: the names it reserves, which the azurerm
+    # provider checks when Terraform plans except sa, which the service alone
+    # refuses at apply; a login longer than its 32 characters; and characters
+    # other than the letters, digits and underscores the provider takes.
+    values_the_service_cannot_apply: >-
+      {{- if optional .values "init_scripts" "" -}}
+      {{- fail "values.init_scripts asks for scripts run when the database is first initialised, and a flexible server runs none: remove values.init_scripts from the Aggregate and run them against the server once it exists, or map this component to a realization that initialises the database itself" -}}
+      {{- end -}}
+      {{- if optional .values "custom_config" "" -}}
+      {{- fail "values.custom_config asks for a server configuration file, and a flexible server reads none: its server settings are server parameters, which the Release names in infra.overrides.server_configuration; remove values.custom_config from the Aggregate" -}}
+      {{- end -}}
+      {{- $u := toString (optional .values "user" "") -}}
+      {{- if not $u -}}
+      {{- fail "values.user is unset, and Azure Database for MySQL flexible server creates one administrator login, which values.user names, while root, the account leaving it unset asks for, is a name the azurerm provider refuses for that login: set values.user in the Aggregate to the administrator's login" -}}
+      {{- end -}}
+      {{- if or (has (lower $u) (list "azure_superuser" "admin" "administrator" "root" "guest" "sa" "public")) (not (regexMatch `^[A-Za-z0-9_]{1,32}$` $u)) -}}
+      {{- fail (printf "values.user is %q, the flexible server's administrator login, and Azure Database for MySQL flexible server takes as that login up to 32 letters, digits and underscores other than azure_superuser, admin, administrator, root, guest, sa and public: set values.user in the Aggregate to such a name" $u) -}}
+      {{- end -}}
+    credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "user_password" -}}
+      {{- fail "a credential is attached to the user_password slot, and this Recipe creates the one administrator login values.user names, whose password is the root_password attachment; azurerm declares no resource for a further MySQL user: remove the attachment" -}}
+      {{- end -}}
+      {{- $ty := first (splitList ":" (toString (optional (optional $f "root_password" dict) "type" ""))) -}}
+      {{- if ne $ty "core/random-password" -}}
+      {{- fail (printf "the root_password slot is filled by %s, and this Recipe hands the flexible server its administrator's password as a Terraform reference to one drawn at apply time, which core/random-password publishes through terraform/random-password; neither the service nor this Recipe draws one, and another credential either carries its value as text, which would be written into the rendered configuration, or carries none the service could take: attach core/random-password to the root_password slot instead" (default "an attachment of no type" $ty)) -}}
+      {{- end -}}
+
+  # The String Pipe: the compiler does not interpret these strings. host names
+  # the fqdn output of this component's module — the server's name under
+  # mysql.database.azure.com, which resolves to its private address through
+  # the private DNS zone — through the module call the boundary's root
+  # configuration declares under .context.instance_id for a component
+  # declared in the Aggregate the Release deploys. Terraform resolves it at
+  # apply time, so it resolves only for a consumer authored as a source:
+  # Recipe in the same root configuration; a consumer on another target
+  # receives it as text.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record for it, so the operator points the name at the server outside
+  # the Release. A consumer in the same root configuration receives the name as
+  # well, and a name carries no reference for Terraform to order its module
+  # after this one by; a later syncWave on the consumer's boundary, sharing
+  # this boundary's directory, orders the two.
+  #
+  # port is 3306, where the service serves MySQL. user is the administrator
+  # login values.user names, and database the database the module creates.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.fqdn}{{ end }}"
+    port: "3306"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "mysql"
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own variable. The
+  # server is named after the component, as the other managed Recipes name
+  # theirs, and its storage is given in GiB, as the provider takes it.
+  #
+  # The administrator's password is the attachment's module output joined with
+  # a dot and wrapped in an interpolation, as terraform/random-password
+  # publishes it.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside. Azure Database for
+  # MySQL flexible server backs up every server, once a day at a time it
+  # chooses, and keeps the backups 1 to 35 days, so no setting turns them off
+  # and no time reaches them:
+  #   - With none attached, the server keeps its backups 7 days.
+  #   - An attachment carrying no infra.role_arn, bound to
+  #     terraform/backup-native, sets backup_retention_days from
+  #     infra.retention_days, 1 to 35, and a value outside it halts naming
+  #     the attachment; infra.schedule halts naming it, since the service
+  #     takes no backup time. The service keeps point-in-time recovery for
+  #     every server across that window, and no setting turns it off, so
+  #     infra.point_in_time_recovery left out or true is what it gives, and
+  #     false halts naming the attachment rather than being ignored.
+  #   - An attachment carrying infra.role_arn is AWS Backup's, whose
+  #     realizations refuse a host that is no Amazon RDS instance; this
+  #     Recipe configures nothing from it.
+  #   - Two attachments carrying no infra.role_arn halt naming both: a
+  #     server runs one automated backup.
+  # A Recipe's locals cannot read its attachments, so the reading sits at the
+  # top of the mapping below.
+  valuesMapping: |
+    {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
+    {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}
+    {{- range $name, $attachment := (default dict .features) -}}
+    {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
+    {{- $in := default dict (optional $attachment "infra" dict) -}}
+    {{- if not (trim (toString (optional $in "role_arn" ""))) -}}
+    {{- if $backupNative -}}
+    {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Azure Database for MySQL flexible server, which runs one automated backup on a server: remove one of the two" $backupNative $name $.context.instance_id) -}}
+    {{- end -}}
+    {{- $backupNative = $name -}}{{- $backupNativeInfra = $in -}}
+    {{- end -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $backupRetention := 7 -}}
+    {{- if $backupNative -}}
+    {{- with trim (toString (optional $backupNativeInfra "schedule" "")) -}}
+    {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Azure Database for MySQL flexible server backs up every server once a day at a time it chooses, which no setting moves: remove infra.schedule from the attachment" $backupNative $.context.instance_id .) -}}
+    {{- end -}}
+    {{- $backupRetention = int (optional $backupNativeInfra "retention_days" 7) -}}
+    {{- if or (lt $backupRetention 1) (gt $backupRetention 35) -}}
+    {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and Azure Database for MySQL flexible server keeps backups 1 to 35 days, which this Recipe sets from it: set infra.retention_days to a number in that range" $backupNative .context.instance_id $backupRetention) -}}
+    {{- end -}}
+    {{- if eq (toString (optional $backupNativeInfra "point_in_time_recovery" "")) "false" -}}
+    {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to false, and Azure Database for MySQL flexible server keeps point-in-time recovery for every server, across the retention window, with no setting that turns it off: remove infra.point_in_time_recovery from the attachment, or set it to true" $backupNative .context.instance_id) -}}
+    {{- end -}}
+    {{- end -}}
+    {{- $prov := optional (default dict .features).root_password "provides" dict }}
+    {{- if not (and (kindIs "map" $prov) (optional $prov "name" "") (optional $prov "key" "")) }}
+    {{- fail (printf "the root_password slot of %q is filled by an attachment that publishes no module output, and the administrator's password is handed to the flexible server as a reference to one: bind core/random-password to terraform/random-password in the Manifest" .context.instance_id) }}
+    {{- end }}
+    {{- $o := .infra.overrides }}
+    name: "{{ .context.instance_id }}"
+    resource_group_name: "{{ $o.resource_group_name }}"
+    location: "{{ $o.location }}"
+    mysql_version: "{{ .locals.version }}"
+    sku_name: "{{ .locals.sku }}"
+    storage_size_gb: {{ int (trimSuffix "Gi" (toString .infra.storage.size)) }}
+    administrator_login: "{{ .values.user }}"
+    administrator_password: "{{ printf "${%s.%s}" $prov.name $prov.key }}"
+    delegated_subnet_id: "{{ $o.delegated_subnet_id }}"
+    private_dns_zone_id: "{{ $o.private_dns_zone_id }}"
+    backup_retention_days: {{ $backupRetention }}
+    {{- if .infra.ha.enabled }}
+    high_availability_mode: "ZoneRedundant"
+    {{- end }}
+    {{- with optional $o "zone" "" }}
+    zone: "{{ . }}"
+    {{- end }}
+    database_name: "{{ .values.database }}"
+    charset: "{{ .values.charset }}"
+    collation: "{{ .values.collation }}"
+    {{- with optional $o "server_configuration" "" }}
+    server_configuration: {{ toJson . }}
+    {{- end }}
+    {{- with optional $o "tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}
+
+  # Written once, beside the boundary's root configuration rather than in the
+  # module, and shared by every component of the boundary that declares this
+  # file with these bytes: another component bound to this Recipe, or one whose
+  # Recipe configures azurerm the same way under the same name. The same name
+  # with other bytes halts the build. The azurerm provider refuses to plan
+  # without its features block, and the module carries no provider block of
+  # its own, so it inherits this configuration; the provider reads its
+  # credentials and subscription from the environment Terraform runs in.
+  # Terraform destroys the module's resources with it, so the file stays while
+  # any component declaring it does: remove the last of them from a Release
+  # only after destroying what their modules created, because with the file
+  # gone Terraform refuses to plan, asking for a provider block with the
+  # features argument.
+  boundary:
+    artifacts:
+      provider-azurerm.tf: |
+        provider "azurerm" {
+          features {}
+        }
