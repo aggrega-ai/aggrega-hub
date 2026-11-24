@@ -1,0 +1,317 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: dns-record-route-53
+  version: 1.0.0
+  # The values and infra.overrides keys this Recipe refuses are listed, with
+  # their reasons, in the comments above the assertions.
+  description: >
+    Amazon Route 53 on CloudFormation: one AWS::Route53::RecordSet written
+    into a hosted zone the operator already holds, which the cloudformation
+    provider assembles into the boundary's stack. infra.overrides.HostedZoneId
+    names the zone by its ID; no zone is declared or changed.
+
+    Reach for it where the Release deploys a CloudFormation stack; reach for
+    terraform/dns-record-route-53 where it deploys Terraform. The record set
+    takes A, AAAA, CAA, CNAME, MX, NS, PTR, SRV or TXT records. TXT text is
+    divided into quoted strings of 255 characters at most and a CAA value
+    quoted, as Route 53 takes them. Deleting the stack or removing the
+    component deletes the record set; the CloudFormation reference does not
+    say what the stack does with a record set of the same name and type
+    already in the zone.
+
+    host is a reference to the record set's name. The Component halts on an
+    alias record and on a record not in its type's form. This Recipe halts
+    on infra.overrides.AliasTarget, host or any key not listed,
+    HostedZoneId unset or not a string, more than 400 records, a value
+    longer than Route 53 takes alone or together, a domain name not in
+    ASCII and an entry repeated, each naming what to fix. Knowing the zone
+    by its ID alone, the build cannot see a name outside the zone or a
+    CNAME at its apex, which Route 53 documents it does not take.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: cloudformation
+  implements: core/network/dns-record:1.0.0
+
+  locals:
+    # The resource's logical id, derived from this instance's own name so that
+    # two records deployed into one stack describe two resources rather than
+    # one. A logical id is unique within a CloudFormation template and admits
+    # only letters and digits, so the instance name's separators are read as
+    # word boundaries and each word is capitalised: instance api-dns names
+    # the record set ApiDnsRecordSet.
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+    # values.name without its trailing dot and in lower case: Route 53 treats
+    # a name with and without the trailing dot as identical, and stores its
+    # letters in lower case however they are written (Amazon Route 53
+    # Developer Guide, "DNS domain name format").
+    fqdn: '{{ lower (trimSuffix "." .values.name) }}'
+    # The record set's values, each as Route 53 takes it in a
+    # ResourceRecords entry, as a JSON list:
+    #   A, AAAA, CNAME, NS and PTR   the entry as written;
+    #   MX and SRV                   the entry's fields joined by one space;
+    #   CAA                          flags, tag and the value in double
+    #                                quotes, its own quotes removed first;
+    #   TXT                          the text in double-quoted strings of 255
+    #                                characters at most, separated by a
+    #                                space, never divided inside a character.
+    # In a TXT text and a CAA value a double quote is written \" and a
+    # backslash \\, and every byte of a character outside the printable ASCII
+    # range, space to tilde, is written as a backslash and three octal digits,
+    # so the record carries the text's UTF-8 bytes. The Developer Guide
+    # ("Supported DNS record types", TXT and CAA) gives the quoting, the
+    # 255-character strings, the \" escape and the octal escape for the bytes
+    # 0 to 32 and 127 to 255; its NAPTR section gives the \\ escape for a
+    # backslash in a quoted string. A string's 255 characters are counted as
+    # written, an escape code at its full length, so no string carries more
+    # than 255 characters however Route 53 counts an escape.
+    values: >-
+      {{- $t := .values.type -}}
+      {{- $oct := dict -}}
+      {{- if has $t (list "TXT" "CAA") -}}{{- range $i := until 256 -}}{{- $_ := set $oct (printf "%02x" $i) (printf `\%03o` $i) -}}{{- end -}}{{- end -}}
+      {{- $out := list -}}
+      {{- range $e := .values.records -}}
+      {{- $f := regexSplit `\s+` $e -1 -}}
+      {{- if has $t (list "A" "AAAA" "CNAME" "NS" "PTR") -}}
+      {{- $out = append $out $e -}}
+      {{- else if has $t (list "MX" "SRV") -}}
+      {{- $out = append $out (join " " $f) -}}
+      {{- else -}}
+      {{- $text := $e -}}
+      {{- if eq $t "CAA" -}}
+      {{- $text = regexReplaceAll `^[0-9]+\s+\S+\s+` $e "" -}}
+      {{- if and (ge (len $text) 2) (hasPrefix `"` $text) (hasSuffix `"` $text) -}}{{- $text = trimSuffix `"` (trimPrefix `"` $text) -}}{{- end -}}
+      {{- end -}}
+      {{- $units := list -}}
+      {{- range $c := splitList "" $text -}}
+      {{- if eq $c `"` -}}{{- $units = append $units `\"` -}}
+      {{- else if eq $c `\` -}}{{- $units = append $units `\\` -}}
+      {{- else if regexMatch `^[ -~]$` $c -}}{{- $units = append $units $c -}}
+      {{- else -}}{{- $h := printf "%x" $c -}}{{- $u := "" -}}{{- range $i := until (int (div (len $h) 2)) -}}{{- $u = print $u (get $oct (substr (int (mul $i 2)) (int (add (mul $i 2) 2)) $h)) -}}{{- end -}}{{- $units = append $units $u -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if eq $t "CAA" -}}
+      {{- $out = append $out (printf `%s %s "%s"` (index $f 0) (index $f 1) (join "" $units)) -}}
+      {{- else -}}
+      {{- $strings := list -}}{{- $piece := "" -}}
+      {{- range $u := $units -}}{{- if gt (add (len $piece) (len $u)) 255 -}}{{- $strings = append $strings $piece -}}{{- $piece = "" -}}{{- end -}}{{- $piece = print $piece $u -}}{{- end -}}
+      {{- $out = append $out (printf `"%s"` (join `" "` (append $strings $piece))) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- toJson $out -}}
+
+  # The String Pipe: the compiler pipes this string verbatim into a
+  # consumer's injection context when it uses this record, and resolves none
+  # of it. host is a reference to the record set, whose Ref returns the name
+  # of the record (the AWS::Route53::RecordSet reference); the fragment
+  # writes that name without its trailing dot and in lower case, the form
+  # Route 53 stores its letters in. CloudFormation resolves the reference once
+  # the record set exists, so a consumer in the same stack is created after
+  # it. The provider projects the matching provides block inside the fragment
+  # below into the assembled stack Outputs; this recipe-level provides is the
+  # value-pipe contract, the fragment provides is the Outputs source, and
+  # they carry the same value. A consumer in another stack imports it through
+  # that Output.
+  provides:
+    host: "!Ref {{ .locals.logical_id }}RecordSet"
+
+  # This Recipe reads from infra.overrides:
+  #   HostedZoneId - string, required (HostedZoneId), the ID of the operator's
+  #                  Route 53 hosted zone the record set is written into
+  # AliasTarget halts by name, since the Component offers no alias record, and
+  # so does host: a record set is reached at the name values.name gives. Any
+  # other key halts naming it, Tags among them, which no cloudformation
+  # Recipe of this catalog reads, so a key misspelt, or meant for another
+  # Recipe, is never passed over unread.
+  #
+  # HostedZoneId is the property's own name, which is what a reader matches
+  # against the resource documentation, and the key
+  # cloudformation/aws-certificate-manager reads for the same zone. The zone
+  # is the operator's: a Route 53 hosted zone created outside the Release,
+  # given by its ID, such as Z0123456789ABCDEFGHIJ, the form the Ref of an
+  # AWS::Route53::HostedZone returns. The fragment declares no zone, and
+  # HostedZoneName, the resource's other way of naming the zone, is not
+  # read: the reference says CloudFormation does not create the stack where
+  # two hosted zones carry the name it gives, and an ID names one zone
+  # alone. HostedZoneId takes
+  # Replacement on update (the reference), so changing it creates the record
+  # set in the new zone and deletes it from the old one.
+  #
+  # The zone's own name is not in the Release, so the build cannot see
+  # whether values.name is in the zone or at its apex. The Developer Guide
+  # says a CNAME record cannot be created at the zone's apex ("Supported DNS
+  # record types", CNAME), and a record's name is a name in its hosted zone;
+  # neither is checked here, and what the stack meets on either is not
+  # measured. Route 53 creates the apex's NS and SOA record sets with a
+  # public hosted zone (Developer Guide, "NS and SOA records that Amazon
+  # Route 53 creates for a public hosted zone"), so NS records at the apex
+  # meet a record set of that name and type already in the zone, below.
+  #
+  # The Component's values, each read for the record set:
+  #   name. Name, without the trailing dot and in lower case. A leftmost *
+  #     label makes a wildcard record set, which the reference takes for every
+  #     type but NS; the Component refuses a wildcard NS record set itself.
+  #   type. Type. Route 53 takes every type the Component offers, so this
+  #     Recipe refuses none. The Component refuses every other type itself,
+  #     ALIAS by name: Route 53 keeps an alias as an A, AAAA or other record
+  #     set whose AliasTarget names an AWS resource or another record set in
+  #     the zone, and this Recipe never writes AliasTarget.
+  #   ttl. TTL, written as the string the resource takes. Route 53 takes 0 to
+  #     2,147,483,647 seconds (Amazon Route 53 API Reference,
+  #     ResourceRecordSet), every value the Component admits.
+  #   records. ResourceRecords, in the order given, each entry as the locals
+  #     above write it. The Component halts on an entry not in its type's
+  #     form, a second CNAME entry, an MX preference or an SRV priority,
+  #     weight or port outside 0 to 65535, and CAA flags outside 0 to 255. A
+  #     CAA tag of letters and digits, the form the Component holds, is what
+  #     the Developer Guide says Route 53 takes, so this Recipe refuses no
+  #     tag. The Developer Guide gives a CAA record's flags as 0, or 128 to
+  #     keep a certificate authority that does not support the tag from
+  #     issuing, and RFC 8659 has a record clear every other flag bit;
+  #     cfn-lint 1.60.1's pattern for a RecordSet's CAA records takes 0 and
+  #     128 alone. Other flags reach Route 53 as written.
+  #
+  # Route 53's own limits, held below where the build can see them: 400
+  # records in a record set (Developer Guide, "Quotas", records); a value of
+  # 4,000 characters at most (the AWS::Route53::RecordSet reference,
+  # ResourceRecords); 32,000 characters at most across the values of one
+  # ChangeResourceRecordSets request (the same "Quotas" page, maximums on
+  # API requests), each counted twice in an UPSERT, while the reference does
+  # not say which action CloudFormation takes to update a record set; a
+  # domain name in ASCII, an internationalized one in Punycode (Developer
+  # Guide, "DNS domain name format"); and ResourceRecords holding each value
+  # once (the resource schema's uniqueItems, as cfn-lint 1.60.1 carries it).
+  # A CNAME record set is the one record set of its name (Developer Guide,
+  # "Supported DNS record types"), which the zone, not the build, holds.
+  #
+  # A record set of the same name and type already in the zone. The
+  # AWS::Route53::RecordSet reference does not say what a stack creating a
+  # record set meets there, and this is not measured here: whether the
+  # stack's creation fails on it or the record set is taken over is not
+  # stated. A record set made outside the Release is best deleted, or the
+  # name changed, before the stack is deployed.
+  #
+  # Deletion and replacement. The record set keeps CloudFormation's own
+  # deletion policy, Delete: deleting the stack or removing the component
+  # deletes it. Renaming the component, which changes its logical id,
+  # creates a record set under the new id and deletes the old one in the
+  # stack's clean-up afterwards, so the creation meets the old record set,
+  # of the same name and type, still in the zone, above. Name, Type, TTL and
+  # ResourceRecords update without interruption (the reference).
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # or not read:
+  #   honoured — values.name, values.type, values.ttl and values.records; and
+  #     the override above.
+  #   refused by this Recipe — HostedZoneId unset, not a string or empty;
+  #     more than 400 entries; an entry written longer than 4,000 characters;
+  #     entries written longer than 32,000 characters together; a domain name
+  #     in an entry not in ASCII; an entry written as an earlier one is;
+  #     infra.overrides.AliasTarget and host; and any infra.overrides key not
+  #     listed above.
+  #   refused by the Component, whichever Recipe binds — a values.type other
+  #     than A, AAAA, CAA, CNAME, MX, NS, PTR, SRV and TXT, ALIAS by name; an
+  #     entry of values.records not in its type's form, or a second CNAME
+  #     entry; a wildcard NS record set; a values.name longer than the DNS
+  #     standard allows.
+  #   not read — none.
+  #
+  # The terraform Recipe of this Component holds the same rules on zone_id,
+  # its spelling of the zone: each target reads the key under its own
+  # spelling, so the rules cannot sit in the Component.
+  #
+  # What the fragment writes beside these: nothing. No routing policy, health
+  # check, set identifier or comment is written, so the record set is a
+  # simple one. Credentials. A record set holds none. Backup. Route 53 keeps
+  # no backup of a record set, and this Recipe configures none.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "HostedZoneId" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "AliasTarget" -}}
+      {{- fail "infra.overrides.AliasTarget is set, and this Recipe writes no alias record, a record whose answers Route 53 fills in by looking up an AWS resource or another record in the zone, which the DNS record Component does not offer: remove infra.overrides.AliasTarget from the Release, and give the record's data in values.records under type A, AAAA or CNAME in the Aggregate" -}}
+      {{- end -}}
+      {{- if eq $k "host" -}}
+      {{- fail "infra.overrides.host is set, and a record set is reached at the name values.name gives, which host publishes: remove infra.overrides.host from the Release, and set values.name in the Aggregate" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads HostedZoneId from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # HostedZoneId is required and written as the zone ID the resource takes.
+    hosted_zone_id: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if not (hasKey $o "HostedZoneId") -}}
+      {{- fail "infra.overrides.HostedZoneId is unset, and this Recipe writes the record set into the operator's own Route 53 hosted zone, which it never creates: set infra.overrides.HostedZoneId in the Release to the ID of the hosted zone holding values.name" -}}
+      {{- end -}}
+      {{- $z := $o.HostedZoneId -}}
+      {{- if not (and (typeIs "string" $z) $z) -}}
+      {{- fail (printf "infra.overrides.HostedZoneId is %s, and it is the ID of a Route 53 hosted zone, a string such as Z0123456789ABCDEFGHIJ: set it in the Release to the ID of the hosted zone holding values.name" (toJson $z)) -}}
+      {{- end -}}
+    # What Route 53 and the resource take of the entries the Component
+    # admits, each from the sources in the comments above.
+    records_taken: >-
+      {{- $t := .values.type -}}
+      {{- $records := .values.records -}}
+      {{- if gt (len $records) 400 -}}
+      {{- fail (printf "values.records holds %d entries, and Route 53 takes 400 records in a record set at most: give values.records 400 entries or fewer in the Aggregate" (len $records)) -}}
+      {{- end -}}
+      {{- if has $t (list "CNAME" "NS" "PTR" "MX" "SRV") -}}
+      {{- range $i, $e := $records -}}
+      {{- if not (regexMatch `^[!-~]+$` (last (regexSplit `\s+` $e -1))) -}}
+      {{- fail (printf "values.records[%d] is %q, and Route 53 takes a domain name in ASCII, an internationalized one converted to Punycode: write the domain name in ASCII in the Aggregate, in Punycode where it holds other letters" $i $e) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $total := 0 -}}
+      {{- $seen := dict -}}
+      {{- range $i, $v := fromJson .locals.values -}}
+      {{- if gt (len $v) 4000 -}}
+      {{- fail (printf "values.records[%d] is written to Route 53 as a value of %d characters, quotation marks and escape codes included, and Route 53 takes a value of 4000 characters at most: shorten it in the Aggregate" $i (len $v)) -}}
+      {{- end -}}
+      {{- if hasKey $seen $v -}}
+      {{- fail (printf "values.records[%d] is written to Route 53 as %s, as an earlier entry is, and the record set takes each value once: remove the repeated entry from the Aggregate" $i $v) -}}
+      {{- end -}}
+      {{- $_ := set $seen $v true -}}
+      {{- $total = add $total (len $v) -}}
+      {{- end -}}
+      {{- if gt (int $total) 32000 -}}
+      {{- fail (printf "values.records is written to Route 53 as %d characters in all, and Route 53 takes 32000 characters at most across the values of one change: give the record set fewer or shorter entries in the Aggregate" (int $total)) -}}
+      {{- end -}}
+
+  # The fragment the provider assembles into the boundary's stack. Every
+  # string is written as JSON, so a wildcard name's leading * and a TXT
+  # value's quotation marks stay strings in YAML.
+  artifacts:
+    template.yaml: |
+      {{- $l := .locals.logical_id }}
+      {{- $o := optional .infra "overrides" dict }}
+      Resources:
+        {{ $l }}RecordSet:
+          Type: AWS::Route53::RecordSet
+          Properties:
+            Name: {{ toJson .locals.fqdn }}
+            Type: {{ toJson .values.type }}
+            TTL: {{ toJson (toString (int .values.ttl)) }}
+            ResourceRecords: {{ .locals.values }}
+
+            ## ── Provider-specific overrides ─────────────────────────
+            HostedZoneId: {{ toJson $o.HostedZoneId }}
+
+      # Fragment provides: the provider projects each entry into the assembled
+      # stack Outputs and expands the short-form intrinsics to long form. Each
+      # output is named for this instance and the entry together, so two
+      # records in one stack keep their names apart. A cross-stack consumer
+      # imports this entry; an intra-stack consumer receives it through the
+      # value-pipe above.
+      provides:
+        host: !Ref {{ $l }}RecordSet
