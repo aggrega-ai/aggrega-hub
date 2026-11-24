@@ -1,0 +1,350 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: amazon-api-gateway
+  version: 1.0.0
+  # No metadata.license: this Recipe pins and vendors no third-party module.
+  # The module beside it is the catalog's own, and the API it declares is a
+  # service the reader contracts for directly with AWS, under AWS's terms.
+  description: >
+    Amazon API Gateway, rendered as Terraform for the AWS provider by a
+    module kept beside this Recipe: one HTTP API named after the component,
+    an aws_apigatewayv2_api with one HTTP proxy integration, the catch-all
+    $default route sending every request to it and the $default stage
+    deploying each change. The integration's URL is https://<host>:<port>
+    from what the upstream connection publishes, or, where
+    infra.overrides.connection_id names the operator's VPC link, the
+    listener or AWS Cloud Map service infra.overrides.integration_uri names.
+
+    host and endpoint publish Terraform references to the API's endpoint,
+    outputs of this component's module. infra.overrides.host publishes the
+    operator's DNS name instead and gives the API a custom domain with an
+    API mapping, presenting the certificate
+    infra.overrides.custom_endpoint_certificate_arn names; the DNS record is
+    the operator's. Tags label the API, its stage and its custom domain. No
+    VPC link, load balancer, certificate, log group or role is created.
+
+    An upstream publishing no host halts the build unless a VPC link is
+    named, as do connection_id or integration_uri without the other or of
+    another form, host or custom_endpoint_certificate_arn without the
+    other, a name the custom domain cannot take, tags that are not a map of
+    strings and any infra.overrides key not listed.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: terraform
+  implements: core/gateway/amazon-api-gateway:1.0.0
+
+  # Why the module is the catalog's own. terraform-aws-modules publishes
+  # terraform-aws-modules/apigateway-v2/aws, whose root, at 6.1.1, calls the
+  # registry module terraform-aws-modules/acm/aws for a custom domain's
+  # certificate, and a module this catalog sources calls no registry module
+  # in what it loads, so that one is not sourced. The resources below are
+  # the AWS provider's own, the ones that module declares for one HTTP API
+  # with one integration and its custom domain.
+  # The module sits beside this Recipe, rather than being written into the
+  # component's directory as an artifact, because its arguments carry the
+  # upstream's host, which may be a reference to another module's output:
+  # such a reference resolves only in the boundary's root configuration,
+  # where this component's module block takes its arguments.
+  source: ./module
+
+  locals:
+    # The name the Release gives the API under infra.overrides.host, or empty
+    # while it gives none. Only a string is read here; any other value is
+    # refused by the assertions below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The ARN of the certificate the custom domain presents, under
+    # infra.overrides.custom_endpoint_certificate_arn, or empty while the
+    # Release gives none. Only a string is read here.
+    certificate_arn: '{{ $c := optional (optional .infra "overrides" dict) "custom_endpoint_certificate_arn" "" }}{{ if typeIs "string" $c }}{{ $c }}{{ end }}'
+    # The ID of the operator's VPC link under infra.overrides.connection_id,
+    # or empty while the Release names none. Only a string is read here.
+    connection_id: '{{ $c := optional (optional .infra "overrides" dict) "connection_id" "" }}{{ if typeIs "string" $c }}{{ $c }}{{ end }}'
+
+  # The String Pipe: the compiler pipes these strings verbatim into a
+  # consumer's injection context when it uses this API, and resolves none of
+  # them. Each is a reference to an output of this component's module call:
+  # the module renders into the component's own directory, and the
+  # boundary's root configuration declares that directory as a module block
+  # named .context.instance_id for a component declared in the Aggregate the
+  # Release deploys. The references resolve only for a consumer authored as
+  # a source: Recipe in the same Terraform root configuration, which
+  # Terraform then applies after this module; a consumer on another target
+  # receives them as text. endpoint is the API's api_endpoint,
+  # https://<api-id>.execute-api.<region>.amazonaws.com, which the $default
+  # stage serves at its root, and host the same endpoint without its scheme.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference, and endpoint joins the scheme to it. It is the
+  # operator's deterministic pointer: the compiler pipes it as text and looks
+  # nothing up, and a consumer reading it carries no reference for Terraform
+  # to apply it after this API by. API Gateway answers a request for that
+  # name only through a custom domain presenting a certificate carrying it,
+  # so the module gives the API one, as set out below.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.host}{{ end }}"
+    endpoint: "{{ if .locals.operator_host }}https://{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.endpoint}{{ end }}"
+
+  # This Recipe reads from infra.overrides:
+  #   connection_id                   - string (aws_apigatewayv2_integration.connection_id, with connection_type VPC_LINK)
+  #   integration_uri                 - string (aws_apigatewayv2_integration.integration_uri, with connection_id only)
+  #   host                            - string (published as provides.host; aws_apigatewayv2_domain_name.domain_name)
+  #   custom_endpoint_certificate_arn - string (domain_name_configuration.certificate_arn)
+  #   tags                            - map[string]string (the API's, the stage's and the custom domain's tags)
+  # Any other key halts the build by name.
+  #
+  # connection_id and integration_uri are the AWS provider's own argument
+  # names, which is what a reader matches against the provider
+  # documentation. host is the key the catalog's Recipes of managed services
+  # read for the name a consumer reaches one at,
+  # custom_endpoint_certificate_arn the key the catalog's OpenSearch Service
+  # Recipe reads for the certificate a custom endpoint presents for that
+  # name, and tags the key the catalog's terraform AWS Recipes read for a
+  # resource's tags, so a Release names each the same way whichever Recipe
+  # it configures.
+  #
+  # connection_id and integration_uri, set together or not at all. Unset, the
+  # integration's connection_type is INTERNET and its integration_uri the
+  # upstream's URL, below. Set, the integration forwards through the
+  # operator's VPC link for HTTP APIs: connection_id is its ID, a string of 1
+  # to 1,024 characters as the AWS provider takes it, and integration_uri the
+  # ARN of the Application Load Balancer listener, Network Load Balancer
+  # listener or AWS Cloud Map service behind it, as the API Gateway
+  # reference for an integration's URI lists for an HTTP API private
+  # integration, arn:aws:elasticloadbalancing:<region>:<account>:
+  # listener/app|net/<name>/<id>/<id> or arn:aws:servicediscovery:<region>:
+  # <account>:service/srv-<id>. The VPC link, its subnets and security
+  # groups, the load balancer, its listener and target group, and the Cloud
+  # Map service are the operator's, named here and never created; the server
+  # behind them reaches the listener's target group by its own Recipe, such
+  # as terraform/server-ecs's target_group_arn. A VPC link integration takes
+  # no URL, so the upstream connection's host and port are not read, and
+  # which server stands behind the listener is the operator's to keep true.
+  # The module writes no tls_config, which names the server name API Gateway
+  # checks on the certificate of a listener serving HTTPS. Either key without
+  # the other, a connection_id that is not such a string, and an
+  # integration_uri of another form halt the build.
+  #
+  # host and custom_endpoint_certificate_arn, set together or not at all.
+  # Set, host is published as the API's name and the module declares an
+  # aws_apigatewayv2_domain_name of that name, a Regional custom domain
+  # presenting the certificate custom_endpoint_certificate_arn names, with an
+  # aws_apigatewayv2_api_mapping sending every request for it to the API's
+  # $default stage. API Gateway takes, for an HTTP API's custom domain, a
+  # Regional endpoint, TLS 1.2 as the minimum version, and a certificate
+  # from AWS Certificate Manager in the API's Region (the Developer Guide's
+  # "Custom domain names for HTTP APIs" and "Set up a Regional custom domain
+  # name"). The name is a DNS name of two labels or more and 255 characters
+  # at most, each label 1 to 63 letters, digits and hyphens neither
+  # beginning nor ending with a hyphen, the last two characters or more: the
+  # RFC 1035 rule that guide states, without the wildcard first label it
+  # also admits, since a wildcard is no name a consumer can reach. The
+  # certificate is named by its ARN,
+  # arn:aws:acm:<region>:<account>:certificate/<id>. A name without a
+  # certificate would be published to clients that cannot verify the API
+  # under it, and a certificate without a name configures nothing, so either
+  # alone halts, as do a name not bare or not of that form and an ARN of
+  # another form. The certificate, and the DNS record pointing the name at
+  # the custom domain's Regional domain name, which API Gateway reports for
+  # the domain once it exists, are the operator's: this Recipe creates
+  # neither, and the compiler looks neither up.
+  #
+  # tags tag the API, its stage and its custom domain, as a map from each tag
+  # name to a string; the integration, the route and the API mapping take no
+  # tags.
+  #
+  # The custom domain and the API's own endpoint. The module writes no
+  # disable_execute_api_endpoint, so the API keeps answering at its own
+  # endpoint beside the custom domain, as it does by default.
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # held by the Component's assertions, or not read:
+  #   honoured — the upstream connection's host and port, while no VPC link
+  #     is named, and the overrides above. The Component declares no values.
+  #   refused — an upstream target publishing no host while no VPC link is
+  #     named; connection_id or integration_uri without the other, a
+  #     connection_id that is not a string of 1 to 1,024 characters and an
+  #     integration_uri that is not a listener's or a Cloud Map service's
+  #     ARN; host or custom_endpoint_certificate_arn without the other, a
+  #     host that is not a bare DNS name the custom domain takes, and a
+  #     certificate ARN of another form; tags that are not a map of strings;
+  #     and any infra.overrides key not listed above.
+  #   held by the Component — a second connection on the upstream socket.
+  #   not read — none; the Component declares no other value or infra key.
+  #
+  # What the module writes beside these: nothing else of the API's own, so
+  # the AWS provider's defaults hold, which create the API the
+  # cloudformation Recipe of this Component leaves to API Gateway's own
+  # defaults, so both targets create the same API. The API answers over IPv4
+  # alone, with the provider's api_key_selection_expression and
+  # route_selection_expression, the service's own; the provider also sends
+  # the integration's passthrough_behavior, WHEN_NO_MATCH, which API Gateway
+  # reads for a WebSocket API alone. No CORS configuration is written, so
+  # API Gateway adds no CORS headers and passes a preflight request to the
+  # upstream like any other. The integration waits 30
+  # seconds for the upstream, API Gateway's default for an HTTP API, and
+  # passes the request through with no parameter mapping. The stage writes
+  # no default_route_settings, so no throttling of its own and no detailed
+  # metrics, and no access_log_settings, so no access log, which takes a log
+  # group of the operator's. The Region is the one the root configures for
+  # the AWS provider.
+  #
+  # The name and deletion. A destroy, or removing the component, deletes the
+  # API, its integration, route and stage, and the custom domain and its
+  # mapping; the VPC link, the listener, the certificate and the DNS record
+  # are the operator's and stay, the record then naming a domain that no
+  # longer exists. The API's name can change in place, but renaming the
+  # component renames its module block, so Terraform destroys the API and
+  # creates a new one, with a new identifier and so a new endpoint. The AWS
+  # provider replaces the custom domain when its name changes, so changing
+  # infra.overrides.host replaces the custom domain and its mapping.
+  #
+  # Credentials. API Gateway holds no credential a consumer needs: clients
+  # reach the API anonymously, and authenticating them is the upstream's
+  # work. The upstream is reached without one, so nothing is published but
+  # the API's address. Terraform authenticates to AWS with the credentials
+  # in the environment it runs in, so the rendered configuration names none.
+  # Backup. API Gateway keeps no data of its own, only its configuration,
+  # which this module declares, so no backup is configured.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "connection_id" "integration_uri" "host" "custom_endpoint_certificate_arn" "tags" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads connection_id, integration_uri, host, custom_endpoint_certificate_arn and tags from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # A VPC link integration takes the link and the ARN of what stands behind
+    # it together, and an integration without a link takes the upstream's
+    # URL, so the two keys are set together or not at all; each is passed to
+    # the resource as written, so one of another shape would render an
+    # argument the AWS provider or API Gateway refuses. The cloudformation
+    # Recipe of this Component holds the same rules on ConnectionId and
+    # IntegrationUri: each target reads the keys under its own spelling, so
+    # the rules cannot sit in the Component.
+    vpc_link: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "connection_id" -}}
+      {{- if not (and (typeIs "string" $o.connection_id) $o.connection_id (le (len $o.connection_id) 1024)) -}}
+      {{- fail (printf "infra.overrides.connection_id is %s, and it is the ID of the operator's VPC link for HTTP APIs, given as a string of 1 to 1,024 characters, as the AWS provider takes it: set it in the Release to that ID" (toJson $o.connection_id)) -}}
+      {{- end -}}
+      {{- if not (hasKey $o "integration_uri") -}}
+      {{- fail "infra.overrides.connection_id is set, and an integration through a VPC link forwards to the Application Load Balancer listener, Network Load Balancer listener or AWS Cloud Map service it names by ARN in integration_uri, which the Release leaves unset: set infra.overrides.integration_uri in the Release to that ARN, or remove infra.overrides.connection_id to forward to the upstream's host" -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "integration_uri" -}}
+      {{- if not (hasKey $o "connection_id") -}}
+      {{- fail "infra.overrides.integration_uri is set, and this Recipe reads it only as the listener or AWS Cloud Map service behind the VPC link infra.overrides.connection_id names, which the Release leaves unset; without a VPC link the integration's URL is the upstream's host: set infra.overrides.connection_id in the Release to the ID of the operator's VPC link, or remove infra.overrides.integration_uri" -}}
+      {{- end -}}
+      {{- $u := $o.integration_uri -}}
+      {{- if not (and (typeIs "string" $u) (regexMatch `^arn:aws[a-zA-Z-]*:(elasticloadbalancing:[a-z0-9-]+:[0-9]{12}:listener/(app|net)/[^/\s]+/[^/\s]+/[^/\s]+|servicediscovery:[a-z0-9-]+:[0-9]{12}:service/srv-[a-z0-9]+)$` $u)) -}}
+      {{- fail (printf "infra.overrides.integration_uri is %s, and an integration through a VPC link takes the ARN of an Application Load Balancer or Network Load Balancer listener, arn:aws:elasticloadbalancing:<region>:<account>:listener/app/<name>/<id>/<id> or listener/net/..., or of an AWS Cloud Map service, arn:aws:servicediscovery:<region>:<account>:service/srv-<id>: set it in the Release to such an ARN" (toJson $u)) -}}
+      {{- end -}}
+      {{- end -}}
+    # The name a consumer reaches the API at is a host name alone, with no
+    # scheme, path, user or port: the API serves HTTPS on 443.
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this API reaches it at, given as a DNS name alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the API serves HTTPS on 443` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The API answers a request for the operator's name only through a custom
+    # domain presenting a certificate carrying that name, so host and the
+    # certificate are set together, the name follows the rule for a custom
+    # domain's name given above, and the certificate is named by its AWS
+    # Certificate Manager ARN. The cloudformation Recipe of this Component
+    # holds the same rules on host and CustomEndpointCertificateArn, for the
+    # reason given above.
+    custom_domain: >-
+      {{- $c := optional (optional .infra "overrides" dict) "custom_endpoint_certificate_arn" "" -}}
+      {{- if not (or (kindIs "invalid" $c) (eq (toJson $c) `""`) (and (typeIs "string" $c) (regexMatch `^arn:aws[a-zA-Z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/[A-Za-z0-9-]+$` $c))) -}}
+      {{- fail (printf "infra.overrides.custom_endpoint_certificate_arn is %s, and it is the ARN of the AWS Certificate Manager certificate the API's custom domain presents, arn:aws:acm:<region>:<account>:certificate/<id>, in the API's Region: set it in the Release to that ARN" (toJson $c)) -}}
+      {{- end -}}
+      {{- $h := .locals.operator_host -}}
+      {{- if and $h (not .locals.certificate_arn) -}}
+      {{- fail (printf "infra.overrides.host is %q, and Amazon API Gateway answers a request for that name only through a custom domain presenting an AWS Certificate Manager certificate carrying it; without one, a client verifying the API's certificate cannot reach it by that name: set infra.overrides.custom_endpoint_certificate_arn in the Release to the ARN of a certificate carrying the name, or remove infra.overrides.host to publish the API's own endpoint" $h) -}}
+      {{- end -}}
+      {{- if and .locals.certificate_arn (not $h) -}}
+      {{- fail "infra.overrides.custom_endpoint_certificate_arn is set, and it is the certificate of the API's custom domain, whose name is infra.overrides.host, which the Release leaves unset or empty: set infra.overrides.host in the Release to the DNS name the certificate carries, or remove infra.overrides.custom_endpoint_certificate_arn" -}}
+      {{- end -}}
+      {{- if $h -}}
+      {{- if or (regexMatch `^[0-9]+(\.[0-9]+){3}$` $h) (contains ":" $h) -}}
+      {{- fail (printf "infra.overrides.host is %q, an IP literal, and the API's custom domain takes a DNS name, one the certificate it presents carries: set infra.overrides.host in the Release to the DNS name the certificate in infra.overrides.custom_endpoint_certificate_arn carries" $h) -}}
+      {{- end -}}
+      {{- $labels := splitList "." $h -}}
+      {{- $ok := and (ge (len $labels) 2) (le (len $h) 255) (ge (len (last $labels)) 2) -}}
+      {{- range $labels }}{{ if not (regexMatch `^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$` .) }}{{ $ok = false }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.host is %q, and the API's custom domain takes a DNS name of two labels or more and 255 characters at most, each label 1 to 63 letters, digits and hyphens neither beginning nor ending with a hyphen, the last two characters or more, and no wildcard, which names no host a consumer can reach: set infra.overrides.host in the Release to such a name, one the certificate in infra.overrides.custom_endpoint_certificate_arn carries" $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The AWS provider types tags as a map of strings.
+    tags_map: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "tags" -}}
+      {{- $g := get $o "tags" -}}
+      {{- $ok := kindIs "map" $g -}}
+      {{- if $ok }}{{ range $_, $v := $g }}{{ if not (typeIs "string" $v) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.tags is %s, and the API takes tags as a map from each tag name to a string: set it in the Release to such a map, or remove it" (toJson $g)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # Each key becomes an argument of this component's module block in the
+  # boundary's root configuration, named for the module's own variable. The
+  # upstream connection is read first: while no VPC link is named, the target
+  # it reaches must publish a host, and integration_uri is https://, the
+  # host, and a colon followed by the port where the target publishes one;
+  # API Gateway sends a request to the URL's default port, 443, where it
+  # carries none. The host is copied as the target publishes it: a name, or
+  # a reference to another module's output, which resolves in the
+  # boundary's root configuration for a target in the same boundary. Every
+  # request reaches the upstream with its full path, since the $default route
+  # sends the full request path to its integration (the Developer Guide's
+  # "Create routes for HTTP APIs"). Each tag reaches API Gateway as written:
+  # Terraform would read ${ and %{ inside a string as the start of an
+  # interpolation or a directive, so they are written $${ and %%{, which
+  # Terraform turns back into the characters written.
+  valuesMapping: |
+    {{- $o := optional .infra "overrides" dict }}
+    {{- $n := .context.instance_id }}
+    {{- $vpc := .locals.connection_id }}
+    {{- $host := "" }}
+    {{- $port := "" }}
+    {{- $hasPort := false }}
+    {{- range $alias, $edge := .context.uses }}
+    {{- if eq $edge.socket "upstream" }}
+    {{- $p := optional $edge "provides" dict }}
+    {{- if and (not $vpc) (not (hasKey $p "host")) }}
+    {{- fail (printf "the upstream connection %q of %q reaches %q, which publishes no host, and Amazon API Gateway forwards every request to the host its upstream publishes unless the Release names a VPC link: wire upstream in the Aggregate to a component that publishes host, or set infra.overrides.connection_id and integration_uri in the Release to the operator's VPC link and the listener or AWS Cloud Map service behind it" $alias $n $edge.target) }}
+    {{- end }}
+    {{- if hasKey $p "host" }}{{ $host = $p.host }}{{ end }}
+    {{- if hasKey $p "port" }}{{ $port = $p.port }}{{ $hasPort = true }}{{ end }}
+    {{- end }}
+    {{- end }}
+    name: "{{ $n }}"
+    {{- if $vpc }}
+    connection_id: {{ toJson $o.connection_id }}
+    integration_uri: {{ toJson $o.integration_uri }}
+    {{- else }}
+    integration_uri: "https://{{ $host }}{{ if $hasPort }}:{{ $port }}{{ end }}"
+    {{- end }}
+    {{- if .locals.operator_host }}
+    domain_name: "{{ .locals.operator_host }}"
+    certificate_arn: {{ toJson .locals.certificate_arn }}
+    {{- end }}
+    {{- with optional $o "tags" "" }}
+    tags: {{ toJson . | replace "${" "$${" | replace "%{" "%%{" }}
+    {{- end }}
