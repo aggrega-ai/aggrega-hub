@@ -1,0 +1,544 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: sql-server-rds
+  version: 1.0.0
+  # The values, infra keys and infra.overrides keys this Recipe refuses are
+  # listed, with their reasons, in the comments above the assertions.
+  description: >
+    SQL Server on Amazon RDS, rendered as an authored Terraform body, main.tf:
+    one aws_db_instance named after the component. infra.overrides.engine
+    chooses the edition, sqlserver-ex unless set, under the license-included
+    model, and infra.engine_version the release, 2017, 2019, 2022 or 2025;
+    the Web edition has no 2025.
+
+    RDS creates no database on a SQL Server instance, so values.database is
+    not read: the application creates that database under the master login
+    values.user names, and database publishes its name. values.collation is
+    the server collation. RDS generates the master password and keeps it in
+    AWS Secrets Manager: the password slot stays empty or takes
+    core/generated-secret, and any other credential halts the build.
+
+    host publishes a Terraform reference to the instance's address, an output
+    of this component's module, or infra.overrides.host; port publishes
+    infra.port. infra.ha.enabled sets multi_az, on the editions and releases
+    RDS keeps a standby for. A core/backup attachment bound to
+    terraform/backup-native sets the instance's automated backups; one asking
+    AWS Backup halts in the FeatureRecipe it is bound to.
+
+    The subnet group, security groups, parameter group and KMS key are the
+    operator's, named in infra.overrides, and none is created. A value RDS
+    cannot take, infra.compute, and any infra.overrides key not listed halt
+    the build naming the key.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: terraform
+  implements: core/datastore/sql-server:1.0.0
+
+  locals:
+    # The instance's identifier, the component's name.
+    db_identifier: "{{ .context.instance_id }}"
+    # The name the Release gives the instance under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value is
+    # refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # Names the backup this Recipe configures from a core/backup attachment.
+    # The FeatureRecipe binding such an attachment to the service's own backup
+    # reads it beneath its own locals, and halts on a host whose Recipe
+    # declares none, which would configure nothing from the attachment.
+    native_backup: "Amazon RDS automated backups"
+    # The edition, infra.overrides.engine or sqlserver-ex. Only a string is
+    # read here; any other value is refused by the assertion below.
+    engine: '{{ $e := optional (optional .infra "overrides" dict) "engine" "sqlserver-ex" }}{{ if typeIs "string" $e }}{{ $e }}{{ end }}'
+    # The major version infra.engine_version names, as the comment above the
+    # assertions says, and empty for a release RDS does not offer, which the
+    # assertion below refuses.
+    engine_version: '{{ get (dict "2017" "14.00" "2019" "15.00" "2022" "16.00" "2025" "17.00") (toString .infra.engine_version) }}'
+    # The instance class, infra.overrides.instance_class, or the class this
+    # Recipe takes for the edition, as the comment above the assertions says.
+    instance_class: '{{ $o := optional .infra "overrides" dict }}{{ $e := optional $o "engine" "sqlserver-ex" }}{{ $c := optional $o "instance_class" (get (dict "sqlserver-ex" "db.t3.small" "sqlserver-web" "db.t3.small" "sqlserver-se" "db.m6i.large" "sqlserver-ee" "db.m6i.xlarge") (toString $e)) }}{{ if typeIs "string" $c }}{{ $c }}{{ end }}'
+    # Whether the instance keeps a standby in another Availability Zone:
+    # infra.overrides.multi_az, or infra.ha.enabled while it is unset. Only a
+    # boolean is read here; any other value is refused by the assertion below.
+    multi_az: '{{ $m := optional (optional .infra "overrides" dict) "multi_az" .infra.ha.enabled }}{{ if kindIs "bool" $m }}{{ $m }}{{ end }}'
+
+  # The String Pipe: the compiler does not know host is a Terraform reference.
+  # It pipes the string; Terraform resolves it at apply time.
+  #
+  # host names the address output the body below declares, through this
+  # component's module call: the body renders into the component's own module
+  # directory, and the boundary's root configuration declares that directory as
+  # a module block named .context.instance_id for a component declared in the
+  # Aggregate the Release deploys. The reference resolves only for a consumer
+  # authored as a source: Recipe in the same Terraform root configuration; a
+  # consumer on another target receives it as text. The output is the
+  # instance's address attribute, its bare hostname; the provider's endpoint
+  # attribute is address:port.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record or alias for it, so the operator points the name at the instance
+  # outside the Release. A consumer in the same root configuration receives
+  # the name as well, and a name carries no reference for Terraform to order
+  # its module after this one by; a later syncWave on the consumer's boundary,
+  # sharing this boundary's directory, orders the two.
+  #
+  # port is the value the body sets on the instance, so it is known ahead of
+  # time and published as that value. user is the master login values.user
+  # names. database is values.database, the name of the database the
+  # application creates on the instance, since RDS creates none on SQL Server.
+  # protocol is sqlserver.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.address}{{ end }}"
+    port: "{{ .infra.port }}"
+    user: "{{ .values.user }}"
+    database: "{{ .values.database }}"
+    protocol: "sqlserver"
+
+  # This Recipe reads from infra.overrides:
+  #   engine              - string (engine, the edition; default "sqlserver-ex")
+  #   license_model       - string (license_model; "license-included", the default)
+  #   instance_class      - string (instance_class; default per edition, below)
+  #   multi_az            - bool (multi_az; defaults to infra.ha.enabled)
+  #   subnet_group        - string (db_subnet_group_name)
+  #   parameter_group     - string (parameter_group_name)
+  #   vpc_security_groups - []string (vpc_security_group_ids)
+  #   kms_key_id          - string (kms_key_id, a key ARN; also sets storage_encrypted true)
+  #   deletion_protection - bool (deletion_protection)
+  #   tags                - map[string]string (tags)
+  #   host                - string (published as provides.host; renders nothing)
+  # Any other key halts naming it, so a key misspelt, or meant for another
+  # Recipe, is never passed over unread.
+  #
+  # A key is the Terraform argument name, which is what a reader matches
+  # against provider documentation, unless the catalog's AWS Recipes share one
+  # spelling for a concept: subnet_group, parameter_group and
+  # vpc_security_groups are the names other AWS Recipes in the catalog read
+  # for a subnet group, a parameter group and security groups, and the table
+  # gives the argument each one sets in parentheses; every key
+  # terraform/postgres-rds reads is read here under the same name. host is
+  # the exception to the naming: it is no argument of the resource but the
+  # address a consumer reaches the database at, under the name every managed
+  # datastore Recipe of this catalog reads for it. host is a bare DNS name or
+  # IP literal. The assertion below refuses a value carrying a scheme, a path,
+  # a user, a port or whitespace, because a consumer composes its connection
+  # from host and port and would compose a broken one; the port is infra.port.
+  #
+  # engine is the edition: sqlserver-ee (Enterprise), sqlserver-se (Standard),
+  # sqlserver-ex (Express) or sqlserver-web (Web). RDS also runs the Developer
+  # editions, sqlserver-dev-ee and sqlserver-dev-se, only from a custom engine
+  # version the operator creates from installation media of their own, and
+  # license_model bring-your-own-media launches Enterprise and Standard from
+  # such a version too; that version is named by its full minor version,
+  # which infra.engine_version's year does not name and no key of this Recipe
+  # carries, so both halt the build. The Recipe writes license_model
+  # license-included on every instance: the RDS User Guide states that a
+  # request naming no license model fails once the account holds a
+  # bring-your-own-media version of the engine version it asks for.
+  #
+  # instance_class sizes the instance. Unset, it is a class the edition takes
+  # on every release this Recipe offers, from the RDS User Guide's table of DB
+  # instance class support for SQL Server: db.t3.small for Express and Web,
+  # db.m6i.large for Standard and db.m6i.xlarge for Enterprise. Which other
+  # class an edition and release take, RDS checks when Terraform applies.
+  #
+  # subnet_group, vpc_security_groups, parameter_group and kms_key_id name the
+  # operator's subnet group, security groups, parameter group and KMS key,
+  # which this Recipe never creates. kms_key_id is the key's ARN, the form the
+  # AWS provider's kms_key_id takes (it refuses a key ID or an alias name),
+  # and encrypts the instance's storage with that key. Unset, RDS takes the
+  # account's default DB subnet group, where it has one, the default parameter
+  # group for the engine and version, and the VPC's default security group,
+  # and the storage is not encrypted. deletion_protection takes true or false,
+  # false as RDS creates an instance. tags tag the instance, as a map from
+  # each tag name to a string.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read:
+  #   honoured — values.user, as username; values.collation, as
+  #     character_set_name, the server collation; infra.port, as port;
+  #     infra.engine_version, as engine_version; infra.storage.size, as
+  #     allocated_storage; infra.storage.type, as storage_type (gp3 when
+  #     unset); infra.ha.enabled, as multi_az; a core/backup attachment, as
+  #     the comment above the body says; the password slot left empty or bound
+  #     to core/generated-secret; and the overrides above.
+  #   refused — a component name RDS does not take as an instance identifier;
+  #     infra.engine_version naming a release RDS does not offer on the
+  #     edition; infra.port outside what RDS takes; infra.compute.cpu and
+  #     infra.compute.memory, since instance_class sizes the instance;
+  #     infra.storage.type other than gp2, gp3 and standard, and
+  #     infra.storage.size outside what RDS takes for the type; values.user
+  #     not a login name RDS takes; infra.ha.enabled or multi_az true on an
+  #     edition and release RDS keeps no standby for; any other credential on
+  #     the password slot; an engine or a license_model not taken here; an
+  #     override of the wrong shape; and any infra.overrides key not listed
+  #     above. A core/backup attachment carrying infra.role_arn is refused by
+  #     the FeatureRecipe it is bound to, as the comment above the body says.
+  #   not read — values.database: RDS creates no database when it creates a
+  #     SQL Server instance (the AWS provider's db_name "does not apply for
+  #     Oracle or SQL Server engines"), so the application creates it under
+  #     the master login, and database publishes the name it creates.
+  #
+  # The identifier. The instance is named after the component, and RDS takes
+  # an identifier of 1 to 63 letters, digits and hyphens, beginning with a
+  # letter, neither ending with a hyphen nor holding two in a row (the
+  # CreateDBInstance reference); the AWS provider takes its letters in lower
+  # case alone. A component name outside that rule halts the build.
+  #
+  # The release. infra.engine_version names a SQL Server release by its year,
+  # and the body sets engine_version to the release's major version, which
+  # the RDS User Guide's page of SQL Server versions on Amazon RDS lists:
+  # 14.00 for 2017, 15.00 for 2019, 16.00 for 2022 and 17.00 for 2025. RDS
+  # creates the instance at a recent minor version of it, which the provider
+  # reports as engine_version_actual. RDS stopped creating SQL Server 2016
+  # instances on 15 January 2026, and the DB instance class table names no
+  # Web edition of SQL Server 2025, so 2016, 2025 on sqlserver-web and any
+  # other year halt the build naming infra.engine_version.
+  #
+  # The collation. RDS takes a server-level collation for a SQL Server
+  # instance as character_set_name, and a database created on it without a
+  # collation of its own takes the server's. Unset, RDS creates the instance
+  # with its default, SQL_Latin1_General_CP1_CI_AS. The build passes the name
+  # as written, and RDS refuses one it does not take. The collation is fixed
+  # when the instance is created.
+  #
+  # The master login. RDS takes a master user name of 1 to 128 characters,
+  # letters, digits and underscores, beginning with a letter (the
+  # CloudFormation resource schema's pattern for the same setting), and not a
+  # word the engine reserves; SQL Server keeps sa, dbo, guest,
+  # INFORMATION_SCHEMA and sys, and the fixed server roles sysadmin,
+  # serveradmin, securityadmin, processadmin, setupadmin, bulkadmin,
+  # diskadmin, dbcreator and public, for principals of its own (its
+  # documentation of the Database Engine's principals and of server-level
+  # roles), and a login cannot take a server role's name. The master user name
+  # is fixed when the instance is created.
+  #
+  # The port. RDS takes a SQL Server port from 1150 to 65535, other than 1234,
+  # 1434, 3260, 3343, 3389, 47001 and 49152 to 49156 (the CreateDBInstance
+  # reference), and the Component's 1433 is its default.
+  #
+  # The storage. infra.storage.size is allocated_storage in whole gibibytes,
+  # and infra.storage.type the RDS storage type, gp3 when unset. RDS takes 20
+  # to 16384 GiB of gp2 or gp3 and 20 to 1024 GiB of standard, magnetic,
+  # storage on every SQL Server edition (the CreateDBInstance reference). io1
+  # and io2 take a provisioned IOPS figure RDS requires with them, which no
+  # key of this Recipe carries, so both halt.
+  #
+  # High availability. RDS keeps a standby in another Availability Zone for
+  # SQL Server Enterprise and Standard on every release offered here, and for
+  # SQL Server 2022 Web from 16.00.4215.2; it keeps none for Express, nor for
+  # Web on 2017 and 2019 (the RDS User Guide's Multi-AZ page for SQL Server).
+  # multi_az true, from infra.ha.enabled or the override, halts on those,
+  # naming the key that set it.
+  #
+  # The master password. RDS generates it and keeps it in AWS Secrets Manager
+  # (manage_master_user_password), so a credential attached to the password
+  # slot would reach no byte of the output while the build reads as if it had
+  # set it. The slot stays empty, or takes core/generated-secret, which says
+  # the service owns the password and renders nothing; any other credential
+  # halts naming what filled the slot. The type is compared with any version
+  # set aside.
+  assertions:
+    overrides_known: >-
+      {{- $known := list "engine" "license_model" "instance_class" "multi_az" "subnet_group" "parameter_group" "vpc_security_groups" "kms_key_id" "deletion_protection" "tags" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads engine, license_model, instance_class, multi_az, subnet_group, parameter_group, vpc_security_groups, kms_key_id, deletion_protection, tags and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this database reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the port is infra.port` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    instance_identifier: >-
+      {{- $n := toString .metadata.instance_id -}}
+      {{- if not (and (regexMatch `^[a-z][a-z0-9]*(-[a-z0-9]+)*$` $n) (le (len $n) 63)) -}}
+      {{- fail (printf "the component %q names its Amazon RDS instance, and RDS takes an instance identifier of 1 to 63 lowercase letters, digits and hyphens, beginning with a letter, neither ending with a hyphen nor holding two in a row: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+    edition_offered: >-
+      {{- if not (has .locals.engine (list "sqlserver-ee" "sqlserver-se" "sqlserver-ex" "sqlserver-web")) -}}
+      {{- fail (printf "infra.overrides.engine is %s, and this Recipe creates SQL Server as sqlserver-ee, sqlserver-se, sqlserver-ex or sqlserver-web; RDS runs the Developer editions, sqlserver-dev-ee and sqlserver-dev-se, only from a custom engine version made from the operator's own installation media, named by a full minor version that infra.engine_version does not name: set infra.overrides.engine to one of the four, or remove it for sqlserver-ex" (toJson (optional (optional .infra "overrides" dict) "engine" ""))) -}}
+      {{- end -}}
+    license_model_offered: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "license_model" -}}
+      {{- if ne (toString $o.license_model) "license-included" -}}
+      {{- fail (printf "infra.overrides.license_model is %s, and this Recipe creates the instance under license-included, the licence RDS includes; bring-your-own-media launches it from a custom engine version made from the operator's own installation media, named by a full minor version that infra.engine_version does not name: set infra.overrides.license_model to license-included, or remove it" (toJson $o.license_model)) -}}
+      {{- end -}}
+      {{- end -}}
+    engine_version_offered: >-
+      {{- $y := toString .infra.engine_version -}}
+      {{- if not .locals.engine_version -}}
+      {{- fail (printf "infra.engine_version is %q, and Amazon RDS creates SQL Server 2017, 2019, 2022 and 2025 instances, having stopped creating SQL Server 2016 ones on 15 January 2026: set infra.engine_version in the Release to 2017, 2019, 2022 or 2025" $y) -}}
+      {{- end -}}
+      {{- if and (eq $y "2025") (eq .locals.engine "sqlserver-web") -}}
+      {{- fail "infra.engine_version is \"2025\", and Amazon RDS offers SQL Server 2025 in the Enterprise, Standard and Express editions and no Web edition: set infra.engine_version to 2022 or earlier, or infra.overrides.engine to sqlserver-ee, sqlserver-se or sqlserver-ex" -}}
+      {{- end -}}
+    # Each of these overrides is passed to the instance as written, so one of
+    # another shape would render an argument the AWS provider refuses.
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- range $k := list "instance_class" "subnet_group" "parameter_group" -}}
+      {{- if hasKey $o $k -}}
+      {{- $v := get $o $k -}}
+      {{- if not (and (typeIs "string" $v) (regexMatch `^\S+$` $v)) -}}
+      {{- fail (printf "infra.overrides.%s is %s, and this Recipe passes it to the instance as one name, written as a string with no space: set it to one in the Release, or remove it" $k (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- range $k := list "multi_az" "deletion_protection" -}}
+      {{- if and (hasKey $o $k) (not (kindIs "bool" (get $o $k))) -}}
+      {{- fail (printf "infra.overrides.%s is %s, and the instance's %s takes true or false: set it to true or false in the Release, or remove it" $k (toJson (get $o $k)) $k) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "vpc_security_groups" -}}
+      {{- $g := $o.vpc_security_groups -}}
+      {{- $ok := and (kindIs "slice" $g) (gt (len $g) 0) -}}
+      {{- if $ok }}{{ range $g }}{{ if not (and (typeIs "string" .) (regexMatch `^\S+$` .)) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.vpc_security_groups is %s, and the instance takes its VPC security groups as a list of security group IDs, each a string: set it in the Release to such a list, or remove it" (toJson $g)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "kms_key_id" -}}
+      {{- if not (and (typeIs "string" $o.kms_key_id) (regexMatch `^arn:[^:\s]+:kms:[^:\s]*:[0-9]{12}:key/\S+$` $o.kms_key_id)) -}}
+      {{- fail (printf "infra.overrides.kms_key_id is %s, and the AWS provider takes the KMS key an RDS instance's storage is encrypted with by its ARN, arn:<partition>:kms:<region>:<account>:key/<id>: set it to one in the Release, or remove it to leave the storage unencrypted" (toJson $o.kms_key_id)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "tags" -}}
+      {{- $g := get $o "tags" -}}
+      {{- $ok := kindIs "map" $g -}}
+      {{- if $ok }}{{ range $_, $v := $g }}{{ if not (typeIs "string" $v) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.tags is %s, and the instance takes tags as a map from each tag name to a string: set it in the Release to such a map, or remove it" (toJson $g)) -}}
+      {{- end -}}
+      {{- end -}}
+    port_rds_takes: >-
+      {{- $p := int .infra.port -}}
+      {{- if or (lt $p 1150) (has $p (list 1234 1434 3260 3343 3389 47001)) (and (ge $p 49152) (le $p 49156)) -}}
+      {{- fail (printf "infra.port is %v, and Amazon RDS serves SQL Server on a port from 1150 to 65535 other than 1234, 1434, 3260, 3343, 3389, 47001 and 49152 to 49156: set infra.port in the Release to such a port, or remove it for 1433" .infra.port) -}}
+      {{- end -}}
+    compute_not_taken: >-
+      {{- $c := optional .infra "compute" dict -}}
+      {{- range $k := list "cpu" "memory" -}}
+      {{- with optional $c $k "" -}}
+      {{- fail (printf "infra.compute.%s is %v, and Amazon RDS sizes a SQL Server instance by its DB instance class, which this Recipe reads from infra.overrides.instance_class, not by a CPU or memory figure: remove infra.compute.%s from the Release and set infra.overrides.instance_class" $k . $k) -}}
+      {{- end -}}
+      {{- end -}}
+    storage: >-
+      {{- $size := toString .infra.storage.size -}}
+      {{- $type := toString (optional .infra.storage "type" "gp3") -}}
+      {{- if not (has $type (list "gp2" "gp3" "standard")) -}}
+      {{- fail (printf "infra.storage.type is %q, and this Recipe creates the instance on gp2 or gp3, General Purpose SSD, or standard, magnetic, storage; io1 and io2 take a provisioned IOPS figure Amazon RDS requires with them, which this Recipe does not carry: set infra.storage.type in the Release to gp2, gp3 or standard, or remove it for gp3" $type) -}}
+      {{- end -}}
+      {{- $max := 16384 -}}{{- if eq $type "standard" }}{{ $max = 1024 }}{{ end -}}
+      {{- $gi := int (regexFind `^[0-9]+` $size) -}}
+      {{- if not (and (regexMatch `^[0-9]+Gi$` $size) (ge $gi 20) (le $gi $max)) -}}
+      {{- fail (printf "infra.storage.size is %q, and Amazon RDS gives a SQL Server instance %d to %d GiB of %s storage, in whole gibibytes: set infra.storage.size in the Release to such a size, such as 32Gi" $size 20 $max $type) -}}
+      {{- end -}}
+    master_username: >-
+      {{- $u := toString .values.user -}}
+      {{- if or (not (regexMatch `^[a-zA-Z][a-zA-Z0-9_]{0,127}$` $u)) (has (lower $u) (list "sa" "dbo" "guest" "information_schema" "sys" "sysadmin" "serveradmin" "securityadmin" "processadmin" "setupadmin" "bulkadmin" "diskadmin" "dbcreator" "public")) -}}
+      {{- fail (printf "values.user is %q, the instance's master login, and Amazon RDS takes a master user name of 1 to 128 letters, digits and underscores beginning with a letter, other than the names SQL Server keeps for principals of its own: sa, dbo, guest, INFORMATION_SCHEMA, sys and the fixed server roles sysadmin, serveradmin, securityadmin, processadmin, setupadmin, bulkadmin, diskadmin, dbcreator and public: set values.user in the Aggregate to such a name" $u) -}}
+      {{- end -}}
+    multi_az_offered: >-
+      {{- if eq .locals.multi_az "true" -}}
+      {{- $e := .locals.engine -}}
+      {{- if or (eq $e "sqlserver-ex") (and (eq $e "sqlserver-web") (ne (toString .infra.engine_version) "2022")) -}}
+      {{- $key := "infra.ha.enabled" }}{{ if hasKey (optional .infra "overrides" dict) "multi_az" }}{{ $key = "infra.overrides.multi_az" }}{{ end -}}
+      {{- fail (printf "%s asks for a standby in another Availability Zone, and Amazon RDS keeps one for SQL Server Enterprise and Standard, and for SQL Server 2022 Web, but none for %s on SQL Server %s: set infra.overrides.engine to sqlserver-se or sqlserver-ee, or remove %s from the Release" $key $e (toString .infra.engine_version) $key) -}}
+      {{- end -}}
+      {{- end -}}
+    credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "password" -}}
+      {{- $ty := toString (optional $f.password "type" "") -}}
+      {{- if ne (first (splitList ":" $ty)) "core/generated-secret" -}}
+      {{- fail (printf "the password slot is filled by %s, and Amazon RDS generates this instance's master password itself and keeps it in AWS Secrets Manager, so the attachment would set nothing: remove it from the password slot when deploying to this target, or attach core/generated-secret there, which says the service owns the password" (default "an attachment of no type" $ty)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # required_providers pins hashicorp/aws so the engine installs a provider
+  # whose resource schema this body was written against. It is a range rather
+  # than an exact version because every AWS body in a boundary's root
+  # configuration shares one installed provider, and two exact pins that differ
+  # fail init. The constraint string is the one the catalog conventions'
+  # "One AWS provider constraint for every AWS body" section states; each AWS
+  # body repeats it deliberately, because a library import cannot place a block
+  # inside an authored body.
+  #
+  # The body is a full-body artifact named main.tf that emits verbatim as a
+  # standalone file alongside any other artifacts contributed at the same
+  # boundary.
+  #
+  # Backup is the core/backup attachment, found among the component's
+  # attachments by its type with any version set aside, and kept as the
+  # instance's own automated backups, which this Recipe sets through the
+  # arguments backup_retention_period and backup_window:
+  #   - With none attached, RDS keeps automated backups for 7 days, in a
+  #     window it chooses.
+  #   - An attachment carrying no infra.role_arn, bound to
+  #     terraform/backup-native, configures them. infra.retention_days is
+  #     backup_retention_period, 1 to 35 days, the range RDS keeps, and a value
+  #     outside it halts naming the attachment. infra.schedule, where set,
+  #     must name one minute and one hour of every day, such as 30 2 * * *:
+  #     RDS takes one automated backup a day, in a window it reads in UTC, so
+  #     that time opens backup_window, 30 minutes long, the shortest
+  #     window RDS takes, 02:30-03:00 here; any other expression halts
+  #     naming it. Unset, RDS chooses the window.
+  #   - Two attachments carrying no infra.role_arn halt naming both: an
+  #     instance runs one automated backup.
+  #   - Point-in-time recovery is Amazon RDS's for as long as the instance
+  #     keeps automated backups, with no setting of its own, so left out or
+  #     true, infra.point_in_time_recovery is what the instance gives, and
+  #     false on an attachment carrying no infra.role_arn halts naming it.
+  #   - An attachment carrying infra.role_arn asks AWS Backup to back the
+  #     instance up, and halts in the FeatureRecipe it is bound to:
+  #     terraform/backup-native refuses the role, since the service's own
+  #     backup assumes none, and terraform/backup-aws-backup backs up the
+  #     catalog's PostgreSQL, MySQL and MariaDB instances alone and refuses a
+  #     SQL Server one. The FeatureRecipe's assertions run before this
+  #     Recipe's template, so the reading below, which also carries what an
+  #     AWS Backup attachment changes on an RDS instance, meets no such
+  #     attachment here.
+  # A Recipe's locals cannot read its attachments, so the reading sits at the
+  # top of the template below, and every RDS Recipe of this catalog, on
+  # terraform and CloudFormation, declares it word for word: a change to it
+  # is made to each of them.
+  artifacts:
+    main.tf: |
+      {{- /* core/backup, found among this component's attachments by its type with any version set aside. */ -}}
+      {{- $backupNative := "" -}}{{- $backupNativeInfra := dict -}}{{- $backupKeepOn := "" -}}{{- $backupKeepOff := "" -}}{{- $backupContinuous := "" -}}{{- $backupContinuousInfra := dict -}}
+      {{- range $name, $attachment := (default dict .features) -}}
+      {{- if eq (first (splitList ":" (toString (optional $attachment "type" "")))) "core/backup" -}}
+      {{- $in := default dict (optional $attachment "infra" dict) -}}
+      {{- if trim (toString (optional $in "role_arn" "")) -}}
+      {{- if hasKey $in "keep_automated_backups" -}}
+      {{- if $in.keep_automated_backups }}{{ $backupKeepOn = $name }}{{ else }}{{ $backupKeepOff = $name }}{{ end -}}
+      {{- end -}}
+      {{- if eq (toString (optional $in "point_in_time_recovery" "")) "true" -}}
+      {{- if $backupContinuous -}}
+      {{- fail (printf "core/backup attachments %q and %q on %q both set infra.point_in_time_recovery to true, each asking AWS Backup for a continuous backup of the instance, and AWS Backup keeps one continuous backup of a resource: set it on one of the two" $backupContinuous $name $.context.instance_id) -}}
+      {{- end -}}
+      {{- $backupContinuous = $name -}}{{- $backupContinuousInfra = $in -}}
+      {{- end -}}
+      {{- else if $backupNative -}}
+      {{- fail (printf "core/backup attachments %q and %q on %q both leave its backup to Amazon RDS, which runs one automated backup on an instance: remove one of the two, or bind one to AWS Backup in the Manifest" $backupNative $name $.context.instance_id) -}}
+      {{- else -}}
+      {{- $backupNative = $name -}}{{- $backupNativeInfra = $in -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if and $backupNative $backupKeepOff -}}
+      {{- fail (printf "core/backup attachment %q on %q has Amazon RDS keep automated backups of the instance, and core/backup attachment %q sets infra.keep_automated_backups to false, turning them off: remove one of the two attachments, or infra.keep_automated_backups" $backupNative .context.instance_id $backupKeepOff) -}}
+      {{- end -}}
+      {{- if and $backupKeepOn $backupKeepOff -}}
+      {{- fail (printf "core/backup attachments %q and %q on %q set infra.keep_automated_backups to true and to false, and the instance either keeps its automated backups or does not: set the option on one of the two" $backupKeepOn $backupKeepOff .context.instance_id) -}}
+      {{- end -}}
+      {{- if eq (toString (optional $backupNativeInfra "point_in_time_recovery" "")) "false" -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to false, and Amazon RDS keeps point-in-time recovery for as long as it keeps automated backups, which this attachment configures, with no setting that turns it off: remove infra.point_in_time_recovery from the attachment, or set it to true" $backupNative .context.instance_id) -}}
+      {{- end -}}
+      {{- if and $backupContinuous $backupNative -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to true, so AWS Backup keeps a continuous backup of the instance and takes over its automated backups, their window and how many days they are kept, and core/backup attachment %q configures those automated backups too: remove one of the two attachments, or infra.point_in_time_recovery" $backupContinuous .context.instance_id $backupNative) -}}
+      {{- end -}}
+      {{- if and $backupContinuous $backupKeepOff (ne $backupContinuous $backupKeepOff) -}}
+      {{- fail (printf "core/backup attachment %q on %q sets infra.point_in_time_recovery to true, and AWS Backup's continuous backup keeps the instance's automated backups on, for as many days as its own, while core/backup attachment %q sets infra.keep_automated_backups to false, turning them off: remove one of the two attachments, or one of the two options" $backupContinuous .context.instance_id $backupKeepOff) -}}
+      {{- end -}}
+      {{- $backupRetention := 7 -}}{{- $backupWindow := "" -}}
+      {{- if $backupKeepOff }}{{ $backupRetention = 0 }}{{ end -}}
+      {{- if $backupContinuous }}{{ $backupRetention = int (optional $backupContinuousInfra "retention_days" 7) }}{{ end -}}
+      {{- if $backupNative -}}
+      {{- $backupRetention = int (optional $backupNativeInfra "retention_days" 7) -}}
+      {{- if or (lt $backupRetention 1) (gt $backupRetention 35) -}}
+      {{- fail (printf "core/backup attachment %q on %q keeps each backup for %d days in infra.retention_days, and Amazon RDS keeps automated backups for 1 to 35 days: set infra.retention_days to 35 or fewer, or bind the attachment to AWS Backup in the Manifest, which keeps backups longer" $backupNative .context.instance_id $backupRetention) -}}
+      {{- end -}}
+      {{- with trim (toString (optional $backupNativeInfra "schedule" "")) -}}
+      {{- $f := regexSplit `\s+` . -1 -}}
+      {{- if not (and (eq (len $f) 5) (regexMatch `^[0-9]{1,2}$` (index $f 0)) (regexMatch `^[0-9]{1,2}$` (index $f 1)) (lt (atoi (index $f 0)) 60) (lt (atoi (index $f 1)) 24) (has (index $f 2) (list "*" "?")) (has (index $f 3) (list "*" "?")) (has (index $f 4) (list "*" "?"))) -}}
+      {{- fail (printf "core/backup attachment %q on %q is scheduled %q in infra.schedule, and Amazon RDS takes one automated backup a day, in a window opening at a time of day it reads in UTC: write a schedule naming one minute and one hour of every day, such as 30 2 * * *, or remove infra.schedule to let RDS choose the time" $backupNative $.context.instance_id .) -}}
+      {{- end -}}
+      {{- $start := add (mul (atoi (index $f 1)) 60) (atoi (index $f 0)) -}}
+      {{- $end := mod (add $start 30) 1440 -}}
+      {{- $backupWindow = printf "%02d:%02d-%02d:%02d" (div $start 60) (mod $start 60) (div $end 60) (mod $end 60) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $o := optional .infra "overrides" dict -}}
+      terraform {
+        required_providers {
+          aws = {
+            source  = "hashicorp/aws"
+            version = "~> 6.69"
+          }
+        }
+      }
+
+      resource "aws_db_instance" "{{ .locals.db_identifier }}" {
+        identifier     = "{{ .locals.db_identifier }}"
+        engine         = "{{ .locals.engine }}"
+        engine_version = "{{ .locals.engine_version }}"
+        license_model  = "license-included"
+        port           = {{ .infra.port }}
+
+        ## ── Compute ──────────────────────────────────────────────
+        instance_class = "{{ .locals.instance_class }}"
+
+        ## ── Storage ──────────────────────────────────────────────
+        allocated_storage = {{ trimSuffix "Gi" (toString .infra.storage.size) }}
+        storage_type      = "{{ optional .infra.storage "type" "gp3" }}"
+
+        ## ── Master login ─────────────────────────────────────────
+        username = "{{ .values.user }}"
+        {{- with optional .values "collation" "" }}
+        character_set_name = {{ toJson . }}
+        {{- end }}
+
+        ## Black-Box: RDS manages the password via Secrets Manager.
+        manage_master_user_password = true
+
+        ## ── HA ───────────────────────────────────────────────────
+        multi_az = {{ .locals.multi_az }}
+
+        ## ── Backup ───────────────────────────────────────────────
+        backup_retention_period = {{ $backupRetention }}
+        {{- if $backupWindow }}
+        backup_window           = "{{ $backupWindow }}"
+        {{- end }}
+        {{- if not $backupRetention }}
+        skip_final_snapshot     = true
+        {{- end }}
+
+        ## ── Provider-specific overrides ──────────────────────────
+        {{- with optional $o "subnet_group" "" }}
+        db_subnet_group_name = {{ toJson . }}
+        {{- end }}
+        {{- with optional $o "parameter_group" "" }}
+        parameter_group_name = {{ toJson . }}
+        {{- end }}
+        {{- with optional $o "vpc_security_groups" "" }}
+        vpc_security_group_ids = {{ toJson . }}
+        {{- end }}
+        {{- with optional $o "kms_key_id" "" }}
+        storage_encrypted = true
+        kms_key_id        = {{ toJson . }}
+        {{- end }}
+        {{- if hasKey $o "deletion_protection" }}
+        deletion_protection = {{ $o.deletion_protection }}
+        {{- end }}
+        {{- with optional $o "tags" "" }}
+        tags = {{ toJson . }}
+        {{- end }}
+      }
+
+      output "address" {
+        value = aws_db_instance.{{ .locals.db_identifier }}.address
+      }
