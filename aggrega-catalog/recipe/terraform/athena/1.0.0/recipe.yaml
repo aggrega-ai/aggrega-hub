@@ -23,8 +23,11 @@ metadata:
     override a client's own, it publishes query metrics to CloudWatch, and
     Athena chooses its engine version.
 
-    No bucket, key or role is created. infra.overrides.host halts the
-    build, since a client reaches every workgroup at Athena's endpoint in
+    A workgroup that has run a query holds query executions, and Athena
+    refuses to delete it without force_destroy, which this Recipe leaves
+    off: removing or renaming its component makes the destroy fail and the
+    apply stop. No bucket, key or role is created. infra.overrides.host
+    halts the build, since a client reaches every workgroup at Athena's endpoint in
     its Region, as do a value Athena or the AWS provider cannot take and
     any infra.overrides key not listed.
   maintainers:
@@ -75,12 +78,14 @@ spec:
   # results). The AWS provider refuses an output_location beside enabled
   # managed query results, so the body writes one or the other.
   #
-  # kms_key_id is the ARN of the operator's KMS key, or of an alias naming it:
-  # the AWS provider takes both of the arguments it sets as an ARN alone and
-  # refuses a key ID or an alias name. With output_location it sets
+  # kms_key_id is the ARN of the operator's KMS key: the AWS provider takes
+  # both of the arguments it sets as an ARN alone and refuses a key ID or an
+  # alias name. With output_location it sets
   # result_configuration.encryption_configuration, encryption_option SSE_KMS
-  # and kms_key_arn, so Amazon S3 encrypts each result with the key; with
-  # managed query results it sets
+  # and kms_key_arn, so Amazon S3 encrypts each result with the key; the
+  # Athena API reference's EncryptionConfiguration names the key ARN or ID
+  # there, so the ARN of an alias halts the build. With managed query results
+  # it also takes the ARN of an alias naming the key, and sets
   # managed_query_results_configuration.encryption_configuration.kms_key,
   # whose key policy lets the service principal
   # encryption.athena.amazonaws.com use the key (the managed query results
@@ -91,9 +96,9 @@ spec:
   # the workgroup may scan; Athena cancels a query that scans more (the Athena
   # User Guide's page on data usage controls). The AWS provider takes a whole
   # number of at least 10485760, above the 10000000 Athena's API takes, or 0,
-  # which it reads as no limit and this Recipe refuses, since leaving the key
-  # unset says that; any other value halts the build. Unset, the body writes
-  # none and a query's scan has no limit.
+  # which it reads as no limit; this Recipe refuses 0 with a message of its
+  # own, since leaving the key unset says that, and any other value halts the
+  # build. Unset, the body writes none and a query's scan has no limit.
   #
   # tags tag the workgroup, as a map from each tag name to a string.
   #
@@ -112,9 +117,10 @@ spec:
   #   not read — none; the Component declares no values and no other infra key.
   #
   # The name. The workgroup is named after the component, and its name is
-  # fixed when it is created: Terraform replaces the workgroup when the
-  # component is renamed, and the new one starts with no query history or
-  # saved queries.
+  # fixed when it is created. A rename is a new workgroup under a new name,
+  # which starts with no query history or saved queries, and Terraform
+  # destroys the old one, which Athena refuses while it holds any (see
+  # Deletion).
   #
   # The settings the body writes on every workgroup:
   # enforce_workgroup_configuration true, so the workgroup's results location
@@ -129,10 +135,18 @@ spec:
   # caller's identity: execution_role applies to Apache Spark and IAM Identity
   # Center workgroups alone, and is not written.
   #
-  # Deletion. The body sets no force_destroy, which the AWS provider describes
-  # as the option to delete the workgroup and its contents even if it holds
-  # named queries. The data a query reads, and the results in the operator's
-  # bucket, are not the workgroup's, and stay when it is destroyed.
+  # Deletion. The body sets no force_destroy, whose default is false and which
+  # the AWS provider passes as the DeleteWorkGroup call's RecursiveDeleteOption.
+  # The Athena API's DeleteWorkGroup reference says that option is what deletes
+  # a workgroup "even if the workgroup contains any named queries, query
+  # executions, or notebooks", so without it Athena refuses to delete a
+  # workgroup that holds any, and a workgroup that has run a query holds query
+  # executions. Removing the component from the Aggregate, or renaming it,
+  # therefore makes the destroy of the old workgroup fail with Athena's error
+  # and the apply stop, and an operator removes the workgroup outside
+  # Terraform once its queries are gone. A workgroup that has run none is
+  # destroyed cleanly. The data a query reads, and the results in the
+  # operator's bucket, are not the workgroup's, and stay when it is destroyed.
   assertions:
     overrides_known: >-
       {{- $known := list "output_location" "bytes_scanned_cutoff_per_query" "kms_key_id" "tags" -}}
@@ -157,6 +171,9 @@ spec:
       {{- if hasKey $o "bytes_scanned_cutoff_per_query" -}}
       {{- $v := $o.bytes_scanned_cutoff_per_query -}}
       {{- $ok := or (kindIs "int" $v) (kindIs "int64" $v) (and (kindIs "float64" $v) (eq (float64 (int64 $v)) $v)) -}}
+      {{- if and $ok (eq (int64 $v) 0) -}}
+      {{- fail "infra.overrides.bytes_scanned_cutoff_per_query is 0, which the AWS provider reads as no limit, and this Recipe leaves the limit off by an unset key rather than a zero: remove it from the Release for no limit, or set it to a whole number of bytes, at least 10485760" -}}
+      {{- end -}}
       {{- if $ok }}{{ $ok = ge (int64 $v) 10485760 }}{{ end -}}
       {{- if not $ok -}}
       {{- fail (printf "infra.overrides.bytes_scanned_cutoff_per_query is %s, and the AWS provider takes the most data one query may scan as a whole number of bytes, at least 10485760: set it in the Release to such a number, or remove it for no limit" (toJson $v)) -}}
@@ -166,6 +183,9 @@ spec:
       {{- if not (and (typeIs "string" $o.kms_key_id) (regexMatch `^arn:[^:\s]+:kms:[^:\s]*:[0-9]{12}:(key|alias)/\S+$` $o.kms_key_id)) -}}
       {{- fail (printf "infra.overrides.kms_key_id is %s, and the AWS provider takes the KMS key the workgroup's query results are encrypted with by its ARN, arn:<partition>:kms:<region>:<account>:key/<id>, or the ARN of an alias naming it: set it to one in the Release, or remove it" (toJson $o.kms_key_id)) -}}
       {{- end -}}
+      {{- end -}}
+      {{- if and (hasKey $o "output_location") (hasKey $o "kms_key_id") (typeIs "string" $o.kms_key_id) (regexMatch `:alias/` $o.kms_key_id) -}}
+      {{- fail (printf "infra.overrides.kms_key_id is %s, the ARN of an alias, and with infra.overrides.output_location set the results are encrypted through Athena's S3 encryption configuration, which names the KMS key by its key ID or key ARN: set kms_key_id in the Release to the key's ARN, or remove output_location for results Athena keeps itself, which take an alias ARN" (toJson $o.kms_key_id)) -}}
       {{- end -}}
       {{- if hasKey $o "tags" -}}
       {{- $g := get $o "tags" -}}

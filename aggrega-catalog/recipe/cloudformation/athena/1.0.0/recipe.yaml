@@ -24,8 +24,11 @@ metadata:
     publishes query metrics to CloudWatch, and Athena chooses its engine
     version.
 
-    No bucket, key or role is created. infra.overrides.host halts the
-    build, since a client reaches every workgroup at Athena's endpoint in
+    A workgroup that has run a query holds query executions, and Athena
+    refuses to delete it without its RecursiveDeleteOption, which this
+    Recipe leaves off: removing or renaming its component leaves the old
+    workgroup in place. No bucket, key or role is created.
+    infra.overrides.host halts the build, since a client reaches every workgroup at Athena's endpoint in
     its Region, as do a value Athena cannot take and any infra.overrides
     key not listed.
   maintainers:
@@ -85,12 +88,15 @@ spec:
   # OutputLocation beside managed query results, so the fragment writes one or
   # the other.
   #
-  # KmsKeyId is the operator's KMS key, by its key ID, key ARN, alias name or
-  # alias ARN, written as a string with no space. With OutputLocation it sets
-  # ResultConfiguration.EncryptionConfiguration, EncryptionOption SSE_KMS and
-  # KmsKey, so Amazon S3 encrypts each result with the key; with managed query
-  # results it sets ManagedQueryResultsConfiguration.EncryptionConfiguration's
-  # KmsKey, whose key policy lets the service principal
+  # KmsKeyId is the operator's KMS key, written as a string with no space.
+  # With OutputLocation it sets ResultConfiguration.EncryptionConfiguration,
+  # EncryptionOption SSE_KMS and KmsKey, so Amazon S3 encrypts each result with
+  # the key; the Athena API reference's EncryptionConfiguration names the key
+  # ARN or ID there, so an alias name or alias ARN halts the build. With
+  # managed query results it sets
+  # ManagedQueryResultsConfiguration.EncryptionConfiguration's KmsKey, whose
+  # pattern also takes an alias name or alias ARN, and whose key policy lets
+  # the service principal
   # encryption.athena.amazonaws.com use the key (the managed query results
   # page). Unset, results in the operator's bucket take the bucket's default
   # encryption and managed results are encrypted with a key AWS owns.
@@ -116,9 +122,10 @@ spec:
   #   not read — none; the Component declares no values and no other infra key.
   #
   # The name. The workgroup is named after the component, and its name is
-  # fixed when it is created: CloudFormation replaces the workgroup when the
-  # component is renamed, and the new one starts with no query history or
-  # saved queries.
+  # fixed when it is created. A rename is a new workgroup under a new name,
+  # which starts with no query history or saved queries, and the old one is
+  # deleted at the stack's cleanup, which Athena refuses while it holds any
+  # (see Deletion).
   #
   # The settings the fragment writes on every workgroup:
   # EnforceWorkGroupConfiguration true, so the workgroup's results location
@@ -132,11 +139,18 @@ spec:
   # query under its caller's identity: ExecutionRole applies to Apache Spark
   # and IAM Identity Center workgroups alone, and is not written.
   #
-  # Deletion. The fragment sets no RecursiveDeleteOption, which the
-  # DeleteWorkGroup reference describes as the option to delete a workgroup
-  # and its contents even if it holds named queries, query executions or
-  # notebooks. The data a query reads, and the results in the operator's
-  # bucket, are not the workgroup's, and stay when it is deleted.
+  # Deletion. The fragment sets no RecursiveDeleteOption, whose default is
+  # false. The Athena API's DeleteWorkGroup reference says the option is what
+  # deletes a workgroup "even if the workgroup contains any named queries,
+  # query executions, or notebooks", so without it Athena refuses to delete
+  # a workgroup that holds any, and a workgroup that has run a query holds
+  # query executions. Removing the component from the Aggregate, or renaming
+  # it, therefore makes CloudFormation's delete of the old workgroup fail: the
+  # stack update finishes with that workgroup left in place and its resource
+  # in DELETE_FAILED, and an operator removes it outside the stack once its
+  # queries are gone. A workgroup that has run none deletes cleanly. The data
+  # a query reads, and the results in the operator's bucket, are not the
+  # workgroup's, and stay when it is deleted.
   assertions:
     overrides_known: >-
       {{- $known := list "OutputLocation" "BytesScannedCutoffPerQuery" "KmsKeyId" -}}
@@ -169,6 +183,14 @@ spec:
       {{- if not (and (typeIs "string" $o.KmsKeyId) (regexMatch `^\S+$` $o.KmsKeyId)) -}}
       {{- fail (printf "infra.overrides.KmsKeyId is %s, and the workgroup takes the KMS key its query results are encrypted with as one key ID, key ARN, alias name or alias ARN, written as a string with no space: set it to one in the Release, or remove it" (toJson $o.KmsKeyId)) -}}
       {{- end -}}
+      {{- end -}}
+    # Athena's EncryptionConfiguration for results in Amazon S3 names the key
+    # ARN or ID, so an alias is refused beside OutputLocation; managed query
+    # results take it.
+    kms_key_results_path: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if and (hasKey $o "OutputLocation") (hasKey $o "KmsKeyId") (typeIs "string" $o.KmsKeyId) (regexMatch `(^alias/|:alias/)` $o.KmsKeyId) -}}
+      {{- fail (printf "infra.overrides.KmsKeyId is %s, an alias, and with infra.overrides.OutputLocation set the results are encrypted through Athena's S3 encryption configuration, which names the KMS key by its key ID or key ARN: set KmsKeyId in the Release to the key's ID or ARN, or remove OutputLocation for results Athena keeps itself, which take an alias" (toJson $o.KmsKeyId)) -}}
       {{- end -}}
 
   artifacts:
