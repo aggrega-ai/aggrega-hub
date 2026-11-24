@@ -1,0 +1,242 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: cognito
+  version: 1.0.0
+  # The infra.overrides keys this Recipe refuses are listed, with their
+  # reasons, in the comments above the assertions.
+  description: >
+    Amazon Cognito on CloudFormation: one AWS::Cognito::UserPool named after
+    the component and one AWS::Cognito::UserPoolClient in it, with no client
+    secret, which the cloudformation provider assembles into the boundary's
+    stack. Nothing else is created: no domain, identity provider, resource
+    server, Lambda trigger, IAM role or KMS key.
+
+    user_pool_id, client_id and arn publish CloudFormation references to the
+    pool and the client, and oidc_discovery_url an Fn::Sub joining the
+    pool's ID to the Cognito endpoint of the stack's Region; the pool is
+    written with the original issuer, the one that URL serves. UserPoolTier
+    sets the pool's feature plan, ESSENTIALS unless set.
+
+    Deletion protection stays off: deleting the stack, or removing or
+    renaming the component, deletes the pool and every user in it.
+    CloudFormation does not replace the pool when username_attributes
+    change, and Cognito keeps them as created, so a change to them is a
+    component of another name. A tier other than LITE, ESSENTIALS or PLUS,
+    LITE with ALLOW_USER_AUTH, infra.overrides.host, and any
+    infra.overrides key not listed halt the build naming the key.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: cloudformation
+  implements: core/security/cognito:1.0.0
+
+  # The resources' logical ids, derived from this instance's own name so that
+  # two pools deployed into one stack describe two sets of resources rather
+  # than one. A logical id is unique within a CloudFormation template and
+  # admits only letters and digits, so the instance name's separators are
+  # read as word boundaries and each word is capitalised: instance members
+  # names the pool MembersUserPool and its client MembersClient.
+  locals:
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+
+  # The String Pipe: the compiler pipes each of these strings verbatim into a
+  # consumer's injection context when it uses this pool, and resolves none of
+  # them. user_pool_id and arn are references to the pool's UserPoolId and
+  # Arn attributes and client_id to the client's ClientId, which
+  # CloudFormation resolves when it creates them, so a consumer in the same
+  # stack is created after them. oidc_discovery_url is an Fn::Sub joining
+  # https://cognito-idp., the AWS::Region and AWS::URLSuffix pseudo
+  # parameters, the pool's ID and /.well-known/openid-configuration: the
+  # discovery endpoint the Amazon Cognito Developer Guide gives for a pool
+  # ("Identity provider and relying party endpoints"), composed from the
+  # pool's ID because the reference documents no form for the pool's
+  # ProviderURL attribute. The provider projects the matching provides block
+  # inside the fragment below into the assembled stack Outputs; this
+  # recipe-level provides is the value-pipe contract, the fragment provides
+  # is the Outputs source, and they carry the same values. A consumer in
+  # another stack imports them through those Outputs.
+  provides:
+    user_pool_id: "!GetAtt {{ .locals.logical_id }}UserPool.UserPoolId"
+    client_id: "!GetAtt {{ .locals.logical_id }}Client.ClientId"
+    oidc_discovery_url: "!Sub https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${ {{- .locals.logical_id }}UserPool.UserPoolId}/.well-known/openid-configuration"
+    arn: "!GetAtt {{ .locals.logical_id }}UserPool.Arn"
+
+  # This Recipe reads from infra.overrides:
+  #   UserPoolTier - string (the pool's UserPoolTier): LITE, ESSENTIALS or PLUS
+  # Any other key halts naming it, so a key misspelt, or meant for another
+  # Recipe, is never passed over unread.
+  #
+  # UserPoolTier is the pool's own property name, which is what a reader
+  # matches against the resource documentation. It is the pool's feature
+  # plan ("User pool feature plans" in the Developer Guide), which decides
+  # the features the pool may use and what Cognito charges for it. Unset,
+  # the fragment writes ESSENTIALS, the plan the reference names as the
+  # default, so the tier is always written. A value other than LITE,
+  # ESSENTIALS or PLUS halts the build. Choice-based sign-in, ALLOW_USER_AUTH
+  # in explicit_auth_flows, needs the Essentials plan or higher (the
+  # CreateUserPoolClient reference), so LITE beside it halts the build too.
+  # PLUS adds threat protection, which this Recipe does not configure. The
+  # tier changes in place.
+  #
+  # host is not read: the Component publishes no address of its own. A
+  # client calls the user pools API at the Cognito endpoint of the pool's
+  # Region, and a custom domain names the pool's managed login and OAuth 2.0
+  # endpoints, which this Recipe does not set up, so infra.overrides.host
+  # halts the build naming it. Tags is not read: no CloudFormation Recipe of
+  # this catalog reads one, and it halts as any key not listed does.
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # or not read:
+  #   honoured — values.username_attributes, as the pool's
+  #     UsernameAttributes, and values.auto_verified_attributes, as its
+  #     AutoVerifiedAttributes, each written only while set;
+  #     values.mfa_configuration, as its MfaConfiguration, with EnabledMfas
+  #     SOFTWARE_TOKEN_MFA, an authenticator app, while it is ON or
+  #     OPTIONAL and no EnabledMfas while it is OFF, as the reference asks
+  #     ("To disable all MFAs after it has been enabled, set
+  #     MfaConfiguration to OFF and remove EnabledMfas");
+  #     values.explicit_auth_flows, as the client's ExplicitAuthFlows; and
+  #     the override above. The Component refuses a client whose flows sign
+  #     no one in, for every realization.
+  #   refused — a UserPoolTier other than LITE, ESSENTIALS or PLUS; LITE
+  #     with ALLOW_USER_AUTH; infra.overrides.host; and any infra.overrides
+  #     key not listed above.
+  #   not read — none; the Component declares no other value or infra key.
+  #
+  # The terraform Recipe of this Component holds the same rules on
+  # user_pool_tier: each target reads the key under its own spelling, so the
+  # rules cannot sit in the Component.
+  #
+  # What the fragment writes beside these. On the pool: UserPoolName, the
+  # instance's name; UserPoolTier, as above; DeletionProtection INACTIVE,
+  # Cognito's own default, written so the pool's deletion is stated rather
+  # than left to the service; and IssuerConfiguration Type ORIGINAL, the
+  # issuer whose discovery document oidc_discovery_url names, which the
+  # Developer Guide gives as the current default ("Identity provider and
+  # relying party endpoints"), written so the URL stays that issuer's. On
+  # the client: UserPoolId, the pool; ClientName, the instance's name; and
+  # GenerateSecret false, so the client is public. Nothing else of either is
+  # written, so Cognito's defaults hold: no alias attributes, no custom
+  # attributes and no attribute required at sign-up; users may sign
+  # themselves up, as AdminCreateUserConfig allows unless
+  # AllowAdminCreateUserOnly is set; Cognito's default password policy and
+  # account recovery; email sent through Cognito's default email
+  # configuration, from no-reply@verificationemail.com, which limits the
+  # messages it sends each day below what the Developer Guide's "Email
+  # settings" calls a typical production volume; no SMS configuration, so
+  # Cognito sends no SMS message; no Lambda trigger, threat protection,
+  # device tracking or KMS key of the operator's. On the client: no OAuth
+  # 2.0 feature, AllowedOAuthFlowsUserPoolClient false by default, so users
+  # sign in only through the user pools API; access and ID tokens valid for
+  # one hour and refresh tokens for 30 days; token revocation on; and
+  # PreventUserExistenceErrors LEGACY, the reference's default, so a sign-in
+  # or password recovery for a username that does not exist answers
+  # UserNotFoundException. The Region is the one the stack is deployed to.
+  #
+  # Deletion and replacement. Every resource keeps CloudFormation's own
+  # deletion policy, Delete, and the pool's deletion protection is off, so
+  # deleting the stack, removing the component from it, or renaming the
+  # component, which changes the pool's logical id and creates a new, empty
+  # pool in its place with a new ID, client ID and discovery URL, deletes the
+  # old pool with every user in it, their attributes and their passwords.
+  # The CloudFormation reference lists UsernameAttributes as updated with no
+  # interruption rather than by replacement, while the Developer Guide says
+  # of username attributes "After you create a user pool, you can't change
+  # this setting" ("Working with user attributes"), so CloudFormation creates
+  # no new pool for a change to username_attributes, and the change is made
+  # as a component of another name: a new pool, which starts with no users.
+  # AutoVerifiedAttributes, MfaConfiguration, EnabledMfas, UserPoolTier and
+  # the client's ExplicitAuthFlows change in place. The client's UserPoolId
+  # and GenerateSecret change by replacement, so the client is replaced, with
+  # a new ID, only together with its pool.
+  #
+  # Credentials. The client is public: GenerateSecret is false, so Cognito
+  # generates no client secret. A secret would reach a consumer only as the
+  # client's ClientSecret attribute resolved into the consumer's own
+  # template, so none is offered. The client's ID, the pool's ID and ARN and
+  # the discovery URL are no credentials, and users' passwords stay in
+  # Cognito, so nothing secret is published. Backup. Amazon Cognito offers
+  # no backup of a user pool for this Recipe to configure, so none is.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "UserPoolTier" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "host" -}}
+      {{- fail "infra.overrides.host is set, and an Amazon Cognito user pool publishes no address of its own: a client calls the user pools API at the Cognito endpoint of the pool's Region and names the pool by its ID, and this Recipe sets up no custom domain: remove infra.overrides.host from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads UserPoolTier from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # UserPoolTier is one of the three feature plans the resource takes.
+    user_pool_tier: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "UserPoolTier" -}}
+      {{- $t := $o.UserPoolTier -}}
+      {{- if not (and (typeIs "string" $t) (has $t (list "LITE" "ESSENTIALS" "PLUS"))) -}}
+      {{- fail (printf "infra.overrides.UserPoolTier is %s, and an Amazon Cognito user pool takes the feature plan LITE, ESSENTIALS or PLUS: set it to one in the Release, or remove it for ESSENTIALS" (toJson $t)) -}}
+      {{- end -}}
+      {{- end -}}
+    # Choice-based sign-in needs the Essentials feature plan or higher.
+    user_pool_tier_user_auth: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if and (eq (toJson (optional $o "UserPoolTier" "")) `"LITE"`) (has "ALLOW_USER_AUTH" .values.explicit_auth_flows) -}}
+      {{- fail "infra.overrides.UserPoolTier is LITE while values.explicit_auth_flows names ALLOW_USER_AUTH, and Amazon Cognito takes choice-based sign-in on the Essentials feature plan or higher: set UserPoolTier in the Release to ESSENTIALS or PLUS, or remove ALLOW_USER_AUTH from the Aggregate" -}}
+      {{- end -}}
+
+  # The fragment. The client names the pool by its ID, through Ref, which
+  # returns a pool's ID, so CloudFormation creates the client after the pool
+  # and deletes it before.
+  artifacts:
+    template.yaml: |
+      {{- $l := .locals.logical_id }}
+      {{- $o := optional .infra "overrides" dict }}
+      Resources:
+        {{ $l }}UserPool:
+          Type: AWS::Cognito::UserPool
+          Properties:
+            UserPoolName: "{{ .context.instance_id }}"
+            DeletionProtection: INACTIVE
+            IssuerConfiguration:
+              Type: ORIGINAL
+            MfaConfiguration: "{{ .values.mfa_configuration }}"
+            {{- if ne (toString .values.mfa_configuration) "OFF" }}
+            EnabledMfas:
+              - SOFTWARE_TOKEN_MFA
+            {{- end }}
+            {{- with optional .values "username_attributes" "" }}
+            UsernameAttributes: {{ toJson . }}
+            {{- end }}
+            {{- with optional .values "auto_verified_attributes" "" }}
+            AutoVerifiedAttributes: {{ toJson . }}
+            {{- end }}
+
+            ## ── Provider-specific overrides ─────────────────────────
+            UserPoolTier: "{{ optional $o "UserPoolTier" "ESSENTIALS" }}"
+        {{ $l }}Client:
+          Type: AWS::Cognito::UserPoolClient
+          Properties:
+            UserPoolId: !Ref {{ $l }}UserPool
+            ClientName: "{{ .context.instance_id }}"
+            GenerateSecret: false
+            ExplicitAuthFlows: {{ toJson .values.explicit_auth_flows }}
+
+      # Fragment provides: the provider projects each entry into the assembled
+      # stack Outputs and expands the short-form intrinsics to long form. Each
+      # output is named for this instance and the entry together, so two pools
+      # in one stack keep their identities apart. A cross-stack consumer
+      # imports these entries; an intra-stack consumer receives them through
+      # the value-pipe above.
+      provides:
+        user_pool_id: !GetAtt {{ $l }}UserPool.UserPoolId
+        client_id: !GetAtt {{ $l }}Client.ClientId
+        oidc_discovery_url: !Sub "https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${ {{- $l }}UserPool.UserPoolId}/.well-known/openid-configuration"
+        arn: !GetAtt {{ $l }}UserPool.Arn
