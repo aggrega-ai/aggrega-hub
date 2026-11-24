@@ -1,0 +1,288 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: kinesis-data-streams
+  version: 1.0.0
+  # The infra.overrides keys this Recipe refuses are listed, with their
+  # reasons, in the comments above the assertions.
+  description: >
+    Amazon Kinesis Data Streams, rendered as an authored Terraform body,
+    main.tf: one aws_kinesis_stream named after the component, keeping
+    records for values.retention_period_hours. arn publishes a Terraform
+    reference to the stream's ARN, an output of this component's module,
+    which Terraform resolves when it applies.
+
+    The stream runs in on-demand capacity mode, where Kinesis Data Streams
+    manages its shards, unless stream_mode is PROVISIONED, which takes the
+    shard_count the operator sets. Kinesis Data Streams encrypts each record
+    at rest under the KMS key kms_key_id names, the operator's or the key
+    AWS manages for Kinesis, alias/aws/kinesis; with none named the stream
+    has no server-side encryption. Tags label the stream. No consumer,
+    resource policy, key or role is created. A destroy, or removing the
+    stream from the configuration, deletes the stream with every record it
+    holds, and fails while an enhanced fan-out consumer is registered on it.
+
+    infra.overrides.host halts the build, since a client reaches every
+    stream at Kinesis Data Streams' endpoint in its Region and names the
+    stream by its ARN, as do a stream_mode, shard_count or kms_key_id the
+    stream cannot take, a shard_count without PROVISIONED, PROVISIONED
+    without a shard_count, tags that are not a map of strings and any
+    infra.overrides key not listed.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: terraform
+  implements: core/messaging/kinesis-data-streams:1.0.0
+
+  locals:
+    # The stream's capacity mode: infra.overrides.stream_mode, or ON_DEMAND
+    # where the Release names none. Only a string is read here; any other
+    # value is refused by the assertion below rather than written.
+    stream_mode: '{{ $m := optional (optional .infra "overrides" dict) "stream_mode" "ON_DEMAND" }}{{ if typeIs "string" $m }}{{ $m }}{{ end }}'
+
+  # The String Pipe: the compiler pipes this string verbatim into a consumer's
+  # injection context when it uses this stream, and resolves none of it. arn
+  # is a reference to the arn output of this component's module call: the
+  # body renders into the component's own module directory, and the
+  # boundary's root configuration declares that directory as a module block
+  # named .context.instance_id for a component declared in the Aggregate the
+  # Release deploys. The reference resolves only for a consumer authored as a
+  # source: Recipe in the same Terraform root configuration, which Terraform
+  # then applies after this module; a consumer on another target receives it
+  # as text. The output is the stream's ARN.
+  provides:
+    arn: "${module.{{ .context.instance_id }}.arn}"
+
+  # This Recipe reads from infra.overrides:
+  #   stream_mode - string (stream_mode_details.stream_mode; ON_DEMAND or PROVISIONED; default ON_DEMAND)
+  #   shard_count - integer (shard_count, with stream_mode PROVISIONED alone)
+  #   kms_key_id  - string (kms_key_id, with encryption_type KMS)
+  #   tags        - map[string]string (the stream's tags)
+  # host halts by name, as any key not listed does.
+  #
+  # stream_mode and shard_count are the AWS provider's own argument names,
+  # which is what a reader matches against the provider documentation.
+  # kms_key_id and tags are the keys, under the same names, that the
+  # catalog's terraform AWS Recipes read for the KMS key a resource is
+  # encrypted with and for its tags, so a Release names each once whichever
+  # Recipe it configures.
+  #
+  # stream_mode is the stream's capacity mode. ON_DEMAND, also written where
+  # the Release names none, needs no capacity setting: Kinesis Data Streams
+  # manages the stream's shards and scales them with the throughput it
+  # receives (the CreateStream API reference). PROVISIONED gives the stream
+  # the number of shards shard_count names, each taking up to 1 MiB or 1,000
+  # records a second of writes and 2 MiB a second of reads, and the operator
+  # changes that number to change its capacity. The AWS provider takes a
+  # stream with no stream_mode_details as PROVISIONED, which needs a
+  # shard_count, so the body writes the mode on every stream, as the
+  # cloudformation Recipe of this Component does, and both targets create
+  # the same stream. Any other mode halts the build.
+  #
+  # shard_count is the number of shards of a PROVISIONED stream, a whole
+  # number of at least 1, which the AWS provider requires of a provisioned
+  # stream; the account's shard quota, which the operator's account sets,
+  # bounds it from above and is not read at build. PROVISIONED without a
+  # shard_count halts the build, and so does a shard_count without
+  # PROVISIONED, which the AWS provider refuses on an on-demand stream.
+  #
+  # kms_key_id names the KMS key by one of the forms Kinesis Data Streams
+  # documents for the key a stream is encrypted with: a key ID (a UUID, or,
+  # for a multi-Region key, mrk- and 32 hexadecimal digits, the key ID KMS
+  # gives it), an alias name (alias/ followed by its name), or the ARN of a
+  # key or of an alias. The AWS provider passes the string as written, so a
+  # value of another form halts the build here rather than at apply.
+  # alias/aws/kinesis names the key AWS manages for Kinesis Data Streams in
+  # the account, whose use needs no IAM permission of the operator's own; any
+  # other key, and its key policy, are the operator's, named here and never
+  # created. The body then writes
+  # encryption_type KMS and the key, and Kinesis Data Streams encrypts each
+  # record under that key before it writes the record to the stream's
+  # storage, and decrypts it as a consumer reads it, so the stream's records
+  # are encrypted at rest. With a key of the operator's, a producer needs
+  # kms:GenerateDataKey and a consumer kms:Decrypt on it, or their writes and
+  # reads fail (the Kinesis Data Streams Developer Guide's page on
+  # permissions to use user-generated KMS keys). The AWS provider starts the
+  # encryption once it has created the stream, and naming a key on a stream
+  # that already exists encrypts the records written from then on and not
+  # those it already holds; removing kms_key_id turns the encryption off.
+  # Unset, the body writes encryption_type NONE, the AWS provider's default,
+  # and the stream has no server-side encryption.
+  #
+  # tags tag the stream, as a map from each tag name to a string.
+  #
+  # host is refused by name. Kinesis Data Streams publishes no address of a
+  # stream of its own: a client calls the service's endpoint in the stream's
+  # Region, an endpoint the service names and offers no custom domain for,
+  # and names the stream by its ARN in each call, so this Component publishes
+  # no host for the name to replace.
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # held by the Component's assertions, or not read:
+  #   honoured — values.retention_period_hours (retention_period), and the
+  #     overrides above.
+  #   refused — a stream_mode other than ON_DEMAND or PROVISIONED; a
+  #     shard_count that is not a whole number of at least 1; a shard_count
+  #     without stream_mode PROVISIONED; stream_mode PROVISIONED without a
+  #     shard_count; a kms_key_id of another form; tags that are not a map of
+  #     strings; infra.overrides.host; and any infra.overrides key not listed
+  #     above.
+  #   held by the Component — the component's name, which names the stream,
+  #     and values.retention_period_hours outside 24 to 8,760.
+  #   not read — none; the Component declares no other value or infra key.
+  #
+  # The name. The AWS provider replaces the stream when its name changes, so
+  # renaming the component makes Terraform delete the old stream, with every
+  # record it holds, and create a new one under the new name.
+  #
+  # What the body writes beside the name, the retention period, the
+  # capacity, the key and the tags: nothing else of the stream's own. It
+  # writes no shard_level_metrics, so the stream publishes no shard-level
+  # metrics; no max_record_size_in_kib, so the stream takes the service's
+  # default record size; no warm_throughput_mib_ps, so the stream is given no
+  # target warm throughput; and the Region of the AWS provider the root
+  # configures. It declares no consumer and no resource policy, each a
+  # resource of its own: enhanced fan-out consumers are the subscribers', and
+  # with no resource policy only identities of the account owning the
+  # stream, as their IAM permissions allow, write to it or read from it.
+  #
+  # Deletion. A destroy, or removing the component, deletes the stream, its
+  # shards and every record they hold (the DeleteStream API reference), and
+  # Kinesis Data Streams keeps no backup to restore it from. The body writes
+  # enforce_consumer_deletion false, the AWS provider's default, which the
+  # provider passes as DeleteStream's EnforceConsumerDeletion: with it false,
+  # Kinesis Data Streams refuses to delete a stream while an enhanced fan-out
+  # consumer is registered on it, so the destroy fails until the subscribers
+  # deregister theirs, and this Recipe never deregisters a subscriber's
+  # consumer.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "stream_mode" "shard_count" "kms_key_id" "tags" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "host" -}}
+      {{- fail "infra.overrides.host is set, and Amazon Kinesis Data Streams publishes no address of a stream: a client calls the service's endpoint in the stream's Region, which offers no custom domain, and names the stream by arn: remove infra.overrides.host from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads stream_mode, shard_count, kms_key_id and tags from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # Each override is passed to the resource as written, so one of another
+    # shape would render an argument the AWS provider or Kinesis Data Streams
+    # refuses. stream_mode takes the two modes the provider's
+    # stream_mode_details lists; shard_count a whole number of at least 1;
+    # kms_key_id the forms Kinesis Data Streams documents for the key, each
+    # within the letters, digits, hyphens, underscores, slashes and colons
+    # they use, an alias name being held to KMS's own CreateAlias AliasName
+    # pattern (alias/ then letters, digits, slashes, underscores and hyphens,
+    # no colon; only the ARN forms carry one); and tags the map of strings
+    # the provider types them as. The cloudformation Recipe of this Component
+    # holds the same mode and key rules on StreamMode and KmsKeyId, and on
+    # ShardCount the bounds its resource type's schema gives: each target
+    # reads the keys under its own spelling, so the rules cannot sit in the
+    # Component.
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "stream_mode" -}}
+      {{- if not (and (typeIs "string" $o.stream_mode) (has $o.stream_mode (list "ON_DEMAND" "PROVISIONED"))) -}}
+      {{- fail (printf "infra.overrides.stream_mode is %s, and a Kinesis data stream runs in capacity mode ON_DEMAND or PROVISIONED: set it to one of them in the Release, or remove it for an on-demand stream" (toJson $o.stream_mode)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "shard_count" -}}
+      {{- $v := $o.shard_count -}}
+      {{- $ok := or (kindIs "int" $v) (kindIs "int64" $v) (and (kindIs "float64" $v) (eq (float64 (int64 $v)) $v)) -}}
+      {{- if $ok }}{{ $ok = ge (int64 $v) 1 }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.shard_count is %s, and the AWS provider takes the number of shards of a provisioned stream as a whole number, at least 1: set it in the Release to such a number" (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "kms_key_id" -}}
+      {{- if not (and (typeIs "string" $o.kms_key_id) (regexMatch `^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32}|alias/[a-zA-Z0-9/_-]+|arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:(key|alias)/[a-zA-Z0-9/_-]+)$` $o.kms_key_id)) -}}
+      {{- fail (printf "infra.overrides.kms_key_id is %s, and Kinesis Data Streams takes the KMS key a stream is encrypted with as a key ID, an alias name beginning alias/, or the ARN of a key or an alias: set it to one of them in the Release, such as alias/aws/kinesis, or remove it" (toJson $o.kms_key_id)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "tags" -}}
+      {{- $g := get $o "tags" -}}
+      {{- $ok := kindIs "map" $g -}}
+      {{- if $ok }}{{ range $_, $v := $g }}{{ if not (typeIs "string" $v) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.tags is %s, and the stream takes tags as a map from each tag name to a string: set it in the Release to such a map, or remove it" (toJson $g)) -}}
+      {{- end -}}
+      {{- end -}}
+    # A provisioned stream takes its number of shards, and an on-demand one
+    # none, as the AWS provider requires. The cloudformation Recipe of this
+    # Component holds the same pairing on StreamMode and ShardCount, for the
+    # reason given above.
+    capacity_mode: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if and (eq .locals.stream_mode "PROVISIONED") (not (hasKey $o "shard_count")) -}}
+      {{- fail "infra.overrides.stream_mode is PROVISIONED, and a provisioned Kinesis data stream takes its number of shards, which infra.overrides.shard_count names and the Release does not set: set infra.overrides.shard_count in the Release, or remove stream_mode for an on-demand stream" -}}
+      {{- end -}}
+      {{- if and (hasKey $o "shard_count") (ne .locals.stream_mode "PROVISIONED") -}}
+      {{- fail "infra.overrides.shard_count is set while infra.overrides.stream_mode is not PROVISIONED, and an on-demand Kinesis data stream takes no number of shards, which the service manages: set infra.overrides.stream_mode to PROVISIONED in the Release, or remove shard_count" -}}
+      {{- end -}}
+
+  # required_providers pins hashicorp/aws so the engine installs a provider
+  # whose resource schema this body was written against. It is a range rather
+  # than an exact version because every AWS body in a boundary's root
+  # configuration shares one installed provider, and two exact pins that differ
+  # fail init. The constraint string is the one the catalog conventions'
+  # "One AWS provider constraint for every AWS body" section states; each AWS
+  # body repeats it deliberately, because a library import cannot place a block
+  # inside an authored body.
+  #
+  # The body is the catalog's own, a full-body artifact named main.tf that
+  # emits verbatim as a standalone file alongside any other artifacts
+  # contributed at the same boundary: terraform-aws-modules publishes no
+  # Kinesis Data Streams module. The resource is named this, since each
+  # component's body renders into a module directory of its own. The
+  # retention period reaches it as the Component's schema holds it, a whole
+  # number of hours within the range Kinesis Data Streams takes.
+  artifacts:
+    main.tf: |
+      {{- $o := optional .infra "overrides" dict -}}
+      terraform {
+        required_providers {
+          aws = {
+            source  = "hashicorp/aws"
+            version = "~> 6.69"
+          }
+        }
+      }
+
+      resource "aws_kinesis_stream" "this" {
+        name                      = "{{ .context.instance_id }}"
+        retention_period          = {{ int64 .values.retention_period_hours }}
+        enforce_consumer_deletion = false
+
+        ## ── Provider-specific overrides ──────────────────────────
+        stream_mode_details {
+          stream_mode = "{{ .locals.stream_mode }}"
+        }
+        {{- if eq .locals.stream_mode "PROVISIONED" }}
+
+        shard_count = {{ int64 $o.shard_count }}
+        {{- end }}
+        {{- with optional $o "kms_key_id" "" }}
+
+        encryption_type = "KMS"
+        kms_key_id      = {{ toJson . }}
+        {{- else }}
+
+        encryption_type = "NONE"
+        {{- end }}
+        {{- with optional $o "tags" "" }}
+
+        tags = {{ toJson . }}
+        {{- end }}
+      }
+
+      output "arn" {
+        value = aws_kinesis_stream.this.arn
+      }
