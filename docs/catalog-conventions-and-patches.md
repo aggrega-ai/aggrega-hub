@@ -1832,6 +1832,12 @@ spec:
     ...
 ```
 
+A cloud importer in `aggrega-cli` generates its mapping table from the Recipes of its capability, this header
+included — the `arm` Recipes for the importer of Azure Resource Manager templates — so a new `arm` Recipe or
+FeatureRecipe needs a row in that importer's table or a `notImported` entry with its reason in
+`plugins/internal/armimport/table.go`, then `go generate ./plugins/internal/armimport` run in `aggrega-cli`, or the
+importer's coverage test fails.
+
 ### Sourced mode is the default wherever a good chart exists
 
 A helm Recipe takes one of two shapes. A **sourced** Recipe names an upstream
