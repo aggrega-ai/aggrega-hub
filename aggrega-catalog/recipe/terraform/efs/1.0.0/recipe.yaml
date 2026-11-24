@@ -1,0 +1,390 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: efs
+  version: 1.0.0
+  # The licence of the vendored module, the terraform-aws-modules project's
+  # EFS module: the third-party code this Recipe pins and writes into the
+  # output. The file system it provisions is a service the reader contracts
+  # for directly with AWS, under AWS's terms.
+  license: Apache-2.0
+  description: >
+    Amazon EFS, realized by the published EFS module of the
+    terraform-aws-modules project, terraform-aws-modules/efs/aws at v2.2.1,
+    Apache-2.0, fetched from its git repository at that tag and pinned by
+    the commit it names in the entity.lock beside this Recipe: one file
+    system named after the component, encrypted at rest, and one mount
+    target in each subnet subnet_ids names, in the security groups
+    vpc_security_groups names. The module's security group, file system
+    policy, backup policy and replication stay off; no access point,
+    lifecycle policy, subnet or key is created.
+
+    file_system_id, host and arn publish the module's id, dns_name and arn
+    outputs, as Terraform references that resolve for a consumer authored as
+    a source: Recipe in the same root configuration, or host publishes
+    infra.overrides.host, the operator's DNS name for the mount. A consumer
+    is applied after the file system, not after its mount targets. A
+    destroy, renaming the component, or changing performance_mode or
+    kms_key_id deletes the file system and its data.
+
+    performance_mode, throughput_mode and provisioned_throughput_in_mibps
+    set its modes, kms_key_id the key encrypting its files' contents, and
+    tags label it. subnet_ids or vpc_security_groups unset or of another
+    form, a subnet named twice, a mode the file system or a key the AWS
+    provider cannot take, maxIO with elastic, provisioned throughput without its figure or a
+    figure without it, a host that is not bare, tags that are not a map of
+    strings or carry Name, and any infra.overrides key not listed halt the
+    build naming the key.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  implements: core/storage/efs:1.0.0
+
+  # The published module, at the tag the registry publishes as version 2.2.1.
+  # A registry version of a module is a tag of its git repository, and
+  # Terraform's dependency lock file records providers and no module, so the
+  # pin is taken here: `aggrega pin` resolves the tag to its commit and
+  # records that commit and the archive's digest in entity.lock, and every
+  # build vendors exactly those bytes.
+  #
+  # The source names the repository root, which is the module: the
+  # configuration Terraform loads from it is that root's own files, which
+  # declare no module call, so initialising it fetches providers and nothing
+  # else. The repository's examples/ and wrappers/ directories are vendored
+  # with it and never loaded, since nothing the root declares reaches them.
+  #
+  # The module declares hashicorp/aws >= 6.28 and Terraform >= 1.5.7 in its
+  # own terraform block and is vendored byte for byte, so this Recipe adds no
+  # provider constraint of its own; the catalog conventions' "One AWS
+  # provider constraint for every AWS body" section says how it composes with
+  # the catalog's authored AWS bodies.
+  #
+  # The tag is written out rather than read from infra.source_version: a
+  # source whose coordinates come from a template is pinned per Release
+  # instead of in this Recipe's own entity.lock, and this Recipe's pin is the
+  # one stated above.
+  source:
+    kind: git-repository
+    url: https://github.com/terraform-aws-modules/terraform-aws-efs.git
+    ref: v2.2.1
+
+  locals:
+    # The name the Release gives the file system under infra.overrides.host,
+    # or empty while it gives none. Only a string is read here; any other
+    # value is refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # The String Pipe: the compiler does not interpret these strings.
+  # file_system_id, host and arn name the module's id, dns_name and arn
+  # outputs, through this component's module call, which the boundary's root
+  # configuration declares under .context.instance_id for a component
+  # declared in the Aggregate the Release deploys. Terraform resolves them at
+  # apply time, so they resolve only for a consumer authored as a source:
+  # Recipe in the same root configuration; a consumer on another target
+  # receives them as text. dns_name is the AWS provider's own composition of
+  # the file system's DNS name from its ID and Region,
+  # <file_system_id>.efs.<region>. followed by the partition's domain suffix,
+  # the name the Amazon EFS User Guide composes ("Mounting on Amazon EC2 with
+  # a DNS name").
+  #
+  # Each output names the file system alone, so a consumer reading one is
+  # applied after the file system, but not after its mount targets: the DNS
+  # name resolves once a mount target is available in the client's
+  # Availability Zone, and the guide's page above recommends waiting 90
+  # seconds after a mount target is created before mounting. A consumer
+  # mounting at start-up is ordered after the mount targets by a later
+  # syncWave on its own boundary, sharing this boundary's directory.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record for it, so the operator points the name at the file system's
+  # mount targets outside the Release.
+  provides:
+    file_system_id: "${module.{{ .context.instance_id }}.id}"
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.dns_name}{{ end }}"
+    arn: "${module.{{ .context.instance_id }}.arn}"
+
+  # This Recipe reads from infra.overrides:
+  #   subnet_ids                     - []string, required (mount_targets, one in each, its subnet_id)
+  #   vpc_security_groups            - []string, required (each mount target's security_groups)
+  #   performance_mode               - string (performance_mode)
+  #   throughput_mode                - string (throughput_mode)
+  #   provisioned_throughput_in_mibps - number (provisioned_throughput_in_mibps)
+  #   kms_key_id                     - string (kms_key_arn, beside encrypted true)
+  #   host                           - string (published as provides.host; renders nothing)
+  #   tags                           - map[string]string (tags)
+  # Any other key halts naming it, so a key misspelt, or meant for another
+  # Recipe, is never passed over unread.
+  #
+  # subnet_ids, vpc_security_groups, kms_key_id and tags are the keys, under
+  # the same names, that the catalog's terraform Recipes for AWS read for the
+  # subnets and the security groups a resource is placed in, the KMS key it
+  # is encrypted with and its tags, whatever the module's input is called, so
+  # a Release names each once whichever Recipe it configures. The modes are
+  # named by the module inputs they set. host is the address a consumer
+  # reaches the file system at, under the name every Recipe of a managed
+  # service in this catalog reads for it.
+  #
+  # subnet_ids names the operator's subnets, each subnet- followed by 8 to 40
+  # lower-case hexadecimal digits as Amazon EFS reads a mount target's subnet,
+  # each once, and the module creates one mount target in each, keyed by the
+  # subnet's ID. Amazon EFS takes mount targets of one file system in one VPC
+  # alone, and one in each Availability Zone (the CreateMountTarget
+  # reference), so the subnets are in one VPC and in distinct zones; which
+  # zone and VPC each subnet sits in is the service's to check at apply.
+  # vpc_security_groups names one to 100 distinct security groups, each sg-
+  # followed by 8 to 40 lower-case hexadecimal digits, the limits Amazon EFS
+  # sets on a mount target's security groups, written on every mount target;
+  # the account's quota of security groups for a network interface may be
+  # lower, which the service checks. Both are required, as on the
+  # CloudFormation Recipe of this Component, whose resource requires the
+  # security groups of a mount target: without vpc_security_groups Amazon EFS
+  # would place each mount target in the VPC's default security group, and
+  # without subnet_ids no client reaches the file system. They are the only
+  # gate on a client, since no file system policy is set and Amazon EFS then
+  # grants full access to any client reaching a mount target ("Using IAM to
+  # control access to file systems"), so the groups admit NFS on TCP port
+  # 2049 from the clients alone.
+  #
+  # performance_mode is generalPurpose or maxIO and throughput_mode bursting,
+  # elastic or provisioned, the values the AWS provider validates; unset, the
+  # mapping writes neither, and the provider creates the file system in
+  # generalPurpose, Amazon EFS's default, and bursting, the provider's
+  # default and Amazon EFS's (the CreateFileSystem reference). Amazon EFS
+  # takes maxIO on no file system using elastic throughput (the same
+  # reference), so the two together halt. provisioned_throughput_in_mibps is
+  # the throughput of a provisioned file system, in MiB a second, a number
+  # from 1, which Amazon EFS requires with throughput_mode provisioned and
+  # holds valid for a file system in that mode alone, and which the provider
+  # sends with no other mode; so provisioned without it, and it without
+  # provisioned, halt. The reference gives 1 to 3414 MiB a second, the upper
+  # limit depending on the Region and raised through AWS Support, which the
+  # service checks.
+  #
+  # kms_key_id is the ARN of the KMS key encrypting the contents of the file
+  # system's files, or of an alias of it: the AWS provider takes the key by
+  # an ARN alone, its kms_key_id argument validated as one, so a key ID or an
+  # alias name halts the build here, as does an ARN of a form Amazon EFS does
+  # not read (its CreateFileSystem reference's KmsKeyId pattern). Amazon EFS
+  # takes a symmetric key alone, which the service checks. File names,
+  # directory names and directory contents are encrypted under a key Amazon
+  # EFS manages internally, whichever key is named ("Encrypting data at
+  # rest"). Unset, the mapping writes none and the file contents are
+  # encrypted under the key for Amazon EFS that AWS provides,
+  # aws/elasticfilesystem. The key and its key policy are the operator's,
+  # named here and never created.
+  #
+  # The CloudFormation Recipe of this Component holds the same rules on
+  # SubnetIds, SecurityGroups, PerformanceMode, ThroughputMode and
+  # ProvisionedThroughputInMibps, and its own on KmsKeyId, whose resource
+  # also reads a key ID or an alias name: each target reads the keys under
+  # its own spelling, so the rules cannot sit in the Component.
+  #
+  # host is a bare DNS name or IP literal: the assertion below refuses a
+  # value carrying a scheme, a path, a user, a port or whitespace, because a
+  # client mounts the name over NFS on port 2049 and would compose a broken
+  # address from anything else. tags is a map from each tag name to a string,
+  # written on the file system, the one resource the module creates here that
+  # takes tags: an aws_efs_mount_target takes none. The module tags the file
+  # system Name, with the component's name as the value, after merging tags,
+  # so a Name key in tags would be overwritten and halts the build instead.
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # or not read:
+  #   honoured — the overrides above. The Component declares no values.
+  #   refused — subnet_ids or vpc_security_groups unset or of another form;
+  #     a subnet named twice; a performance_mode or throughput_mode the file
+  #     system does not take; maxIO with elastic; provisioned throughput
+  #     without provisioned_throughput_in_mibps, and that figure without
+  #     provisioned or below 1; a kms_key_id that is not an ARN Amazon EFS
+  #     reads; a host that is not bare; tags that are not a map of strings,
+  #     or carry Name; and any infra.overrides key not listed above.
+  #   not read — none; the Component declares no other value or infra key.
+  #
+  # What the mapping writes beside these: encrypted true, the module's
+  # default written out, since Amazon EFS takes encryption through its API
+  # only when asked ("Encrypting data at rest"), and name, the component's
+  # name, which the module writes as the file system's Name tag and Amazon
+  # EFS reports as the file system's name; the CloudFormation Recipe of this
+  # Component writes both too, so both targets agree. Three module toggles
+  # whose default is true are written false, each of which would create what
+  # the Component does not offer: create_security_group (the module's own
+  # security group, added to every mount target), attach_policy (a file
+  # system policy denying requests not over TLS and allowing every principal
+  # through a mount target) and create_backup_policy (a backup policy turning
+  # automatic backups on); create_replication_configuration, false by
+  # default, is written false too. So automatic backups stay off, as Amazon
+  # EFS creates a Regional file system through its API ("Backing up EFS file
+  # systems").
+  # The module's own defaults stand for every input the mapping leaves out:
+  # a Regional file system, its data stored across several Availability
+  # Zones; no lifecycle policy, so every file stays in the Standard storage
+  # class; replication overwrite protection on; no access point; each mount
+  # target at an IPv4 address Amazon EFS chooses in its subnet; and a
+  # creation token the AWS provider generates.
+  #
+  # Deletion and replacement. A destroy, or removing the component, deletes
+  # the mount targets and then the file system with every file it holds, and
+  # with automatic backups off no recovery point remains unless the operator
+  # backs the file system up outside the Release. performance_mode,
+  # kms_key_id and encrypted force a new file system in the AWS provider, so
+  # changing performance_mode or kms_key_id on a file system that exists
+  # makes Terraform delete it with its data and create a new, empty one; so
+  # does renaming the component, which changes the module's address.
+  # throughput_mode and provisioned_throughput_in_mibps change in place,
+  # within the waiting periods Amazon EFS sets between such changes, and so
+  # do vpc_security_groups. A mount target's subnet forces a new one, and
+  # each mount target is keyed by its subnet, so listing the subnets in
+  # another order changes nothing, adding one adds its mount target and
+  # removing one deletes it. Terraform does not order the deletion of one
+  # mount target before the creation of another, so moving a mount target to
+  # another subnet of the same Availability Zone takes two applies: remove
+  # the old subnet, then add the new one.
+  #
+  # Credentials. Amazon EFS holds no credential a consumer presents: a client
+  # mounts through a mount target its security groups admit, so nothing is
+  # published but the file system's identifiers and address. Backup. No
+  # backup is configured: core/backup applies to stateful servers, and an
+  # attachment of it to this resource halts before anything renders.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "subnet_ids" "vpc_security_groups" "performance_mode" "throughput_mode" "provisioned_throughput_in_mibps" "kms_key_id" "host" "tags" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads subnet_ids, vpc_security_groups, performance_mode, throughput_mode, provisioned_throughput_in_mibps, kms_key_id, host and tags from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a client mounts this file system at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — a client mounts it over NFS on port 2049` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The mount targets: one in each subnet subnet_ids names, each in the
+    # security groups vpc_security_groups names, both required and passed to
+    # the module as written. Each mount target is keyed by its subnet, so a
+    # subnet named twice would name one mount target twice.
+    mount_targets: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if not (hasKey $o "subnet_ids") -}}
+      {{- fail "infra.overrides.subnet_ids is unset, and this Recipe places the file system's mount targets in the operator's subnets, one in each subnet named, through which alone a client reaches the file system: set infra.overrides.subnet_ids in the Release to the IDs of those subnets, one in each Availability Zone a client mounts from" -}}
+      {{- end -}}
+      {{- $s := $o.subnet_ids -}}
+      {{- $ok := and (kindIs "slice" $s) (gt (len $s) 0) -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) (regexMatch `^subnet-[0-9a-f]{8,40}$` .)) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.subnet_ids is %s, and a mount target takes its subnet by ID, subnet- followed by 8 to 40 lower-case hexadecimal digits: set it in the Release to a list of such IDs, one for each mount target" (toJson $s)) -}}
+      {{- end -}}
+      {{- if ne (len (uniq $s)) (len $s) -}}
+      {{- fail (printf "infra.overrides.subnet_ids is %s, which names a subnet more than once, and Amazon EFS takes one mount target of a file system in a subnet, and one in each Availability Zone: name each subnet once in the Release" (toJson $s)) -}}
+      {{- end -}}
+      {{- if not (hasKey $o "vpc_security_groups") -}}
+      {{- fail "infra.overrides.vpc_security_groups is unset, and this Recipe places each mount target in the operator's security groups, which admit NFS on TCP port 2049 from the file system's clients, rather than in the VPC's default security group: set infra.overrides.vpc_security_groups in the Release to the IDs of those security groups" -}}
+      {{- end -}}
+      {{- $g := $o.vpc_security_groups -}}
+      {{- $ok = and (kindIs "slice" $g) (ge (len $g) 1) (le (len $g) 100) -}}
+      {{- if $ok }}{{ range $g }}{{ if not (and (typeIs "string" .) (regexMatch `^sg-[0-9a-f]{8,40}$` .)) }}{{ $ok = false }}{{ end }}{{ end }}{{ $ok = and $ok (eq (len (uniq $g)) (len $g)) }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.vpc_security_groups is %s, and a mount target takes its security groups as a list of 1 to 100 distinct security group IDs, each sg- followed by 8 to 40 lower-case hexadecimal digits: set it in the Release to such a list" (toJson $g)) -}}
+      {{- end -}}
+    # The performance and throughput modes the AWS provider validates, the
+    # pairing of maxIO and elastic that the CreateFileSystem reference
+    # refuses, and the provisioned throughput that mode requires and the
+    # provider sends with no other mode.
+    file_system_modes: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "performance_mode" -}}
+      {{- if not (and (typeIs "string" $o.performance_mode) (has $o.performance_mode (list "generalPurpose" "maxIO"))) -}}
+      {{- fail (printf "infra.overrides.performance_mode is %s, and an Amazon EFS file system runs in the performance mode generalPurpose or maxIO: set it to one of them in the Release, or remove it for generalPurpose" (toJson $o.performance_mode)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "throughput_mode" -}}
+      {{- if not (and (typeIs "string" $o.throughput_mode) (has $o.throughput_mode (list "bursting" "elastic" "provisioned"))) -}}
+      {{- fail (printf "infra.overrides.throughput_mode is %s, and an Amazon EFS file system runs in the throughput mode bursting, elastic or provisioned: set it to one of them in the Release, or remove it for bursting" (toJson $o.throughput_mode)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $mode := toString (optional $o "throughput_mode" "bursting") -}}
+      {{- if and (eq (toString (optional $o "performance_mode" "")) "maxIO") (eq $mode "elastic") -}}
+      {{- fail "infra.overrides.performance_mode is maxIO and infra.overrides.throughput_mode elastic, and Amazon EFS takes the maxIO performance mode on no file system using elastic throughput: set performance_mode to generalPurpose, or throughput_mode to bursting or provisioned, in the Release" -}}
+      {{- end -}}
+      {{- if hasKey $o "provisioned_throughput_in_mibps" -}}
+      {{- $v := $o.provisioned_throughput_in_mibps -}}
+      {{- $ok := or (kindIs "int" $v) (kindIs "int64" $v) (kindIs "float64" $v) -}}
+      {{- if $ok }}{{ $ok = ge (float64 $v) 1.0 }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.provisioned_throughput_in_mibps is %s, and Amazon EFS takes a provisioned throughput as a number of MiB a second from 1: set it in the Release to such a number" (toJson $v)) -}}
+      {{- end -}}
+      {{- if ne $mode "provisioned" -}}
+      {{- fail (printf "infra.overrides.provisioned_throughput_in_mibps is set while the throughput mode is %s, and Amazon EFS reads a provisioned throughput only in the throughput mode provisioned: set infra.overrides.throughput_mode to provisioned in the Release, or remove provisioned_throughput_in_mibps" $mode) -}}
+      {{- end -}}
+      {{- else if eq $mode "provisioned" -}}
+      {{- fail "infra.overrides.throughput_mode is provisioned, and a file system in that mode takes the throughput it is provisioned with, which infra.overrides.provisioned_throughput_in_mibps names and the Release does not set: set infra.overrides.provisioned_throughput_in_mibps in the Release, or choose another throughput_mode" -}}
+      {{- end -}}
+    # kms_key_id is passed to the module's kms_key_arn as the ARN the AWS
+    # provider validates its kms_key_id argument as, in a form the
+    # CreateFileSystem reference's KmsKeyId pattern reads: a key's ARN, a
+    # multi-Region key's, or an alias's. tags is passed as the map of strings
+    # the module's tags input is typed as.
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "kms_key_id" -}}
+      {{- if not (and (typeIs "string" $o.kms_key_id) (regexMatch `^arn:aws[-a-z]*:kms:[a-z0-9-]+:[0-9]{12}:(key/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|key/mrk-[0-9a-f]{32}|alias/[a-zA-Z0-9/_-]+)$` $o.kms_key_id)) -}}
+      {{- fail (printf "infra.overrides.kms_key_id is %s, and the AWS provider takes the KMS key encrypting an Amazon EFS file system's file contents by its ARN, arn:<partition>:kms:<region>:<account>:key/<id>, or an alias's ARN: set it to one of them in the Release, or remove it to encrypt them under aws/elasticfilesystem" (toJson $o.kms_key_id)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "tags" -}}
+      {{- $g := get $o "tags" -}}
+      {{- $ok := kindIs "map" $g -}}
+      {{- if $ok }}{{ range $_, $v := $g }}{{ if not (typeIs "string" $v) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if and $ok (hasKey $g "Name") -}}
+      {{- fail "infra.overrides.tags carries a Name key, and the module tags the file system Name with the component's name, overwriting any value set here: remove Name from infra.overrides.tags in the Release" -}}
+      {{- end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.tags is %s, and the module takes tags as a map from each tag name to a string: set it in the Release to such a map, or remove it" (toJson $g)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # Each rendered key becomes an argument of this component's module block in
+  # the boundary's root configuration, named for the module's own input.
+  # mount_targets maps each subnet's ID to the mount target in it, its
+  # subnet_id and security_groups, so the module creates one mount target for
+  # each key; a map renders with its keys in sorted order, which Terraform
+  # reads the same as any other.
+  valuesMapping: |
+    {{- $o := optional .infra "overrides" dict -}}
+    {{- $targets := dict -}}
+    {{- range (optional $o "subnet_ids" list) }}{{ $_ := set $targets . (dict "subnet_id" . "security_groups" $o.vpc_security_groups) }}{{ end -}}
+    name: {{ toJson .context.instance_id }}
+    encrypted: true
+    create_security_group: false
+    attach_policy: false
+    create_backup_policy: false
+    create_replication_configuration: false
+    mount_targets: {{ toJson $targets }}
+    {{- with optional $o "performance_mode" "" }}
+    performance_mode: {{ toJson . }}
+    {{- end }}
+    {{- with optional $o "throughput_mode" "" }}
+    throughput_mode: {{ toJson . }}
+    {{- end }}
+    {{- if hasKey $o "provisioned_throughput_in_mibps" }}
+    provisioned_throughput_in_mibps: {{ toJson $o.provisioned_throughput_in_mibps }}
+    {{- end }}
+    {{- with optional $o "kms_key_id" "" }}
+    kms_key_arn: {{ toJson . }}
+    {{- end }}
+    {{- with optional $o "tags" "" }}
+    tags: {{ toJson . }}
+    {{- end }}
