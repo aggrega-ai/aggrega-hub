@@ -1,0 +1,399 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: redshift
+  version: 1.0.0
+  # The values, infra keys and infra.overrides keys this Recipe refuses are
+  # listed, with their reasons, in the comments above the assertions.
+  description: >
+    Amazon Redshift Serverless, rendered as an authored Terraform body,
+    main.tf: one aws_redshiftserverless_namespace and one
+    aws_redshiftserverless_workgroup, both named after the component.
+
+    The namespace creates the database values.database names and the
+    administrator values.user names. Amazon Redshift generates the
+    administrator's password and keeps it in AWS Secrets Manager: the
+    password slot stays empty or takes core/generated-secret, and any other
+    credential halts the build.
+
+    host publishes a Terraform reference to the workgroup's address, an
+    output of this component's module, or infra.overrides.host; port
+    publishes infra.port. No backup is configured: the service keeps the
+    namespace's recovery points itself. Destroying the namespace deletes it
+    and its data, with no final snapshot.
+
+    The subnets, security groups, KMS key and IAM roles are the operator's,
+    named in infra.overrides, and none is created. A value Amazon Redshift
+    Serverless cannot take and any infra.overrides key not listed halt the
+    build naming the key.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: terraform
+  implements: core/bigdata/redshift:1.0.0
+
+  locals:
+    # The name the Release gives the workgroup under infra.overrides.host, or
+    # empty while it gives none. Only a string is read here; any other value
+    # is refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The words Amazon Redshift reserves, which a database or user name
+    # cannot take: the Amazon Redshift Database Developer Guide's list of
+    # reserved words, in lower case.
+    reserved_words: >-
+      aes128 aes256 all allowoverwrite analyse analyze and any array as asc
+      authorization az64 backup between binary blanksasnull both bytedict
+      bzip2 case cast check collate column constraint create credentials
+      cross current_date current_time current_timestamp current_user
+      current_user_id default deferrable deflate defrag delta delta32k desc
+      disable distinct do else emptyasnull enable encode encrypt encryption
+      end except explicit false for foreign freeze from full globaldict256
+      globaldict64k grant group gzip having identity ignore ilike in
+      initially inner intersect interval into is isnull join leading left
+      like limit localtime localtimestamp lun luns lzo lzop minus mostly16
+      mostly32 mostly8 natural new not notnull null nulls off offline offset
+      oid old on only open or order outer overlaps parallel partition
+      percent permissions pivot placing primary raw readratio recover
+      references rejectlog resort respect restore right select session_user
+      similar snapshot some sysdate system table tag tdes text255 text32k
+      then timestamp to top trailing true truncatecolumns union unique
+      unnest unpivot user using verbose wallet when where with without
+
+  # The String Pipe: the compiler does not know host is a Terraform reference.
+  # It pipes the string; Terraform resolves it at apply time.
+  #
+  # host names the address output the body below declares, through this
+  # component's module call: the body renders into the component's own module
+  # directory, and the boundary's root configuration declares that directory as
+  # a module block named .context.instance_id for a component declared in the
+  # Aggregate the Release deploys. The reference resolves only for a consumer
+  # authored as a source: Recipe in the same Terraform root configuration; a
+  # consumer on another target receives it as text. The output is the address
+  # of the workgroup's endpoint, its bare hostname.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name
+  # instead of the reference. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record, alias or custom domain name for it, so the operator points
+  # the name at the workgroup outside the Release. A consumer in the same root
+  # configuration receives the name as well, and a name carries no reference
+  # for Terraform to order its module after this one by; a later syncWave on
+  # the consumer's boundary, sharing this boundary's directory, orders the
+  # two.
+  #
+  # The workgroup presents a certificate carrying its own endpoint name. A
+  # client that checks the server's name against the certificate
+  # (sslmode=verify-full) accepts the operator's name only once that name is
+  # the workgroup's custom domain name, associated with an AWS Certificate
+  # Manager certificate carrying it, which this Recipe does not create: the
+  # operator makes the association outside the Release, after which
+  # verify-full holds for the custom name alone. A client checking the
+  # certificate's issuer alone (sslmode=verify-ca) connects under either name
+  # (the Amazon Redshift Management Guide's pages on custom domain names).
+  #
+  # port is the value the body sets on the workgroup, so it is known ahead of
+  # time and published as that value. user and database are the administrator
+  # and the database the namespace creates, in lower case as the namespace
+  # keeps them, and protocol is redshift.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.address}{{ end }}"
+    port: "{{ .infra.port }}"
+    user: "{{ lower .values.user }}"
+    database: "{{ lower .values.database }}"
+    protocol: "redshift"
+
+  # This Recipe reads from infra.overrides:
+  #   base_capacity        - integer (the workgroup's base_capacity, in Redshift Processing Units)
+  #   subnet_ids           - []string (the workgroup's subnet_ids)
+  #   vpc_security_groups  - []string (the workgroup's security_group_ids)
+  #   publicly_accessible  - bool (the workgroup's publicly_accessible)
+  #   kms_key_id           - string (the namespace's kms_key_id, a key or alias ARN)
+  #   iam_roles            - []string (the namespace's iam_roles, role ARNs)
+  #   default_iam_role_arn - string (the namespace's default_iam_role_arn, one of iam_roles)
+  #   tags                 - map[string]string (tags, on both resources)
+  #   host                 - string (published as provides.host; renders nothing)
+  # Any other key halts naming it, so a key misspelt, or meant for another
+  # Recipe, is never passed over unread.
+  #
+  # A key is the Terraform argument name, which is what a reader matches
+  # against provider documentation, unless the catalog's AWS Recipes share one
+  # spelling for a concept: vpc_security_groups is the name other AWS Recipes
+  # in the catalog read for security groups, and the table gives the argument
+  # it sets in parentheses. host is the exception to the naming: it is no
+  # argument of either resource but the address a consumer reaches the
+  # warehouse at, under the name every managed datastore Recipe of this
+  # catalog reads for it. host is a bare DNS name or IP literal. The assertion
+  # below refuses a value carrying a scheme, a path, a user, a port or
+  # whitespace, because a consumer composes its connection from host and port
+  # and would compose a broken one; the port is infra.port.
+  #
+  # base_capacity is the compute the workgroup starts from, in Redshift
+  # Processing Units. Amazon Redshift Serverless takes 4, every multiple of 8
+  # from 8 to 512, and every multiple of 32 from 544 to 1024 (the Amazon
+  # Redshift Management Guide's page on compute capacity), and any other value
+  # halts the build. 4 and the values above 512 are offered in some AWS
+  # Regions alone, which the service checks when Terraform applies. Unset, the
+  # body writes none and the service chooses the base capacity.
+  #
+  # subnet_ids, vpc_security_groups, kms_key_id and iam_roles name the
+  # operator's subnets, security groups, KMS key and IAM roles, which this
+  # Recipe never creates. A workgroup without enhanced VPC routing, which this
+  # Recipe does not turn on, takes at least two subnets spanning two
+  # Availability Zones (the Management Guide's considerations for Redshift
+  # Serverless; the AWS provider's documentation asks for three, which a
+  # workgroup with enhanced VPC routing needs), so subnet_ids names at least
+  # two, each subnet- followed by hexadecimal digits; which zone each subnet
+  # sits in, the service checks. vpc_security_groups names one to 32 security
+  # groups, each sg- followed by hexadecimal digits. Unset, the body writes
+  # neither and the service chooses the subnets and the security group
+  # itself, as its CreateWorkgroup reference's example shows.
+  # publicly_accessible takes true or false, false as the service creates a
+  # workgroup. kms_key_id is the ARN of the key the namespace's data is
+  # encrypted with, or of an alias naming it: the AWS provider takes it as an
+  # ARN alone and refuses a key ID or an alias name; unset, Amazon Redshift
+  # encrypts the data with a key AWS owns (the Management Guide's page on
+  # database encryption). iam_roles are the roles the warehouse loads and
+  # unloads data with, each a role ARN, and default_iam_role_arn the one of
+  # them its SQL commands take by default, which the AWS provider's
+  # documentation requires to be one of iam_roles, so default_iam_role_arn
+  # not among iam_roles halts. tags tag the namespace and the workgroup, as a
+  # map from each tag name to a string.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read:
+  #   honoured — values.database, as the namespace's db_name; values.user, as
+  #     its admin_username; infra.port, as the workgroup's port; the password
+  #     slot left empty or bound to core/generated-secret; and the overrides
+  #     above.
+  #   refused — a component name the service does not take as a namespace or
+  #     workgroup name; values.database or values.user not a name the service
+  #     takes; infra.port outside the ports the service serves; any other
+  #     credential on the password slot; a base_capacity the service does not
+  #     offer; an override of the wrong shape; default_iam_role_arn not among
+  #     iam_roles; and any infra.overrides key not listed above.
+  #   not read — none.
+  #
+  # The names. The namespace and the workgroup are both named after the
+  # component, and the service takes a name of 3 to 64 lowercase letters,
+  # digits and hyphens for each (the CreateNamespace and CreateWorkgroup
+  # references); a component name outside that rule halts the build. Both
+  # names are fixed when the resources are created: Terraform replaces them
+  # when the component is renamed.
+  #
+  # The database and the administrator. The service takes a database name and
+  # an administrator name of letters, digits and underscores beginning with a
+  # letter (the CloudFormation resource documentation of the same settings),
+  # of up to 127 bytes and not a word Amazon Redshift reserves, and no user
+  # named PUBLIC (the Database Developer Guide's pages on names and
+  # identifiers, reserved words and CREATE USER). A name outside that rule
+  # halts the build naming the key. Amazon Redshift folds the letters of a
+  # name to lower case, so the body writes each in lower case and user and
+  # database publish the name the namespace keeps.
+  #
+  # The port. Amazon Redshift Serverless serves a workgroup on a port from
+  # 5431 to 5455 or from 8191 to 8215 (the CreateWorkgroup reference), and the
+  # Component's 5439 is its default.
+  #
+  # The administrator's password. Amazon Redshift generates it and keeps it in
+  # AWS Secrets Manager, in a secret it creates (manage_admin_password), so a
+  # credential attached to the password slot would reach no byte of the
+  # output while the build reads as if it had set it. The slot stays empty,
+  # or takes core/generated-secret, which says the service owns the password
+  # and renders nothing; any other credential halts naming what filled the
+  # slot. The type is compared with any version set aside.
+  #
+  # Backup. No backup is configured: Amazon Redshift Serverless keeps recovery
+  # points of the namespace, taken at least every 30 minutes and kept for 24
+  # hours, with no setting that changes either (the Management Guide's page on
+  # snapshots and recovery points). The namespace's resource takes no final
+  # snapshot, so destroying it, or a change replacing it, deletes the
+  # namespace and its data; a snapshot the operator takes outside the Release
+  # is kept.
+  assertions:
+    overrides_known: >-
+      {{- $known := list "base_capacity" "subnet_ids" "vpc_security_groups" "publicly_accessible" "kms_key_id" "iam_roles" "default_iam_role_arn" "tags" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads base_capacity, subnet_ids, vpc_security_groups, publicly_accessible, kms_key_id, iam_roles, default_iam_role_arn, tags and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this warehouse reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the port is infra.port` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    resource_names: >-
+      {{- $n := toString .metadata.instance_id -}}
+      {{- if not (regexMatch `^[a-z0-9-]{3,64}$` $n) -}}
+      {{- fail (printf "the component %q names its Amazon Redshift Serverless namespace and workgroup, and the service takes a name of 3 to 64 lowercase letters, digits and hyphens for each: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+    database_name: >-
+      {{- $d := toString .values.database -}}
+      {{- if or (not (regexMatch `^[a-zA-Z][a-zA-Z0-9_]{0,126}$` $d)) (has (lower $d) (splitList " " .locals.reserved_words)) -}}
+      {{- fail (printf "values.database is %q, the database the namespace creates, and Amazon Redshift takes a database name of 1 to 127 letters, digits and underscores beginning with a letter that is not one of its reserved words: set values.database in the Aggregate to such a name" $d) -}}
+      {{- end -}}
+    admin_username: >-
+      {{- $u := toString .values.user -}}
+      {{- if or (not (regexMatch `^[a-zA-Z][a-zA-Z0-9_]{0,126}$` $u)) (eq (lower $u) "public") (has (lower $u) (splitList " " .locals.reserved_words)) -}}
+      {{- fail (printf "values.user is %q, the administrator the namespace creates, and Amazon Redshift takes a user name of 1 to 127 letters, digits and underscores beginning with a letter, other than PUBLIC and its reserved words: set values.user in the Aggregate to such a name" $u) -}}
+      {{- end -}}
+    port_served: >-
+      {{- $p := int .infra.port -}}
+      {{- if not (or (and (ge $p 5431) (le $p 5455)) (and (ge $p 8191) (le $p 8215))) -}}
+      {{- fail (printf "infra.port is %v, and Amazon Redshift Serverless serves a workgroup on a port from 5431 to 5455 or from 8191 to 8215: set infra.port in the Release to such a port, or remove it for 5439" .infra.port) -}}
+      {{- end -}}
+    base_capacity_offered: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "base_capacity" -}}
+      {{- $s := toString $o.base_capacity -}}
+      {{- $n := 0 }}{{ if regexMatch `^[0-9]+$` $s }}{{ $n = atoi $s }}{{ end -}}
+      {{- if not (or (eq $n 4) (and (ge $n 8) (le $n 512) (eq (mod $n 8) 0)) (and (gt $n 512) (le $n 1024) (eq (mod $n 32) 0))) -}}
+      {{- fail (printf "infra.overrides.base_capacity is %s, and Amazon Redshift Serverless starts a workgroup at 4 Redshift Processing Units, a multiple of 8 from 8 to 512, or a multiple of 32 from 544 to 1024: set it to one of them in the Release, or remove it to let the service choose" (toJson $o.base_capacity)) -}}
+      {{- end -}}
+      {{- end -}}
+    # Each of these overrides is passed to its resource as written, so one of
+    # another shape would render an argument the AWS provider refuses.
+    overrides_shape: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "subnet_ids" -}}
+      {{- $g := $o.subnet_ids -}}
+      {{- $ok := and (kindIs "slice" $g) (ge (len $g) 2) (le (len $g) 32) -}}
+      {{- if $ok }}{{ range $g }}{{ if not (and (typeIs "string" .) (regexMatch `^subnet-[0-9a-fA-F]{8,}$` .)) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.subnet_ids is %s, and the workgroup takes its subnets as a list of 2 to 32 subnet IDs, each subnet- followed by hexadecimal digits, spanning at least two Availability Zones: set it in the Release to such a list, or remove it to let the service choose" (toJson $g)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "vpc_security_groups" -}}
+      {{- $g := $o.vpc_security_groups -}}
+      {{- $ok := and (kindIs "slice" $g) (ge (len $g) 1) (le (len $g) 32) -}}
+      {{- if $ok }}{{ range $g }}{{ if not (and (typeIs "string" .) (regexMatch `^sg-[0-9a-fA-F]{8,}$` .)) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.vpc_security_groups is %s, and the workgroup takes its security groups as a list of 1 to 32 security group IDs, each sg- followed by hexadecimal digits: set it in the Release to such a list, or remove it to let the service choose" (toJson $g)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if and (hasKey $o "publicly_accessible") (not (kindIs "bool" $o.publicly_accessible)) -}}
+      {{- fail (printf "infra.overrides.publicly_accessible is %s, and the workgroup's publicly_accessible takes true or false: set it to true or false in the Release, or remove it" (toJson $o.publicly_accessible)) -}}
+      {{- end -}}
+      {{- if hasKey $o "kms_key_id" -}}
+      {{- if not (and (typeIs "string" $o.kms_key_id) (regexMatch `^arn:[^:\s]+:kms:[^:\s]*:[0-9]{12}:(key|alias)/\S+$` $o.kms_key_id)) -}}
+      {{- fail (printf "infra.overrides.kms_key_id is %s, and the AWS provider takes the KMS key the namespace's data is encrypted with by its ARN, arn:<partition>:kms:<region>:<account>:key/<id>, or the ARN of an alias naming it: set it to one in the Release, or remove it" (toJson $o.kms_key_id)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "tags" -}}
+      {{- $g := get $o "tags" -}}
+      {{- $ok := kindIs "map" $g -}}
+      {{- if $ok }}{{ range $_, $v := $g }}{{ if not (typeIs "string" $v) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.tags is %s, and every resource this Recipe declares takes tags as a map from each tag name to a string: set it in the Release to such a map, or remove it" (toJson $g)) -}}
+      {{- end -}}
+      {{- end -}}
+    iam_roles: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $roles := list -}}
+      {{- if hasKey $o "iam_roles" -}}
+      {{- $g := $o.iam_roles -}}
+      {{- $ok := and (kindIs "slice" $g) (gt (len $g) 0) -}}
+      {{- if $ok }}{{ range $g }}{{ if not (and (typeIs "string" .) (regexMatch `^arn:[^:\s]+:iam::[0-9]{12}:role/\S+$` .)) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.iam_roles is %s, and the namespace takes the roles it loads and unloads data with as a list of IAM role ARNs, arn:<partition>:iam::<account>:role/<name>: set it in the Release to such a list, or remove it" (toJson $g)) -}}
+      {{- end -}}
+      {{- $roles = $g -}}
+      {{- end -}}
+      {{- if hasKey $o "default_iam_role_arn" -}}
+      {{- if not (has $o.default_iam_role_arn $roles) -}}
+      {{- fail (printf "infra.overrides.default_iam_role_arn is %s, and Amazon Redshift sets as the namespace's default role only one of the roles associated with it, which this Recipe reads from infra.overrides.iam_roles: add it to infra.overrides.iam_roles in the Release, or remove infra.overrides.default_iam_role_arn" (toJson $o.default_iam_role_arn)) -}}
+      {{- end -}}
+      {{- end -}}
+    credentials: >-
+      {{- $f := default dict .features -}}
+      {{- if hasKey $f "password" -}}
+      {{- $ty := toString (optional $f.password "type" "") -}}
+      {{- if ne (first (splitList ":" $ty)) "core/generated-secret" -}}
+      {{- fail (printf "the password slot is filled by %s, and Amazon Redshift generates this namespace's administrator password itself and keeps it in AWS Secrets Manager, so the attachment would set nothing: remove it from the password slot when deploying to this target, or attach core/generated-secret there, which says the service owns the password" (default "an attachment of no type" $ty)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # required_providers pins hashicorp/aws so the engine installs a provider
+  # whose resource schema this body was written against. It is a range rather
+  # than an exact version because every AWS body in a boundary's root
+  # configuration shares one installed provider, and two exact pins that differ
+  # fail init. The constraint string is the one the catalog conventions'
+  # "One AWS provider constraint for every AWS body" section states; each AWS
+  # body repeats it deliberately, because a library import cannot place a block
+  # inside an authored body.
+  #
+  # The body is the catalog's own, a full-body artifact named main.tf that
+  # emits verbatim as a standalone file alongside any other artifacts
+  # contributed at the same boundary: the published Redshift module of
+  # terraform-aws-modules provisions a Redshift cluster, and no Serverless
+  # namespace or workgroup. Both resources are named this, since each
+  # component's body renders into a module directory of its own.
+  artifacts:
+    main.tf: |
+      {{- $o := optional .infra "overrides" dict -}}
+      terraform {
+        required_providers {
+          aws = {
+            source  = "hashicorp/aws"
+            version = "~> 6.69"
+          }
+        }
+      }
+
+      resource "aws_redshiftserverless_namespace" "this" {
+        namespace_name = "{{ .context.instance_id }}"
+        db_name        = "{{ lower .values.database }}"
+        admin_username = "{{ lower .values.user }}"
+
+        ## Black-Box: Amazon Redshift manages the password via Secrets Manager.
+        manage_admin_password = true
+
+        ## ── Provider-specific overrides ──────────────────────────
+        {{- with optional $o "kms_key_id" "" }}
+        kms_key_id = {{ toJson . }}
+        {{- end }}
+        {{- with optional $o "iam_roles" "" }}
+        iam_roles = {{ toJson . }}
+        {{- end }}
+        {{- with optional $o "default_iam_role_arn" "" }}
+        default_iam_role_arn = {{ toJson . }}
+        {{- end }}
+        {{- with optional $o "tags" "" }}
+        tags = {{ toJson . }}
+        {{- end }}
+      }
+
+      resource "aws_redshiftserverless_workgroup" "this" {
+        namespace_name = aws_redshiftserverless_namespace.this.namespace_name
+        workgroup_name = "{{ .context.instance_id }}"
+        port           = {{ .infra.port }}
+
+        ## ── Provider-specific overrides ──────────────────────────
+        {{- if hasKey $o "base_capacity" }}
+        base_capacity = {{ atoi (toString $o.base_capacity) }}
+        {{- end }}
+        {{- with optional $o "subnet_ids" "" }}
+        subnet_ids = {{ toJson . }}
+        {{- end }}
+        {{- with optional $o "vpc_security_groups" "" }}
+        security_group_ids = {{ toJson . }}
+        {{- end }}
+        {{- if hasKey $o "publicly_accessible" }}
+        publicly_accessible = {{ $o.publicly_accessible }}
+        {{- end }}
+        {{- with optional $o "tags" "" }}
+        tags = {{ toJson . }}
+        {{- end }}
+      }
+
+      output "address" {
+        value = aws_redshiftserverless_workgroup.this.endpoint[0].address
+      }
