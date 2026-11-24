@@ -1,0 +1,351 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: dns-record-route-53
+  version: 1.0.0
+  # The values and infra.overrides keys this Recipe refuses are listed, with
+  # their reasons, in the comments above the assertions.
+  description: >
+    Amazon Route 53, rendered as an authored Terraform body, main.tf: one
+    aws_route53_record written into a hosted zone the operator already
+    holds, infra.overrides.zone_id. No zone is declared or changed.
+
+    Reach for it where the Release deploys Terraform; reach for
+    cloudformation/dns-record-route-53 where it deploys a CloudFormation
+    stack. The record set takes A, AAAA, CAA, CNAME, MX, NS, PTR, SRV or
+    TXT records. TXT text is divided into quoted strings of 255 characters
+    at most and a CAA value quoted, as Route 53 takes them. A record set of
+    the same name and type already in the zone fails the apply and is left
+    untouched; a destroy deletes the record set the apply wrote.
+
+    host is a reference to the name the provider reports for the record
+    set. The Component halts on an alias record and on a record not in its
+    type's form. This Recipe halts on infra.overrides.alias, host, tags or
+    any key not listed, zone_id unset or not a string, more than 400
+    records, a value longer than Route 53 takes alone or together and a
+    domain name not in ASCII, each naming what to fix. Knowing the zone by
+    its ID alone, the build cannot see a name outside the zone, which the
+    AWS provider writes under the zone's name, or a CNAME at its apex.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: terraform
+  implements: core/network/dns-record:1.0.0
+
+  locals:
+    # values.name without its trailing dot and in lower case: Route 53 treats
+    # a name with and without the trailing dot as identical, and stores its
+    # letters in lower case however they are written (Amazon Route 53
+    # Developer Guide, "DNS domain name format"); the AWS provider, at
+    # 6.73.0, keeps the name in its state in the same form.
+    fqdn: '{{ lower (trimSuffix "." .values.name) }}'
+    # The record set's values, each as Route 53 takes it in a ResourceRecord
+    # Value, as a JSON list, written as
+    # cloudformation/dns-record-route-53 writes them:
+    #   A, AAAA, CNAME, NS and PTR   the entry as written;
+    #   MX and SRV                   the entry's fields joined by one space;
+    #   CAA                          flags, tag and the value in double
+    #                                quotes, its own quotes removed first;
+    #   TXT                          the text in double-quoted strings of 255
+    #                                characters at most, separated by a
+    #                                space, never divided inside a character.
+    # In a TXT text and a CAA value a double quote is written \" and a
+    # backslash \\, and every byte of a character outside the printable ASCII
+    # range, space to tilde, is written as a backslash and three octal digits,
+    # so the record carries the text's UTF-8 bytes. The Developer Guide
+    # ("Supported DNS record types", TXT and CAA) gives the quoting, the
+    # 255-character strings, the \" escape and the octal escape for the bytes
+    # 0 to 32 and 127 to 255; its NAPTR section gives the \\ escape for a
+    # backslash in a quoted string. A string's 255 characters are counted as
+    # written, an escape code at its full length, so no string carries more
+    # than 255 characters however Route 53 counts an escape.
+    values: >-
+      {{- $t := .values.type -}}
+      {{- $oct := dict -}}
+      {{- if has $t (list "TXT" "CAA") -}}{{- range $i := until 256 -}}{{- $_ := set $oct (printf "%02x" $i) (printf `\%03o` $i) -}}{{- end -}}{{- end -}}
+      {{- $out := list -}}
+      {{- range $e := .values.records -}}
+      {{- $f := regexSplit `\s+` $e -1 -}}
+      {{- if has $t (list "A" "AAAA" "CNAME" "NS" "PTR") -}}
+      {{- $out = append $out $e -}}
+      {{- else if has $t (list "MX" "SRV") -}}
+      {{- $out = append $out (join " " $f) -}}
+      {{- else -}}
+      {{- $text := $e -}}
+      {{- if eq $t "CAA" -}}
+      {{- $text = regexReplaceAll `^[0-9]+\s+\S+\s+` $e "" -}}
+      {{- if and (ge (len $text) 2) (hasPrefix `"` $text) (hasSuffix `"` $text) -}}{{- $text = trimSuffix `"` (trimPrefix `"` $text) -}}{{- end -}}
+      {{- end -}}
+      {{- $units := list -}}
+      {{- range $c := splitList "" $text -}}
+      {{- if eq $c `"` -}}{{- $units = append $units `\"` -}}
+      {{- else if eq $c `\` -}}{{- $units = append $units `\\` -}}
+      {{- else if regexMatch `^[ -~]$` $c -}}{{- $units = append $units $c -}}
+      {{- else -}}{{- $h := printf "%x" $c -}}{{- $u := "" -}}{{- range $i := until (int (div (len $h) 2)) -}}{{- $u = print $u (get $oct (substr (int (mul $i 2)) (int (add (mul $i 2) 2)) $h)) -}}{{- end -}}{{- $units = append $units $u -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if eq $t "CAA" -}}
+      {{- $out = append $out (printf `%s %s "%s"` (index $f 0) (index $f 1) (join "" $units)) -}}
+      {{- else -}}
+      {{- $strings := list -}}{{- $piece := "" -}}
+      {{- range $u := $units -}}{{- if gt (add (len $piece) (len $u)) 255 -}}{{- $strings = append $strings $piece -}}{{- $piece = "" -}}{{- end -}}{{- $piece = print $piece $u -}}{{- end -}}
+      {{- $out = append $out (printf `"%s"` (join `" "` (append $strings $piece))) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- toJson $out -}}
+
+  # The String Pipe: the compiler pipes this string verbatim into a
+  # consumer's injection context when it uses this record, and resolves none
+  # of it. host is a reference to the host output of this component's module
+  # call: the body renders into the component's own module directory, and
+  # the boundary's root configuration declares that directory as a module
+  # block named .context.instance_id for a component declared in the
+  # Aggregate the Release deploys. The output is the record's fqdn, which
+  # the AWS provider, at 6.73.0, reads from the name Route 53 reports for the
+  # record set, without the trailing dot and with a leading \052 written back
+  # as the * of a wildcard (internal/service/route53/clean.go). Terraform
+  # resolves it at apply time, after the record set exists, so it resolves
+  # only for a consumer authored as a source: Recipe in the same root
+  # configuration; a consumer on another target receives it as text.
+  provides:
+    host: "${module.{{ .context.instance_id }}.host}"
+
+  # This Recipe reads from infra.overrides:
+  #   zone_id - string, required (zone_id), the ID of the operator's Route 53
+  #             hosted zone the record set is written into
+  # alias halts by name, since the Component offers no alias record; host
+  # halts too, since a record set is reached at the name values.name gives;
+  # and tags halts, since aws_route53_record takes no tags. Any other key
+  # halts naming it, so a key misspelt, or meant for another Recipe, is never
+  # passed over unread.
+  #
+  # zone_id is the resource's own argument, which is what a reader matches
+  # against the provider documentation, and the key
+  # terraform/aws-certificate-manager reads for the same zone. tags is the
+  # key the catalog's terraform AWS Recipes read for a resource's tags, and a
+  # Route 53 record set carries none, so it is refused rather than passed
+  # over.
+  #
+  # zone_id. The zone is the operator's: a Route 53 hosted zone created
+  # outside the Release, given by its ID, such as Z0123456789ABCDEFGHIJ; the
+  # AWS provider, at 6.73.0, also takes it with the /hostedzone/ prefix the
+  # Route 53 API returns, which it removes (clean.go). The body declares no
+  # zone. zone_id forces a new record set, so changing it creates the record
+  # set in the new zone and destroys the one in the old.
+  #
+  # The zone's name is not in the Release, so the build cannot see whether
+  # values.name is in the zone or at its apex. The AWS provider, at 6.73.0,
+  # reads the zone's name from Route 53 when it writes the record set and,
+  # where the name it is given does not end in the zone's name, writes the
+  # record set under the given name followed by the zone's name
+  # (record.go, expandRecordName): values.name api.example.org in the zone
+  # example.com is written as api.example.org.example.com, and host publishes
+  # that name. The Developer Guide says a CNAME record cannot be created at
+  # the zone's apex ("Supported DNS record types", CNAME); what the apply
+  # meets there is not measured. Route 53 creates the apex's NS and SOA
+  # record sets with a public hosted zone (Developer Guide, "NS and SOA
+  # records that Amazon Route 53 creates for a public hosted zone"), so NS
+  # records at the apex meet a record set of that name and type already in
+  # the zone, below.
+  #
+  # The Component's values, each read for the record set:
+  #   name. name, without the trailing dot and in lower case. A leftmost *
+  #     label makes a wildcard record set, which Route 53 takes for every
+  #     type but NS ("DNS domain name format"); the Component refuses a
+  #     wildcard NS record set itself.
+  #   type. type. Route 53 and the provider take every type the Component
+  #     offers, so this Recipe refuses none. The Component refuses every
+  #     other type itself, ALIAS by name: Route 53 keeps an alias as a record
+  #     set whose alias target names an AWS resource or another record set in
+  #     the zone, the resource's alias block, which this Recipe never writes.
+  #   ttl. ttl. Route 53 takes 0 to 2,147,483,647 seconds (Amazon Route 53 API
+  #     Reference, ResourceRecordSet), every value the Component admits.
+  #   records. records, each value as the locals above write it, a TXT value
+  #     without its first and last quotation marks, which the provider, at
+  #     6.73.0, adds when it writes a TXT value and removes when it reads one
+  #     (record.go, flattenTxtEntry and expandTxtEntry). The provider keeps
+  #     records as a set, so an entry written as an earlier one is written
+  #     once, and Route 53 receives the values in no order of the Aggregate's.
+  #     The Component halts on an entry not in its type's form, a second
+  #     CNAME entry, an MX preference or an SRV priority, weight or port
+  #     outside 0 to 65535, and CAA flags outside 0 to 255. A CAA tag of
+  #     letters and digits, the form the Component holds, is what the
+  #     Developer Guide says Route 53 takes, so this Recipe refuses no tag.
+  #     The Developer Guide gives a CAA record's flags as 0, or 128 to keep a
+  #     certificate authority that does not support the tag from issuing, and
+  #     RFC 8659 has a record clear every other flag bit. Other flags reach
+  #     Route 53 as written.
+  #
+  # Route 53's own limits, held below where the build can see them: 400
+  # records in a record set (Developer Guide, "Quotas", records); a value of
+  # 4,000 characters at most (the same guide, TXT, and the
+  # AWS::Route53::RecordSet reference, ResourceRecords); 32,000 characters
+  # at most across the values of one ChangeResourceRecordSets request (the
+  # "Quotas" page, maximums on API requests); and a domain name in ASCII, an
+  # internationalized one in Punycode ("DNS domain name format"). Route 53
+  # counts each character of an UPSERT twice, and the provider, at 6.73.0,
+  # writes a change of records or ttl as an UPSERT (record.go), so such a
+  # change fails for a record set holding more than 16,000 characters. A
+  # CNAME record set is the one record set of its name (Developer Guide,
+  # "Supported DNS record types"), which the zone, not the build, holds.
+  #
+  # A record set of the same name and type already in the zone. The body
+  # writes allow_overwrite = false, the provider's own default written out
+  # so it is read: the provider, at 6.73.0, then creates the record set by
+  # Route 53's CREATE action, which its source says fails if the same record
+  # exists (record.go, resourceRecordCreate), while allow_overwrite = true
+  # writes it by UPSERT, replacing the record set already there and taking
+  # it into the state, so a destroy would delete a record set the apply did
+  # not create. A record set made outside the Release therefore fails the
+  # apply and is left untouched; terraform import takes it into the state
+  # instead.
+  #
+  # Deletion and replacement. A destroy, or removing the component, deletes
+  # the record set. name and zone_id force a new record set, so changing
+  # values.name or zone_id destroys the record set and creates it again under
+  # the new name or in the new zone; a change of values.type deletes the old
+  # record set and creates the new one in one Route 53 change; a change of
+  # values.records or values.ttl updates it in place (record.go,
+  # resourceRecordUpdate). Renaming the component, which changes the module's
+  # address, destroys the record set and creates it again; the order of the
+  # two is not measured, and a creation before the destruction meets the
+  # record set still in the zone and fails the apply.
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # or not read:
+  #   honoured — values.name, values.type, values.ttl and values.records; and
+  #     the override above.
+  #   refused by this Recipe — zone_id unset, not a string or empty; more
+  #     than 400 entries; an entry written longer than 4,000 characters;
+  #     entries written longer than 32,000 characters together; a domain name
+  #     in an entry not in ASCII; infra.overrides.alias, host and tags; and
+  #     any infra.overrides key not listed above.
+  #   refused by the Component, whichever Recipe binds — a values.type other
+  #     than A, AAAA, CAA, CNAME, MX, NS, PTR, SRV and TXT, ALIAS by name; an
+  #     entry of values.records not in its type's form, or a second CNAME
+  #     entry; a wildcard NS record set; a values.name longer than the DNS
+  #     standard allows.
+  #   not read — none.
+  #
+  # The CloudFormation Recipe of this Component holds the same rules on
+  # HostedZoneId, its spelling of the zone, and refuses there an entry
+  # written as an earlier one is, which the CloudFormation resource takes
+  # once: each target reads the key under its own spelling, so the rules
+  # cannot sit in the Component.
+  #
+  # What the body writes beside these: allow_overwrite = false. No routing
+  # policy, health check or set identifier is written, so the record set is
+  # a simple one. Credentials. A record set holds none; Terraform
+  # authenticates to AWS with the credentials in the environment it runs
+  # in, so the rendered configuration names none. Backup. Route 53 keeps no
+  # backup of a record set, and this Recipe configures none.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "zone_id" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "alias" -}}
+      {{- fail "infra.overrides.alias is set, and this Recipe writes no alias record, a record whose answers Route 53 fills in by looking up an AWS resource or another record in the zone, which the DNS record Component does not offer: remove infra.overrides.alias from the Release, and give the record's data in values.records under type A, AAAA or CNAME in the Aggregate" -}}
+      {{- end -}}
+      {{- if eq $k "host" -}}
+      {{- fail "infra.overrides.host is set, and a record set is reached at the name values.name gives, which host publishes: remove infra.overrides.host from the Release, and set values.name in the Aggregate" -}}
+      {{- end -}}
+      {{- if eq $k "tags" -}}
+      {{- fail "infra.overrides.tags is set, and a Route 53 record set carries no tags, so aws_route53_record takes none: remove infra.overrides.tags from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads zone_id from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # zone_id is required and written as the string the resource takes.
+    zone_id: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if not (hasKey $o "zone_id") -}}
+      {{- fail "infra.overrides.zone_id is unset, and this Recipe writes the record set into the operator's own Route 53 hosted zone, which it never creates: set infra.overrides.zone_id in the Release to the ID of the hosted zone holding values.name" -}}
+      {{- end -}}
+      {{- $z := $o.zone_id -}}
+      {{- if not (and (typeIs "string" $z) $z) -}}
+      {{- fail (printf "infra.overrides.zone_id is %s, and it is the ID of a Route 53 hosted zone, a string such as Z0123456789ABCDEFGHIJ: set it in the Release to the ID of the hosted zone holding values.name" (toJson $z)) -}}
+      {{- end -}}
+    # What Route 53 takes of the entries the Component admits, each from the
+    # sources in the comments above.
+    records_taken: >-
+      {{- $t := .values.type -}}
+      {{- $records := .values.records -}}
+      {{- if gt (len $records) 400 -}}
+      {{- fail (printf "values.records holds %d entries, and Route 53 takes 400 records in a record set at most: give values.records 400 entries or fewer in the Aggregate" (len $records)) -}}
+      {{- end -}}
+      {{- if has $t (list "CNAME" "NS" "PTR" "MX" "SRV") -}}
+      {{- range $i, $e := $records -}}
+      {{- if not (regexMatch `^[!-~]+$` (last (regexSplit `\s+` $e -1))) -}}
+      {{- fail (printf "values.records[%d] is %q, and Route 53 takes a domain name in ASCII, an internationalized one converted to Punycode: write the domain name in ASCII in the Aggregate, in Punycode where it holds other letters" $i $e) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $total := 0 -}}
+      {{- range $i, $v := fromJson .locals.values -}}
+      {{- if gt (len $v) 4000 -}}
+      {{- fail (printf "values.records[%d] is written to Route 53 as a value of %d characters, quotation marks and escape codes included, and Route 53 takes a value of 4000 characters at most: shorten it in the Aggregate" $i (len $v)) -}}
+      {{- end -}}
+      {{- $total = add $total (len $v) -}}
+      {{- end -}}
+      {{- if gt (int $total) 32000 -}}
+      {{- fail (printf "values.records is written to Route 53 as %d characters in all, and Route 53 takes 32000 characters at most across the values of one change: give the record set fewer or shorter entries in the Aggregate" (int $total)) -}}
+      {{- end -}}
+
+  # required_providers pins hashicorp/aws so the engine installs a provider
+  # whose resource schema this body was written against. It is a range rather
+  # than an exact version because every AWS body in a boundary's root
+  # configuration shares one installed provider, and two exact pins that differ
+  # fail init. The constraint string is the one the catalog conventions'
+  # "One AWS provider constraint for every AWS body" section states; each AWS
+  # body repeats it deliberately, because a library import cannot place a block
+  # inside an authored body.
+  #
+  # The body is the catalog's own, a full-body artifact named main.tf that
+  # emits verbatim as a standalone file alongside any other artifacts
+  # contributed at the same boundary: terraform-aws-modules publishes no
+  # module for a single Route 53 record. The resource is named this, since
+  # each component's body renders into a module directory of its own. Every
+  # string is written as JSON, which Terraform reads as a string of the same
+  # characters; ${ and %{ inside a record are written $${ and %%{, which
+  # Terraform turns back into the characters written rather than reading an
+  # interpolation or a directive.
+  artifacts:
+    main.tf: |
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $records := list -}}
+      {{- range $v := fromJson .locals.values -}}
+      {{- if eq $.values.type "TXT" }}{{ $v = trimSuffix `"` (trimPrefix `"` $v) }}{{ end -}}
+      {{- $records = append $records $v -}}
+      {{- end -}}
+      terraform {
+        required_providers {
+          aws = {
+            source  = "hashicorp/aws"
+            version = "~> 6.69"
+          }
+        }
+      }
+
+      resource "aws_route53_record" "this" {
+        name    = {{ toJson .locals.fqdn }}
+        type    = {{ toJson .values.type }}
+        ttl     = {{ int .values.ttl }}
+        records = {{ toJson $records | replace "${" "$${" | replace "%{" "%%{" }}
+
+        ## ── Provider-specific overrides ──────────────────────────
+        zone_id         = {{ toJson $o.zone_id }}
+        allow_overwrite = false
+      }
+
+      output "host" {
+        value = aws_route53_record.this.fqdn
+      }
