@@ -22,13 +22,17 @@ metadata:
     untouched; a destroy deletes the record set the apply wrote.
 
     host is a reference to the name the provider reports for the record
-    set. The Component halts on an alias record and on a record not in its
-    type's form. This Recipe halts on infra.overrides.alias, host, tags or
-    any key not listed, zone_id unset or not a string, more than 400
-    records, a value longer than Route 53 takes alone or together and a
-    domain name not in ASCII, each naming what to fix. Knowing the zone by
-    its ID alone, the build cannot see a name outside the zone, which the
-    AWS provider writes under the zone's name, or a CNAME at its apex.
+    set. The Component halts on an alias record, a record not in its
+    type's form and CAA flags other than 0 and 128. This Recipe halts on
+    infra.overrides.alias, host, tags or any key not listed, zone_id unset
+    or not a string, more than 400 records, a value longer than Route 53
+    takes alone or together, a domain name not in ASCII and an entry
+    repeated, each naming what to fix. It reads the zone with
+    data.aws_route53_zone, which needs route53:GetHostedZone and
+    route53:ListTagsForResource, and refuses at plan, by a precondition on
+    the record set, a name outside the zone, which the AWS provider would
+    write under the zone's name. The build cannot see that, nor a CNAME at
+    the zone's apex.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -53,16 +57,22 @@ spec:
     #   TXT                          the text in double-quoted strings of 255
     #                                characters at most, separated by a
     #                                space, never divided inside a character.
-    # In a TXT text and a CAA value a double quote is written \" and a
-    # backslash \\, and every byte of a character outside the printable ASCII
-    # range, space to tilde, is written as a backslash and three octal digits,
-    # so the record carries the text's UTF-8 bytes. The Developer Guide
-    # ("Supported DNS record types", TXT and CAA) gives the quoting, the
-    # 255-character strings, the \" escape and the octal escape for the bytes
-    # 0 to 32 and 127 to 255; its NAPTR section gives the \\ escape for a
-    # backslash in a quoted string. A string's 255 characters are counted as
-    # written, an escape code at its full length, so no string carries more
-    # than 255 characters however Route 53 counts an escape.
+    # In a TXT text a double quote is written \" and a backslash \\, and every
+    # byte of a character outside the printable ASCII range, space to tilde,
+    # is written as a backslash and three octal digits, so the record carries
+    # the text's UTF-8 bytes. The Developer Guide ("Supported DNS record
+    # types", TXT) gives the quoting, the 255-character strings, the \"
+    # escape (its example is "This string includes \"quotation marks\".") and
+    # the octal escape for the bytes 0 to 32 and 127 to 255; its NAPTR
+    # section gives the \\ escape for a backslash in a quoted string. Its TXT
+    # example writes a letter outside ASCII, a with a diaeresis, as one byte,
+    # \344; this Recipe writes the UTF-8 bytes of the character, \303\244,
+    # which differs from that example. The same escapes are written in a CAA
+    # value by carrying the TXT rule over: the CAA section of the guide shows
+    # the value in double quotes and gives no escape of its own, so that is
+    # not measured. A string's 255 characters are counted as written, an
+    # escape code at its full length, so no string carries more than 255
+    # characters however Route 53 counts an escape.
     values: >-
       {{- $t := .values.type -}}
       {{- $oct := dict -}}
@@ -135,7 +145,7 @@ spec:
   # outside the Release, given by its ID, such as Z0123456789ABCDEFGHIJ; the
   # AWS provider, at 6.73.0, also takes it with the /hostedzone/ prefix the
   # Route 53 API returns, which it removes (clean.go). The body declares no
-  # zone. zone_id forces a new record set, so changing it creates the record
+  # zone and only reads it. zone_id forces a new record set, so changing it creates the record
   # set in the new zone and destroys the one in the old.
   #
   # The zone's name is not in the Release, so the build cannot see whether
@@ -144,10 +154,21 @@ spec:
   # where the name it is given does not end in the zone's name, writes the
   # record set under the given name followed by the zone's name
   # (record.go, expandRecordName): values.name api.example.org in the zone
-  # example.com is written as api.example.org.example.com, and host publishes
-  # that name. The Developer Guide says a CNAME record cannot be created at
-  # the zone's apex ("Supported DNS record types", CNAME); what the apply
-  # meets there is not measured. Route 53 creates the apex's NS and SOA
+  # example.com would be written as api.example.org.example.com, and host
+  # would publish that name. The body therefore reads the zone with a
+  # data "aws_route53_zone" block, by zone_id (without a /hostedzone/
+  # prefix), and a precondition on the record set refuses the plan when the
+  # name is neither the zone's name nor ends in a dot and the zone's name,
+  # compared without a trailing dot and in lower case, so the test respects
+  # label boundaries: example.com holds www.example.com and not
+  # badexample.com. The refusal is at plan, after the zone is read, and not
+  # at build; no fixture negative can show it, since the build cannot read
+  # the zone. Reading the zone is a route53:GetHostedZone call, and the
+  # provider's data source also calls route53:ListTagsForResource, so the
+  # credentials Terraform runs with need both. The Developer Guide says a
+  # CNAME record cannot be created at the zone's apex ("Supported DNS record
+  # types", CNAME); the body does not test it, and what the apply meets
+  # there is not measured. Route 53 creates the apex's NS and SOA
   # record sets with a public hosted zone (Developer Guide, "NS and SOA
   # records that Amazon Route 53 creates for a public hosted zone"), so NS
   # records at the apex meet a record set of that name and type already in
@@ -169,17 +190,15 @@ spec:
   #     without its first and last quotation marks, which the provider, at
   #     6.73.0, adds when it writes a TXT value and removes when it reads one
   #     (record.go, flattenTxtEntry and expandTxtEntry). The provider keeps
-  #     records as a set, so an entry written as an earlier one is written
-  #     once, and Route 53 receives the values in no order of the Aggregate's.
+  #     records as a set, so Route 53 receives the values in no order of the
+  #     Aggregate's; an entry written as an earlier one halts below, since
+  #     the set would otherwise collapse it without a word.
   #     The Component halts on an entry not in its type's form, a second
   #     CNAME entry, an MX preference or an SRV priority, weight or port
-  #     outside 0 to 65535, and CAA flags outside 0 to 255. A CAA tag of
-  #     letters and digits, the form the Component holds, is what the
-  #     Developer Guide says Route 53 takes, so this Recipe refuses no tag.
-  #     The Developer Guide gives a CAA record's flags as 0, or 128 to keep a
-  #     certificate authority that does not support the tag from issuing, and
-  #     RFC 8659 has a record clear every other flag bit. Other flags reach
-  #     Route 53 as written.
+  #     outside 0 to 65535, and CAA flags other than 0 and 128, the two RFC
+  #     8659 gives. A CAA tag of letters and digits, the form the Component
+  #     holds, is what the Developer Guide says Route 53 takes, so this
+  #     Recipe refuses no tag.
   #
   # Route 53's own limits, held below where the build can see them: 400
   # records in a record set (Developer Guide, "Quotas", records); a value of
@@ -193,6 +212,12 @@ spec:
   # change fails for a record set holding more than 16,000 characters. A
   # CNAME record set is the one record set of its name (Developer Guide,
   # "Supported DNS record types"), which the zone, not the build, holds.
+  # Entries are compared as Route 53 compares them: the Developer Guide
+  # ("DNS domain name format") stores names in lower case and treats a name
+  # with and without its trailing dot alike, so for the types holding a
+  # domain name or an address the comparison sets aside letter case and a
+  # trailing dot; TXT and CAA entries are compared as written. Two spellings
+  # of one IPv6 address that differ by zero compression are not compared.
   #
   # A record set of the same name and type already in the zone. The body
   # writes allow_overwrite = false, the provider's own default written out
@@ -223,8 +248,11 @@ spec:
   #   refused by this Recipe — zone_id unset, not a string or empty; more
   #     than 400 entries; an entry written longer than 4,000 characters;
   #     entries written longer than 32,000 characters together; a domain name
-  #     in an entry not in ASCII; infra.overrides.alias, host and tags; and
-  #     any infra.overrides key not listed above.
+  #     in an entry not in ASCII; an entry written as an earlier one is, a
+  #     trailing dot and letter case set aside for a domain name or an
+  #     address; infra.overrides.alias, host and tags; and any
+  #     infra.overrides key not listed above. At plan, not at build: a
+  #     values.name outside the zone zone_id names.
   #   refused by the Component, whichever Recipe binds — a values.type other
   #     than A, AAAA, CAA, CNAME, MX, NS, PTR, SRV and TXT, ALIAS by name; an
   #     entry of values.records not in its type's form, or a second CNAME
@@ -233,12 +261,13 @@ spec:
   #   not read — none.
   #
   # The CloudFormation Recipe of this Component holds the same rules on
-  # HostedZoneId, its spelling of the zone, and refuses there an entry
-  # written as an earlier one is, which the CloudFormation resource takes
-  # once: each target reads the key under its own spelling, so the rules
-  # cannot sit in the Component.
+  # HostedZoneId, its spelling of the zone, and refuses there too the zone
+  # ID written with the /hostedzone/ prefix, which this body takes: each
+  # target reads the key under its own spelling, so the rules cannot sit in
+  # the Component.
   #
-  # What the body writes beside these: allow_overwrite = false. No routing
+  # What the body writes beside these: the zone read, the precondition and
+  # allow_overwrite = false. No routing
   # policy, health check or set identifier is written, so the record set is
   # a simple one. Credentials. A record set holds none; Terraform
   # authenticates to AWS with the credentials in the environment it runs
@@ -290,10 +319,17 @@ spec:
       {{- end -}}
       {{- end -}}
       {{- $total := 0 -}}
+      {{- $seen := dict -}}
       {{- range $i, $v := fromJson .locals.values -}}
       {{- if gt (len $v) 4000 -}}
       {{- fail (printf "values.records[%d] is written to Route 53 as a value of %d characters, quotation marks and escape codes included, and Route 53 takes a value of 4000 characters at most: shorten it in the Aggregate" $i (len $v)) -}}
       {{- end -}}
+      {{- $k := $v -}}
+      {{- if has $t (list "A" "AAAA" "CNAME" "NS" "PTR" "MX" "SRV") -}}{{- $k = lower (trimSuffix "." $v) -}}{{- end -}}
+      {{- if hasKey $seen $k -}}
+      {{- fail (printf "values.records[%d] is written to Route 53 as %s, as an earlier entry is, a domain name's trailing dot and letter case set aside, and the record set takes each value once: remove the repeated entry from the Aggregate" $i $v) -}}
+      {{- end -}}
+      {{- $_ := set $seen $k true -}}
       {{- $total = add $total (len $v) -}}
       {{- end -}}
       {{- if gt (int $total) 32000 -}}
@@ -335,8 +371,17 @@ spec:
         }
       }
 
+      data "aws_route53_zone" "this" {
+        zone_id = {{ toJson (trimPrefix "/hostedzone/" $o.zone_id) }}
+      }
+
+      locals {
+        record_name = {{ toJson .locals.fqdn }}
+        zone_name   = trimsuffix(lower(data.aws_route53_zone.this.name), ".")
+      }
+
       resource "aws_route53_record" "this" {
-        name    = {{ toJson .locals.fqdn }}
+        name    = local.record_name
         type    = {{ toJson .values.type }}
         ttl     = {{ int .values.ttl }}
         records = {{ toJson $records | replace "${" "$${" | replace "%{" "%%{" }}
@@ -344,6 +389,13 @@ spec:
         ## ── Provider-specific overrides ──────────────────────────
         zone_id         = {{ toJson $o.zone_id }}
         allow_overwrite = false
+
+        lifecycle {
+          precondition {
+            condition     = local.record_name == local.zone_name || endswith(local.record_name, ".${local.zone_name}")
+            error_message = "values.name ${local.record_name} is outside the Route 53 hosted zone ${local.zone_name} that infra.overrides.zone_id names, and the AWS provider would write the record set under the zone's name: set values.name in the Aggregate to a name in the zone, or infra.overrides.zone_id in the Release to the zone holding it."
+          }
+        }
       }
 
       output "host" {
