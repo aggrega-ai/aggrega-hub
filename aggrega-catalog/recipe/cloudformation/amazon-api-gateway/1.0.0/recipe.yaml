@@ -1,0 +1,385 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: amazon-api-gateway
+  version: 1.0.0
+  description: >
+    Amazon API Gateway on CloudFormation: one HTTP API named after the
+    component, an AWS::ApiGatewayV2::Api with one HTTP proxy integration,
+    the catch-all $default route sending every request to it and the
+    $default stage deploying each change, which the cloudformation provider
+    assembles into the boundary's stack. The integration's URL is
+    https://<host>:<port> from what the upstream connection publishes, or,
+    where infra.overrides.ConnectionId names the operator's VPC link, the
+    listener or AWS Cloud Map service infra.overrides.IntegrationUri names.
+
+    host and endpoint publish CloudFormation references to the API's
+    endpoint, which CloudFormation resolves when it creates the stack.
+    infra.overrides.host publishes the operator's DNS name instead and gives
+    the API a custom domain with an API mapping, presenting the certificate
+    infra.overrides.CustomEndpointCertificateArn names; the DNS record is
+    the operator's. No VPC link, load balancer, certificate, log group or
+    role is created.
+
+    An upstream publishing no host halts the build unless a VPC link is
+    named, as do ConnectionId or IntegrationUri without the other or of
+    another form, host or CustomEndpointCertificateArn without the other, a
+    name the custom domain cannot take, and any infra.overrides key not
+    listed.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: cloudformation
+  implements: core/gateway/amazon-api-gateway:1.0.0
+
+  # The resources' logical ids, derived from this instance's own name so that
+  # two APIs deployed into one stack describe two sets of resources rather
+  # than one. A logical id is unique within a CloudFormation template and
+  # admits only letters and digits, so the instance name's separators are
+  # read as word boundaries and each word is capitalised: instance
+  # orders-entry names the API OrdersEntryApi, and its integration, route,
+  # stage, custom domain and API mapping OrdersEntryIntegration,
+  # OrdersEntryRoute, OrdersEntryStage, OrdersEntryDomainName and
+  # OrdersEntryApiMapping.
+  locals:
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+    # The name the Release gives the API under infra.overrides.host, or empty
+    # while it gives none. Only a string is read here; any other value is
+    # refused by the assertions below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The ARN of the certificate the custom domain presents, under
+    # infra.overrides.CustomEndpointCertificateArn, or empty while the
+    # Release gives none. Only a string is read here.
+    certificate_arn: '{{ $c := optional (optional .infra "overrides" dict) "CustomEndpointCertificateArn" "" }}{{ if typeIs "string" $c }}{{ $c }}{{ end }}'
+    # The ID of the operator's VPC link under infra.overrides.ConnectionId,
+    # or empty while the Release names none. Only a string is read here.
+    connection_id: '{{ $c := optional (optional .infra "overrides" dict) "ConnectionId" "" }}{{ if typeIs "string" $c }}{{ $c }}{{ end }}'
+
+  # The String Pipe: the compiler pipes these strings verbatim into a
+  # consumer's injection context when it uses this API, and resolves none of
+  # them. endpoint is the API's ApiEndpoint attribute,
+  # https://<api-id>.execute-api.<region>.amazonaws.com, which the $default
+  # stage serves at its root, and host is the host of that same attribute,
+  # the third field of the endpoint split at each slash; CloudFormation
+  # resolves both when it creates the API, so a consumer in the same stack
+  # reading either is created after it. The provider projects the matching
+  # provides block inside the fragment below into the assembled stack
+  # Outputs; this recipe-level provides is the value-pipe contract, the
+  # fragment provides is the Outputs source, and they carry the same values.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name in
+  # both provides blocks instead of the reference, and endpoint joins the
+  # scheme to it. It is the operator's deterministic pointer: the compiler
+  # pipes it as text and looks nothing up. A consumer in the same stack
+  # receives the name as well, and a name carries no reference for
+  # CloudFormation to create that consumer after this API by; a later
+  # syncWave on the consumer's boundary, sharing this boundary's directory,
+  # orders the two. API Gateway answers a request for that name only through
+  # a custom domain presenting a certificate carrying it, so the fragment
+  # gives the API one, as set out below.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}!Select [2, !Split [\"/\", !GetAtt {{ .locals.logical_id }}Api.ApiEndpoint]]{{ end }}"
+    endpoint: "{{ if .locals.operator_host }}https://{{ .locals.operator_host }}{{ else }}!GetAtt {{ .locals.logical_id }}Api.ApiEndpoint{{ end }}"
+
+  # This Recipe reads from infra.overrides:
+  #   ConnectionId                 - string (the integration's ConnectionId, with ConnectionType VPC_LINK)
+  #   IntegrationUri               - string (the integration's IntegrationUri, with ConnectionId only)
+  #   host                         - string (published as provides.host; the custom domain's DomainName)
+  #   CustomEndpointCertificateArn - string (the custom domain's DomainNameConfigurations[].CertificateArn)
+  # Any other key halts the build by name.
+  #
+  # ConnectionId and IntegrationUri are the resource's own property names,
+  # which is what a reader matches against the resource documentation. host
+  # is the key the catalog's Recipes of managed services read for the name a
+  # consumer reaches one at, and CustomEndpointCertificateArn the key the
+  # catalog's OpenSearch Service Recipe reads for the certificate a custom
+  # endpoint presents for that name, so a Release names both the same way
+  # whichever Recipe it configures.
+  #
+  # ConnectionId and IntegrationUri, set together or not at all. Unset, the
+  # integration's ConnectionType is INTERNET and its IntegrationUri the
+  # upstream's URL, below. Set, the integration forwards through the
+  # operator's VPC link for HTTP APIs: ConnectionId is its ID and
+  # IntegrationUri the ARN of the Application Load Balancer listener,
+  # Network Load Balancer listener or AWS Cloud Map service behind it, as
+  # the CloudFormation reference for IntegrationUri lists for an HTTP API
+  # private integration, arn:aws:elasticloadbalancing:<region>:
+  # <account>:listener/app|net/<name>/<id>/<id> or arn:aws:servicediscovery:
+  # <region>:<account>:service/srv-<id>. The VPC link, its subnets and
+  # security groups, the load balancer, its listener and target group, and
+  # the Cloud Map service are the operator's, named here and never created;
+  # the server behind them reaches the listener's target group by its own
+  # Recipe, such as cloudformation/server-ecs's TargetGroupArn. A VPC link
+  # integration takes no URL, so the upstream connection's host and port are
+  # not read, and which server stands behind the listener is the operator's
+  # to keep true. The fragment writes no TlsConfig, which names the server
+  # name API Gateway checks on the certificate of a listener serving HTTPS.
+  # Either key without the other, a ConnectionId that is empty or not a
+  # string, and an IntegrationUri of another form halt the build.
+  #
+  # host and CustomEndpointCertificateArn, set together or not at all. Set,
+  # host is published as the API's name and the fragment declares an
+  # AWS::ApiGatewayV2::DomainName of that name, a Regional custom domain
+  # presenting the certificate CustomEndpointCertificateArn names, with an
+  # AWS::ApiGatewayV2::ApiMapping sending every request for it to the API's
+  # $default stage. API Gateway takes, for an HTTP API's custom domain, a
+  # Regional endpoint, TLS 1.2 as the minimum version, and a certificate
+  # from AWS Certificate Manager in the API's Region (the Developer Guide's
+  # "Custom domain names for HTTP APIs" and "Set up a Regional custom domain
+  # name"). The name is a DNS name of two labels or more and 255 characters
+  # at most, each label 1 to 63 letters, digits and hyphens neither
+  # beginning nor ending with a hyphen, the last two characters or more: the
+  # RFC 1035 rule that guide states, without the wildcard first label it
+  # also admits, since a wildcard is no name a consumer can reach. The
+  # certificate is named by its ARN,
+  # arn:aws:acm:<region>:<account>:certificate/<id>. A name without a
+  # certificate would be published to clients that cannot verify the API
+  # under it, and a certificate without a name configures nothing, so either
+  # alone halts, as do a name not bare or not of that form and an ARN of
+  # another form. The certificate, and the DNS record pointing the name at
+  # the custom domain's Regional domain name, which API Gateway reports for
+  # the domain once it exists, are the operator's: this Recipe creates
+  # neither, and the compiler looks neither up.
+  #
+  # Tags is not read: no CloudFormation Recipe of this catalog reads one, and
+  # it halts as any key not listed does.
+  #
+  # The custom domain and the API's own endpoint. The fragment writes no
+  # DisableExecuteApiEndpoint, so the API keeps answering at its own
+  # endpoint beside the custom domain, as it does by default.
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # held by the Component's assertions, or not read:
+  #   honoured — the upstream connection's host and port, while no VPC link
+  #     is named, and the overrides above. The Component declares no values.
+  #   refused — an upstream target publishing no host while no VPC link is
+  #     named; ConnectionId or IntegrationUri without the other, a
+  #     ConnectionId that is empty or not a string and an IntegrationUri
+  #     that is not a listener's or a Cloud Map service's ARN; host or
+  #     CustomEndpointCertificateArn without the other, a host that is not a
+  #     bare DNS name the custom domain takes, and a certificate ARN of
+  #     another form; and any infra.overrides key not listed above.
+  #   held by the Component — a second connection on the upstream socket.
+  #   not read — none; the Component declares no other value or infra key.
+  #
+  # What the fragment writes beside these: nothing else of the API's own, so
+  # API Gateway's defaults hold, and the AWS provider's defaults create the
+  # same API for the terraform Recipe of this Component, so both targets
+  # agree. The API answers over IPv4 alone; no CORS configuration is
+  # written, so API Gateway adds no CORS headers and passes a preflight
+  # request to the upstream like any other. The integration waits 30
+  # seconds for the upstream, API Gateway's default for an HTTP API, and
+  # passes the request through with no parameter mapping. The stage writes
+  # no DefaultRouteSettings, so no throttling of its own and no detailed
+  # metrics, and no AccessLogSettings, so no access log, which takes a log
+  # group of the operator's.
+  #
+  # The name and deletion. Every resource keeps CloudFormation's own
+  # deletion policy, Delete: deleting the stack, or removing the API from
+  # it, deletes the API, its integration, route and stage, and the custom
+  # domain and its mapping; the VPC link, the listener, the certificate and
+  # the DNS record are the operator's and stay, the record then naming a
+  # domain that no longer exists. The API's Name can change in place, but
+  # renaming the component changes every logical id, so CloudFormation
+  # creates a new API, with a new identifier and so a new endpoint, and
+  # deletes the old one. DomainName is create-only on the custom domain and
+  # on its mapping alike, so changing infra.overrides.host replaces the
+  # custom domain and its mapping.
+  #
+  # Credentials. API Gateway holds no credential a consumer needs: clients
+  # reach the API anonymously, and authenticating them is the upstream's
+  # work. The upstream is reached without one, so nothing is published but
+  # the API's address. Backup. API Gateway keeps no data of its own, only
+  # its configuration, which this fragment declares, so no backup is
+  # configured.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "ConnectionId" "IntegrationUri" "host" "CustomEndpointCertificateArn" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads ConnectionId, IntegrationUri, host and CustomEndpointCertificateArn from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # A VPC link integration takes the link and the ARN of what stands behind
+    # it together, and an integration without a link takes the upstream's
+    # URL, so the two keys are set together or not at all; each is passed to
+    # the resource as written, so one of another shape would render a
+    # property API Gateway refuses. The terraform Recipe of this Component
+    # holds the same rules on connection_id and integration_uri: each target
+    # reads the keys under its own spelling, so the rules cannot sit in the
+    # Component.
+    vpc_link: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "ConnectionId" -}}
+      {{- if not (and (typeIs "string" $o.ConnectionId) $o.ConnectionId) -}}
+      {{- fail (printf "infra.overrides.ConnectionId is %s, and it is the ID of the operator's VPC link for HTTP APIs, given as a string: set it in the Release to that ID" (toJson $o.ConnectionId)) -}}
+      {{- end -}}
+      {{- if not (hasKey $o "IntegrationUri") -}}
+      {{- fail "infra.overrides.ConnectionId is set, and an integration through a VPC link forwards to the Application Load Balancer listener, Network Load Balancer listener or AWS Cloud Map service it names by ARN in IntegrationUri, which the Release leaves unset: set infra.overrides.IntegrationUri in the Release to that ARN, or remove infra.overrides.ConnectionId to forward to the upstream's host" -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "IntegrationUri" -}}
+      {{- if not (hasKey $o "ConnectionId") -}}
+      {{- fail "infra.overrides.IntegrationUri is set, and this Recipe reads it only as the listener or AWS Cloud Map service behind the VPC link infra.overrides.ConnectionId names, which the Release leaves unset; without a VPC link the integration's URL is the upstream's host: set infra.overrides.ConnectionId in the Release to the ID of the operator's VPC link, or remove infra.overrides.IntegrationUri" -}}
+      {{- end -}}
+      {{- $u := $o.IntegrationUri -}}
+      {{- if not (and (typeIs "string" $u) (regexMatch `^arn:aws[a-zA-Z-]*:(elasticloadbalancing:[a-z0-9-]+:[0-9]{12}:listener/(app|net)/[^/\s]+/[^/\s]+/[^/\s]+|servicediscovery:[a-z0-9-]+:[0-9]{12}:service/srv-[a-z0-9]+)$` $u)) -}}
+      {{- fail (printf "infra.overrides.IntegrationUri is %s, and an integration through a VPC link takes the ARN of an Application Load Balancer or Network Load Balancer listener, arn:aws:elasticloadbalancing:<region>:<account>:listener/app/<name>/<id>/<id> or listener/net/..., or of an AWS Cloud Map service, arn:aws:servicediscovery:<region>:<account>:service/srv-<id>: set it in the Release to such an ARN" (toJson $u)) -}}
+      {{- end -}}
+      {{- end -}}
+    # The name a consumer reaches the API at is a host name alone, with no
+    # scheme, path, user or port: the API serves HTTPS on 443.
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this API reaches it at, given as a DNS name alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the API serves HTTPS on 443` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The API answers a request for the operator's name only through a custom
+    # domain presenting a certificate carrying that name, so host and the
+    # certificate are set together, the name follows the rule for a custom
+    # domain's name given above, and the certificate is named by its AWS
+    # Certificate Manager ARN. The terraform Recipe of this Component holds
+    # the same rules on host and custom_endpoint_certificate_arn, for the
+    # reason given above.
+    custom_domain: >-
+      {{- $c := optional (optional .infra "overrides" dict) "CustomEndpointCertificateArn" "" -}}
+      {{- if not (or (kindIs "invalid" $c) (eq (toJson $c) `""`) (and (typeIs "string" $c) (regexMatch `^arn:aws[a-zA-Z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/[A-Za-z0-9-]+$` $c))) -}}
+      {{- fail (printf "infra.overrides.CustomEndpointCertificateArn is %s, and it is the ARN of the AWS Certificate Manager certificate the API's custom domain presents, arn:aws:acm:<region>:<account>:certificate/<id>, in the API's Region: set it in the Release to that ARN" (toJson $c)) -}}
+      {{- end -}}
+      {{- $h := .locals.operator_host -}}
+      {{- if and $h (not .locals.certificate_arn) -}}
+      {{- fail (printf "infra.overrides.host is %q, and Amazon API Gateway answers a request for that name only through a custom domain presenting an AWS Certificate Manager certificate carrying it; without one, a client verifying the API's certificate cannot reach it by that name: set infra.overrides.CustomEndpointCertificateArn in the Release to the ARN of a certificate carrying the name, or remove infra.overrides.host to publish the API's own endpoint" $h) -}}
+      {{- end -}}
+      {{- if and .locals.certificate_arn (not $h) -}}
+      {{- fail "infra.overrides.CustomEndpointCertificateArn is set, and it is the certificate of the API's custom domain, whose name is infra.overrides.host, which the Release leaves unset or empty: set infra.overrides.host in the Release to the DNS name the certificate carries, or remove infra.overrides.CustomEndpointCertificateArn" -}}
+      {{- end -}}
+      {{- if $h -}}
+      {{- if or (regexMatch `^[0-9]+(\.[0-9]+){3}$` $h) (contains ":" $h) -}}
+      {{- fail (printf "infra.overrides.host is %q, an IP literal, and the API's custom domain takes a DNS name, one the certificate it presents carries: set infra.overrides.host in the Release to the DNS name the certificate in infra.overrides.CustomEndpointCertificateArn carries" $h) -}}
+      {{- end -}}
+      {{- $labels := splitList "." $h -}}
+      {{- $ok := and (ge (len $labels) 2) (le (len $h) 255) (ge (len (last $labels)) 2) -}}
+      {{- range $labels }}{{ if not (regexMatch `^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$` .) }}{{ $ok = false }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.host is %q, and the API's custom domain takes a DNS name of two labels or more and 255 characters at most, each label 1 to 63 letters, digits and hyphens neither beginning nor ending with a hyphen, the last two characters or more, and no wildcard, which names no host a consumer can reach: set infra.overrides.host in the Release to such a name, one the certificate in infra.overrides.CustomEndpointCertificateArn carries" $h) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The fragment. The upstream connection is read first: while no VPC link
+  # is named, the target it reaches must publish a host, which the
+  # integration's URL is composed from with Fn::Join, as https://, the host,
+  # and a colon followed by the port where the target publishes one; API
+  # Gateway sends a request to the URL's default port, 443, where it carries
+  # none. The host is copied into the join whole, as the target wrote it: a
+  # name, a CloudFormation reference to a resource in the same stack, or,
+  # for a target in another stack, the cross-stack reference the provider
+  # puts in its place. The port is written as text after the colon, in one
+  # string, as every Recipe of this catalog publishes a port as a number
+  # written out, so it reaches the join as a string, the type Fn::Join
+  # joins, whichever stack the target is in. Every request reaches the
+  # upstream with its full path, since the $default route sends the full
+  # request path to its integration (the Developer Guide's "Create routes
+  # for HTTP APIs").
+  #
+  # The integration's type is HTTP_PROXY on the method ANY, so API Gateway
+  # passes each request and response through whole, and its
+  # PayloadFormatVersion is 1.0, the one value the CloudFormation reference
+  # admits for an integration other than a Lambda function's.
+  artifacts:
+    template.yaml: |
+      {{- $id := .context.instance_id }}
+      {{- $l := .locals.logical_id }}
+      {{- $o := optional .infra "overrides" dict }}
+      {{- $vpc := .locals.connection_id }}
+      {{- $host := "" }}
+      {{- $port := "" }}
+      {{- $hasPort := false }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "upstream" }}
+      {{- $p := optional $edge "provides" dict }}
+      {{- if and (not $vpc) (not (hasKey $p "host")) }}
+      {{- fail (printf "the upstream connection %q of %q reaches %q, which publishes no host, and Amazon API Gateway forwards every request to the host its upstream publishes unless the Release names a VPC link: wire upstream in the Aggregate to a component that publishes host, or set infra.overrides.ConnectionId and IntegrationUri in the Release to the operator's VPC link and the listener or AWS Cloud Map service behind it" $alias $id $edge.target) }}
+      {{- end }}
+      {{- if hasKey $p "host" }}{{ $host = $p.host }}{{ end }}
+      {{- if hasKey $p "port" }}{{ $port = $p.port }}{{ $hasPort = true }}{{ end }}
+      {{- end }}
+      {{- end }}
+      Resources:
+        {{ $l }}Api:
+          Type: AWS::ApiGatewayV2::Api
+          Properties:
+            Name: "{{ $id }}"
+            ProtocolType: HTTP
+        {{ $l }}Integration:
+          Type: AWS::ApiGatewayV2::Integration
+          Properties:
+            ApiId: !Ref {{ $l }}Api
+            IntegrationType: HTTP_PROXY
+            IntegrationMethod: ANY
+            PayloadFormatVersion: "1.0"
+            {{- if $vpc }}
+
+            ## ── Provider-specific overrides ─────────────────────────
+            ConnectionType: VPC_LINK
+            ConnectionId: {{ toJson $o.ConnectionId }}
+            IntegrationUri: {{ toJson $o.IntegrationUri }}
+            {{- else }}
+            ConnectionType: INTERNET
+            IntegrationUri: !Join
+              - ""
+              - - "https://"
+                - {{ toJson $host }}
+                {{- if $hasPort }}
+                - ":{{ $port }}"
+                {{- end }}
+            {{- end }}
+        {{ $l }}Route:
+          Type: AWS::ApiGatewayV2::Route
+          Properties:
+            ApiId: !Ref {{ $l }}Api
+            RouteKey: "$default"
+            Target: !Sub "integrations/${ {{- $l }}Integration}"
+        {{ $l }}Stage:
+          Type: AWS::ApiGatewayV2::Stage
+          Properties:
+            ApiId: !Ref {{ $l }}Api
+            StageName: "$default"
+            AutoDeploy: true
+        {{- if .locals.operator_host }}
+        {{ $l }}DomainName:
+          Type: AWS::ApiGatewayV2::DomainName
+          Properties:
+            DomainName: "{{ .locals.operator_host }}"
+            DomainNameConfigurations:
+              - CertificateArn: {{ toJson .locals.certificate_arn }}
+                EndpointType: REGIONAL
+                SecurityPolicy: TLS_1_2
+            RoutingMode: API_MAPPING_ONLY
+        {{ $l }}ApiMapping:
+          Type: AWS::ApiGatewayV2::ApiMapping
+          Properties:
+            ApiId: !Ref {{ $l }}Api
+            DomainName: !Ref {{ $l }}DomainName
+            Stage: !Ref {{ $l }}Stage
+        {{- end }}
+
+      # Fragment provides: the provider projects each entry into the assembled
+      # stack Outputs and expands the short-form intrinsics to long form. The
+      # output is named for this instance and the entry together, so two APIs
+      # in one stack keep their identities apart. A cross-stack consumer
+      # imports the entry; an intra-stack consumer receives it through the
+      # value-pipe above.
+      provides:
+        host: {{ if .locals.operator_host }}"{{ .locals.operator_host }}"{{ else }}!Select [2, !Split ["/", !GetAtt {{ $l }}Api.ApiEndpoint]]{{ end }}
+        endpoint: {{ if .locals.operator_host }}"https://{{ .locals.operator_host }}"{{ else }}!GetAtt {{ $l }}Api.ApiEndpoint{{ end }}
