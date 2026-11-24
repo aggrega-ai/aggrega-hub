@@ -1,0 +1,264 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: aws-kms
+  version: 1.0.0
+  # The infra.overrides keys this Recipe refuses are listed, with their
+  # reasons, in the comments above the assertions.
+  description: >
+    AWS KMS on CloudFormation: one AWS::KMS::Key of the component's key spec
+    and key usage, and an AWS::KMS::Alias naming it where the Aggregate sets
+    alias_name, which the cloudformation provider assembles into the
+    boundary's stack. Nothing else is created: no grant, replica key, role or
+    policy beyond the key's own key policy.
+
+    key_id and arn publish CloudFormation references to the key. The key
+    policy is infra.overrides.policy where the Release sets it, else none is
+    written and KMS attaches its default key policy, one statement giving
+    the account that owns the key every KMS action. The policy lockout
+    safety check is never bypassed, so KMS refuses a policy that would not
+    let the principal creating the key change it later.
+
+    EnableKeyRotation turns on yearly rotation, and PendingWindowInDays sets
+    the days KMS waits before deleting a key removed from the stack, 30
+    unless set. Removing or renaming the component, or deleting the stack,
+    schedules the key's deletion; changing key_spec or key_usage fails the
+    update. EnableKeyRotation not a boolean or set on a key other than a
+    symmetric encryption key, a waiting period outside 7 to 30 days, a policy
+    that is not a mapping, infra.overrides.host, and any infra.overrides key
+    not listed halt the build naming the key.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: cloudformation
+  implements: core/security/aws-kms:1.0.0
+
+  # The resources' logical ids, derived from this instance's own name so that
+  # two keys deployed into one stack describe two sets of resources rather
+  # than one. A logical id is unique within a CloudFormation template and
+  # admits only letters and digits, so the instance name's separators are
+  # read as word boundaries and each word is capitalised: instance
+  # records-encryption names the key RecordsEncryptionKey and its alias
+  # RecordsEncryptionAlias.
+  locals:
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+
+  # The String Pipe: the compiler pipes each of these strings verbatim into a
+  # consumer's injection context when it uses this key, and resolves none of
+  # them. key_id and arn are references to the key's KeyId and Arn
+  # attributes, which CloudFormation resolves when it creates the key, so a
+  # consumer in the same stack is created after the key. The provider
+  # projects the matching provides block inside the fragment below into the
+  # assembled stack Outputs; this recipe-level provides is the value-pipe
+  # contract, the fragment provides is the Outputs source, and they carry the
+  # same values. A consumer in another stack imports them through those
+  # Outputs. No address is published: a client calls the KMS endpoint of the
+  # key's Region and names the key by its ID, its ARN or its alias.
+  provides:
+    key_id: "!GetAtt {{ .locals.logical_id }}Key.KeyId"
+    arn: "!GetAtt {{ .locals.logical_id }}Key.Arn"
+
+  # This Recipe reads from infra.overrides:
+  #   EnableKeyRotation   - boolean (the key's EnableKeyRotation)
+  #   PendingWindowInDays - integer (the key's PendingWindowInDays)
+  #   policy              - object (the key's KeyPolicy), the key policy document
+  # Any other key halts naming it, so a key misspelt, or meant for another
+  # Recipe, is never passed over unread.
+  #
+  # EnableKeyRotation and PendingWindowInDays are the key's own property
+  # names, which is what a reader matches against the resource
+  # documentation. policy is the name the catalog's CloudFormation Recipes
+  # read for a resource policy document, here the key's KeyPolicy.
+  #
+  # EnableKeyRotation is true or false, false unless set, and the fragment
+  # writes it either way. True turns on automatic rotation: KMS creates new
+  # key material for the key every 365 days from the day rotation is turned
+  # on, keeps every earlier key material to decrypt what it encrypted, and
+  # the key keeps its ID and ARN ("Rotate AWS KMS keys"). KMS rotates a
+  # symmetric encryption key whose key material it generates alone; an HMAC
+  # or asymmetric key is rotated by creating another key (the same page, and
+  # the resource's EnableKeyRotation: "For asymmetric KMS keys, HMAC KMS
+  # keys, and KMS keys with Origin EXTERNAL, omit the EnableKeyRotation
+  # property or set it to false"), so true with a key_spec other than
+  # SYMMETRIC_DEFAULT halts.
+  #
+  # PendingWindowInDays is the number of days, 7 to 30, that KMS waits
+  # before deleting the key once CloudFormation schedules its deletion, the
+  # range the resource's schema and the "Delete an AWS KMS key" page give;
+  # unset, the fragment writes none and KMS waits 30 days, its default. It is
+  # read when the key is removed, not when it is created, so changing it
+  # changes nothing in AWS until then.
+  #
+  # policy is the operator's key policy, written as a mapping, the JSON
+  # policy document in YAML or JSON form, with its Version and Statement
+  # keys, and written as the key's KeyPolicy as it stands; this Recipe adds
+  # no statement of its own to it. Unset, the fragment writes no KeyPolicy
+  # and KMS attaches its default key policy ("Default key policy"): one
+  # statement, Sid "Enable IAM User Permissions", allowing the account
+  # principal arn:<partition>:iam::<account>:root, the AWS account that owns
+  # the key, every action (kms:*) on the key, so the account's IAM policies
+  # grant access to it and the account's administrators keep control of it.
+  # The fragment never writes BypassPolicyLockoutSafetyCheck, so KMS runs its
+  # policy lockout safety check on the operator's policy: it refuses, when
+  # CloudFormation creates the key or changes its policy, a key policy that
+  # does not allow the principal making the request to call PutKeyPolicy on
+  # the key later, so the policy cannot lock that principal out of the key.
+  # A principal the policy names that does not exist, a statement without a
+  # principal, and a policy longer than 32,768 characters are refused by KMS
+  # when the key is created, and cfn-lint reads the document's form before
+  # then.
+  #
+  # host is not read: the Component publishes no address, since a client
+  # reaches every key through the KMS endpoint of its Region and KMS offers
+  # no custom domain, so infra.overrides.host halts the build naming it.
+  # Tags is not read: no CloudFormation Recipe of this catalog reads one, and
+  # it halts as any key not listed does.
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # or not read:
+  #   honoured — values.key_spec, as the key's KeySpec; values.key_usage, as
+  #     its KeyUsage; values.alias_name, as the AliasName of an
+  #     AWS::KMS::Alias whose TargetKeyId is the key, declared only while it
+  #     is set; and the overrides above. The Component refuses a key usage
+  #     the key spec does not take and an alias under alias/aws/, for every
+  #     realization; KMS takes every key spec and key usage the Component
+  #     lists on CloudFormation, SM2 in the China Regions alone and ML-KEM
+  #     outside them, which the service checks.
+  #   refused — EnableKeyRotation not a boolean, or true with a key_spec
+  #     other than SYMMETRIC_DEFAULT; PendingWindowInDays not a whole number
+  #     from 7 to 30; policy that is not a mapping; infra.overrides.host; and
+  #     any infra.overrides key not listed above.
+  #   not read — none; the Component declares no other value or infra key.
+  #
+  # The terraform Recipe of this Component holds the same rules on
+  # enable_key_rotation, deletion_window_in_days and policy: each target
+  # reads the keys under its own spelling, so the rules cannot sit in the
+  # Component.
+  #
+  # What the fragment writes beside these: KeySpec and KeyUsage, always,
+  # from the Component's values, and EnableKeyRotation, false unless set; the
+  # terraform Recipe of this Component writes the same three, so both targets
+  # agree whatever their tools default to. It writes nothing else of the
+  # key's own, so KMS's defaults hold: key material KMS generates (Origin
+  # AWS_KMS), a single-Region key, enabled, with no description, in the
+  # Region the stack is deployed to; no custom key store; and, while
+  # rotation is on, a rotation period of 365 days. Nothing beside the key and
+  # its alias is declared: no grant, replica key, IAM role or policy.
+  #
+  # Deletion and replacement. Every resource keeps CloudFormation's own
+  # deletion policy, Delete. For the key that schedules its deletion: deleting
+  # the stack, removing the component from it, or renaming the component,
+  # which changes the key's logical id and creates a new key in its place,
+  # puts the key in the Pending deletion state, in which it encrypts and
+  # decrypts nothing, for PendingWindowInDays days, after which KMS deletes
+  # it with its aliases, and data encrypted under it can no longer be
+  # decrypted. Within the waiting period the deletion is cancelled through
+  # KMS itself, its CancelKeyDeletion operation or its console: CloudFormation
+  # cannot cancel it, and declaring the component again creates another key
+  # rather than taking the old one back. KeySpec and KeyUsage cannot change
+  # on a key that exists: CloudFormation fails the update that changes
+  # key_spec or key_usage, whatever its replacement policy, so a key of
+  # another type is a component of another name. CloudFormation creates new
+  # resources before it deletes those removed, and KMS refuses an alias
+  # whose name another alias holds, so renaming the component while
+  # alias_name is set fails the update: unset alias_name in one update and
+  # rename in the next. EnableKeyRotation and policy change in place.
+  # AliasName is create-only, so changing alias_name deletes the old alias
+  # and creates the new one, and unsetting it deletes the alias; the key
+  # stays.
+  #
+  # Credentials. A KMS key holds no credential a consumer presents: a client
+  # calls KMS with its own AWS credentials, which the key policy and the
+  # account's IAM policies admit, so nothing is published but the key's ID
+  # and ARN. Backup. KMS keeps no data of this key's beyond its key material,
+  # which never leaves KMS unencrypted, so no backup is configured.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "EnableKeyRotation" "PendingWindowInDays" "policy" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "host" -}}
+      {{- fail "infra.overrides.host is set, and a KMS key has no address of its own: a client calls the KMS endpoint of the key's Region and names the key by its ID, ARN or alias, and KMS offers no custom domain: remove infra.overrides.host from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads EnableKeyRotation, PendingWindowInDays and policy from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # EnableKeyRotation is written to the key as a boolean, and KMS rotates
+    # a symmetric encryption key alone.
+    key_rotation: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "EnableKeyRotation" -}}
+      {{- if not (kindIs "bool" $o.EnableKeyRotation) -}}
+      {{- fail (printf "infra.overrides.EnableKeyRotation is %s, and a KMS key takes true or false for its automatic rotation: set it to true or false in the Release, or remove it to leave rotation off" (toJson $o.EnableKeyRotation)) -}}
+      {{- end -}}
+      {{- if and $o.EnableKeyRotation (ne (toString .values.key_spec) "SYMMETRIC_DEFAULT") -}}
+      {{- fail (printf "infra.overrides.EnableKeyRotation is true while values.key_spec is %s, and AWS KMS rotates a symmetric encryption key, SYMMETRIC_DEFAULT, alone: an HMAC or asymmetric key is rotated by creating another key. Remove EnableKeyRotation from the Release, or set it to false" (toString .values.key_spec)) -}}
+      {{- end -}}
+      {{- end -}}
+    # PendingWindowInDays, the waiting period the resource's schema and KMS
+    # take: a whole number of days from 7 to 30.
+    pending_window: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "PendingWindowInDays" -}}
+      {{- $v := $o.PendingWindowInDays -}}
+      {{- $ok := and (not (typeIs "string" $v)) (regexMatch `^[0-9]+$` (toString $v)) -}}
+      {{- if $ok }}{{ $ok = and (ge (int $v) 7) (le (int $v) 30) }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.PendingWindowInDays is %s, and AWS KMS waits a whole number of days from 7 to 30 before deleting a key: set it to one in the Release, or remove it to wait 30 days" (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+    # policy is written as the key's KeyPolicy, a policy document.
+    key_policy: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "policy" -}}
+      {{- if not (and (kindIs "map" $o.policy) $o.policy) -}}
+      {{- fail (printf "infra.overrides.policy is %s, and it is the key policy document, written as a mapping with its Version and Statement keys: set infra.overrides.policy in the Release to the policy document as a mapping, or remove it for KMS's default key policy" (toJson $o.policy)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The fragment. The alias names the key by its ID, through Ref, which
+  # returns a key's ID, so CloudFormation creates the alias after the key and
+  # deletes it before.
+  artifacts:
+    template.yaml: |
+      {{- $l := .locals.logical_id }}
+      {{- $o := optional .infra "overrides" dict }}
+      Resources:
+        {{ $l }}Key:
+          Type: AWS::KMS::Key
+          Properties:
+            KeySpec: "{{ .values.key_spec }}"
+            KeyUsage: "{{ .values.key_usage }}"
+            EnableKeyRotation: {{ if optional $o "EnableKeyRotation" false }}true{{ else }}false{{ end }}
+
+            ## ── Provider-specific overrides ─────────────────────────
+            {{- if hasKey $o "PendingWindowInDays" }}
+            PendingWindowInDays: {{ int $o.PendingWindowInDays }}
+            {{- end }}
+            {{- with optional $o "policy" "" }}
+            KeyPolicy: {{ toJson . }}
+            {{- end }}
+        {{- with optional .values "alias_name" "" }}
+        {{ $l }}Alias:
+          Type: AWS::KMS::Alias
+          Properties:
+            AliasName: "{{ . }}"
+            TargetKeyId: !Ref {{ $l }}Key
+        {{- end }}
+
+      # Fragment provides: the provider projects each entry into the assembled
+      # stack Outputs and expands the short-form intrinsics to long form. Each
+      # output is named for this instance and the entry together, so two keys
+      # in one stack keep their identities apart. A cross-stack consumer
+      # imports these entries; an intra-stack consumer receives them through
+      # the value-pipe above.
+      provides:
+        key_id: !GetAtt {{ $l }}Key.KeyId
+        arn: !GetAtt {{ $l }}Key.Arn
