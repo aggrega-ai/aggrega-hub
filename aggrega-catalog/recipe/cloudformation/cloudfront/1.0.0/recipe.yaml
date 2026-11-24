@@ -1,0 +1,417 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: cloudfront
+  version: 1.0.0
+  description: >
+    Amazon CloudFront on CloudFormation: one AWS::CloudFront::Distribution
+    with one origin and its default cache behaviour, which the
+    cloudformation provider assembles into the boundary's stack. The origin
+    is the host the upstream connection publishes, reached over HTTPS on the
+    port it publishes or 443, or, where infra.overrides.VpcOriginId names the
+    operator's VPC origin, through that origin. infra.waf_policy_id is the
+    distribution's WebACLId.
+
+    host and endpoint publish CloudFormation references to the
+    distribution's domain name, which CloudFormation resolves when it
+    creates the stack. infra.overrides.host publishes the operator's DNS
+    name instead and adds it as the distribution's alternate domain name,
+    presenting the certificate infra.overrides.CustomEndpointCertificateArn
+    names; the DNS record is the operator's. PriceClass and CachePolicyId
+    replace PriceClass_All and the managed CachingDisabled policy. No origin
+    access control, cache or origin request policy, function, log bucket,
+    web ACL, certificate or DNS record is created.
+
+    An upstream publishing no host, an IP literal or a port CloudFront does
+    not take halts the build, as do host or CustomEndpointCertificateArn
+    without the other, a name the distribution cannot take, a certificate
+    outside us-east-1, a VpcOriginId, PriceClass or CachePolicyId of another
+    form and any infra.overrides key not listed.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: cloudformation
+  implements: core/network/cloudfront:1.0.0
+
+  # The distribution's logical id, derived from this instance's own name so
+  # that two distributions deployed into one stack describe two resources
+  # rather than one. A logical id is unique within a CloudFormation template
+  # and admits only letters and digits, so the instance name's separators
+  # are read as word boundaries and each word is capitalised: instance
+  # assets-cdn names the distribution AssetsCdnDistribution.
+  locals:
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+    # The name the Release gives the distribution under infra.overrides.host,
+    # or empty while it gives none. Only a string is read here; any other
+    # value is refused by the assertions below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+    # The ARN of the certificate the alternate domain name is served with,
+    # under infra.overrides.CustomEndpointCertificateArn, or empty while the
+    # Release gives none. Only a string is read here.
+    certificate_arn: '{{ $c := optional (optional .infra "overrides" dict) "CustomEndpointCertificateArn" "" }}{{ if typeIs "string" $c }}{{ $c }}{{ end }}'
+    # The ID of the operator's VPC origin under infra.overrides.VpcOriginId,
+    # or empty while the Release names none. Only a string is read here.
+    vpc_origin_id: '{{ $v := optional (optional .infra "overrides" dict) "VpcOriginId" "" }}{{ if typeIs "string" $v }}{{ $v }}{{ end }}'
+
+  # The String Pipe: the compiler pipes these strings verbatim into a
+  # consumer's injection context when it uses this distribution, and
+  # resolves none of them. host is the distribution's DomainName attribute,
+  # such as d111111abcdef8.cloudfront.net (the CloudFormation reference for
+  # AWS::CloudFront::Distribution), and endpoint joins https:// to it;
+  # CloudFormation resolves both when it creates the distribution, so a
+  # consumer in the same stack reading either is created after it. The
+  # provider projects the matching provides block inside the fragment below
+  # into the assembled stack Outputs; this recipe-level provides is the
+  # value-pipe contract, the fragment provides is the Outputs source, and
+  # they carry the same values.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name in
+  # both provides blocks instead of the reference, and endpoint joins the
+  # scheme to it. It is the operator's deterministic pointer: the compiler
+  # pipes it as text and looks nothing up. A consumer in the same stack
+  # receives the name as well, and a name carries no reference for
+  # CloudFormation to create that consumer after this distribution by; a
+  # later syncWave on the consumer's boundary, sharing this boundary's
+  # directory, orders the two. CloudFront answers a request for that name
+  # only as an alternate domain name of the distribution, served with a
+  # certificate carrying it, so the fragment adds both, as set out below.
+  provides:
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}!GetAtt {{ .locals.logical_id }}Distribution.DomainName{{ end }}"
+    endpoint: "{{ if .locals.operator_host }}https://{{ .locals.operator_host }}{{ else }}!Sub https://${ {{- .locals.logical_id }}Distribution.DomainName}{{ end }}"
+
+  # This Recipe reads from infra.overrides:
+  #   host                         - string (published as provides.host; DistributionConfig.Aliases)
+  #   CustomEndpointCertificateArn - string (DistributionConfig.ViewerCertificate.AcmCertificateArn)
+  #   VpcOriginId                  - string (the origin's VpcOriginConfig.VpcOriginId)
+  #   PriceClass                   - string (DistributionConfig.PriceClass)
+  #   CachePolicyId                - string (DistributionConfig.DefaultCacheBehavior.CachePolicyId)
+  # Any other key halts the build by name.
+  #
+  # VpcOriginId, PriceClass and CachePolicyId are the resource's own
+  # property names, which is what a reader matches against the resource
+  # documentation. host is the key the catalog's Recipes of managed services
+  # read for the name a consumer reaches one at, and
+  # CustomEndpointCertificateArn the key the catalog's OpenSearch Service and
+  # API Gateway Recipes read for the certificate served for that name, so a
+  # Release names both the same way whichever Recipe it configures.
+  #
+  # host and CustomEndpointCertificateArn, set together or not at all. Set,
+  # host is published as the distribution's name and written as its one
+  # alternate domain name, and the viewer certificate is the AWS Certificate
+  # Manager certificate CustomEndpointCertificateArn names, served to
+  # clients that send the name by Server Name Indication (sni-only, which
+  # the CloudFront Developer Guide's "Distribution settings" recommends;
+  # the other method, vip, carries a monthly charge) with the security
+  # policy TLSv1.2_2021, so TLS 1.2 is the oldest protocol a client may use
+  # (the Developer Guide's "Supported protocols and ciphers between viewers
+  # and CloudFront"). CloudFront takes an alternate domain name only with a
+  # certificate covering it, and an alternate domain name only in lower
+  # case (the Developer Guide's "Use custom URLs by adding alternate domain
+  # names"), and an ACM certificate only from US East (N. Virginia),
+  # us-east-1 (the CloudFormation reference for ViewerCertificate's
+  # AcmCertificateArn). The name is a DNS name of two labels or more and 253
+  # characters at most, the DNS standard's longest name, each label 1 to 63
+  # lower-case letters, digits and hyphens neither beginning nor ending with
+  # a hyphen, the last two characters or more, and without the wildcard
+  # first label CloudFront also takes, since a wildcard is no name a
+  # consumer can reach. The certificate is named by its ARN,
+  # arn:aws:acm:us-east-1:<account>:certificate/<id>. A name without a
+  # certificate would be published to clients that cannot reach the
+  # distribution under it, and a certificate without a name configures
+  # nothing, so either alone halts, as do a name not bare or not of that
+  # form, an ARN of another form and a certificate in another Region.
+  # Whether the certificate covers the name is CloudFront's to check when
+  # it creates the distribution: the compiler looks no certificate up.
+  # CloudFront refuses an alternate domain name another distribution
+  # already holds, in any account (the same page). The certificate, and the
+  # DNS record pointing the name at the distribution's domain name, are the
+  # operator's: this Recipe creates neither. While no name is set, the
+  # distribution serves HTTPS on its own name with CloudFront's default
+  # certificate, *.cloudfront.net, with which CloudFront sets the security
+  # policy TLSv1 itself (the Developer Guide's "Distribution settings").
+  #
+  # VpcOriginId names the operator's VPC origin, an AWS::CloudFront::VpcOrigin
+  # in front of an Application Load Balancer, Network Load Balancer or EC2
+  # instance in private subnets (the Developer Guide's "Restrict access with
+  # VPC origins"), so the origin carries VpcOriginConfig in place of
+  # CustomOriginConfig: the VPC origin's own settings decide the protocol
+  # and port CloudFront connects with, and the upstream's port is not read.
+  # The origin's domain name is still the host the upstream publishes, and
+  # that guide gives it as the load balancer's DNS name or the instance's
+  # private IP DNS name: which name the upstream publishes, and which
+  # resource the VPC origin stands in front of, are the operator's to keep
+  # true. The VPC origin, its load balancer or instance and their security
+  # groups are the operator's, named here and never created. A VpcOriginId
+  # that is empty or not a string halts the build.
+  #
+  # PriceClass is one of PriceClass_100, PriceClass_200 and PriceClass_All,
+  # the price classes the CloudFront API Reference describes for
+  # DistributionConfig, which also lists None without saying what it
+  # serves; None and any other value halt the build. Unset, PriceClass_All,
+  # CloudFront's default: every edge location serves the distribution.
+  #
+  # CachePolicyId names the cache policy of the default cache behaviour, a
+  # managed policy or one of the operator's, such as
+  # 658327ea-f89d-4fab-a63d-7e88639e58f6, the managed CachingOptimized
+  # (the Developer Guide's "Use managed cache policies"). Unset, the managed
+  # CachingDisabled, 4135ea2d-6df8-44a3-9df3-4b5a84be39ad, whose TTLs are
+  # all 0, so CloudFront caches nothing and forwards every request. A cache
+  # policy of the operator's is theirs, named here and never created. A
+  # CachePolicyId that is empty or not a string halts the build.
+  #
+  # Tags is not read: no CloudFormation Recipe of this catalog reads one, and
+  # it halts as any key not listed does.
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # held by the Component's assertions, or not read:
+  #   honoured — the upstream connection's host, and its port while no VPC
+  #     origin is named; infra.waf_policy_id, as DistributionConfig.WebACLId;
+  #     and the overrides above. The Component declares no values.
+  #   refused — an upstream target publishing no host, or a host written as
+  #     an IP literal, or a port written as a number CloudFront does not
+  #     take; host or CustomEndpointCertificateArn without the other, a host
+  #     that is not a bare DNS name the distribution takes, and a
+  #     certificate ARN of another form or another Region; a VpcOriginId or
+  #     a CachePolicyId that is empty or not a string; a PriceClass outside
+  #     those listed; and any infra.overrides key not listed above.
+  #   held by the Component — a second connection on the upstream socket,
+  #     and a waf_policy_id that is not the ARN of a CLOUDFRONT web ACL.
+  #   not read — none; the Component declares no other value or infra key.
+  #
+  # What the fragment writes beside these, so the terraform Recipe of this
+  # Component, whose module and AWS provider default otherwise, creates the
+  # same distribution:
+  #   Enabled true, so the distribution takes requests once deployed.
+  #   HttpVersion http2: the CloudFront API Reference gives http2 as the
+  #     default for a new distribution and the CloudFormation reference
+  #     http1.1, so it is written out. A viewer without HTTP/2 uses HTTP/1.1.
+  #   IPV6Enabled true, so the distribution answers IPv6 viewers as well,
+  #     as the API Reference advises in general; a Route 53 alias record
+  #     pointing the custom domain at the distribution then needs an AAAA
+  #     record beside the A record, while a CNAME record needs nothing more.
+  #   The origin's CustomOriginConfig, while no VPC origin is named:
+  #     OriginProtocolPolicy https-only, HTTPSPort the upstream's port or
+  #     443, HTTPPort 80, which an https-only origin does not use but the
+  #     terraform Recipe's module requires, and OriginSSLProtocols TLSv1.2
+  #     alone, where CloudFormation's default also admits TLSv1 and SSLv3.
+  #     CloudFront takes 80, 443 and 1024 to 65535 as an origin's port (the
+  #     Developer Guide's "Origin settings"). Its Id is the upstream
+  #     component's name, which the default cache behaviour targets.
+  #   The default cache behaviour: ViewerProtocolPolicy redirect-to-https,
+  #     so a request over HTTP is answered with a 301 to its HTTPS URL;
+  #     AllowedMethods GET, HEAD, OPTIONS, PUT, PATCH, POST and DELETE, so
+  #     every method reaches the origin, where CloudFront's default is GET
+  #     and HEAD; CachedMethods GET and HEAD, CloudFront's default; Compress
+  #     false, CloudFront's default, so CloudFront compresses nothing
+  #     itself; and OriginRequestPolicyId b689b0a8-53d0-40ab-baf2-68738e2966ac,
+  #     the managed AllViewerExceptHostHeader, so every viewer header but
+  #     Host, every cookie and every query string reach the origin, and
+  #     CloudFront sends the origin's domain name as Host (the Developer
+  #     Guide's "Use managed origin request policies").
+  #   Nothing else: no Restrictions, so no geographic restriction; no
+  #     Logging; no default root object, custom error response, function,
+  #     Lambda@Edge association or further cache behaviour; no Comment.
+  #
+  # The name and deletion. CloudFormation updates DistributionConfig with no
+  # interruption (the CloudFormation reference), so every key above changes
+  # the distribution in place. Renaming the component changes the logical
+  # id, so CloudFormation creates a new distribution, with a new domain
+  # name, and deletes the old one; CloudFront refuses an alternate domain
+  # name another distribution holds, so with infra.overrides.host set the
+  # new distribution meets the name the old one still carries. Deleting the
+  # stack, or removing the distribution from it, deletes the distribution.
+  # CloudFront deletes a distribution only once it is disabled (the API
+  # Reference's DeleteDistribution); the CloudFormation reference does not
+  # say how the resource's deletion meets that, and it is not measured here.
+  # The web ACL, the certificate, the VPC origin, the cache policy and the
+  # DNS record are the operator's and stay, the record then naming a
+  # distribution that no longer exists.
+  #
+  # Credentials. CloudFront holds no credential a consumer needs: clients
+  # reach the distribution anonymously, and authenticating them is the
+  # origin's work. The origin is reached without one, so nothing is
+  # published but the distribution's address. Backup. CloudFront keeps
+  # nothing to back up: its cache holds copies of the origin's responses,
+  # and its configuration is this fragment.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "host" "CustomEndpointCertificateArn" "VpcOriginId" "PriceClass" "CachePolicyId" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads host, CustomEndpointCertificateArn, VpcOriginId, PriceClass and CachePolicyId from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    # The name a consumer reaches the distribution at is a host name alone,
+    # with no scheme, path, user or port: the distribution serves HTTPS on
+    # 443.
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this distribution reaches it at, given as a DNS name alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the distribution serves HTTPS on 443` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # CloudFront answers a request for the operator's name only as an
+    # alternate domain name served with a certificate covering it, so host
+    # and the certificate are set together, the name follows the rule given
+    # above, and the certificate is named by its AWS Certificate Manager ARN
+    # in us-east-1. The terraform Recipe of this Component holds the same
+    # rules on host and custom_endpoint_certificate_arn: each target reads
+    # the certificate under its own spelling, so the rules cannot sit in the
+    # Component.
+    custom_domain: >-
+      {{- $c := optional (optional .infra "overrides" dict) "CustomEndpointCertificateArn" "" -}}
+      {{- if not (or (kindIs "invalid" $c) (eq (toJson $c) `""`) (and (typeIs "string" $c) (regexMatch `^arn:aws[a-zA-Z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/[A-Za-z0-9-]+$` $c))) -}}
+      {{- fail (printf "infra.overrides.CustomEndpointCertificateArn is %s, and it is the ARN of the AWS Certificate Manager certificate the distribution serves its alternate domain name with, arn:aws:acm:us-east-1:<account>:certificate/<id>: set it in the Release to that ARN" (toJson $c)) -}}
+      {{- end -}}
+      {{- if and .locals.certificate_arn (not (regexMatch `^arn:aws:acm:us-east-1:` .locals.certificate_arn)) -}}
+      {{- fail (printf "infra.overrides.CustomEndpointCertificateArn is %q, and Amazon CloudFront takes an AWS Certificate Manager certificate only from US East (N. Virginia), us-east-1: request or import the certificate in us-east-1 and set infra.overrides.CustomEndpointCertificateArn in the Release to its ARN" .locals.certificate_arn) -}}
+      {{- end -}}
+      {{- $h := .locals.operator_host -}}
+      {{- if and $h (not .locals.certificate_arn) -}}
+      {{- fail (printf "infra.overrides.host is %q, and Amazon CloudFront takes an alternate domain name only with a certificate covering it; without one, no client can reach the distribution by that name: set infra.overrides.CustomEndpointCertificateArn in the Release to the ARN of an AWS Certificate Manager certificate in us-east-1 carrying the name, or remove infra.overrides.host to publish the distribution's own domain name" $h) -}}
+      {{- end -}}
+      {{- if and .locals.certificate_arn (not $h) -}}
+      {{- fail "infra.overrides.CustomEndpointCertificateArn is set, and it is the certificate of the distribution's alternate domain name, which is infra.overrides.host, which the Release leaves unset or empty: set infra.overrides.host in the Release to the DNS name the certificate carries, or remove infra.overrides.CustomEndpointCertificateArn" -}}
+      {{- end -}}
+      {{- if $h -}}
+      {{- if or (regexMatch `^[0-9]+(\.[0-9]+){3}$` $h) (contains ":" $h) -}}
+      {{- fail (printf "infra.overrides.host is %q, an IP literal, and the distribution's alternate domain name is a DNS name, one the certificate it is served with carries: set infra.overrides.host in the Release to the DNS name the certificate in infra.overrides.CustomEndpointCertificateArn carries" $h) -}}
+      {{- end -}}
+      {{- $labels := splitList "." $h -}}
+      {{- $ok := and (ge (len $labels) 2) (le (len $h) 253) (ge (len (last $labels)) 2) -}}
+      {{- range $labels }}{{ if not (regexMatch `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$` .) }}{{ $ok = false }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.host is %q, and the distribution's alternate domain name is a DNS name of two labels or more and 253 characters at most, each label 1 to 63 lower-case letters, digits and hyphens neither beginning nor ending with a hyphen, the last two characters or more, with no upper-case letter, which CloudFront does not take in an alternate domain name, and no wildcard, which names no host a consumer can reach: set infra.overrides.host in the Release to such a name, one the certificate in infra.overrides.CustomEndpointCertificateArn carries" $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The operator's VPC origin, the price class and the cache policy, each
+    # passed to the resource as written, so one of another shape would
+    # render a property CloudFront refuses. The terraform Recipe of this
+    # Component holds the same rules on vpc_origin_id, price_class and
+    # cache_policy_id, for the reason given above.
+    distribution_settings: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "VpcOriginId" -}}
+      {{- if not (and (typeIs "string" $o.VpcOriginId) $o.VpcOriginId) -}}
+      {{- fail (printf "infra.overrides.VpcOriginId is %s, and it is the ID of the operator's CloudFront VPC origin, given as a string: set it in the Release to that ID, or remove it to reach the upstream's host over the internet" (toJson $o.VpcOriginId)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "PriceClass" -}}
+      {{- if not (has $o.PriceClass (list "PriceClass_100" "PriceClass_200" "PriceClass_All")) -}}
+      {{- fail (printf "infra.overrides.PriceClass is %s, and this Recipe takes PriceClass_100, PriceClass_200 or PriceClass_All, the price classes the CloudFront API Reference describes: set it in the Release to one of them, or remove it for PriceClass_All" (toJson $o.PriceClass)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "CachePolicyId" -}}
+      {{- if not (and (typeIs "string" $o.CachePolicyId) $o.CachePolicyId) -}}
+      {{- fail (printf "infra.overrides.CachePolicyId is %s, and it is the ID of a CloudFront cache policy, managed or the operator's, given as a string such as 658327ea-f89d-4fab-a63d-7e88639e58f6: set it in the Release to that ID, or remove it to cache nothing" (toJson $o.CachePolicyId)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The fragment. The upstream connection is read first: the target it
+  # reaches must publish a host, which becomes the origin's DomainName. The
+  # host is copied whole, as the target wrote it: a name, a CloudFormation
+  # reference to a resource in the same stack, or, for a target in another
+  # stack, the cross-stack reference the provider puts in its place. A host
+  # written as an IPv4 or IPv6 literal halts, since an origin's domain name
+  # is a publicly resolvable DNS name (the Developer Guide's "Origin
+  # settings"); a reference is resolved by CloudFormation and not judged
+  # here. While no VPC origin is named, the port the target publishes is the
+  # origin's HTTPSPort, and 443 where it publishes none; a port written as a
+  # number other than 80, 443 or 1024 to 65535 halts, and every Recipe of
+  # this catalog publishes a port as a number written out.
+  artifacts:
+    template.yaml: |
+      {{- $id := .context.instance_id }}
+      {{- $l := .locals.logical_id }}
+      {{- $o := optional .infra "overrides" dict }}
+      {{- $vpc := .locals.vpc_origin_id }}
+      {{- $host := "" }}
+      {{- $port := "443" }}
+      {{- $origin := "" }}
+      {{- range $alias, $edge := .context.uses }}
+      {{- if eq $edge.socket "upstream" }}
+      {{- $p := optional $edge "provides" dict }}
+      {{- if not (hasKey $p "host") }}
+      {{- fail (printf "the upstream connection %q of %q reaches %q, which publishes no host, and Amazon CloudFront forwards every request to the host its origin names: wire upstream in the Aggregate to a component that publishes host" $alias $id $edge.target) }}
+      {{- end }}
+      {{- $host = printf "%v" $p.host }}
+      {{- $origin = $edge.target }}
+      {{- if or (regexMatch `^[0-9]+(\.[0-9]+){3}$` $host) (and (contains ":" $host) (not (hasPrefix "!" $host))) }}
+      {{- fail (printf "the upstream connection %q of %q reaches %q, which publishes the host %q, an IP literal, and an Amazon CloudFront origin is a publicly resolvable DNS name: wire upstream in the Aggregate to a component that publishes a DNS name, or give that component a DNS name as its host in the Release" $alias $id $edge.target $host) }}
+      {{- end }}
+      {{- if and (not $vpc) (hasKey $p "port") }}
+      {{- $port = printf "%v" $p.port }}
+      {{- if regexMatch `^[0-9]+$` $port }}
+      {{- $n := atoi $port }}
+      {{- if not (or (eq $n 80) (eq $n 443) (and (ge $n 1024) (le $n 65535))) }}
+      {{- fail (printf "the upstream connection %q of %q reaches %q, which publishes the port %s, and Amazon CloudFront connects to an origin on port 80, 443 or 1024 to 65535: wire upstream in the Aggregate to a component serving HTTPS on such a port" $alias $id $edge.target $port) }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      Resources:
+        {{ $l }}Distribution:
+          Type: AWS::CloudFront::Distribution
+          Properties:
+            DistributionConfig:
+              Enabled: true
+              HttpVersion: http2
+              IPV6Enabled: true
+              PriceClass: {{ toJson (optional $o "PriceClass" "PriceClass_All") }}
+              {{- with .infra.waf_policy_id }}
+              WebACLId: {{ toJson . }}
+              {{- end }}
+              Origins:
+                - Id: "{{ $origin }}"
+                  DomainName: {{ toJson $host }}
+                  {{- if $vpc }}
+                  VpcOriginConfig:
+                    VpcOriginId: {{ toJson $vpc }}
+                  {{- else }}
+                  CustomOriginConfig:
+                    OriginProtocolPolicy: https-only
+                    HTTPPort: 80
+                    HTTPSPort: {{ if regexMatch `^[0-9]+$` $port }}{{ $port }}{{ else }}{{ toJson $port }}{{ end }}
+                    OriginSSLProtocols:
+                      - TLSv1.2
+                  {{- end }}
+              DefaultCacheBehavior:
+                TargetOriginId: "{{ $origin }}"
+                ViewerProtocolPolicy: redirect-to-https
+                AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+                CachedMethods: [GET, HEAD]
+                Compress: false
+                CachePolicyId: {{ toJson (optional $o "CachePolicyId" "4135ea2d-6df8-44a3-9df3-4b5a84be39ad") }}
+                OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+              {{- if .locals.operator_host }}
+              Aliases:
+                - "{{ .locals.operator_host }}"
+              ViewerCertificate:
+                AcmCertificateArn: {{ toJson .locals.certificate_arn }}
+                SslSupportMethod: sni-only
+                MinimumProtocolVersion: TLSv1.2_2021
+              {{- else }}
+              ViewerCertificate:
+                CloudFrontDefaultCertificate: true
+              {{- end }}
+
+      # Fragment provides: the provider projects each entry into the assembled
+      # stack Outputs and expands the short-form intrinsics to long form. The
+      # output is named for this instance and the entry together, so two
+      # distributions in one stack keep their identities apart. A cross-stack
+      # consumer imports the entry; an intra-stack consumer receives it
+      # through the value-pipe above.
+      provides:
+        host: {{ if .locals.operator_host }}"{{ .locals.operator_host }}"{{ else }}!GetAtt {{ $l }}Distribution.DomainName{{ end }}
+        endpoint: {{ if .locals.operator_host }}"https://{{ .locals.operator_host }}"{{ else }}!Sub "https://${ {{- $l }}Distribution.DomainName}"{{ end }}
