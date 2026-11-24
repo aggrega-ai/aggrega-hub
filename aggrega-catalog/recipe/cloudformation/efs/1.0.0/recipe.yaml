@@ -1,0 +1,364 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: efs
+  version: 1.0.0
+  # The infra.overrides keys this Recipe refuses are listed, with their
+  # reasons, in the comments above the assertions.
+  description: >
+    Amazon EFS on CloudFormation: one AWS::EFS::FileSystem named after the
+    component, encrypted at rest, and one AWS::EFS::MountTarget in each
+    subnet infra.overrides.SubnetIds names, in the security groups
+    infra.overrides.SecurityGroups names, which the cloudformation provider
+    assembles into the boundary's stack. The subnets, the security groups
+    and the KMS key are the operator's, and none is created; nor is a file
+    system policy, an access point, a lifecycle policy, a replication or a
+    backup policy.
+
+    file_system_id and arn publish CloudFormation references to the file
+    system, and host the mount DNS name composed from its ID and the stack's
+    Region, or infra.overrides.host, the operator's DNS name for it. A
+    consumer in the stack is created after the file system, not after its
+    mount targets. Deleting the stack, renaming the component, or changing
+    PerformanceMode or KmsKeyId deletes the file system and its data.
+
+    PerformanceMode, ThroughputMode and ProvisionedThroughputInMibps set the
+    file system's modes, and KmsKeyId the key encrypting its files'
+    contents. SubnetIds or SecurityGroups unset or of another form, a
+    subnet named twice, a mode or key Amazon EFS does not take, maxIO with
+    elastic, provisioned throughput without its figure or a figure without
+    it, a host that is not bare, and any infra.overrides key not listed halt
+    the build naming the key.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: cloudformation
+  implements: core/storage/efs:1.0.0
+
+  # The resources' logical ids, derived from this instance's own name so that
+  # two file systems deployed into one stack describe two sets of resources
+  # rather than one. A logical id is unique within a CloudFormation template
+  # and admits only letters and digits, so the instance name's separators are
+  # read as word boundaries and each word is capitalised: instance
+  # shared-media names the file system SharedMediaFileSystem, and its mount
+  # target in subnet-0a1b2c3d4e5f60718 SharedMediaMountTarget0a1b2c3d4e5f60718,
+  # the subnet's ID without its subnet- prefix.
+  locals:
+    logical_id: '{{ capitalizedWords .context.instance_id }}'
+    # The name the Release gives the file system under infra.overrides.host,
+    # or empty while it gives none. Only a string is read here; any other
+    # value is refused by the assertion below rather than published.
+    operator_host: '{{ $h := optional (optional .infra "overrides" dict) "host" "" }}{{ if typeIs "string" $h }}{{ $h }}{{ end }}'
+
+  # The String Pipe: the compiler pipes each of these strings verbatim into a
+  # consumer's injection context when it uses this file system, and resolves
+  # none of them. file_system_id and arn are references to the file system's
+  # FileSystemId and Arn attributes, which CloudFormation resolves when it
+  # creates the file system. host is an Fn::Sub joining that FileSystemId to
+  # .efs., the AWS::Region pseudo parameter, the Region the stack is deployed
+  # to, and the AWS::URLSuffix pseudo parameter, the domain suffix of the
+  # stack's partition, such as amazonaws.com or amazonaws.com.cn: the file
+  # system's DNS name as the Amazon EFS User Guide composes it from the file
+  # system's ID and Region ("Mounting on Amazon EC2 with a DNS name"), which
+  # the resource offers as no attribute of its own. The provider projects the
+  # matching provides block inside the fragment below into the assembled
+  # stack Outputs; this recipe-level provides is the value-pipe contract, the
+  # fragment provides is the Outputs source, and they carry the same values.
+  #
+  # Each reference names the file system, so CloudFormation creates a
+  # consumer in the same stack after the file system, but not after its
+  # mount targets, which name the file system in turn: the DNS name resolves
+  # once a mount target is available in the client's Availability Zone, and
+  # the guide's page above recommends waiting 90 seconds after a mount target
+  # is created before mounting. A consumer mounting at start-up is ordered
+  # after the mount targets by a later syncWave on its own boundary, sharing
+  # this boundary's directory.
+  #
+  # While the Release sets infra.overrides.host, host publishes that name in
+  # both provides blocks instead of the composed name. It is the operator's
+  # deterministic pointer: the compiler pipes it as text and looks nothing
+  # up, and this Recipe emits no DNS record for it, so the operator points
+  # the name at the file system's mount targets outside the Release. A
+  # consumer in another stack imports the name through the same export it
+  # imports the composed name through.
+  provides:
+    file_system_id: "!GetAtt {{ .locals.logical_id }}FileSystem.FileSystemId"
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}!Sub ${ {{- .locals.logical_id }}FileSystem.FileSystemId}.efs.${AWS::Region}.${AWS::URLSuffix}{{ end }}"
+    arn: "!GetAtt {{ .locals.logical_id }}FileSystem.Arn"
+
+  # This Recipe reads from infra.overrides:
+  #   SubnetIds                    - []string, required (one AWS::EFS::MountTarget in each, its SubnetId)
+  #   SecurityGroups               - []string, required (each mount target's SecurityGroups)
+  #   PerformanceMode              - string (the file system's PerformanceMode)
+  #   ThroughputMode               - string (the file system's ThroughputMode)
+  #   ProvisionedThroughputInMibps - number (the file system's ProvisionedThroughputInMibps)
+  #   KmsKeyId                     - string (the file system's KmsKeyId, beside Encrypted true)
+  #   host                         - string (published as provides.host; renders nothing)
+  # Any other key halts naming it, so a key misspelt, or meant for another
+  # Recipe, is never passed over unread.
+  #
+  # SubnetIds and SecurityGroups are the names the catalog's CloudFormation
+  # Recipes read for the subnets and the security groups a resource is placed
+  # in, SecurityGroups being the mount target's own property name. The modes
+  # are the file system's own property names, which is what a reader matches
+  # against the resource documentation. KmsKeyId is the name the catalog's
+  # CloudFormation Recipes read for the KMS key a resource is encrypted with,
+  # here the file system's own KmsKeyId. host is no property of either
+  # resource but the address a consumer reaches the file system at, under the
+  # name every Recipe of a managed service in this catalog reads for it.
+  #
+  # SubnetIds names the operator's subnets, each subnet- followed by 8 to 40
+  # lower-case hexadecimal digits as the mount target's SubnetId reads it,
+  # each once, and the fragment declares one mount target in each. Amazon EFS
+  # takes mount targets of one file system in one VPC alone, and one in each
+  # Availability Zone (the CreateMountTarget reference), so the subnets are
+  # in one VPC and in distinct zones; which zone and VPC each subnet sits in
+  # is the service's to check when the stack is created. SecurityGroups names
+  # one to 100 distinct security groups, each sg- followed by 8 to 40
+  # lower-case hexadecimal digits, the limits of the mount target's
+  # SecurityGroups, written on every mount target; the account's quota of
+  # security groups for a network interface may be lower, which the service
+  # checks. Both are required: the resource requires SecurityGroups on a
+  # mount target, and a file system without a mount target is reached by no
+  # client. They are the only gate on a client, since no file system policy
+  # is set and Amazon EFS then grants full access to any client reaching a
+  # mount target ("Using IAM to control access to file systems"), so the
+  # groups admit NFS on TCP port 2049 from the clients alone.
+  #
+  # PerformanceMode is generalPurpose or maxIO and ThroughputMode bursting,
+  # elastic or provisioned, the values the resource's schema lists; unset,
+  # the fragment writes neither and Amazon EFS creates the file system in
+  # generalPurpose and bursting, the defaults the CreateFileSystem reference
+  # states. Amazon EFS takes maxIO on no file system using elastic throughput
+  # (the same reference), so the two together halt.
+  # ProvisionedThroughputInMibps is the throughput of a provisioned file
+  # system, in MiB a second, a number from 1, which the resource requires
+  # with ThroughputMode provisioned and which the CreateFileSystem reference
+  # holds valid for a file system in that mode alone; so provisioned without
+  # it, and it without provisioned, halt. The reference gives 1 to 3414 MiB a
+  # second, the upper limit depending on the Region and raised through AWS
+  # Support, which the service checks.
+  #
+  # KmsKeyId names the KMS key encrypting the contents of the file system's
+  # files, in one of the forms the resource's schema reads: a key ID (a UUID,
+  # or mrk- and 32 hexadecimal digits for a multi-Region key), an alias name
+  # (alias/ followed by letters, digits, slashes, underscores and hyphens),
+  # or the ARN of a key or of an alias; a value of another form halts the
+  # build. Amazon EFS takes a symmetric key alone, which the service checks.
+  # File names, directory names and directory contents are encrypted under a
+  # key Amazon EFS manages internally, whichever key is named ("Encrypting
+  # data at rest"). Unset, the fragment writes none and the file contents are
+  # encrypted under the key for Amazon EFS that AWS provides,
+  # aws/elasticfilesystem. The key and its key policy are the operator's,
+  # named here and never created.
+  #
+  # The terraform Recipe of this Component holds the same rules on
+  # subnet_ids, vpc_security_groups, performance_mode, throughput_mode and
+  # provisioned_throughput_in_mibps, and its own on kms_key_id: each target
+  # reads the keys under its own spelling, so the rules cannot sit in the
+  # Component.
+  #
+  # host is a bare DNS name or IP literal: the assertion below refuses a
+  # value carrying a scheme, a path, a user, a port or whitespace, because a
+  # client mounts the name over NFS on port 2049 and would compose a broken
+  # address from anything else.
+  #
+  # Tags is not read: no CloudFormation Recipe of this catalog reads one, and
+  # it halts as any key not listed does.
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # or not read:
+  #   honoured — the overrides above. The Component declares no values.
+  #   refused — SubnetIds or SecurityGroups unset or of another form; a
+  #     subnet named twice; a PerformanceMode or ThroughputMode the file
+  #     system does not take; maxIO with elastic; provisioned throughput
+  #     without ProvisionedThroughputInMibps, and that figure without
+  #     provisioned or below 1; a KmsKeyId of another form; a host that is
+  #     not bare; and any infra.overrides key not listed above.
+  #   not read — none; the Component declares no other value or infra key.
+  #
+  # What the fragment writes beside these: Encrypted true, which Amazon EFS
+  # takes through its API only when asked ("Encrypting data at rest"), and
+  # the file system's Name tag, the component's name, which Amazon EFS
+  # reports as the file system's name; the terraform Recipe of this
+  # Component writes both too, so both targets agree. It writes nothing else
+  # of the file system's own, so Amazon EFS's defaults hold: a Regional file
+  # system, its data stored across several Availability Zones; no
+  # BackupPolicy, so automatic backups stay off, as Amazon EFS creates a
+  # Regional file system through its API ("Backing up EFS file systems"); no
+  # LifecyclePolicies, so every file stays in the Standard storage class; no
+  # FileSystemPolicy; replication overwrite protection on; no replication.
+  # Each mount target takes an IPv4 address Amazon EFS chooses in its subnet.
+  #
+  # Deletion and replacement. Every resource keeps CloudFormation's own
+  # deletion policy, Delete: deleting the stack, or removing the component
+  # from it, deletes the mount targets and then the file system with every
+  # file it holds, and with automatic backups off no recovery point remains
+  # unless the operator backs the file system up outside the Release.
+  # PerformanceMode, Encrypted and KmsKeyId are create-only, so changing
+  # PerformanceMode or KmsKeyId on a file system that exists makes
+  # CloudFormation create a new, empty file system and delete the old one with
+  # its data; so does renaming the component, which changes every logical
+  # id. ThroughputMode and ProvisionedThroughputInMibps change in place,
+  # within the waiting periods Amazon EFS sets between such changes, and so
+  # do SecurityGroups. A mount target's SubnetId is create-only, and each
+  # mount target's logical id carries its subnet, so listing the subnets in
+  # another order changes nothing, adding one adds its mount target and
+  # removing one deletes it. CloudFormation creates new resources before it
+  # deletes those removed, so moving a mount target to another subnet of the
+  # same Availability Zone takes two updates: remove the old subnet, then add
+  # the new one.
+  #
+  # Credentials. Amazon EFS holds no credential a consumer presents: a client
+  # mounts through a mount target its security groups admit, so nothing is
+  # published but the file system's identifiers and address. Backup. No
+  # backup is configured: core/backup applies to stateful servers, and an
+  # attachment of it to this resource halts before anything renders.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "SubnetIds" "SecurityGroups" "PerformanceMode" "ThroughputMode" "ProvisionedThroughputInMibps" "KmsKeyId" "host" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads SubnetIds, SecurityGroups, PerformanceMode, ThroughputMode, ProvisionedThroughputInMibps, KmsKeyId and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $h := optional (optional .infra "overrides" dict) "host" "" -}}
+      {{- if not (kindIs "invalid" $h) -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a client mounts this file system at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — a client mounts it over NFS on port 2049` $h) -}}
+      {{- end -}}
+      {{- end -}}
+    # The mount targets: one in each subnet SubnetIds names, each in the
+    # security groups SecurityGroups names, both required and passed to the
+    # resources as written, so a value of another shape would render a
+    # property CloudFormation refuses. Each mount target's logical id carries
+    # its subnet, so a subnet named twice would declare one resource twice.
+    mount_targets: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if not (hasKey $o "SubnetIds") -}}
+      {{- fail "infra.overrides.SubnetIds is unset, and this Recipe places the file system's mount targets in the operator's subnets, one in each subnet named, through which alone a client reaches the file system: set infra.overrides.SubnetIds in the Release to the IDs of those subnets, one in each Availability Zone a client mounts from" -}}
+      {{- end -}}
+      {{- $s := $o.SubnetIds -}}
+      {{- $ok := and (kindIs "slice" $s) (gt (len $s) 0) -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) (regexMatch `^subnet-[0-9a-f]{8,40}$` .)) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.SubnetIds is %s, and a mount target takes its subnet by ID, subnet- followed by 8 to 40 lower-case hexadecimal digits: set it in the Release to a list of such IDs, one for each mount target" (toJson $s)) -}}
+      {{- end -}}
+      {{- if ne (len (uniq $s)) (len $s) -}}
+      {{- fail (printf "infra.overrides.SubnetIds is %s, which names a subnet more than once, and Amazon EFS takes one mount target of a file system in a subnet, and one in each Availability Zone: name each subnet once in the Release" (toJson $s)) -}}
+      {{- end -}}
+      {{- if not (hasKey $o "SecurityGroups") -}}
+      {{- fail "infra.overrides.SecurityGroups is unset, and the AWS::EFS::MountTarget resource requires the security groups each mount target is placed in, which admit NFS on TCP port 2049 from the file system's clients: set infra.overrides.SecurityGroups in the Release to the IDs of those security groups" -}}
+      {{- end -}}
+      {{- $g := $o.SecurityGroups -}}
+      {{- $ok = and (kindIs "slice" $g) (ge (len $g) 1) (le (len $g) 100) -}}
+      {{- if $ok }}{{ range $g }}{{ if not (and (typeIs "string" .) (regexMatch `^sg-[0-9a-f]{8,40}$` .)) }}{{ $ok = false }}{{ end }}{{ end }}{{ $ok = and $ok (eq (len (uniq $g)) (len $g)) }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.SecurityGroups is %s, and a mount target takes its security groups as a list of 1 to 100 distinct security group IDs, each sg- followed by 8 to 40 lower-case hexadecimal digits: set it in the Release to such a list" (toJson $g)) -}}
+      {{- end -}}
+    # The performance and throughput modes the AWS::EFS::FileSystem schema
+    # lists, the pairing of maxIO and elastic that the CreateFileSystem
+    # reference refuses, and the provisioned throughput that mode requires
+    # and no other mode reads.
+    file_system_modes: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "PerformanceMode" -}}
+      {{- if not (and (typeIs "string" $o.PerformanceMode) (has $o.PerformanceMode (list "generalPurpose" "maxIO"))) -}}
+      {{- fail (printf "infra.overrides.PerformanceMode is %s, and an Amazon EFS file system runs in the performance mode generalPurpose or maxIO: set it to one of them in the Release, or remove it for generalPurpose" (toJson $o.PerformanceMode)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "ThroughputMode" -}}
+      {{- if not (and (typeIs "string" $o.ThroughputMode) (has $o.ThroughputMode (list "bursting" "elastic" "provisioned"))) -}}
+      {{- fail (printf "infra.overrides.ThroughputMode is %s, and an Amazon EFS file system runs in the throughput mode bursting, elastic or provisioned: set it to one of them in the Release, or remove it for bursting" (toJson $o.ThroughputMode)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $mode := toString (optional $o "ThroughputMode" "bursting") -}}
+      {{- if and (eq (toString (optional $o "PerformanceMode" "")) "maxIO") (eq $mode "elastic") -}}
+      {{- fail "infra.overrides.PerformanceMode is maxIO and infra.overrides.ThroughputMode elastic, and Amazon EFS takes the maxIO performance mode on no file system using elastic throughput: set PerformanceMode to generalPurpose, or ThroughputMode to bursting or provisioned, in the Release" -}}
+      {{- end -}}
+      {{- if hasKey $o "ProvisionedThroughputInMibps" -}}
+      {{- $v := $o.ProvisionedThroughputInMibps -}}
+      {{- $ok := or (kindIs "int" $v) (kindIs "int64" $v) (kindIs "float64" $v) -}}
+      {{- if $ok }}{{ $ok = ge (float64 $v) 1.0 }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.ProvisionedThroughputInMibps is %s, and Amazon EFS takes a provisioned throughput as a number of MiB a second from 1: set it in the Release to such a number" (toJson $v)) -}}
+      {{- end -}}
+      {{- if ne $mode "provisioned" -}}
+      {{- fail (printf "infra.overrides.ProvisionedThroughputInMibps is set while the throughput mode is %s, and Amazon EFS reads a provisioned throughput only in the throughput mode provisioned: set infra.overrides.ThroughputMode to provisioned in the Release, or remove ProvisionedThroughputInMibps" $mode) -}}
+      {{- end -}}
+      {{- else if eq $mode "provisioned" -}}
+      {{- fail "infra.overrides.ThroughputMode is provisioned, and a file system in that mode takes the throughput it is provisioned with, which infra.overrides.ProvisionedThroughputInMibps names and the Release does not set: set infra.overrides.ProvisionedThroughputInMibps in the Release, or choose another ThroughputMode" -}}
+      {{- end -}}
+    # The forms the AWS::EFS::FileSystem schema reads for KmsKeyId: a key ID,
+    # a multi-Region key ID, an alias name, or a key's or an alias's ARN.
+    kms_key: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "KmsKeyId" -}}
+      {{- if not (and (typeIs "string" $o.KmsKeyId) (regexMatch `^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32}|alias/[a-zA-Z0-9/_-]+|arn:aws[-a-z]*:kms:[a-z0-9-]+:[0-9]{12}:(key/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|key/mrk-[0-9a-f]{32}|alias/[a-zA-Z0-9/_-]+))$` $o.KmsKeyId)) -}}
+      {{- fail (printf "infra.overrides.KmsKeyId is %s, and Amazon EFS takes the KMS key encrypting a file system's file contents as a key ID, an alias name beginning alias/, or the ARN of a key or an alias: set it to one of them in the Release, or remove it to encrypt them under aws/elasticfilesystem" (toJson $o.KmsKeyId)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The fragment. The mount targets are written out at build, one for each
+  # subnet in SubnetIds, in the order the Release lists them, rather than
+  # repeated by CloudFormation at deploy: a repetition there needs the
+  # AWS::LanguageExtensions transform, which would apply to the whole
+  # assembled stack, and every resource written here is one cfn-lint reads
+  # before the stack is deployed. Each mount target names the file system by
+  # its FileSystemId, so CloudFormation creates it after the file system and
+  # deletes it before.
+  artifacts:
+    template.yaml: |
+      {{- $l := .locals.logical_id }}
+      {{- $o := optional .infra "overrides" dict }}
+      Resources:
+        {{ $l }}FileSystem:
+          Type: AWS::EFS::FileSystem
+          Properties:
+            Encrypted: true
+            FileSystemTags:
+              - Key: Name
+                Value: "{{ .context.instance_id }}"
+
+            ## ── Provider-specific overrides ─────────────────────────
+            {{- with optional $o "KmsKeyId" "" }}
+            KmsKeyId: {{ toJson . }}
+            {{- end }}
+            {{- with optional $o "PerformanceMode" "" }}
+            PerformanceMode: {{ toJson . }}
+            {{- end }}
+            {{- with optional $o "ThroughputMode" "" }}
+            ThroughputMode: {{ toJson . }}
+            {{- end }}
+            {{- if hasKey $o "ProvisionedThroughputInMibps" }}
+            ProvisionedThroughputInMibps: {{ toJson $o.ProvisionedThroughputInMibps }}
+            {{- end }}
+        {{- range $o.SubnetIds }}
+        {{ $l }}MountTarget{{ trimPrefix "subnet-" . }}:
+          Type: AWS::EFS::MountTarget
+          Properties:
+            FileSystemId: !GetAtt {{ $l }}FileSystem.FileSystemId
+            SubnetId: "{{ . }}"
+            SecurityGroups: {{ toJson $o.SecurityGroups }}
+        {{- end }}
+
+      # Fragment provides: the provider projects each entry into the assembled
+      # stack Outputs and expands the short-form intrinsics to long form. Each
+      # output is named for this instance and the entry together, so two file
+      # systems in one stack keep their identities apart. A cross-stack
+      # consumer imports these entries; an intra-stack consumer receives them
+      # through the value-pipe above.
+      provides:
+        file_system_id: !GetAtt {{ $l }}FileSystem.FileSystemId
+        host: {{ if .locals.operator_host }}"{{ .locals.operator_host }}"{{ else }}!Sub "${ {{- $l }}FileSystem.FileSystemId}.efs.${AWS::Region}.${AWS::URLSuffix}"{{ end }}
+        arn: !GetAtt {{ $l }}FileSystem.Arn
