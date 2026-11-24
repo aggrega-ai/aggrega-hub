@@ -13,9 +13,10 @@ metadata:
     AWS::CertificateManager::Certificate for the component's names,
     validated through DNS, which the cloudformation provider assembles into
     the boundary's stack. infra.overrides.HostedZoneId names the operator's
-    Route 53 public hosted zone, and each name's DomainValidationOptions
-    entry carries it, so ACM writes the name's validation record into that
-    zone; no zone, record set or role is declared.
+    Route 53 public hosted zone, in the account the certificate is requested
+    in, and each validation record's DomainValidationOptions entry carries
+    it, so ACM writes the record into that zone; a wildcard name and its
+    base name take one entry. No zone, record set or role is declared.
 
     arn publishes a reference to the certificate, which CloudFormation
     resolves once ACM has issued it: the stack's creation waits for the
@@ -58,7 +59,8 @@ spec:
   # This Recipe reads from infra.overrides:
   #   HostedZoneId - string, required (each DomainValidationOptions entry's
   #                  HostedZoneId), the ID of the operator's Route 53 public
-  #                  hosted zone
+  #                  hosted zone, in the account the certificate is
+  #                  requested in
   # Any other key halts naming it, so a key misspelt, or meant for another
   # Recipe, is never passed over unread.
   #
@@ -70,15 +72,23 @@ spec:
   # DomainValidationOption reference says CloudFormation does not take. That
   # reference says the HostedZoneId "causes ACM to add your CNAME to the
   # domain record", and that it is required for a publicly trusted
-  # certificate. The fragment writes one DomainValidationOptions entry for
-  # each distinct name, domain_name first, then each of
-  # subject_alternative_names in its order, each naming that zone, so every
-  # name's validation record is written into it; the
-  # AWS::CertificateManager::Certificate reference requires domain_name among
-  # those entries for CloudFormation to validate the certificate itself. A
-  # wildcard name and its base name share one validation record (ACM User
-  # Guide, "AWS Certificate Manager DNS validation"), and both entries name
-  # it. ACM looks for each record in public DNS, so a private hosted zone,
+  # certificate. The zone must be in the account the certificate is
+  # requested in: the reference says validation is automatic only if the
+  # domain resides in that account. The fragment writes one
+  # DomainValidationOptions entry for each validation record, each naming
+  # that zone, so every record is written into it. A wildcard name and its
+  # base name share one record (ACM User Guide, "AWS Certificate Manager DNS
+  # validation"), so the fragment removes a leading *. from each name and
+  # writes the entry once for the names left alike, named as domain_name
+  # when domain_name is among them (the AWS::CertificateManager::Certificate
+  # reference requires domain_name among the entries for CloudFormation to
+  # validate the certificate itself), otherwise as the first of the names in
+  # order of appearance, domain_name first, then each of
+  # subject_alternative_names in its order. Two entries for one record would
+  # fail: the AWS CDK's aws-certificatemanager module removes a wildcard
+  # name whose base name is present, because "the automated CloudFormation
+  # DNS validation errors out with the duplicate records" (lib/certificate.ts,
+  # getUniqueDnsDomainNames). ACM looks for each record in public DNS, so a private hosted zone,
   # or a zone not serving a name, leaves that name unvalidated, and ACM marks
   # the certificate as timed out after 72 hours (the same guide,
   # "Troubleshoot DNS validation problems"). The CloudFormation reference
@@ -97,9 +107,10 @@ spec:
   # Every Component value and infra key is honoured, refused below by name,
   # or not read:
   #   honoured — values.domain_name, as the certificate's DomainName and the
-  #     first DomainValidationOptions entry; values.subject_alternative_names,
-  #     as its SubjectAlternativeNames, written only while set, and a
-  #     DomainValidationOptions entry for each name not already listed; and
+  #     name of its DomainValidationOptions entry; values.subject_alternative_names,
+  #     as its SubjectAlternativeNames, written only while set, and the name
+  #     of a DomainValidationOptions entry for each record no earlier name
+  #     has; and
   #     the override above. The Component refuses more than 100 names, for
   #     every realization, and its schema the names ACM does not take.
   #   refused — HostedZoneId unset, not a string or empty, or beginning
@@ -199,9 +210,14 @@ spec:
 
             ## ── Provider-specific overrides ─────────────────────────
             DomainValidationOptions:
-            {{- range uniq (prepend $sans (toString .values.domain_name)) }}
+            {{- $seen := dict }}
+            {{- range prepend $sans (toString .values.domain_name) }}
+            {{- $base := trimPrefix "*." . }}
+            {{- if not (hasKey $seen $base) }}
+            {{- $_ := set $seen $base true }}
               - DomainName: {{ toJson . }}
                 HostedZoneId: {{ toJson $o.HostedZoneId }}
+            {{- end }}
             {{- end }}
 
       # Fragment provides: the provider projects each entry into the assembled

@@ -18,15 +18,17 @@ metadata:
     the commit it names in the entity.lock beside this Recipe: one
     certificate for the component's names, validated through DNS. The
     module writes each name's validation record into the operator's Route 53
-    hosted zone, infra.overrides.zone_id, and waits for ACM to issue the
+    hosted zone in the account the certificate is requested in,
+    infra.overrides.zone_id, and waits for ACM to issue the
     certificate; no zone or role is created.
 
     arn publishes the module's acm_certificate_arn output, which resolves
     once ACM has issued the certificate, for a consumer authored as a
     source: Recipe in the same root configuration; the apply waits for it,
     75 minutes at most by the AWS provider's default at 6.73.0. A
-    validation record already in the zone is taken over, and a destroy
-    deletes the records. Changing a name replaces the certificate, the new
+    validation record already in the zone fails the apply at that record
+    and is left untouched, and a destroy deletes the records the apply
+    wrote. Changing a name replaces the certificate, the new
     one created before the old one is deleted, which ACM refuses while
     another AWS service uses it. tags label the certificate.
     zone_id unset or not a string, tags not a map of strings,
@@ -92,7 +94,8 @@ spec:
   # resource's tags, so a Release names it once whichever Recipe it
   # configures.
   #
-  # zone_id is the operator's Route 53 public hosted zone, the one serving
+  # zone_id is the operator's Route 53 public hosted zone, in the account
+  # the certificate is requested in, the one serving
   # every name the certificate carries, given by its ID, such as
   # Z0123456789ABCDEFGHIJ; the AWS provider, at 6.73.0, also takes it with
   # the /hostedzone/ prefix the Route 53 API returns, which it removes. The
@@ -107,16 +110,30 @@ spec:
   # timed out after 72 hours (the same guide, "Troubleshoot DNS validation
   # problems").
   #
-  # A validation record already in the zone. ACM gives a name the same
-  # record for every certificate its account requests for it, in any Region
-  # (its DNS validation page), so a name the account has validated before
-  # may already have its record in the zone. The mapping writes
-  # validation_allow_overwrite_records true, the module's default, so the
-  # AWS provider, at 6.73.0, writes each record by UPSERT and takes over one
-  # already there, whose name and value are those it writes; with false the
-  # provider's CREATE fails the apply on it. A record taken over is deleted
-  # on a destroy like the others, and ACM then stops renewing any other
-  # certificate of the account that still carries its name.
+  # A validation record already in the zone. ACM gives a name one record
+  # for each account, which every later certificate of the account for that
+  # name reuses, in any Region, and deleting it stops the renewal of a
+  # certificate still carrying the name (ACM User Guide, "AWS Certificate
+  # Manager DNS validation"). The module passes allow_overwrite as
+  # validation_allow_overwrite_records, true by default, and the AWS
+  # provider, at 6.73.0, writes a record by UPSERT when allow_overwrite is
+  # set or the record is not new, by CREATE otherwise (route53/record.go).
+  # The mapping writes validation_allow_overwrite_records false, so the
+  # provider's CREATE refuses a record already in the zone, and a destroy
+  # never deletes one the apply did not write. The cost: a name whose record
+  # is already in the zone, because another certificate of the name in the
+  # account, in any Region, has it, or the CloudFormation sibling Recipe
+  # wrote it, or someone made it by hand, fails the apply at that record and
+  # leaves it untouched; this Recipe has no way to reuse it. The module
+  # numbers its records by position, count over the distinct names with each
+  # element taken by index, and a record's name forces a new record (the
+  # provider's record.go), so a name change replaces the certificate and its
+  # records, and a record can move to another position, or to another module
+  # address when the component is renamed, and meet its own earlier copy
+  # there; with false that fails the apply at the record, and nothing
+  # deletes the record afterwards. The order in which the provider creates
+  # and deletes these records is not measured, so this is possible, not
+  # certain.
   #
   # tags is a map from each tag name to a string, written on the
   # certificate, the one resource the module creates here that takes tags:
@@ -246,7 +263,7 @@ spec:
     create_route53_records_only: false
     validate_certificate: true
     wait_for_validation: true
-    validation_allow_overwrite_records: true
+    validation_allow_overwrite_records: false
     {{- with optional $o "tags" "" }}
     tags: {{ toJson . }}
     {{- end }}
