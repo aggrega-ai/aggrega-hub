@@ -153,7 +153,7 @@ spec:
   #
   # Each is named by the module input it sets, given in brackets, as
   # terraform/postgres-cloud-sql and terraform/mysql-cloud-sql read the same
-  # inputs, save three. kms_key_name is the name the catalog's Google bodies
+  # inputs, apart from sql_server_edition, kms_key_name and host. kms_key_name is the name the catalog's Google bodies
   # read for a customer-managed key. sql_server_edition is the SQL Server
   # edition, which Cloud SQL spells inside database_version, apart from
   # edition, the Cloud SQL edition. host is the address a consumer reaches the
@@ -227,8 +227,7 @@ spec:
   #     the sqlserver login; values.collation, as db_collation, the database's
   #     collation, the instance's staying Cloud SQL's default;
   #     infra.engine_version, as the year in database_version;
-  #     infra.storage.size, as the data disk in GB, 10 or more (20 for
-  #     HYPERDISK_BALANCED); infra.storage.type, as the disk type, PD_SSD or
+  #     infra.storage.size, as the data disk in GB, 10 or more and 64 TB or less; infra.storage.type, as the disk type, PD_SSD or
   #     HYPERDISK_BALANCED, PD_SSD when unset; infra.ha.enabled, as the
   #     REGIONAL availability type; infra.port while it is 1433; a core/backup
   #     attachment, as the comment above the mapping says; the password slot,
@@ -238,8 +237,8 @@ spec:
   #     SQL does not combine; infra.port other than 1433; infra.compute.cpu
   #     and infra.compute.memory, since tier sizes the instance;
   #     infra.storage.type other than PD_SSD and HYPERDISK_BALANCED, or one
-  #     the tier's series does not take, and infra.storage.size below the
-  #     type's least; values.user naming a server principal SQL Server or
+  #     the tier's series does not take, and infra.storage.size below 10 GB
+  #     or above 64 TB; values.user naming a server principal SQL Server or
   #     Cloud SQL keeps; any other credential on the password slot; an
   #     override of another shape; and any infra.overrides key not listed
   #     above.
@@ -277,6 +276,12 @@ spec:
   # written into the rendered configuration; the apply keeps both in the
   # Terraform state, where an operator reads them, and the module ignores a
   # later change to the root password.
+  #
+  # Whether the eight-character passwords the module draws, for the sqlserver
+  # login and for the login values.user names when no password is attached,
+  # always satisfy the password policy SQL Server enforces on Cloud SQL is not
+  # measured: the check lives in the service, which accepts or refuses the
+  # password when Terraform applies.
   assertions:
     overrides_known: >-
       {{- $known := list "project_id" "region" "private_network" "allocated_ip_range" "zone" "tier" "edition" "sql_server_edition" "database_flags" "deletion_protection" "user_labels" "kms_key_name" "host" -}}
@@ -306,8 +311,8 @@ spec:
       {{- end -}}
       {{- end -}}
     # The releases and editions Cloud SQL runs, read off its database
-    # versions page. A release it adds later is refused here until this list
-    # names it.
+    # versions page: the lists here are the ones it documents, and any other
+    # release or edition is refused.
     engine_version_offered: >-
       {{- $y := toString .infra.engine_version -}}
       {{- if not (has $y (list "2017" "2019" "2022" "2025")) -}}
@@ -347,11 +352,32 @@ spec:
       {{- if eq (toString .infra.engine_version) "2017" -}}
       {{- fail "infra.overrides.edition is ENTERPRISE_PLUS, and Cloud SQL runs Enterprise Plus edition for SQL Server 2019, 2022 and 2025, while infra.engine_version is \"2017\": set infra.engine_version to 2019 or later, or infra.overrides.edition to ENTERPRISE" -}}
       {{- end -}}
+      {{- if not (hasKey (optional .infra "overrides" dict) "tier") -}}
+      {{- fail "infra.overrides.edition is ENTERPRISE_PLUS, and Cloud SQL Enterprise Plus edition takes no default machine type here, so none is set: set infra.overrides.tier to a db-perf-optimized-* or db-memory-optimized-* type, or infra.overrides.edition to ENTERPRISE" -}}
+      {{- end -}}
       {{- if not (or (hasPrefix "db-perf-optimized-" $t) (hasPrefix "db-memory-optimized-" $t)) -}}
       {{- fail (printf "infra.overrides.tier is %q, and Cloud SQL Enterprise Plus edition takes the N2, memory-optimized N2, C4 and C4D machine types alone, named db-perf-optimized-* and db-memory-optimized-*; the general purpose dedicated core and N4 types, named db-custom-*, need ENTERPRISE: set infra.overrides.tier to such a type, or infra.overrides.edition to ENTERPRISE" $t) -}}
       {{- end -}}
       {{- else if not (hasPrefix "db-custom-" $t) -}}
       {{- fail (printf "infra.overrides.tier is %q, and Cloud SQL Enterprise edition takes the general purpose dedicated core and N4 machine types alone, named db-custom-*: set infra.overrides.tier to such a type, or infra.overrides.edition to ENTERPRISE_PLUS for a db-perf-optimized-* or db-memory-optimized-* type" $t) -}}
+      {{- end -}}
+      {{- if regexMatch `^db-custom-[1-9][0-9]*-[0-9]+$` $t -}}
+      {{- $cpu := int (regexReplaceAll `^db-custom-([1-9][0-9]*)-[0-9]+$` $t "${1}") -}}
+      {{- $se := .locals.sql_server_edition -}}
+      {{- $lo := 1 }}{{ $hi := 0 -}}
+      {{- if eq $se "EXPRESS" }}{{ $hi = 8 }}{{ else if eq $se "WEB" }}{{ $hi = 32 }}{{ else if eq $se "STANDARD" }}{{ $hi = 48 }}{{ else if eq $se "ENTERPRISE" }}{{ $lo = 2 }}{{ $hi = 96 }}{{ end -}}
+      {{- if and $hi (or (lt $cpu $lo) (gt $cpu $hi)) -}}
+      {{- fail (printf "infra.overrides.tier is %q, naming %d vCPUs, and Cloud SQL takes a general purpose dedicated core machine type for SQL Server %s with %d to %d vCPUs (its machine series overview): set infra.overrides.tier to a db-custom-<vCPUs>-<memory> type in that range, or infra.overrides.sql_server_edition to an edition that takes it" $t $cpu $se $lo $hi) -}}
+      {{- end -}}
+      {{- end -}}
+    instance_name: >-
+      {{- $n := toString .metadata.instance_id -}}
+      {{- if not (regexMatch `^[a-z][a-z0-9-]*$` $n) -}}
+      {{- fail (printf "the instance ID %q becomes the Cloud SQL instance's name, and Cloud SQL names an instance with lowercase letters, numbers and hyphens, starting with a letter (its instance settings page): rename the instance in the Aggregate" $n) -}}
+      {{- end -}}
+      {{- $pid := toString (optional (optional .infra "overrides" dict) "project_id" "") -}}
+      {{- if gt (add (len $pid) 1 (len $n)) 98 -}}
+      {{- fail (printf "the instance ID %q and the project ID %q make a project-ID:instance-ID of %d characters, and Cloud SQL takes 98 or fewer (its instance settings page): rename the instance in the Aggregate, or use a project with a shorter ID" $n $pid (add (len $pid) 1 (len $n))) -}}
       {{- end -}}
     disk: >-
       {{- $size := toString .infra.storage.size -}}
@@ -371,9 +397,11 @@ spec:
       {{- if and (not $hyperdisk) (eq $d "HYPERDISK_BALANCED") -}}
       {{- fail (printf "infra.storage.type is HYPERDISK_BALANCED, and the tier %s belongs to the general purpose dedicated core, N2 or memory-optimized N2 machine series, which Cloud SQL gives SSD storage alone: set infra.storage.type to PD_SSD, or leave it unset" $t) -}}
       {{- end -}}
-      {{- $min := 10 }}{{ if eq $d "HYPERDISK_BALANCED" }}{{ $min = 20 }}{{ end -}}
-      {{- if lt $gb $min -}}
-      {{- fail (printf "infra.storage.size is %q, and Cloud SQL gives a %s data disk at least %d GB: set infra.storage.size to %dGi or more" $size $d $min $min) -}}
+      {{- if lt $gb 10 -}}
+      {{- fail (printf "infra.storage.size is %q, and Cloud SQL gives a %s data disk at least 10 GB: set infra.storage.size to 10Gi or more" $size $d) -}}
+      {{- end -}}
+      {{- if gt $gb 65536 -}}
+      {{- fail (printf "infra.storage.size is %q, and Cloud SQL gives an instance with a dedicated vCPU up to 64 TB of storage (its instance settings page), 65536 GB: set infra.storage.size to 65536Gi or less" $size) -}}
       {{- end -}}
     # Each of these overrides is passed to the module as written, so one of
     # another shape would render an input the module's type refuses.
