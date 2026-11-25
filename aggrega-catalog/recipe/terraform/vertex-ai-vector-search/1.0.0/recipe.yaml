@@ -15,10 +15,13 @@ metadata:
     google_vertex_ai_index_endpoint_deployed_index serving the index from
     it, in the operator's project at infra.overrides.region. The endpoint is
     public unless infra.overrides.private_network names the VPC network to
-    peer it with. host, endpoint, deployed_index_id, index_endpoint and
-    index publish outputs of this component's module, which Terraform
-    resolves when it applies; port is 443 on a public endpoint and 10000 on
-    a private one.
+    peer it with; a private endpoint takes no authentication, so any client
+    the network routes to it may query. host, endpoint, deployed_index_id,
+    index_endpoint and index publish outputs of this component's module,
+    which Terraform resolves when it applies, except that on a private
+    endpoint infra.overrides.host publishes the name the operator gives its
+    address, and endpoint that name followed by :10000; port is 443 on a
+    public endpoint and 10000 on a private one.
 
     The project, the network and its private services access, the Cloud
     Storage files a batch update reads and the KMS key are the operator's:
@@ -27,10 +30,11 @@ metadata:
 
     A project_id or region missing, a network not named by its project's
     number, an allocated_ip_range without one, a shard size, machine type or
-    replica count Vertex AI does not take, a contents_delta_uri or
-    kms_key_name of another form, an instance name no deployed index ID is
-    made from, infra.overrides.host, and any infra.overrides key not listed
-    halt the build.
+    replica count Vertex AI does not take, a storage-optimized shard size,
+    a contents_delta_uri or kms_key_name of another form, an instance name
+    no deployed index ID is made from, infra.overrides.host on a public
+    endpoint or of another form than a bare name, and any infra.overrides
+    key not listed halt the build.
   maintainers:
     - name: "Massimiliano Ferrero"
       email: "m.ferrero@cognitio.it"
@@ -44,6 +48,11 @@ spec:
     # letters, digits and underscores alone. The assertion deployed_index_id
     # below holds it to the rest of the rule.
     deployed_index_id: "{{ .context.instance_id | replace \"-\" \"_\" }}"
+    # The name the Release gives the private endpoint's address under
+    # infra.overrides.host, or empty while it gives none. Only a string is
+    # read here; any other value is refused by the assertion below rather
+    # than published.
+    operator_host: '{{ $o := optional .infra "overrides" dict }}{{ $h := optional $o "host" "" }}{{ if and (typeIs "string" $h) (hasKey $o "private_network") }}{{ $h }}{{ end }}'
 
   # The String Pipe: the compiler pipes these strings verbatim into a
   # consumer's injection context when it uses this index, and resolves none
@@ -67,14 +76,21 @@ spec:
   # assigns it in the peered range, which answers gRPC on 10000 ("Query an
   # index over VPC Network Peering"), and endpoint is that address followed
   # by :10000. Each port is the service's own, so port is published as text.
-  # The public name is Google's, whose certificate a name of the operator's
-  # would not match, and the private address is the one Vertex AI assigns
-  # and publishes no name for, so infra.overrides.host is refused by the
-  # assertion below rather than published.
+  # The public name is Google's, served under Google's certificate, which a
+  # name of the operator's would not match, so infra.overrides.host is
+  # refused on a public endpoint. A private endpoint answers gRPC on 10000
+  # with no certificate to match (the same page), so a name of the
+  # operator's for its address serves as the address does: while the Release
+  # sets infra.overrides.host and infra.overrides.private_network, host
+  # publishes that name and endpoint that name followed by :10000, in place
+  # of the references. It is the operator's deterministic pointer: the
+  # compiler pipes it as text and looks nothing up, and this Recipe emits no
+  # DNS record for it, so the operator points the name at the address outside
+  # the Release.
   provides:
-    host: "${module.{{ .context.instance_id }}.host}"
+    host: "{{ if .locals.operator_host }}{{ .locals.operator_host }}{{ else }}${module.{{ .context.instance_id }}.host}{{ end }}"
     port: "{{ if optional (optional .infra \"overrides\" dict) \"private_network\" \"\" }}10000{{ else }}443{{ end }}"
-    endpoint: "${module.{{ .context.instance_id }}.endpoint}"
+    endpoint: "{{ if .locals.operator_host }}{{ .locals.operator_host }}:10000{{ else }}${module.{{ .context.instance_id }}.endpoint}{{ end }}"
     deployed_index_id: "${module.{{ .context.instance_id }}.deployed_index_id}"
     index_endpoint: "${module.{{ .context.instance_id }}.index_endpoint}"
     index: "${module.{{ .context.instance_id }}.index}"
@@ -90,7 +106,7 @@ spec:
   #   shard_size          - string (metadata.config.shard_size; default "SHARD_SIZE_MEDIUM")
   #   contents_delta_uri  - string (metadata.contents_delta_uri)
   #   kms_key_name        - string (encryption_spec.kms_key_name, on the index and the endpoint)
-  # host halts by name, as any key not listed does.
+  #   host                - string (provides.host, with private_network)
   #
   # project_id, region, private_network, allocated_ip_range and kms_key_name
   # are the names the catalog's terraform Google Recipes read for the
@@ -125,10 +141,16 @@ spec:
   # value of another form does.
   #
   # shard_size is SHARD_SIZE_SMALL, SHARD_SIZE_MEDIUM or SHARD_SIZE_LARGE,
-  # 2, 20 or 50 GiB a shard, and any other value halts. The provider's
-  # description says the size must be given when the index is created, and
-  # SHARD_SIZE_MEDIUM is the size the Vertex AI SDK for Python documents as
-  # the default, so the body writes it when the key is unset. machine_type
+  # 2, 20 or 50 GiB a shard, the three sizes the google provider's
+  # description of shard_size lists, and any other value halts.
+  # SHARD_SIZE_SO_DYNAMIC, the size of a storage-optimized index ("Storage-
+  # optimized Vector Search" sets shardSize to it), halts with a message of
+  # its own: that page deploys such an index with deploymentTier STORAGE, and
+  # the provider's deployed index takes no such argument, so it cannot
+  # deploy the index as a storage-optimized one. The provider's description says
+  # the size must be given when the index is created, and the catalog
+  # chooses SHARD_SIZE_MEDIUM, the middle size, which the body writes when
+  # the key is unset. machine_type
   # deploys the index on dedicated machines of that type, which Vertex AI
   # offers by shard size ("Create and manage your index", and the provider's
   # description of dedicated_resources): n1-standard-32, e2-highmem-16 and
@@ -139,9 +161,13 @@ spec:
   # automatic_resources.
   #
   # min_replica_count and max_replica_count bound the replicas serving the
-  # index: integers of at least 1 and at most 1000 (the provider's
-  # description of both blocks), the maximum not below the minimum, which is
-  # 2 when unset, and any other value halts. With machine_type the service
+  # index: integers of at least 1 (the provider's description of
+  # dedicated_resources' minimum states it, and the catalog asks it of every
+  # count), the maximum not below the minimum, which is 2 when unset, and any
+  # other value halts. Without machine_type the maximum is at most 1000, the
+  # bound the provider's description of automatic_resources' maximum states;
+  # with machine_type the provider states no upper bound, so none is
+  # checked. With machine_type the service
   # requires the minimum, and the body writes 2 when it is unset, the
   # replicas Vertex AI keeps when it decides the resources, below which its
   # documentation states no service level; without machine_type each is
@@ -163,9 +189,10 @@ spec:
   # which Vertex AI checks when it creates them. Unset, Vertex AI encrypts
   # them with a key Google manages. A value of another form halts.
   #
-  # host is refused by name: the public endpoint answers under a name of
-  # Google's and the private one at the address Vertex AI assigns, as the
-  # comment above provides says.
+  # host is the name of the operator's for the private endpoint's address,
+  # given with private_network: a DNS name or an IP literal alone, with no
+  # scheme, path, user or port, since the endpoint serves port 10000. On a
+  # public endpoint it halts by name, as the comment above provides says.
   #
   # Every Component value and infra key is honoured, refused below by name,
   # or not read:
@@ -176,10 +203,12 @@ spec:
   #     private_network of another form; an allocated_ip_range without
   #     private_network or of another form; a shard_size not offered; a
   #     machine_type not offered or not offered for the shard size; a
-  #     replica count not an integer from 1 to 1000, or a maximum below the
-  #     minimum, 2 when unset; a contents_delta_uri or a kms_key_name of another form; an
-  #     instance name no deployed index ID is made from;
-  #     infra.overrides.host; and any infra.overrides key not listed above.
+  #     replica count not an integer of at least 1, a maximum above 1000
+  #     without machine_type, or a maximum below the minimum, 2 when unset;
+  #     SHARD_SIZE_SO_DYNAMIC; a contents_delta_uri or a kms_key_name of
+  #     another form; an instance name no deployed index ID is made from;
+  #     infra.overrides.host without private_network or not a bare name; and
+  #     any infra.overrides key not listed above.
   #   not read — none; the Component declares no other value or infra key.
   #
   # What the body writes beside these: the instance's name as the index's
@@ -190,10 +219,10 @@ spec:
   # with the service's own leaf settings, under which Vertex AI requires the
   # approximate neighbour count values.approximate_neighbors_count gives; no
   # feature_norm_type, so no normalization is applied, the service's
-  # default; no labels or access logs, and the deployed index in the group
-  # Vertex AI names default; and each resource's deletion_policy left at the
-  # provider's DELETE. The provider
-  # replaces the index when project_id, region, a value, shard_size or
+  # default; no deployed_index_auth_config, so a private endpoint takes no
+  # authentication; no labels or access logs, and the deployed index in the
+  # group Vertex AI names default; and each resource's deletion_policy left at
+  # the provider's DELETE. The provider replaces the index when project_id, region, a value, shard_size or
   # kms_key_name changes, the endpoint when project_id, region,
   # private_network or kms_key_name changes, and the deployed index when
   # either of those is replaced or allocated_ip_range or machine_type
@@ -205,13 +234,14 @@ spec:
     # spelt otherwise, or meant for another Recipe, would reach no byte of the
     # output while the build reads as if it had been applied.
     overrides_known: >-
-      {{- $known := list "project_id" "region" "private_network" "allocated_ip_range" "machine_type" "min_replica_count" "max_replica_count" "shard_size" "contents_delta_uri" "kms_key_name" -}}
-      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
-      {{- if eq $k "host" -}}
-      {{- fail "infra.overrides.host is set, and Vertex AI Vector Search answers under a name of Google's on a public endpoint, whose certificate a name of the operator's would not match, and at the address Vertex AI assigns the deployed index on a private one: remove infra.overrides.host from the Release" -}}
+      {{- $known := list "project_id" "region" "private_network" "allocated_ip_range" "machine_type" "min_replica_count" "max_replica_count" "shard_size" "contents_delta_uri" "kms_key_name" "host" -}}
+      {{- $ov := optional .infra "overrides" dict -}}
+      {{- range $k, $_ := $ov -}}
+      {{- if and (eq $k "host") (not (hasKey $ov "private_network")) -}}
+      {{- fail "infra.overrides.host is set without infra.overrides.private_network, and a public endpoint answers under a name of Google's, served under Google's certificate, which a name of the operator's would not match: set infra.overrides.private_network beside it, or remove infra.overrides.host from the Release" -}}
       {{- end -}}
       {{- if not (has $k $known) -}}
-      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads project_id, region, private_network, allocated_ip_range, machine_type, min_replica_count, max_replica_count, shard_size, contents_delta_uri and kms_key_name from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads project_id, region, private_network, allocated_ip_range, machine_type, min_replica_count, max_replica_count, shard_size, contents_delta_uri, kms_key_name and host from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
       {{- end -}}
       {{- end -}}
     project_and_region_supplied: >-
@@ -240,8 +270,11 @@ spec:
     resources_offered: >-
       {{- $o := optional .infra "overrides" dict -}}
       {{- $shard := optional $o "shard_size" "SHARD_SIZE_MEDIUM" -}}
+      {{- if eq (toString $shard) "SHARD_SIZE_SO_DYNAMIC" -}}
+      {{- fail "infra.overrides.shard_size is \"SHARD_SIZE_SO_DYNAMIC\", and a storage-optimized index deploys at a tier the google provider's deployed index does not take, so it cannot deploy it as one: set it to SHARD_SIZE_SMALL, SHARD_SIZE_MEDIUM or SHARD_SIZE_LARGE, or remove it for SHARD_SIZE_MEDIUM" -}}
+      {{- end -}}
       {{- if not (has $shard (list "SHARD_SIZE_SMALL" "SHARD_SIZE_MEDIUM" "SHARD_SIZE_LARGE")) -}}
-      {{- fail (printf "infra.overrides.shard_size is %s, and Vertex AI Vector Search splits an index into shards of SHARD_SIZE_SMALL, SHARD_SIZE_MEDIUM or SHARD_SIZE_LARGE: set it to one of them, or remove it for SHARD_SIZE_MEDIUM" (toJson $shard)) -}}
+      {{- fail (printf "infra.overrides.shard_size is %s, and the google provider takes an index's shard size as SHARD_SIZE_SMALL, SHARD_SIZE_MEDIUM or SHARD_SIZE_LARGE: set it to one of them, or remove it for SHARD_SIZE_MEDIUM" (toJson $shard)) -}}
       {{- end -}}
       {{- if hasKey $o "machine_type" -}}
       {{- $byShard := dict "SHARD_SIZE_SMALL" (list "e2-standard-2" "e2-standard-16" "n1-standard-16" "n1-standard-32" "e2-highmem-16" "n2d-standard-32") "SHARD_SIZE_MEDIUM" (list "e2-standard-16" "n1-standard-16" "n1-standard-32" "e2-highmem-16" "n2d-standard-32") "SHARD_SIZE_LARGE" (list "n1-standard-32" "e2-highmem-16" "n2d-standard-32") -}}
@@ -255,15 +288,28 @@ spec:
       {{- range $k := list "min_replica_count" "max_replica_count" -}}
       {{- if hasKey $o $k -}}
       {{- $v := get $o $k -}}
-      {{- if not (and (or (kindIs "int" $v) (kindIs "int64" $v) (kindIs "float64" $v)) (regexMatch `^[0-9]+$` (toString $v)) (ge (int64 $v) 1) (le (int64 $v) 1000)) -}}
-      {{- fail (printf "infra.overrides.%s is %s, and Vertex AI serves a deployed index from 1 to 1000 replicas: set it to an integer in that range, or remove it" $k (toJson $v)) -}}
+      {{- if not (and (or (kindIs "int" $v) (kindIs "int64" $v) (kindIs "float64" $v)) (regexMatch `^[0-9]+$` (toString $v)) (ge (int64 $v) 1)) -}}
+      {{- fail (printf "infra.overrides.%s is %s, and a deployed index is served by at least 1 replica: set it to an integer of 1 or more, or remove it" $k (toJson $v)) -}}
       {{- end -}}
       {{- end -}}
+      {{- end -}}
+      {{- if and (hasKey $o "max_replica_count") (not (hasKey $o "machine_type")) (gt (int64 $o.max_replica_count) 1000) -}}
+      {{- fail (printf "infra.overrides.max_replica_count is %v, and Vertex AI allows an automatically sized deployed index at most 1000 replicas, as the google provider's description of automatic_resources states: set it to 1000 or fewer, or set infra.overrides.machine_type" $o.max_replica_count) -}}
       {{- end -}}
       {{- if hasKey $o "max_replica_count" -}}
       {{- $min := optional $o "min_replica_count" 2 -}}
       {{- if lt (int64 $o.max_replica_count) (int64 $min) -}}
       {{- fail (printf "infra.overrides.max_replica_count is %v, and the deployed index keeps at least %v replicas, infra.overrides.min_replica_count or else the 2 Vertex AI keeps: set max_replica_count to that minimum or more" $o.max_replica_count $min) -}}
+      {{- end -}}
+      {{- end -}}
+    operator_host_is_bare: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $h := optional $o "host" "" -}}
+      {{- if and (hasKey $o "private_network") (hasKey $o "host") -}}
+      {{- $bare := typeIs "string" $h -}}
+      {{- if $bare }}{{ $bare = not (or (eq $h "") (regexMatch `[/@\s]` $h) (eq (len (splitList ":" $h)) 2) (contains "]:" $h)) }}{{ end -}}
+      {{- if not $bare -}}
+      {{- fail (printf `infra.overrides.host is the address a consumer of this index reaches it at, given as a DNS name or an IP literal alone, and "%v" is not one: set it in the Release to the bare name, with no scheme, path, user or port — the endpoint serves port 10000` $h) -}}
       {{- end -}}
       {{- end -}}
     overrides_shape: >-
