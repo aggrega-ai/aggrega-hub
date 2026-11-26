@@ -102,5 +102,5 @@ variable "hostname" {
 variable "certificate_id" {
   type        = string
   default     = null
-  description = "Resource ID of the existing App Service certificate the custom domain is served with, required beside hostname."
+  description = "Resource ID of the certificate the custom domain is served with, one already added to App Service (Microsoft.Web/certificates) in the resource group, region and operating system of the app's App Service plan; required beside hostname."
 }

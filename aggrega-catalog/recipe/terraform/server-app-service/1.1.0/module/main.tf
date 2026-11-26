@@ -112,8 +112,11 @@ resource "azurerm_app_service_custom_hostname_binding" "this" {
 }
 
 # The certificate the custom domain is served with, bound to it with SNI. The
-# certificate is the operator's, an App Service certificate that already
-# exists, read by the ID certificate_id names; it is bound, not created.
+# certificate is the operator's, one already added to App Service, a
+# Microsoft.Web/certificates resource in the resource group, region and
+# operating system of the app's App Service plan, since App Service lets only
+# apps of that combination use it. It is read by the ID certificate_id names,
+# and bound, not created.
 resource "azurerm_app_service_certificate_binding" "this" {
   count = var.hostname == null ? 0 : 1
 
