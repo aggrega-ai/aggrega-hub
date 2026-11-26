@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: FeatureRecipe
+metadata:
+  name: shared-config-app-configuration
+  version: 1.0.0
+  description: >
+    Realizes core/shared-config on terraform through Azure App
+    Configuration; a Release binds it in its Manifest. It renders once per
+    boundary attachment rather than once per component: one key-value named
+    for the boundary, /<boundary>/shared-config, such as /app/shared-config,
+    holding the settings every component in the boundary shares,
+    tier=<infra.tier>, written into the existing App Configuration store
+    infra.configuration_store_id names. It is written in a module of the
+    attachment's own in the boundary's root configuration, so it is applied
+    with the boundary's components; no store is created.
+
+    The key-value is the settings' one copy: a component reads it from the
+    store by that key, under an identity the operator allows to read it, and
+    nothing is written into a component's own configuration. Terraform writes
+    it through the store's data plane, so the identity Terraform runs as needs
+    the App Configuration Data Owner role on the store or a scope above it.
+    It needs hashicorp/azurerm 5.14 or later, so it goes in a boundary apart
+    from Recipes whose modules admit azurerm 4 alone.
+
+    The build halts, naming the attachment and the boundary, without
+    infra.configuration_store_id, and on a boundary carrying more than one
+    core/shared-config attachment naming the same store, since each would
+    write the same key-value.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  # infra.configuration_store_id is a key of core/shared-config 1.1.0, so this
+  # realization serves that version: a 1.0.0 attachment cannot name a store.
+  implements: core/shared-config:1.1.0
+  # Renders once per boundary attachment: its artifact is a module of the
+  # attachment's own, named after the attachment, beside the boundary's
+  # components in one root configuration, and its template reads the
+  # boundary's own values under .boundary rather than a component's. No
+  # injectMapping: nothing is delivered into a component's configuration.
+  executionScope: boundary
+
+  assertions:
+    # The store is the operator's and the key-value goes nowhere else, so an
+    # attachment naming none halts. An attachment's assertions run for each
+    # component on the boundary, so the message names the boundary.
+    store_is_named: >-
+      {{- if not (trim (toString (optional .infra "configuration_store_id" ""))) -}}
+      {{- fail (printf "core/shared-config attachment %q on the boundary %q is bound to terraform/shared-config-app-configuration, which writes the boundary's settings into an existing Azure App Configuration store, and the attachment names none: set infra.configuration_store_id to the store's resource ID, such as /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.AppConfiguration/configurationStores/<store>" .metadata.feature_instance .metadata.boundary_path) -}}
+      {{- end -}}
+
+  # The key-value. Its key is the boundary's, the scope carrying the
+  # attachment, in the form the AWS realizations give their parameter, so a
+  # component reads one name on Azure as on AWS. Its value is the settings as
+  # key=value text, tier=<infra.tier>, in the same shape. No label is set, so
+  # the key-value carries the store's empty label, and its type is a plain
+  # key-value, the provider's default.
+  #
+  # configuration_store_id is infra.configuration_store_id as the Release
+  # writes it: the build looks nothing up, and the provider checks the ID's
+  # form when it plans and the store when it applies. A boundary's
+  # attachments carry no record of the FeatureRecipe each is bound to, so the
+  # check opening the template counts every core/shared-config attachment on
+  # the boundary naming this store: two would write the same key-value, which
+  # holds one value, and the build halts rather than leave the second write to
+  # fail when the boundary is applied.
+  #
+  # Each string is quoted with toJson, so a " or a backslash in it stays
+  # text, and ${ and %{ are written $${ and %%{, so Terraform reads them as
+  # the characters written rather than as an interpolation or a directive.
+  #
+  # required_providers pins hashicorp/azurerm by the constraint string the
+  # catalog conventions' "One Azure provider constraint for every Azure body"
+  # section states.
+  artifacts:
+    main.tf: |
+      {{- $store := trim (toString (optional .infra "configuration_store_id" "")) -}}
+      {{- $sameStore := list -}}
+      {{- range $a := (default list .boundary.feature_attachments) -}}
+      {{- if and (eq (first (splitList ":" (toString (optional $a "type" "")))) "core/shared-config") (eq (trim (toString (optional (default dict (optional $a "infra" dict)) "configuration_store_id" ""))) $store) -}}
+      {{- $sameStore = append $sameStore $a -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if gt (len $sameStore) 1 -}}
+      {{- fail (printf "the boundary %q carries more than one core/shared-config attachment naming the App Configuration store %q, and each writes the key-value /%s/shared-config into it, which holds one value: attach core/shared-config once on the boundary for that store" .boundary.boundary_name $store .boundary.boundary_name) -}}
+      {{- end -}}
+      terraform {
+        required_providers {
+          azurerm = {
+            source  = "hashicorp/azurerm"
+            version = "~> 5.14"
+          }
+        }
+      }
+
+      resource "azurerm_app_configuration_key" "shared_config" {
+        configuration_store_id = {{ $store | toJson | replace "${" "$${" | replace "%{" "%%{" }}
+        key                    = {{ printf "/%s/shared-config" .boundary.boundary_name | toJson | replace "${" "$${" | replace "%{" "%%{" }}
+        value                  = {{ printf "tier=%s" (toString .infra.tier) | toJson | replace "${" "$${" | replace "%{" "%%{" }}
+      }
