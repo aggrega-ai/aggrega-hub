@@ -2558,10 +2558,11 @@ gives. The provider is generated from the CloudFormation resource schemas and
 released weekly, so the major and minor are those of its newest release at least
 three days old when the constraint is set, the age at which the catalog's vendor
 validators pin a release, and the validators judge every such body at a version the
-constraint admits. A body that configures the provider from the AWS provider, as
-`recipe/terraform/lex` sets its Region from the `aws_region` data source, also
-declares `hashicorp/aws` at the AWS string. This is a catalog convention: the
-compiler pipes the block as text and reads nothing in it.
+constraint admits. Where a Recipe's boundary file configures the provider from a
+data source of the AWS provider, as `recipe/terraform/lex`'s sets its Region from
+`aws_region`, the Recipe's body also declares `hashicorp/aws` at the AWS string, so
+the root installs an AWS provider carrying that data source. This is a catalog
+convention: the compiler pipes the block as text and reads nothing in it.
 
 ### One Google provider constraint for every Google body
 
