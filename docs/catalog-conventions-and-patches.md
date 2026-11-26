@@ -60,18 +60,18 @@ the label section below). The 15 categories:
 | `ai-agent` | AI agent frameworks, platforms, and patterns | worker, server, stateful-server, task, resource | populated |
 | `ai-model` | Model providers and inference runtimes | server, resource | populated |
 | `ai-tool` | Tools agents invoke | function, server, stateful-server, resource | populated |
-| `ai-pipeline` | Orchestrators that run a multi-step job | server | populated |
+| `ai-pipeline` | Orchestrators that run a multi-step job | server, resource | populated |
 | `datastore` | Persistent datastores (relational, vector, document, graph, KV) | stateful-server, server | populated |
 | `gateway` | API and AI gateways | server, resource | populated |
 | `mesh` | Service meshes | server | created when the first entity lands |
-| `network` | Network primitives | server, resource | created when the first entity lands |
-| `messaging` | Event buses, queues, streams, the realtime media services that carry voice and video between participants, and the external carriers a message leaves the Release through | stateful-server, server, resource | populated |
+| `network` | Network primitives: the content-delivery and edge services that front a Release's endpoints, and the DNS records that name them | resource | populated |
+| `messaging` | Event buses, queues, streams, the realtime media services that carry voice and video between participants, and the external providers a message leaves the Release through | stateful-server, server, resource, worker | populated |
 | `storage` | Object/file storage: a bucket reached over the S3 API (`core/storage/s3-object-store`), on Amazon S3 or Google Cloud Storage or on a SeaweedFS server the Release runs; a managed bucket reached through Google Cloud Storage's own API (`core/storage/gcs`); the backup controllers that copy a cluster's resources, or its volumes' files, into such a bucket (`core/storage/velero`, `core/storage/k8up`, `core/storage/kubestash`, `core/storage/kasten`); and the CloudNativePG plugin through which a PostgreSQL cluster archives its write-ahead log and base backups into a bucket (`core/storage/barman-cloud-plugin`) | server, resource | populated |
 | `compute` | Generic compute primitives, plus the control planes an event-driven realization depends on | server, worker, task, function | populated |
-| `observability` | Telemetry, tracing, monitoring | varies | populated |
-| `security` | Security and compliance components | varies | populated |
-| `bigdata` | Large-scale data processing | varies | created when the first entity lands |
-| `devtool` | Developer tooling | varies | populated |
+| `observability` | Telemetry, tracing, monitoring | server, stateful-server, resource | populated |
+| `security` | Security and compliance components | server, stateful-server, resource | populated |
+| `bigdata` | Large-scale data processing: the managed warehouses, query engines, pipelines and notebooks a Release's data lands in or runs through | resource | populated |
+| `devtool` | Developer tooling | server, stateful-server, resource | populated |
 
 The ontology column tracks the shelf. For a populated category it lists exactly
 the `component.aggrega.ai/type` values its entities carry — every value listed
@@ -151,7 +151,47 @@ misdescribe, and every vector-store socket in the standard library admits it
 beside `vector` and `semantic-memory` by selecting
 `datastore.aggrega.ai/engine in (vector, semantic-memory, search)`. A socket
 that must admit only vector stores selects `datastore.aggrega.ai/engine=vector`
-instead. A capability whose truth depends on what the Aggregate declares carries
+instead.
+
+Each engine value names what the product is, and says what a socket that
+selects the value may assume of its target and no more:
+
+- **`kv`** — a key-value store: `core/datastore/redis`, `valkey`, `memcached`
+  and `dynamodb`. The label states identity, not a wire protocol. The sockets of
+  the standard library that select `datastore.aggrega.ai/engine=kv` (the gateways'
+  cache and budget stores, the SIP bridge's state store) are Redis-protocol
+  clients: they read the target's published host and port, and the stores that
+  speak the Redis protocol (Redis and Valkey) are the targets they are written
+  for. Memcached and DynamoDB carry `kv` and speak their own protocol and API, so
+  the selector admits them and a wire built to them is the author's to avoid. A
+  socket that needs more of a Redis store than the protocol, as the semantic
+  cache needs the query engine's vector search, refuses a target that does not
+  publish it.
+- **`vector`** — a vector database: `core/datastore/qdrant`, `weaviate`,
+  `chroma`, `milvus`, `pgvector` and `vertex-ai-vector-search`. A socket selecting
+  it may assume a store it writes embeddings into and queries by similarity. A
+  consumer whose drivers speak only a vector engine's own wire, such as the Dify
+  server and worker, selects the three values and halts the build, naming the
+  label it found, when the target's is not `vector`.
+- **`search`** — a search and analytics engine that also indexes vectors:
+  `core/datastore/elasticsearch`, `opensearch` and `azure-ai-search`. A
+  vector-store socket may assume similarity queries over documents the engine
+  indexes, not a vector database's own API.
+- **`semantic-memory`** — a store that builds its own index from the documents
+  it is handed and answers by meaning: `core/datastore/cognee`, which turns
+  ingested text into a graph of entities and relations beside embeddings, and
+  `core/datastore/bedrock-knowledge-bases`, which chunks a data source's
+  documents and embeds them into a vector store the operator already has. A
+  vector-store socket may assume a store it hands documents to and asks
+  questions of.
+- **`document`** — a database of documents addressed by key and queried by
+  their content: `core/datastore/cosmos-db`, `azure-documentdb` and `firestore`.
+  The label states identity and nothing about the API: Azure DocumentDB is
+  MongoDB-compatible, Cosmos DB and Firestore are reached through their own
+  APIs. No socket of the standard library selects it, so a socket that does names
+  the API it speaks in its own contract rather than assuming one from the label.
+
+A capability whose truth depends on what the Aggregate declares carries
 no label anywhere in the catalog — it is injected at compile time by the governance
 socket's `label-transform` role, which reads the developer's declared `values`.
 There is no stored "is-AI" boolean — tooling derives AI-relevance from any
@@ -947,6 +987,37 @@ choosing the module meets the constraint while reading rather than at the halt.
 Nothing checks this and an author may leave it out — the convention is here
 because the halt names the key that is missing and not the reason the catalog
 left it empty.
+
+**A concept several clouds sell with the same pillars takes a neutral Component.**
+When each cloud's service answers the question above with yes — the same
+`values`, `infra` and `provides`, word for word, every default and unit — the
+Component names the concept and no vendor: `core/datastore/sql-server` for a
+SQL Server database, `core/network/dns-record` for a DNS record. Each cloud's
+service is a Recipe of it, named `<component>-<product>` as "Naming a cloud
+realization" sets out (`sql-server-rds`, `sql-server-cloud-sql`,
+`sql-server-azure-sql-database`, `dns-record-route-53`, `dns-record-cloud-dns`,
+`dns-record-azure-dns`), so an Aggregate declares the concept once and the
+Manifest picks the cloud. Products whose pillars differ across clouds stay
+product Components, one each, and a Release wires the one it wants: queues
+(`core/messaging/sqs`, `azure-service-bus`, `google-cloud-pub-sub`), key-value
+stores (`core/datastore/dynamodb`, `memcached`, `redis`), container registries
+(`core/devtool/ecr`, `azure-container-registry`, `artifact-registry`), key
+services (`core/security/aws-kms`, `azure-key-vault`, `google-cloud-kms`) and
+MongoDB-compatible services (`core/datastore/azure-documentdb`, beside
+`documentdb` and `ferretdb`). A neutral name given to products whose pillars
+differ would make the contract a misdescription of at least one of them.
+
+**A cloud target leaves some domains as a stated gap.** The catalog's cloud
+Components cover the services a Recipe can provision from the operator's
+substrate with the provider's ordinary resources. Identity objects on Azure —
+users, groups, application registrations — live in Microsoft Graph, not in
+the Azure Resource Manager the Azure Recipes drive, so no Component stands for
+them. A resource that exists only in `hashicorp/google-beta` is outside the
+Google bodies' one provider string, `hashicorp/google`, and has no Component. A
+host Recipe takes the identity its workload runs as from the operator by
+`infra.overrides` (the Cloud Run service account, the App Service user-assigned
+managed identity): workload identity stays the host Recipe's override, and no
+Component creates it.
 
 **A credential the components of a module share is a module parameter.** An
 Aggregate importing a module hands it `type`, `active` and `parameters` and
