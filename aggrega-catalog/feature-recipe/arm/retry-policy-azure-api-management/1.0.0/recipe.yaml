@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: FeatureRecipe
+metadata:
+  name: retry-policy-azure-api-management
+  version: 1.0.0
+  description: >
+    Realizes core/retry-policy on core/gateway/azure-api-management's
+    arm Recipe; a Release binds it in its Manifest. It writes Azure's
+    retry around the forwarding, in the backend section of the API's policy,
+    and emits no file.
+
+    A request answered with HTTP 429 or a 5xx status is sent again, its body
+    held so it can be resent, one second after the previous send, up to
+    max_attempts sends in all. A refused or dropped connection, and a model
+    that answers nothing within the forwarding's timeout, are not sent again:
+    Azure ends the retry on such an error and hands it to the policy's
+    on-error section. Azure retries 1 to 50 times after the first send, so
+    max_attempts 1 writes no retry and above 51 is refused by name.
+
+    The retry takes the place of the forwarding the API would inherit, so
+    while it is attached a forwarding setting made at a broader scope of the
+    instance, such as a timeout, does not apply to this API, which forwards
+    with Azure's defaults. It halts on a second retry policy, on any
+    component other than core/gateway/azure-api-management, and on one whose
+    Recipe writes no delivered element into its policy, as
+    arm/azure-api-management 1.0.0; 1.1.0 or later writes it. That the retry
+    applies as described is Microsoft's documented behaviour, and no build
+    observes it.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: arm
+  implements: core/retry-policy:1.0.0
+  # executionScope omitted -> component: the checks and the delivery run once
+  # per attached component.
+  #
+  # DELIBERATE NEAR-DUPLICATE of
+  # terraform/retry-policy-azure-api-management: the same checks,
+  # refusals and delivery, worded for arm, with host_writes_the_policy_element
+  # added. No catalog kind holds an assertion or a delivery for several
+  # FeatureRecipes to share, so a change to one is made to both.
+
+  # What Azure's retry offers. Microsoft's retry policy runs its child policies
+  # once and then again until its condition is false or its count, 1 to 50
+  # retries, is used up; wrapped around forward-request in the backend section
+  # it sends the request again. The condition reads the reply's status, which
+  # forward-request leaves for it to read rather than raising an error, its
+  # fail-on-error-status-code being false by default. A refused or dropped
+  # connection and a reply not received within forward-request's timeout raise
+  # an error instead, and an error sends processing straight to the on-error
+  # section, where forward-request cannot run: those are not resent. interval
+  # is required and the Feature names no delay, so the wait is one second
+  # before every resend, first-fast-retry staying at its default of false; the
+  # policy's reference names no setting reading a Retry-After header.
+  # buffer-request-body keeps the request's body for the resend.
+  assertions:
+    # The host's type reaches this check as the Aggregate wrote it, so it is
+    # compared with any version it was authored with set aside.
+    component_renders_the_body: >-
+      {{- if ne (first (splitList ":" .metadata.component)) "core/gateway/azure-api-management" -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q is bound to the Azure API Management realization, which writes a retry into the API policy core/gateway/azure-api-management renders on arm; %s renders no such policy. Bind this attachment in the Manifest to a realization for %s" .metadata.feature_instance .metadata.instance_id .metadata.component .metadata.component) -}}
+      {{- end -}}
+    # A Recipe that writes an attached FeatureRecipe's element into the
+    # gateway's API policy declares a local named native_policy, naming that
+    # policy; an attached FeatureRecipe reads its host's locals beneath its
+    # own. A host whose Recipe declares none, as arm/azure-api-management
+    # 1.0.0 does, writes nothing delivered on its inject pipe, so the build
+    # halts rather than binding an attachment nothing acts on. The terraform
+    # counterpart needs no such check: every version of
+    # terraform/azure-api-management writes what is delivered.
+    host_writes_the_policy_element: >-
+      {{- if not (toString (optional .locals "native_policy" "")) -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q is bound to arm/retry-policy-azure-api-management, which delivers its element for the API policy the Recipe realizing %q writes, and that Recipe writes no delivered element into its policy, so the attachment would change nothing: map %q in the Manifest to arm/azure-api-management 1.1.0 or later, which writes the element into the Azure API Management API policy" .metadata.feature_instance .metadata.instance_id .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    attempts_are_ones_the_gateway_keeps: >-
+      {{- if gt (int .values.max_attempts) 51 -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q asks for max_attempts %v, but core/gateway/azure-api-management's retry sends a request again at most 50 times after the first send, so it keeps at most 51 sends in all; set max_attempts to 51 or fewer" .metadata.feature_instance .metadata.instance_id .values.max_attempts) -}}
+      {{- end -}}
+    # The backend section of a policy holds one element, so a second retry
+    # could not stand beside the first.
+    one_retry_policy_per_gateway: >-
+      {{- $count := 0 -}}
+      {{- range $name, $attachment := .features -}}
+      {{- if eq (first (splitList ":" $attachment.type)) "core/retry-policy" -}}{{- $count = add1 $count -}}{{- end -}}
+      {{- end -}}
+      {{- if gt $count 1 -}}
+      {{- fail (printf "core/retry-policy attachment %q on %q is one of %d retry policies on this gateway, but Azure API Management takes one element in a policy's backend section, so the gateway keeps one retry; attach one retry policy" .metadata.feature_instance .metadata.instance_id $count) -}}
+      {{- end -}}
+
+  # Delivered on this node's inject pipe, on the azure_api_management mechanism
+  # the gateway's arm Recipe reads, which places the retry in the
+  # policy's backend section in place of the forwarding it would inherit. One
+  # send is delivered empty, and the Recipe then writes the backend section as
+  # it does with nothing attached.
+  injectMapping: |
+    azure_api_management:
+      retry: {{ if gt (int .values.max_attempts) 1 }}{{ printf "<retry condition=\"@(context.Response != null && (context.Response.StatusCode == 429 || context.Response.StatusCode >= 500))\" count=\"%d\" interval=\"1\">\n  <forward-request buffer-request-body=\"true\" />\n</retry>" (sub (int .values.max_attempts) 1) | toJson }}{{ else }}""{{ end }}
