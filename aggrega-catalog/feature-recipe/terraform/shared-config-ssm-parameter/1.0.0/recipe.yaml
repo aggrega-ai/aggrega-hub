@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: FeatureRecipe
+metadata:
+  name: shared-config-ssm-parameter
+  version: 1.0.0
+  description: >
+    Realizes core/shared-config on terraform through AWS Systems Manager
+    Parameter Store; a Release binds it in its Manifest. It renders once per
+    boundary attachment rather than once per component: one String
+    parameter named for the boundary, /<boundary>/shared-config, such as
+    /app/shared-config, holding the settings every component in the boundary
+    shares, tier=<infra.tier>. The parameter is written in a module of the
+    attachment's own in the boundary's root configuration, so it is applied
+    with the boundary's components.
+
+    The parameter is the settings' one copy: a component reads it from
+    Parameter Store by that name, under an identity the operator allows to
+    read it, and nothing is written into a component's own configuration.
+
+    The build halts, naming the attachment and the boundary, on
+    infra.configuration_store_id, since the settings go into Parameter Store
+    and into no App Configuration store, and on a boundary carrying more
+    than one core/shared-config attachment that names no App Configuration
+    store, since each would write the same parameter.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: terraform
+  # An attachment of core/shared-config 1.1.0, whose
+  # infra.configuration_store_id is refused below by name.
+  implements: core/shared-config:1.1.0
+  # Renders once per boundary attachment: its artifact is a module of the
+  # attachment's own, named after the attachment, beside the boundary's
+  # components in one root configuration, and its template reads the
+  # boundary's own values under .boundary rather than a component's. No
+  # injectMapping: nothing is delivered into a component's configuration.
+  executionScope: boundary
+
+  assertions:
+    # infra.configuration_store_id names an Azure App Configuration store,
+    # for a realization that writes the settings into it. This one writes
+    # them into Parameter Store, so the store would reach no emitted byte.
+    # Any value halts, an empty one included: an attachment carrying the key
+    # asks for a store. An attachment's assertions run for each component on
+    # the boundary, so the message names the boundary.
+    no_configuration_store_id: >-
+      {{- if hasKey .infra "configuration_store_id" -}}
+      {{- fail (printf "core/shared-config attachment %q on the boundary %q sets infra.configuration_store_id to %q, and this attachment is bound to terraform/shared-config-ssm-parameter, which writes the boundary's settings into AWS Systems Manager Parameter Store and into no App Configuration store: remove infra.configuration_store_id from the attachment, or bind it in the Manifest to a FeatureRecipe that writes the settings into that store" .metadata.feature_instance .metadata.boundary_path (toString .infra.configuration_store_id)) -}}
+      {{- end -}}
+
+  # The parameter. Its name is the boundary's, the scope carrying the
+  # attachment, in the form cloudformation/shared-config writes, so a
+  # component reads one name on either AWS target. A boundary's attachments
+  # carry no record of the FeatureRecipe each is bound to, so the check
+  # opening the template counts every core/shared-config attachment on the
+  # boundary that names no App Configuration store, as an attachment bound
+  # here names none: two such attachments would write the same parameter,
+  # which holds one value, and the build halts rather than leave the second
+  # write to fail when the boundary is applied.
+  #
+  # Its value is the settings as key=value text, tier=<infra.tier>, the
+  # shape cloudformation/shared-config writes. infra.tier is a label of the
+  # boundary, not the parameter's own storage tier: the tier argument is left
+  # unset, so Parameter Store keeps the parameter in its standard tier.
+  # Each string is quoted with toJson, so a " or a backslash in it stays
+  # text, and ${ and %{ are written $${ and %%{, so Terraform reads them as
+  # the characters written rather than as an interpolation or a directive.
+  #
+  # required_providers pins hashicorp/aws by the constraint string the catalog
+  # conventions' "One AWS provider constraint for every AWS body" section
+  # states.
+  artifacts:
+    main.tf: |
+      {{- $configured := list -}}
+      {{- range $a := (default list .boundary.feature_attachments) -}}
+      {{- if and (eq (first (splitList ":" (toString (optional $a "type" "")))) "core/shared-config") (not (hasKey (default dict (optional $a "infra" dict)) "configuration_store_id")) -}}
+      {{- $configured = append $configured $a -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if gt (len $configured) 1 -}}
+      {{- fail (printf "the boundary %q carries more than one core/shared-config attachment naming no App Configuration store, and each bound to terraform/shared-config-ssm-parameter writes the parameter /%s/shared-config, which holds one value: attach core/shared-config once on the boundary" .boundary.boundary_name .boundary.boundary_name) -}}
+      {{- end -}}
+      terraform {
+        required_providers {
+          aws = {
+            source  = "hashicorp/aws"
+            version = "~> 6.69"
+          }
+        }
+      }
+
+      resource "aws_ssm_parameter" "shared_config" {
+        name        = {{ printf "/%s/shared-config" .boundary.boundary_name | toJson | replace "${" "$${" | replace "%{" "%%{" }}
+        type        = "String"
+        description = {{ printf "Settings shared by every component in the %s boundary" .boundary.boundary_name | toJson | replace "${" "$${" | replace "%{" "%%{" }}
+        value       = {{ printf "tier=%s" (toString .infra.tier) | toJson | replace "${" "$${" | replace "%{" "%%{" }}
+      }
