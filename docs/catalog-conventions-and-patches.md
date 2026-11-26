@@ -53,7 +53,7 @@ The first path segment after the entity type. Identifies the vendor/author.
 
 A Component's second path segment is its cognitive category — the same
 word as its `component.aggrega.ai/category` label (the 1:1 mirror; see
-the label section below). The 15 categories:
+the label section below). The categories:
 
 | Category | Contains | Typical ontology labels | On disk |
 | --- | --- | --- | --- |
@@ -116,7 +116,7 @@ cognitive browse axis of the catalog's three-axis label scheme:
   anything else is refused when the document loads. A catalog needing a
   classification of its own adds its own label key beside this one.
 - **Axis 2 — cognitive `category`** (`component.aggrega.ai/category`): a
-  closed, single-valued set of 15:
+  closed, single-valued set:
   `ai-agent`, `ai-model`, `ai-tool`, `ai-pipeline`, `datastore`, `gateway`,
   `mesh`, `network`, `messaging`, `storage`, `compute`, `observability`,
   `security`, `bigdata`, `devtool`. The value matches the component's
