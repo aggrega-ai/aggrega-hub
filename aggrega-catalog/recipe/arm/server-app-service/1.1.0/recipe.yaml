@@ -1,0 +1,586 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: server-app-service
+  version: 1.1.0
+  description: >
+    The generic long-running server primitive as one Azure App Service app
+    running the Release's image as a Linux custom container on infra.port,
+    declared by an Azure Resource Manager template this Recipe writes. The
+    Azure Verified Module for App Service is not used: its template declares
+    a location on its publishing credential policies, a property the
+    vendor's resource schema for that type does not list, so the catalog's
+    template check refuses it. Reach for it where the Release deploys an
+    Azure Resource Manager template, and for terraform/server-app-service
+    where it deploys Terraform.
+
+    The App Service plan is the operator's, required under infra.overrides;
+    an integration subnet, user-assigned identities and a private registry
+    are optional. Only the app is emitted, with the policies that refuse
+    basic authentication on its publishing endpoints, and public network
+    access off, so the operator's private endpoint is the way in, unless
+    core/public-ingress is attached: access is then on, and its infra.host
+    is bound as a custom domain served with the certificate added to App
+    Service that infra.overrides.certificate_id names.
+
+    Each env entry an inject block dictates becomes an app setting, which the
+    container reads as a variable, a neighbour's value written whole or
+    inside literal text; a name App Service sets, reserves or does not take,
+    and file, arg and other entries halt by name. The app runs on every
+    instance of its plan, which sizes it, so infra.compute is not read and
+    infra.replicas above 1 halts, as does an infra.overrides key this Recipe
+    does not read.
+  maintainers:
+    - name: Massimiliano Ferrero
+      email: m.ferrero@cognitio.it
+spec:
+  capability: arm
+  implements: core/compute/server:1.1.0
+
+  # The app is declared by the fragment below, a Microsoft.Web/sites resource
+  # at API version 2025-03-01 with two Microsoft.Web/sites/basicPublishingCredentialsPolicies
+  # resources beside it, and a Microsoft.Web/sites/hostNameBindings resource
+  # for the custom domain a core/public-ingress attachment names, which the
+  # provider assembles into the boundary's template.
+  #
+  # Microsoft's Azure Verified Modules programme publishes a Bicep module for
+  # App Service apps, avm/res/web/site, MIT. Its parameters carry everything
+  # this Recipe sets, but its compiled template declares location on the
+  # Microsoft.Web/sites/basicPublishingCredentialsPolicies and
+  # Microsoft.Web/sites/slots/basicPublishingCredentialsPolicies resources of
+  # its nested templates, as of the version checked, 0.24.0, a property the
+  # vendor's resource schema for those types does not list. The catalog's
+  # template check holds each resource to that schema, whether or not the
+  # template deploys it, so it refuses the module's template. The module is
+  # therefore not sourced, and no module telemetry exists to turn off.
+  #
+  # The two policies are written as Microsoft's template reference for
+  # Microsoft.Web/sites/basicPublishingCredentialsPolicies at 2025-03-01 sets
+  # the resource out: a name, ftp or scm, and properties, with no location,
+  # where the module and Microsoft's quickstart templates write one the
+  # reference does not list. That the policies take no location rests on the
+  # vendor's resource schema, which the catalog's template check applies, and
+  # on Microsoft's template reference; neither shape was observed running
+  # in Azure. The app carries no reserved property, as the module's own
+  # end-to-end test of a Linux container app deploys it: that test sets
+  # reserved on the App Service plan, which makes it a Linux plan, and not on
+  # the app.
+  locals:
+    # What this Recipe configures from a core/public-ingress attachment, read
+    # by the FeatureRecipe that binds the attachment, which halts on a host
+    # declaring no such local.
+    native_ingress: App Service public access, custom domain and certificate binding
+    # The symbolic names of the fragment's resources, folded from the
+    # instance id as the provider folds a sourced template's: storefront
+    # becomes Storefront.
+    symbol: '{{ capitalizedWords .context.instance_id }}'
+    # The registry host infra.image names, read as a container engine reads
+    # it: the first segment of an image of more than one segment, when it
+    # holds a period or a colon or is localhost; any other image is Docker
+    # Hub's, index.docker.io. registry_server is checked against it.
+    image_host: >-
+      {{- $parts := splitList "/" (toString (optional .infra "image" "")) -}}
+      {{- $first := first $parts -}}
+      {{- if and (gt (len $parts) 1) (or (contains "." $first) (contains ":" $first) (eq $first "localhost")) -}}
+      {{- if eq (lower $first) "docker.io" }}index.docker.io{{ else }}{{ $first }}{{ end -}}
+      {{- else }}index.docker.io{{ end -}}
+
+  # This Recipe reads from infra.overrides:
+  #   service_plan_id             - string (properties.serverFarmId), required
+  #   virtual_network_subnet_id   - string (properties.virtualNetworkSubnetId)
+  #   location                    - string (location; the resource group's
+  #                                 region while it is unset, so set it
+  #                                 wherever the plan's region is another)
+  #   identity_ids                - []string (identity.userAssignedIdentities)
+  #   registry_server             - string (the DOCKER_REGISTRY_SERVER_URL app
+  #                                 setting in properties.siteConfig.appSettings)
+  #   registry_identity           - string (properties.siteConfig.acrUseManagedIdentityCreds,
+  #                                 and the identity's client ID as
+  #                                 properties.siteConfig.acrUserManagedIdentityID)
+  #   registry_username           - string (the DOCKER_REGISTRY_SERVER_USERNAME
+  #                                 app setting)
+  #   registry_password_secret_id - string (a Key Vault reference in the
+  #                                 DOCKER_REGISTRY_SERVER_PASSWORD app setting)
+  #   registry_password_identity  - string (properties.keyVaultReferenceIdentity)
+  #   certificate_id              - string (the certificate whose thumbprint
+  #                                 sets properties.thumbprint of the
+  #                                 Microsoft.Web/sites/hostNameBindings
+  #                                 resource), read only beside a
+  #                                 core/public-ingress attachment that sets
+  #                                 infra.host
+  #   registry_password           - refused: the password is read from Key Vault
+  #   enable_telemetry            - refused: the template is this catalog's
+  #                                 own, with no module telemetry to turn on
+  #                                 or off
+  # resource_group_name is not read: the app is created in the resource group
+  # the template is deployed to. It is admitted, and renders nothing, so a
+  # Release writes one set of overrides for this Recipe and
+  # terraform/server-app-service, which requires it.
+  #
+  # Each key is the one terraform/server-app-service reads for the same
+  # concept, under the same spelling and meaning, and identity_ids and the
+  # registry keys are also the ones arm/server-container-apps reads; the
+  # property each sets is given in brackets. certificate_id is the
+  # certificate's resource ID, the pointer terraform/server-app-service binds
+  # by; a host name binding takes the certificate's thumbprint instead, which
+  # the template reads from that resource when it deploys.
+  #
+  # service_plan_id is required and has no default: the App Service plan the
+  # app runs on is provisioned outside this Release, no
+  # subscription-independent value exists for it, and this Recipe never
+  # chooses a plan, and with it the app's size and instance count, for the
+  # operator. It is the plan's resource ID,
+  # /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Web/serverFarms/<name>,
+  # a Linux plan, one whose reserved property is true. The app runs in its
+  # plan's region, since the apps of a plan run on the compute the plan holds
+  # in its region, so location must name the plan's region wherever it is not
+  # the region of the resource group the template is deployed to. location is
+  # optional: the fragment cannot read the plan's region, since the provider
+  # admits a reference() call in a resource's properties alone and not in its
+  # location, and the resource group's region, the default, is the right one
+  # whenever the plan shares it.
+  #
+  # virtual_network_subnet_id is the resource ID of a subnet delegated to
+  # Microsoft.Web/serverFarms, which the app joins by regional virtual network
+  # integration; all its outbound traffic is then routed through it
+  # (properties.siteConfig.vnetRouteAllEnabled), so a database with private
+  # access in that network, and the private DNS zone its name resolves
+  # through, are reached from the app.
+  #
+  # identity_ids are the resource IDs of user-assigned managed identities that
+  # already exist, which the server's code calls Azure with. A private image is
+  # pulled from registry_server, the registry's host name, which is the host
+  # infra.image names: App Service pulls from one registry address, so a
+  # registry_server naming another host halts. It is pulled either with
+  # registry_identity, a user-assigned identity granted pull on the registry,
+  # whose client ID App Service takes and the template reads when it deploys,
+  # by a reference() call over the identity's resource ID, so the identity
+  # that deploys the template reads it and the ID, written inside that call,
+  # holds no quote, backslash or white space; or with registry_username and a
+  # password App Service reads from the Key Vault secret
+  # registry_password_secret_id names,
+  # https://<vault>.vault.azure.net/secrets/<name>, with or without a version,
+  # through a Key Vault reference it resolves with the user-assigned identity
+  # registry_password_identity names. That identity reads every Key Vault
+  # reference of the app. Each identity named for the registry is given to the
+  # app as well, since App Service uses only the app's own identities. A
+  # password written as text would be written into the template, so it is
+  # taken only by that reference; that App Service resolves a reference in the
+  # registry password as it does in any other app setting is unverified
+  # against a running app, which no build reaches. A system-assigned identity,
+  # which Azure creates with the app, is not one this Recipe names. With no
+  # registry key set the image is pulled as a public one.
+  #
+  # Who reaches the server. Public network access is off unless the component
+  # carries a core/public-ingress attachment, below: the app's default host
+  # name answers no request from the internet, and a private endpoint the
+  # operator creates for the app, in a network its clients reach, is the way
+  # in. Plain HTTP is redirected to HTTPS, which App Service terminates at its
+  # front ends, and a request reaches the container on infra.port, which the
+  # template writes as the WEBSITES_PORT app setting. Session affinity is off,
+  # Always On is on, the minimum TLS version is 1.2, FTP is disabled, and the
+  # two publishing credential policies, ftp and scm, refuse basic
+  # authentication on the FTP and SCM publishing endpoints, since the app runs
+  # an image and nothing is published to it.
+  #
+  # Public ingress. App Service serves an app's public traffic at its own
+  # front ends, so the settings that publish the app are the app's, and this
+  # Recipe writes them from a core/public-ingress attachment on the
+  # component, found among its attachments by the Feature's type and bound
+  # to arm/public-ingress-native, which renders nothing. The local
+  # native_ingress names what it configures; that FeatureRecipe halts on a
+  # host declaring none. With the attachment, publicNetworkAccess is
+  # Enabled, so the app answers requests from the internet on its default
+  # host name, <name>.azurewebsites.net, with the certificate App Service
+  # serves there. The attachment's infra.host, where it sets one, is bound to
+  # the app as a custom domain, a Microsoft.Web/sites/hostNameBindings child
+  # of the app named after the host, deployed after the app, with sslState
+  # SniEnabled and the thumbprint of the certificate certificate_id names.
+  # The template reads that thumbprint when it deploys, by a reference()
+  # call over the certificate's resource ID, so the identity that deploys
+  # the template reads the certificate and the ID, written inside that call,
+  # holds no quote, backslash or white space; that Azure resolves the
+  # thumbprint so and binds the domain is unverified against a running app,
+  # which no build reaches. Every request is redirected to HTTPS, so a custom
+  # domain is served only with a certificate: certificate_id is required
+  # beside infra.host, and refused without it or without the attachment. The
+  # certificate is the operator's, one already added to App Service, a
+  # Microsoft.Web/certificates resource,
+  # /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Web/certificates/<name>,
+  # covering the host. App Service keeps a certificate for the resource
+  # group, region and operating system of the App Service plan it was added
+  # through and lets only apps of that combination use it, so the
+  # certificate certificate_id names is one in the resource group and
+  # region of the plan service_plan_id names, added through a Linux plan.
+  # This Recipe creates neither it nor the DNS records App Service checks
+  # before it binds a domain, a record pointing the host at the app and a
+  # TXT record asuid.<host> holding the app's custom domain verification ID,
+  # none of which the build can see. This Recipe binds the custom domain of
+  # one core/public-ingress attachment, so a second attachment on the
+  # component halts.
+  #
+  # The attachment's values.path is refused here, other than / or unset:
+  # App Service routes every path of the host to the app, with no rule that
+  # routes one path prefix alone, so a prefix would publish more than the
+  # attachment asks. Of its other keys, arm/public-ingress-native refuses by
+  # name service_name, service_port_name, ingress_class_name and tls_secret,
+  # which name a Kubernetes Service, its port, an ingress class and a
+  # Kubernetes Secret; this Recipe does not check them again.
+  # control_plane_present, the affirmation that an ingress controller runs in
+  # a cluster, is not read: App Service's front ends route the host, and no
+  # controller is needed.
+  #
+  # The instance count and the size. Every app on an App Service plan runs on
+  # each instance the plan runs, at the plan's size: the plan's instance count
+  # and its SKU are the operator's, set on the plan. infra.replicas above 1
+  # therefore halts, naming the plan as where to scale, and infra.compute is
+  # not read.
+  #
+  # The environment. Every env entry on the inject pipe, dictated by a
+  # connection's inject block, by the component's own inject block or by an
+  # attachment, becomes one app setting in properties.siteConfig.appSettings,
+  # under the name it was dictated as, its value written whole, so a
+  # neighbour's Azure Resource Manager expression, such as the address a
+  # database publishes, reaches the template as an expression evaluated where
+  # the neighbour's resource is declared, and a neighbour's value written
+  # inside literal text is written by the provider as a format() expression.
+  # App Service hands each app setting to the container as a variable. It
+  # takes an app setting name of letters, digits, periods and underscores
+  # alone. It sets WEBSITE_SITE_NAME, WEBSITE_RESOURCE_GROUP,
+  # WEBSITE_OWNER_NAME, REGION_NAME, WEBSITE_PLATFORM_VERSION, HOME,
+  # SERVER_PORT, WEBSITE_COMPUTE_MODE, WEBSITE_SKU, SITE_BITNESS,
+  # WEBSITE_HOSTNAME, WEBSITE_DEFAULT_HOSTNAME, WEBSITE_VOLUME_TYPE,
+  # WEBSITE_INSTANCE_ID and WEBSITE_ROLE_INSTANCE_ID itself, read-only, as its
+  # "Environment variables and app settings reference" lists; and it reads
+  # WEBSITES_PORT and DOCKER_REGISTRY_SERVER_URL,
+  # DOCKER_REGISTRY_SERVER_USERNAME and DOCKER_REGISTRY_SERVER_PASSWORD, which
+  # this Recipe sets, as settings of its own, none of which reaches the
+  # container. A variable under any of those names, or under a name outside
+  # those characters, halts, naming who dictated it.
+  #
+  # A credential. The fragment is a template, not a values mapping, so no
+  # rule refuses a value declared sensitive in it: every delivered value is
+  # written into the template as it is delivered. A credential reaches the
+  # container without passing through the template as a variable whose value
+  # is a Key Vault reference, @Microsoft.KeyVault(SecretUri=<secret ID>),
+  # dictated as a literal in the component's own inject block, which App
+  # Service resolves with the identity registry_password_identity names, its
+  # one identity for every Key Vault reference of the app. That route holds
+  # only while the image is pulled with registry_username and a password,
+  # since registry_password_identity is set only then: App Service resolves a
+  # reference with the app's system-assigned identity unless another is named,
+  # and this Recipe gives the app none, so with registry_identity or a public
+  # image no identity resolves a reference, and App Service hands the
+  # container the reference text itself in place of the secret.
+  #
+  # Files and other mechanisms. This realization delivers env entries alone,
+  # and every other entry on the pipe halts, naming the entry, its mechanism
+  # and who dictated it, so none is dropped: a file entry, because App Service
+  # gives a custom container no way to write a file's content into it; an arg
+  # entry, because no command line is rendered, and App Service passes a
+  # startup command to the container in place of the image's own; and any
+  # custom mechanism.
+  #
+  # DELIBERATE NEAR-DUPLICATE of the environment assembly every other
+  # target's container Recipes hold, in their own values mapping or in the
+  # shared parameters they import, ContainerAppParameters among them, and of
+  # terraform/server-app-service's, which holds the same app setting rules,
+  # name rule and registry checks: the same reading of the inject pipe and of
+  # who dictated each entry, save the variables each target reserves and the
+  # mechanisms it delivers. No catalog kind composes part of a template into
+  # another, so this Recipe holds its own; a change to one is made to all of
+  # them.
+  #
+  # Every Component value and infra key is honoured, refused below by name, or
+  # not read:
+  #   honoured — infra.image (required), as the image the app runs
+  #     (properties.siteConfig.linuxFxVersion, DOCKER| followed by the image);
+  #     infra.port, as WEBSITES_PORT; infra.replicas while it is 1; the
+  #     overrides above; env entries; and a core/public-ingress attachment
+  #     and its infra.host.
+  #   refused — infra.image unset; infra.published_port, a port published on
+  #     the host with Docker Compose, which an App Service app has no host to
+  #     publish on; infra.replicas above 1; a component name App Service does
+  #     not take for an app; a variable under a name App Service sets or reads
+  #     itself or does not take; a file, arg or custom-mechanism entry; a
+  #     registry_server other than the image's registry; an override that is
+  #     not of the form above; any infra.overrides key not listed above; a
+  #     second core/public-ingress attachment; a values.path on it other than
+  #     /; an infra.host that is no host name; and certificate_id missing
+  #     beside infra.host, or set without it.
+  #   not read — infra.compute.cpu and infra.compute.memory, since the plan's
+  #     SKU sizes every app on it, and a Recipe cannot tell the Component's
+  #     defaults from a value the Release wrote; values.display_name and
+  #     values.description, documentation knobs no Azure setting takes.
+  assertions:
+    overrides_known: >-
+      {{- $known := list "service_plan_id" "virtual_network_subnet_id" "location" "identity_ids" "registry_server" "registry_identity" "registry_username" "registry_password_secret_id" "registry_password_identity" "certificate_id" "resource_group_name" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if eq $k "registry_password" -}}
+      {{- fail "infra.overrides.registry_password is set, and this Recipe takes a registry password only by reference, so that its value is never written into the template: store it as a Key Vault secret and set infra.overrides.registry_password_secret_id to the secret's ID and infra.overrides.registry_password_identity to a user-assigned identity allowed to read it, then remove infra.overrides.registry_password" -}}
+      {{- end -}}
+      {{- if eq $k "enable_telemetry" -}}
+      {{- fail "infra.overrides.enable_telemetry is set, and this Recipe declares the app in a template of this catalog's own, which carries no telemetry to turn on or off: remove infra.overrides.enable_telemetry from the Release" -}}
+      {{- end -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads service_plan_id, virtual_network_subnet_id, location, identity_ids, registry_server, registry_identity, registry_username, registry_password_secret_id, registry_password_identity and certificate_id from infra.overrides, admits resource_group_name without reading it, and takes no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    placement_supplied: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $plan := optional $o "service_plan_id" "" -}}
+      {{- if not (and (typeIs "string" $plan) $plan) -}}
+      {{- fail (printf "the component %q runs as an App Service app on the operator's own App Service plan, and this Recipe never chooses one, but infra.overrides.service_plan_id carries none: set it in the Release to the plan's resource ID" $.metadata.instance_id) -}}
+      {{- end -}}
+      {{- if not (regexMatch `(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Web/serverFarms/[^/]+$` $plan) -}}
+      {{- fail (printf "infra.overrides.service_plan_id is %q, and this Recipe takes the App Service plan the app runs on as the plan's resource ID: set it to /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Web/serverFarms/<name>, a Linux plan" $plan) -}}
+      {{- end -}}
+      {{- if hasKey $o "virtual_network_subnet_id" -}}
+      {{- $s := index $o "virtual_network_subnet_id" -}}
+      {{- if not (and (typeIs "string" $s) (regexMatch `(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Network/virtualNetworks/[^/]+/subnets/[^/]+$` $s)) -}}
+      {{- fail (printf "infra.overrides.virtual_network_subnet_id is %s, and this Recipe takes the subnet the app joins by virtual network integration as the subnet's resource ID: set it to /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Network/virtualNetworks/<network>/subnets/<subnet>, a subnet delegated to Microsoft.Web/serverFarms, or remove it" (toJson $s)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- range $k := list "location" "resource_group_name" -}}
+      {{- if hasKey $o $k -}}
+      {{- $v := index $o $k -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "infra.overrides.%s is %s, and this Recipe reads it as a string: set it in the Release to one, or remove it" $k (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+    # A core/public-ingress attachment and the certificate its custom domain
+    # is served with, as "Public ingress" above sets out. Each check finds
+    # the attachment among the component's attachments by the Feature's
+    # type, its version set aside. An assertion reads an attachment's type
+    # and values and not its infra, so the checks on infra.host sit at the
+    # top of the fragment below.
+    one_public_ingress: >-
+      {{- $found := list -}}
+      {{- range $name, $a := (default dict .features) -}}
+      {{- if eq (first (splitList ":" (toString (optional $a "type" "")))) "core/public-ingress" }}{{ $found = append $found (printf "%q" $name) }}{{ end -}}
+      {{- end -}}
+      {{- if gt (len $found) 1 -}}
+      {{- fail (printf "core/public-ingress attachments %s on %q each publish the app, and this Recipe binds the custom domain of one core/public-ingress attachment, served with the certificate infra.overrides.certificate_id names: keep one of them and remove the others" (join ", " $found) .metadata.instance_id) -}}
+      {{- end -}}
+    path_is_the_whole_host: >-
+      {{- range $name, $a := (default dict .features) -}}
+      {{- if eq (first (splitList ":" (toString (optional $a "type" "")))) "core/public-ingress" -}}
+      {{- with trim (toString (optional (optional $a "values" dict) "path" "")) -}}
+      {{- if ne . "/" -}}
+      {{- fail (printf "core/public-ingress attachment %q on %q routes the path %q in values.path, and App Service routes every path of the host to the app, with no rule that routes one path prefix alone: remove values.path from the attachment in the Aggregate, or set it to /, and route by path with a gateway in front of the app" $name $.metadata.instance_id .) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+    certificate_id_names_a_certificate: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if hasKey $o "certificate_id" -}}
+      {{- $c := index $o "certificate_id" -}}
+      {{- if not (and (typeIs "string" $c) (regexMatch `(?i)^/subscriptions/[^/'"\\\s]+/resourceGroups/[^/'"\\\s]+/providers/Microsoft\.Web/certificates/[^/'"\\\s]+$` $c)) -}}
+      {{- fail (printf "infra.overrides.certificate_id of %q is %s, and this Recipe reads it as the resource ID of a certificate already added to App Service, /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Web/certificates/<name>, in the resource group, region and operating system of the app's App Service plan, written inside an expression, so it holds no quote, backslash or white space: set it in the Release to that ID, or remove it" .metadata.instance_id (toJson $c)) -}}
+      {{- end -}}
+      {{- end -}}
+    certificate_needs_the_attachment: >-
+      {{- $found := false -}}
+      {{- range $name, $a := (default dict .features) -}}
+      {{- if eq (first (splitList ":" (toString (optional $a "type" "")))) "core/public-ingress" }}{{ $found = true }}{{ end -}}
+      {{- end -}}
+      {{- if and (hasKey (optional .infra "overrides" dict) "certificate_id") (not $found) -}}
+      {{- fail (printf "infra.overrides.certificate_id of %q is set, and it names the certificate this Recipe binds to the custom domain a core/public-ingress attachment publishes the app at, but %q carries no core/public-ingress attachment: attach core/public-ingress to %q, or remove infra.overrides.certificate_id from the Release" .metadata.instance_id .metadata.instance_id .metadata.instance_id) -}}
+      {{- end -}}
+    # The app is named after the component, and its name is also the first
+    # label of its default host name under azurewebsites.net, so it is unique
+    # across Azure; the rule Microsoft's naming rules for Azure resources state
+    # for an app is checked here, where the name is known.
+    app_name: >-
+      {{- $n := .metadata.instance_id -}}
+      {{- if not (regexMatch `^[A-Za-z0-9][-A-Za-z0-9]{0,58}[A-Za-z0-9]$` $n) -}}
+      {{- fail (printf "the component %q names its App Service app, and App Service takes an app name of 2 to 60 letters, digits and hyphens that begins and ends with a letter or a digit: rename the component in the Aggregate to such a name" $n) -}}
+      {{- end -}}
+    image_and_ports: >-
+      {{- $id := .metadata.instance_id -}}
+      {{- if not (toString (optional .infra "image" "")) -}}
+      {{- fail (printf "the component %q has no image to run: the Release sets no infra.image, and this Recipe holds no default image, as a Recipe running the Release's own code holds none; set infra.image in the Release to the container image it runs" $id) -}}
+      {{- end -}}
+      {{- if optional .infra "published_port" 0 -}}
+      {{- fail (printf "the component %q sets infra.published_port: publishing a port on the host is a Docker Compose setting, and an App Service app has no host to publish one on, so remove infra.published_port from the Release for this target" $id) -}}
+      {{- end -}}
+    replicas_on_the_plan: >-
+      {{- $r := optional .infra "replicas" 1 -}}
+      {{- if ne (toString $r) "1" -}}
+      {{- fail (printf "infra.replicas of %q is %s, and an App Service app runs on every instance of the App Service plan it runs on, whose instance count is the operator's, set on the plan: scale the plan infra.overrides.service_plan_id names, and remove infra.replicas from the Release" .metadata.instance_id (toJson $r)) -}}
+      {{- end -}}
+    registry: >-
+      {{- $id := .metadata.instance_id -}}
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- $uai := `(?i)^/subscriptions/[^/'"\\\s]+/resourceGroups/[^/'"\\\s]+/providers/Microsoft\.ManagedIdentity/userAssignedIdentities/[^/'"\\\s]+$` -}}
+      {{- if hasKey $o "identity_ids" -}}
+      {{- $s := index $o "identity_ids" -}}
+      {{- $ok := and (kindIs "slice" $s) (gt (len $s) 0) -}}
+      {{- if $ok }}{{ range $s }}{{ if not (and (typeIs "string" .) (regexMatch $uai .)) }}{{ $ok = false }}{{ end }}{{ end }}{{ end -}}
+      {{- if not $ok -}}
+      {{- fail (printf "infra.overrides.identity_ids of %q is %s, and this Recipe reads it as a list of resource IDs of existing user-assigned managed identities, each /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<name>: set it in the Release to such a list, or remove it" $id (toJson $s)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- range $k := list "registry_identity" "registry_password_identity" -}}
+      {{- if hasKey $o $k -}}
+      {{- $v := index $o $k -}}
+      {{- if not (and (typeIs "string" $v) (regexMatch $uai $v)) -}}
+      {{- fail (printf "infra.overrides.%s of %q is %s, and this Recipe reads it as the resource ID of an existing user-assigned managed identity, /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<name>, written inside an expression, so it holds no quote, backslash or white space: set it in the Release to that ID, or remove it" $k $id (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- range $k := list "registry_server" "registry_username" -}}
+      {{- if hasKey $o $k -}}
+      {{- $v := index $o $k -}}
+      {{- if not (and (typeIs "string" $v) $v) -}}
+      {{- fail (printf "infra.overrides.%s of %q is %s, and this Recipe reads it as a string: set it in the Release to one, or remove it" $k $id (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if hasKey $o "registry_password_secret_id" -}}
+      {{- $v := index $o "registry_password_secret_id" -}}
+      {{- if not (and (typeIs "string" $v) (regexMatch `^https://[a-z0-9-]+(\.[a-z0-9-]+)+/secrets/[A-Za-z0-9-]+(/[A-Za-z0-9]+)?$` $v)) -}}
+      {{- fail (printf "infra.overrides.registry_password_secret_id of %q is %s, and this Recipe reads it as the ID of the Key Vault secret holding the registry password, https://<vault>.vault.azure.net/secrets/<name>, with or without a version: set it in the Release to that ID, or remove it" $id (toJson $v)) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- $byPassword := list "registry_username" "registry_password_secret_id" "registry_password_identity" -}}
+      {{- $set := list -}}
+      {{- range $k := concat (list "registry_identity") $byPassword }}{{ if hasKey $o $k }}{{ $set = append $set $k }}{{ end }}{{ end -}}
+      {{- if and $set (not (hasKey $o "registry_server")) -}}
+      {{- fail (printf "infra.overrides.%s of %q is set, and it says how a private image is pulled from a registry, but infra.overrides.registry_server names none: set infra.overrides.registry_server in the Release to the registry's host name, or remove the registry keys" (first $set) $id) -}}
+      {{- end -}}
+      {{- if hasKey $o "registry_server" -}}
+      {{- $missing := list -}}
+      {{- range $k := $byPassword }}{{ if not (hasKey $o $k) }}{{ $missing = append $missing $k }}{{ end }}{{ end -}}
+      {{- if and (hasKey $o "registry_identity") (lt (len $missing) (len $byPassword)) -}}
+      {{- fail (printf "infra.overrides of %q sets registry_identity and a registry user name or password as well, and App Service pulls an image from a registry either with a managed identity or with a user name and password, never both: keep registry_identity alone, or registry_username, registry_password_secret_id and registry_password_identity together" $id) -}}
+      {{- end -}}
+      {{- if and (not (hasKey $o "registry_identity")) $missing -}}
+      {{- fail (printf "infra.overrides.registry_server of %q names a private registry, and this Recipe pulls from it either with registry_identity, or with registry_username, registry_password_secret_id and registry_password_identity together, but infra.overrides.%s is not set: set registry_identity, or the three keys together, in the Release" $id (first $missing)) -}}
+      {{- end -}}
+      {{- if ne (lower (toString $o.registry_server)) (lower .locals.image_host) -}}
+      {{- fail (printf "infra.overrides.registry_server of %q is %q, and infra.image names the registry %s, and App Service pulls the image from one registry address with the registry's credentials: set registry_server to %s, or infra.image to an image in %s" $id (toString $o.registry_server) .locals.image_host .locals.image_host (toString $o.registry_server)) -}}
+      {{- end -}}
+      {{- end -}}
+
+  # The component publishes nothing across an edge, so nothing is emitted for
+  # one.
+  provides: {}
+
+  # The fragment the provider assembles into the boundary's template. Before
+  # anything is written, the inject pipe is read as the comments above set
+  # out: every entry that is not an env entry halts, naming who dictated it,
+  # and every env entry becomes one app setting, under a name App Service
+  # takes and does not set or read itself. A core/public-ingress attachment's
+  # infra.host is then checked as "Public ingress" above sets out, a host
+  # name with certificate_id beside it. The app settings are written in the
+  # order of their names, those this Recipe sets among them.
+  #
+  # The app is named after the component, and created in the resource group
+  # the template is deployed to. The two publishing credential policies are
+  # child resources of the app, named ftp and scm as Microsoft.Web names them,
+  # each written as [format('{0}/{1}', '<app>', '<policy>')], and deployed
+  # after the app; so is the custom domain's host name binding, named after
+  # the host, where a core/public-ingress attachment sets one. Without the
+  # attachment, publicNetworkAccess is Disabled and nothing is written for
+  # it. Every resource is written at Microsoft.Web's 2025-03-01 API version;
+  # the app's siteConfig and its other properties are those the comments
+  # above name, and the provider's defaults stand for every property left
+  # out.
+  artifacts:
+    app-service.yaml: |
+      {{- $id := .context.instance_id }}
+      {{- $sym := .locals.symbol }}
+      {{- $reserved := list "WEBSITE_SITE_NAME" "WEBSITE_RESOURCE_GROUP" "WEBSITE_OWNER_NAME" "REGION_NAME" "WEBSITE_PLATFORM_VERSION" "HOME" "SERVER_PORT" "WEBSITE_COMPUTE_MODE" "WEBSITE_SKU" "SITE_BITNESS" "WEBSITE_HOSTNAME" "WEBSITE_DEFAULT_HOSTNAME" "WEBSITE_VOLUME_TYPE" "WEBSITE_INSTANCE_ID" "WEBSITE_ROLE_INSTANCE_ID" "WEBSITES_PORT" "DOCKER_REGISTRY_SERVER_URL" "DOCKER_REGISTRY_SERVER_USERNAME" "DOCKER_REGISTRY_SERVER_PASSWORD" }}
+      {{- $inject := default dict .context.inject }}
+      {{- $selfInject := default dict .context.self_inject }}
+      {{- range $mechanism, $entries := $inject }}
+      {{- if not (has $mechanism (list "all" "env")) }}
+      {{- range $name, $_ := $entries }}
+      {{- $by := "an attachment on the component" }}
+      {{- if hasKey (optional $selfInject $mechanism dict) $name }}{{ $by = "the component's own inject block" }}{{ end }}
+      {{- range $alias, $edge := $.context.uses }}
+      {{- if hasKey (optional (default dict $edge.inject) $mechanism dict) $name }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+      {{- end }}
+      {{- if eq $mechanism "file" }}
+      {{- fail (printf "the component %q is handed a file at %q by %s, and this realization delivers env entries only: App Service gives a custom container no way to write a file's content into it. Dictate the value as an env entry in that inject block instead" $id $name $by) }}
+      {{- end }}
+      {{- if eq $mechanism "arg" }}
+      {{- fail (printf "the component %q is handed the command-line argument %q by %s, and this realization renders no command line: App Service passes a startup command to the container in place of the image's own, which stays the image's. Dictate the value as an env entry in that inject block instead" $id $name $by) }}
+      {{- end }}
+      {{- fail (printf "the component %q is handed %q under the delivery mechanism %q by %s, and this realization delivers env entries only: dictate the value as an env entry in that inject block instead" $id $name $mechanism $by) }}
+      {{- end }}
+      {{- end }}
+      {{- end }}
+      {{- $settings := dict }}
+      {{- $ownEnv := optional $selfInject "env" dict }}
+      {{- range $k, $v := optional $inject "env" dict }}
+      {{- $by := "an attachment on the component" }}
+      {{- if hasKey $ownEnv $k }}{{ $by = "the component's own inject block" }}{{ end }}
+      {{- range $alias, $edge := $.context.uses }}
+      {{- if hasKey (optional (default dict $edge.inject) "env" dict) $k }}{{ $by = printf "its connection %q" $alias }}{{ end }}
+      {{- end }}
+      {{- if has $k $reserved }}
+      {{- fail (printf "the component %q is handed the variable %q by %s, and App Service sets or reads an app setting of that name itself, so the two would collide: rename the variable where it is dictated" $id $k $by) }}
+      {{- end }}
+      {{- if not (regexMatch `^[A-Za-z0-9._]+$` $k) }}
+      {{- fail (printf "the component %q is handed the variable %q by %s, and App Service takes an app setting name of letters, digits, periods and underscores alone: rename the variable where it is dictated" $id $k $by) }}
+      {{- end }}
+      {{- $_ := set $settings $k (toString $v) }}
+      {{- end }}
+      {{- $o := default dict .infra.overrides }}
+      {{- $ingress := "" }}
+      {{- $host := "" }}
+      {{- range $name, $a := (default dict .features) }}
+      {{- if eq (first (splitList ":" (toString (optional $a "type" "")))) "core/public-ingress" }}
+      {{- $ingress = $name }}
+      {{- $host = toString (optional (optional $a "infra" dict) "host" "") }}
+      {{- end }}
+      {{- end }}
+      {{- if $host }}
+      {{- if not (regexMatch `^(\*\.)?([A-Za-z0-9]([-A-Za-z0-9]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([-A-Za-z0-9]{0,61}[A-Za-z0-9])?$` $host) }}
+      {{- fail (printf "core/public-ingress attachment %q on %q sets infra.host to %q, and App Service binds a custom domain to the app by its host name alone: set infra.host to a name such as shop.example.com, with no scheme, port or path" $ingress $id $host) }}
+      {{- end }}
+      {{- if not (optional $o "certificate_id" "") }}
+      {{- fail (printf "core/public-ingress attachment %q on %q publishes the app at the custom domain %s, and App Service redirects every request to HTTPS, so the domain is served only with a certificate covering it, which this Recipe binds and never creates: set infra.overrides.certificate_id on %q in the Release to the resource ID of a certificate already added to App Service, /subscriptions/<subscription>/resourceGroups/<group>/providers/Microsoft.Web/certificates/<name>, in the resource group, region and operating system of the app's App Service plan" $ingress $id $host $id) }}
+      {{- end }}
+      {{- else if and $ingress (optional $o "certificate_id" "") }}
+      {{- fail (printf "infra.overrides.certificate_id of %q is set, and it names the certificate this Recipe binds to the custom domain a core/public-ingress attachment's infra.host names, but attachment %q sets no infra.host, so the app answers on its default host name with the certificate App Service serves there: set infra.host on the attachment to the custom domain, or remove infra.overrides.certificate_id" $id $ingress) }}
+      {{- end }}
+      {{- $_ := set $settings "WEBSITES_PORT" (toString .infra.port) }}
+      {{- with optional $o "registry_server" "" }}{{ $_ := set $settings "DOCKER_REGISTRY_SERVER_URL" (printf "https://%s" .) }}{{ end }}
+      {{- with optional $o "registry_username" "" }}{{ $_ := set $settings "DOCKER_REGISTRY_SERVER_USERNAME" . }}{{ end }}
+      {{- with optional $o "registry_password_secret_id" "" }}{{ $_ := set $settings "DOCKER_REGISTRY_SERVER_PASSWORD" (printf "@Microsoft.KeyVault(SecretUri=%s)" .) }}{{ end }}
+      {{- $appSettings := list }}
+      {{- range $k := keys $settings | sortAlpha }}{{ $appSettings = append $appSettings (dict "name" $k "value" (index $settings $k)) }}{{ end }}
+      {{- $siteConfig := dict "linuxFxVersion" (printf "DOCKER|%s" (toString .infra.image)) "alwaysOn" true "minTlsVersion" "1.2" "ftpsState" "Disabled" "appSettings" $appSettings }}
+      {{- if optional $o "virtual_network_subnet_id" "" }}{{ $_ := set $siteConfig "vnetRouteAllEnabled" true }}{{ end }}
+      {{- with optional $o "registry_identity" "" }}
+      {{- $_ := set $siteConfig "acrUseManagedIdentityCreds" true }}
+      {{- $_ := set $siteConfig "acrUserManagedIdentityID" (printf "[reference('%s', '2023-01-31').clientId]" .) }}
+      {{- end }}
+      {{- $identities := list }}
+      {{- range $v := optional $o "identity_ids" list }}{{ $identities = append $identities $v }}{{ end }}
+      {{- range $k := list "registry_identity" "registry_password_identity" }}{{ with optional $o $k "" }}{{ if not (has . $identities) }}{{ $identities = append $identities . }}{{ end }}{{ end }}{{ end }}
+      {{- $properties := dict "serverFarmId" $o.service_plan_id "httpsOnly" true "clientAffinityEnabled" false "publicNetworkAccess" (ternary "Enabled" "Disabled" (ne $ingress "")) "siteConfig" $siteConfig }}
+      {{- with optional $o "virtual_network_subnet_id" "" }}{{ $_ := set $properties "virtualNetworkSubnetId" . }}{{ end }}
+      {{- with optional $o "registry_password_identity" "" }}{{ $_ := set $properties "keyVaultReferenceIdentity" . }}{{ end }}
+      {{- $site := dict "type" "Microsoft.Web/sites" "apiVersion" "2025-03-01" "name" $id "kind" "app,linux,container" "location" (default "[resourceGroup().location]" (optional $o "location" "")) "properties" $properties }}
+      {{- with $identities }}
+      {{- $assigned := dict }}
+      {{- range . }}{{ $_ := set $assigned . dict }}{{ end }}
+      {{- $_ := set $site "identity" (dict "type" "UserAssigned" "userAssignedIdentities" $assigned) }}
+      {{- end }}
+      resources:
+        {{ $sym }}: {{ toJson $site }}
+      {{- range $policy := list "ftp" "scm" }}
+        {{ $sym }}{{ title $policy }}Publishing: {{ toJson (dict "type" "Microsoft.Web/sites/basicPublishingCredentialsPolicies" "apiVersion" "2025-03-01" "name" (printf "[format('{0}/{1}', '%s', '%s')]" $id $policy) "dependsOn" (list $sym) "properties" (dict "allow" false)) }}
+      {{- end }}
+      {{- with $host }}
+        {{ $sym }}CustomDomain: {{ toJson (dict "type" "Microsoft.Web/sites/hostNameBindings" "apiVersion" "2025-03-01" "name" (printf "[format('{0}/{1}', '%s', '%s')]" $id .) "dependsOn" (list $sym) "properties" (dict "sslState" "SniEnabled" "thumbprint" (printf "[reference('%s', '2025-03-01').thumbprint]" $o.certificate_id))) }}
+      {{- end }}
