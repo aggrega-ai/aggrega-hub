@@ -22,11 +22,15 @@ metadata:
   # match all condition", and with no rules "a default rule with action
   # "allow" will be added"; a rule's action, allow or deny(STATUS) with
   # STATUS 403, 404 or 502, among others; its priority, from 0 to
-  # 2147483647; its match, versionedExpr SRC_IPS_V1 with config, which "must
-  # be specified if versioned_expr is specified and cannot be specified if
-  # versioned_expr is not specified", and a CEL expression; "Maximum number
-  # of src_ip_ranges allowed is 10"; preview, which leaves the action
-  # unenforced), and Google Cloud Armor's "Security policy overview" ("You
+  # 2147483647; its match, of which "Exactly one field must be specified",
+  # versionedExpr SRC_IPS_V1 with config, which "must be specified if
+  # versioned_expr is specified and cannot be specified if versioned_expr is
+  # not specified", or a CEL expression; "Maximum number of src_ip_ranges
+  # allowed is 10"; preview, which leaves the action unenforced), Google
+  # Cloud Armor's "Quotas and limits" ("Number of characters in a custom
+  # expression", 2048), its "Rules language reference" (inIpRange(x, y),
+  # "Returns true if the IP address x is contained within the IP range y")
+  # and its "Security policy overview" ("You
   # cannot configure two or more rules with the same priority"; "You can't
   # delete the default rule, but you can modify it"; edge policies filter on
   # origin.asn, origin.ip, origin.region_code and the request's headers,
@@ -42,14 +46,15 @@ metadata:
     service, backend bucket or load balancer is created.
 
     A rule allows a request or denies it with the status 403, 404 or 502,
-    and matches by up to 10 source IP ranges, by a Common Expression
-    Language expression over the request, or by both; through an
-    expression a backend security policy can also apply Cloud Armor's
-    preconfigured WAF rules. Rules are evaluated from priority 0 upwards, and the first that matches
-    acts; a rule in preview logs its action without enforcing it. Every
-    policy holds a default rule, at priority 2147483647, matching every
-    source address: rules left unset give the policy Cloud Armor's own,
-    which allows every request, and rules set include it.
+    and matches by one condition: up to 10 source IP ranges, or a Common
+    Expression Language expression over the request of up to 2,048
+    characters, through which a backend security policy can also apply
+    Cloud Armor's preconfigured WAF rules. Rules are evaluated from
+    priority 0 upwards, and the first that matches acts; a rule in preview
+    logs its action without enforcing it. Every policy holds a default
+    rule, at priority 2147483647, matching every source address: rules
+    left unset or empty leave the policy that rule alone, allowing every
+    request, and rules set include it.
 
     Rate limiting, redirects, header actions, WAF exclusions, adaptive
     protection, advanced options and reCAPTCHA are not offered. A policy
@@ -110,7 +115,7 @@ spec:
                     - SRC_IPS_V1
                   description: >
                     SRC_IPS_V1, matching the source addresses config lists;
-                    set with config.
+                    set with config and without expr.
                 config:
                   type: object
                   additionalProperties: false
@@ -138,18 +143,24 @@ spec:
                       minLength: 1
                       description: >
                         A Common Expression Language expression over the
-                        request's attributes, such as
-                        origin.region_code == 'AU', or a call of a
-                        preconfigured WAF rule set, such as
+                        request's attributes, of 1 to 2,048 characters, such
+                        as origin.region_code == 'AU', a source range test
+                        such as inIpRange(origin.ip, '198.51.100.0/24'), or
+                        a call of a preconfigured WAF rule set, such as
                         evaluatePreconfiguredWaf('sqli-v33-stable'). Cloud
                         Armor checks it when the policy is applied.
-                  description: An expression the request is matched against.
+                  description: >
+                    An expression the request is matched against; set
+                    without versioned_expr and config.
               description: >
-                The conditions a request is matched against: versioned_expr
-                with config, expr, or both.
+                The one condition a request is matched against:
+                versioned_expr with config, or expr. A rule matching source
+                ranges and other attributes together tests the ranges inside
+                its expression, with inIpRange.
             description:
               type: string
-              description: What the rule is for, as a reader of the policy sees it.
+              description: >
+                What the rule is for, as a reader of the policy sees it.
             preview:
               type: boolean
               description: >
@@ -158,8 +169,9 @@ spec:
         description: >
           The policy's rules, each with action, priority and match, and
           optionally description and preview. Unset or empty, the policy
-          holds Cloud Armor's default rule alone, which allows every
-          request; set, the list includes the default rule: priority
+          holds the default rule alone, allowing every request, as Cloud
+          Armor gives a policy created with no rule; set, the list includes
+          the default rule: priority
           2147483647, match versioned_expr SRC_IPS_V1 with src_ip_ranges
           ["*"], and the action every request no other rule matches meets.
     infra:
@@ -193,18 +205,27 @@ spec:
       {{- if not (regexMatch `^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$` $n) -}}
       {{- fail (printf "the security policy takes the component's name, %q, and Compute Engine takes a policy name of 1 to 63 lowercase letters, digits and hyphens, beginning with a letter and not ending with a hyphen: rename the component in the Aggregate" (trunc 80 $n)) -}}
       {{- end -}}
-    # A match holds versioned_expr with config, expr, or both: config is set
-    # with versioned_expr and never without it, and a match holds at least
-    # one condition, as the gcloud reference's rule matcher group, "At least
-    # one of these must be specified", states for --src-ip-ranges and
-    # --expression.
+    # A match holds one condition, versioned_expr with config, or expr: the
+    # Compute Engine API's SecurityPolicyRuleMatcher, "Exactly one field must
+    # be specified", config being set with versioned_expr and never without
+    # it.
     rule_match: >-
       {{- range $i, $r := (default list (optional .values "rules" list)) -}}
       {{- $m := default dict (get $r "match") -}}
-      {{- $paired := eq (hasKey $m "versioned_expr") (hasKey $m "config") -}}
-      {{- $any := or (hasKey $m "versioned_expr") (hasKey $m "expr") -}}
-      {{- if not (and $paired $any) -}}
-      {{- fail (printf "values.rules[%d].match holds %s, and Cloud Armor matches a request by versioned_expr SRC_IPS_V1 with config.src_ip_ranges, by expr.expression, or by both, and takes config with versioned_expr and never one without the other: correct the match in the Aggregate" $i (trunc 120 (toJson $m))) -}}
+      {{- $ip := and (hasKey $m "versioned_expr") (hasKey $m "config") -}}
+      {{- $ex := hasKey $m "expr" -}}
+      {{- if not (or (and $ip (not $ex)) (and $ex (not (hasKey $m "versioned_expr")) (not (hasKey $m "config")))) -}}
+      {{- fail (printf "values.rules[%d].match holds %s, and Cloud Armor matches a request by exactly one condition, versioned_expr SRC_IPS_V1 with config.src_ip_ranges or expr.expression: set one of them in the Aggregate, testing source ranges inside an expression with inIpRange(origin.ip, '<range>') where a rule matches other attributes too" $i (trunc 120 (toJson $m))) -}}
+      {{- end -}}
+      {{- end -}}
+    # A custom expression holds at most 2,048 characters (Cloud Armor's
+    # "Quotas and limits", "Number of characters in a custom expression").
+    rule_expression: >-
+      {{- range $i, $r := (default list (optional .values "rules" list)) -}}
+      {{- $e := toString (get (default dict (get (default dict (get $r "match")) "expr")) "expression") -}}
+      {{- $n := len (regexFindAll "(?s)." $e -1) -}}
+      {{- if gt $n 2048 -}}
+      {{- fail (printf "values.rules[%d].match.expr.expression is %d characters long, and Cloud Armor takes a custom expression of at most 2,048 characters: shorten it in the Aggregate" $i $n) -}}
       {{- end -}}
       {{- end -}}
     # No two rules share a priority.

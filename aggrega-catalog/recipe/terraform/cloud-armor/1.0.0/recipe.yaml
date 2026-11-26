@@ -11,11 +11,12 @@ metadata:
   description: >
     Google Cloud Armor, rendered as an authored Terraform body, main.tf: one
     google_compute_security_policy named after the component, in the
-    operator's project, holding a rule for each of the component's rules.
-    The policy is a backend policy, or an edge policy where type says so;
-    it is attached to nothing this Recipe creates, as a backend service or
-    backend bucket names it. security_policy is the policy's self link, an
-    output of this component's module.
+    operator's project, holding a rule for each of the component's rules,
+    or the default rule alone, allowing every request, where the component
+    declares none. The policy is a backend policy, or an edge policy where
+    type says so; it is attached to nothing this Recipe creates, as a
+    backend service or backend bucket names it. security_policy is the
+    policy's self link, an output of this component's module.
 
     The body is the catalog's own: the published cloud-armor module
     10.0.0 fails a test the catalog holds Google bodies to, keeping to the
@@ -77,18 +78,19 @@ spec:
   # CLOUD_ARMOR_NETWORK, a policy filtering packets for network load
   # balancing, is regional, and the google provider's 8.11.0 schema refuses
   # it on this resource; CLOUD_ARMOR_INTERNAL_SERVICE, which the provider
-  # admits, is marked preview only and is absent from the type values of
-  # the Compute Engine API's v1 reference, the API version the provider
-  # calls, and it attaches to a Cloud Service Mesh endpoint policy rather
-  # than a backend service. Either halts, as any other value does.
+  # admits, is described as preview only in the type of the Compute Engine
+  # API's v1 reference, the API version the provider calls, and is absent
+  # from the enum of that API's discovery document; it attaches to a Cloud
+  # Service Mesh endpoint policy rather than a backend service. Either
+  # halts, as any other value does.
   #
   # Every Component value and infra key is honoured, refused below by name,
   # held by the Component's assertions or schema, or not read:
   #   honoured — values.rules, each entry as one rule block: action,
   #     priority, match, as a match block holding versioned_expr with a
-  #     config block holding src_ip_ranges while set and an expr block
-  #     holding expression while set, description while set, and preview,
-  #     false while unset; and the overrides above.
+  #     config block holding src_ip_ranges, or an expr block holding
+  #     expression, description while set, and preview, false while unset;
+  #     unset or empty, as the default rule alone; and the overrides above.
   #   refused — project_id missing or not a string; a type other than
   #     CLOUD_ARMOR or CLOUD_ARMOR_EDGE; a rule's description over 64
   #     characters, which the google provider's schema gives as a rule
@@ -96,20 +98,24 @@ spec:
   #     above.
   #   held by the Component — the component's name, which names the policy;
   #     the keys of a rule and of its match, the actions, the priorities'
-  #     range and uniqueness, the source ranges' count and form, how a match
-  #     is formed, and the default rule a list of rules includes.
+  #     range and uniqueness, the source ranges' count and form, the one
+  #     condition a match holds, an expression's length, and the default
+  #     rule a list of rules includes.
   #   not read — none; the Component declares no other value or infra key.
   #
   # What the body writes beside these: no policy description, labels,
   # advanced options, adaptive protection or reCAPTCHA options, and no rate
   # limit, redirect, header action or WAF exclusion on a rule. The provider
   # keeps what the policy holds for the blocks it computes and the body
-  # leaves out. With no rules, the body writes no rule block, and Compute
-  # Engine adds its default rule, allowing every request, when it creates
-  # the policy; the provider reads that rule back as the policy's, so it
-  # is kept at every later apply. A list of rules is written whole: a rule
-  # added outside the Release, at a priority no rule of the component holds,
-  # is removed at the next apply.
+  # leaves out. With rules unset or empty, the body writes the default rule
+  # itself: allow, at priority 2147483647, matching versioned_expr
+  # SRC_IPS_V1 with src_ip_ranges ["*"], the rule Compute Engine adds to a
+  # policy created with none. The provider computes rule, so a body writing
+  # no rule block would leave the rules last applied in place; writing the
+  # default rule makes removing every rule from the component reach the
+  # policy. A list of rules is written whole: a rule added outside the
+  # Release, at a priority no rule of the component holds, is removed at the
+  # next apply.
   #
   # Changes. A changed rule is patched in place at its priority, a rule
   # added is added, and a rule removed is removed; the default rule is
@@ -154,8 +160,9 @@ spec:
     rule_description: >-
       {{- range $i, $r := (default list (optional .values "rules" list)) -}}
       {{- if hasKey $r "description" -}}
-      {{- if gt (len (toString $r.description)) 64 -}}
-      {{- fail (printf "values.rules[%d].description is %d characters long, and the google provider takes a rule description of at most 64: shorten it in the Aggregate" $i (len (toString $r.description))) -}}
+      {{- $n := len (regexFindAll "(?s)." (toString $r.description) -1) -}}
+      {{- if gt $n 64 -}}
+      {{- fail (printf "values.rules[%d].description is %d characters long, and the google provider takes a rule description of at most 64: shorten it in the Aggregate" $i $n) -}}
       {{- end -}}
       {{- end -}}
       {{- end -}}
@@ -174,7 +181,8 @@ spec:
   # emits verbatim as a standalone file alongside any other artifacts
   # contributed at the same boundary. The resource is named this, since each
   # component's body renders into a module directory of its own. Each rule
-  # is written in the Aggregate's order; the provider holds the rules as a
+  # is written in the Aggregate's order, and the default rule alone where
+  # the component declares none; the provider holds the rules as a
   # set keyed by priority, so the order changes nothing it applies. Each
   # string the Aggregate or the Release gives reaches Compute Engine as
   # written: Terraform would read ${ and %{ inside a string as the start of
@@ -195,7 +203,11 @@ spec:
       resource "google_compute_security_policy" "this" {
         name = "{{ .context.instance_id }}"
         type = {{ toJson (optional $o "type" "CLOUD_ARMOR") }}
-        {{- range $r := (default list (optional .values "rules" list)) }}
+        {{- $rules := default list (optional .values "rules" list) }}
+        {{- if eq (len $rules) 0 }}
+        {{- $rules = list (dict "action" "allow" "priority" 2147483647 "match" (dict "versioned_expr" "SRC_IPS_V1" "config" (dict "src_ip_ranges" (list "*")))) }}
+        {{- end }}
+        {{- range $r := $rules }}
         {{- $m := $r.match }}
 
         rule {
@@ -203,16 +215,15 @@ spec:
           priority = {{ toJson $r.priority }}
 
           match {
-            {{- if hasKey $m "versioned_expr" }}
+            {{- if hasKey $m "expr" }}
+            expr {
+              expression = {{ toJson $m.expr.expression | replace "${" "$${" | replace "%{" "%%{" }}
+            }
+            {{- else }}
             versioned_expr = {{ toJson $m.versioned_expr }}
 
             config {
               src_ip_ranges = {{ toJson $m.config.src_ip_ranges | replace "${" "$${" | replace "%{" "%%{" }}
-            }
-            {{- end }}
-            {{- if hasKey $m "expr" }}
-            expr {
-              expression = {{ toJson $m.expr.expression | replace "${" "$${" | replace "%{" "%%{" }}
             }
             {{- end }}
           }
