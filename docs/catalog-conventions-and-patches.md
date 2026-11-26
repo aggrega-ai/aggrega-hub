@@ -2548,6 +2548,21 @@ The highest of those floors is why the constraint above may not drop below it â€
 a boundary holding both, Terraform installs one provider satisfying the catalog's
 range and every module's floor together.
 
+### One AWS Cloud Control provider constraint for every body using it
+
+Every Terraform body the catalog authors that declares a resource of HashiCorp's AWS
+Cloud Control provider, `hashicorp/awscc`, declares that provider in its
+`required_providers` block as **`~> 1.110`**, one string in every such body, carried
+by each body with a comment naming this section, for the reasons the AWS section
+gives. The provider is generated from the CloudFormation resource schemas and
+released weekly, so the major and minor are those of its newest release at least
+three days old when the constraint is set, the age at which the catalog's vendor
+validators pin a release, and the validators judge every such body at a version the
+constraint admits. A body that configures the provider from the AWS provider, as
+`recipe/terraform/lex` sets its Region from the `aws_region` data source, also
+declares `hashicorp/aws` at the AWS string. This is a catalog convention: the
+compiler pipes the block as text and reads nothing in it.
+
 ### One Google provider constraint for every Google body
 
 The same rule holds for Google Cloud, with its own string. Every Terraform body the
