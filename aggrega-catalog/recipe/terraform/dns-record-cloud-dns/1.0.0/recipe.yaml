@@ -1,0 +1,295 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Cognitio S.r.l.
+
+apiVersion: aggrega.ai/v1beta1
+kind: Recipe
+metadata:
+  name: dns-record-cloud-dns
+  version: 1.0.0
+  # The values and infra.overrides keys this Recipe refuses are listed, with
+  # their reasons, in the comments above the assertions.
+  description: >
+    Cloud DNS, rendered as an authored Terraform body, main.tf: one
+    google_dns_record_set written into a managed zone the operator already
+    holds, named by infra.overrides.managed_zone in the project
+    infra.overrides.project_id. No zone is declared or changed.
+
+    The record set takes A, AAAA, CAA, CNAME, MX, NS, PTR, SRV or TXT
+    records, each written as Cloud DNS takes record data: a domain name
+    ending in a dot, TXT text in quoted strings of 255 characters at most
+    and a CAA value quoted. The provider replaces a record set of the same
+    name and type already in the zone when it creates this one, and a
+    destroy deletes the record set.
+
+    host is a reference to the record set's name without its trailing dot.
+    The Component halts on an alias record, a record not in its type's form
+    and a wildcard NS record set. This Recipe halts on managed_zone or
+    project_id missing or in a form they do not take and on any
+    infra.overrides key not listed, each naming what to fix. The build
+    cannot see the zone's DNS name, so a name outside the zone, or a CNAME
+    at its apex, is left to Cloud DNS at apply.
+  maintainers:
+    - name: "Massimiliano Ferrero"
+      email: "m.ferrero@cognitio.it"
+spec:
+  capability: terraform
+  implements: core/network/dns-record:1.0.0
+
+  locals:
+    # values.name with one trailing dot: the provider refuses a record set's
+    # name without it (its validateRecordNameTrailingDot, at 8.11.0), and
+    # Cloud DNS writes a name so, www.example.com. in its reference of a
+    # resource record set.
+    fqdn: '{{ printf "%s." (trimSuffix "." .values.name) }}'
+    # The record set's data, each entry as Cloud DNS takes it in rrdatas, as
+    # a JSON list:
+    #   A, AAAA                  the entry as written;
+    #   CNAME, NS, PTR           the domain name, ending in a dot;
+    #   MX                       the preference and the domain name, ending
+    #                            in a dot, joined by one space;
+    #   SRV                      the priority, weight, port and target,
+    #                            ending in a dot unless it is the single dot
+    #                            meaning no service, joined by one space;
+    #   CAA                      the flags, the tag and the value in double
+    #                            quotes, its own quotes removed first;
+    #   TXT                      the text in double-quoted strings of 255
+    #                            characters at most, separated by a space,
+    #                            never divided inside an escape.
+    # Cloud DNS's reference of a resource record set defines rrdatas as RFC
+    # 1035, section 5, writes them: in a quoted string a double quote is
+    # written \" and a backslash \\, and every byte outside the printable
+    # ASCII range, space to tilde, as a backslash and its three decimal
+    # digits, so the record carries the text's UTF-8 bytes. Cloud DNS's
+    # record types page asks for each TXT string in quotation marks and for a
+    # text longer than 255 bytes in strings of 255 bytes; a string's 255
+    # characters are counted as written, an escape at its full length, so no
+    # string carries more than 255 bytes however Cloud DNS counts an escape.
+    # The same escapes are written in a CAA value.
+    values: >-
+      {{- $t := .values.type -}}
+      {{- $dec := dict -}}
+      {{- if has $t (list "TXT" "CAA") -}}{{- range $i := until 256 -}}{{- $_ := set $dec (printf "%02x" $i) (printf `\%03d` $i) -}}{{- end -}}{{- end -}}
+      {{- $out := list -}}
+      {{- range $e := .values.records -}}
+      {{- $f := regexSplit `\s+` $e -1 -}}
+      {{- $name := last $f -}}
+      {{- if and (has $t (list "CNAME" "NS" "PTR" "MX" "SRV")) (ne $name ".") (not (hasSuffix "." $name)) }}{{ $name = printf "%s." $name }}{{ end -}}
+      {{- if has $t (list "A" "AAAA") -}}
+      {{- $out = append $out $e -}}
+      {{- else if has $t (list "CNAME" "NS" "PTR") -}}
+      {{- $out = append $out $name -}}
+      {{- else if has $t (list "MX" "SRV") -}}
+      {{- $out = append $out (join " " (append (initial $f) $name)) -}}
+      {{- else -}}
+      {{- $text := $e -}}
+      {{- if eq $t "CAA" -}}
+      {{- $text = regexReplaceAll `^[0-9]+\s+\S+\s+` $e "" -}}
+      {{- if and (ge (len $text) 2) (hasPrefix `"` $text) (hasSuffix `"` $text) -}}{{- $text = trimSuffix `"` (trimPrefix `"` $text) -}}{{- end -}}
+      {{- end -}}
+      {{- $units := list -}}
+      {{- range $c := splitList "" $text -}}
+      {{- if eq $c `"` -}}{{- $units = append $units `\"` -}}
+      {{- else if eq $c `\` -}}{{- $units = append $units `\\` -}}
+      {{- else if regexMatch `^[ -~]$` $c -}}{{- $units = append $units $c -}}
+      {{- else -}}{{- $h := printf "%x" $c -}}{{- $u := "" -}}{{- range $i := until (int (div (len $h) 2)) -}}{{- $u = print $u (get $dec (substr (int (mul $i 2)) (int (add (mul $i 2) 2)) $h)) -}}{{- end -}}{{- $units = append $units $u -}}
+      {{- end -}}
+      {{- end -}}
+      {{- if eq $t "CAA" -}}
+      {{- $out = append $out (printf `%s %s "%s"` (index $f 0) (index $f 1) (join "" $units)) -}}
+      {{- else -}}
+      {{- $strings := list -}}{{- $piece := "" -}}
+      {{- range $u := $units -}}{{- if gt (add (len $piece) (len $u)) 255 -}}{{- $strings = append $strings $piece -}}{{- $piece = "" -}}{{- end -}}{{- $piece = print $piece $u -}}{{- end -}}
+      {{- $out = append $out (printf `"%s"` (join `" "` (append $strings $piece))) -}}
+      {{- end -}}
+      {{- end -}}
+      {{- end -}}
+      {{- toJson $out -}}
+
+  # The String Pipe: the compiler pipes this string verbatim into a
+  # consumer's injection context when it uses this record, and resolves none
+  # of it. host is a reference to the host output of this component's module
+  # call: the body renders into the component's own module directory, and
+  # the boundary's root configuration declares that directory as a module
+  # block named .context.instance_id for a component declared in the
+  # Aggregate the Release deploys. The output is the record set's name with
+  # its trailing dot removed, the form the Component publishes. Terraform
+  # resolves it at apply time, after the record set exists, so it resolves
+  # only for a consumer authored as a source: Recipe in the same root
+  # configuration; a consumer on another target receives it as text.
+  provides:
+    host: "${module.{{ .context.instance_id }}.host}"
+
+  # This Recipe reads from infra.overrides:
+  #   managed_zone - string, required (managed_zone), the name of the
+  #                  operator's Cloud DNS managed zone the record set is
+  #                  written into
+  #   project_id   - string, required (project), the zone's project
+  # Any other key halts naming it, region and location among them: a record
+  # set has no region of its own, and the name it is reached at is
+  # values.name.
+  #
+  # managed_zone is the resource's own argument, which is what a reader
+  # matches against the provider documentation; project_id is the name every
+  # terraform Google Recipe of this catalog reads for the project.
+  #
+  # managed_zone. The zone is the operator's: a Cloud DNS managed zone
+  # created outside the Release, named by the name the operator gave it when
+  # creating it, such as example-zone, not by its DNS name, example.com.
+  # This Recipe never creates or changes it. Cloud DNS's reference of a
+  # managed zone gives its name as 1 to 63 lowercase letters, digits and
+  # dashes, beginning with a letter and ending with a letter or digit;
+  # another form halts below, a DNS name among them. Changing it creates the
+  # record set in the new zone and deletes the one in the old.
+  #
+  # project_id names the operator's Google Cloud project holding the zone,
+  # in which the Cloud DNS API is enabled. Each is a string with no value
+  # this Recipe could choose for the operator, so each halts the build when
+  # it is missing.
+  #
+  # The zone's DNS name is not in the Release, so the build cannot see
+  # whether values.name is in the zone or at its apex: a name outside the
+  # zone is left to Cloud DNS when Terraform applies, and so is a CNAME at
+  # the apex, which Cloud DNS's record types page rules out, since a CNAME
+  # cannot exist beside the zone's SOA record. NS records at the apex meet
+  # the NS record set Cloud DNS creates with the zone, which the provider
+  # replaces, as below, and, by its source at 8.11.0, leaves in place on a
+  # destroy.
+  #
+  # The Component's values, each read for the record set:
+  #   name. name, with one trailing dot, as written otherwise. A leftmost *
+  #     label makes a wildcard record set, which Cloud DNS's record types
+  #     page supports for every type but NS; the Component refuses a
+  #     wildcard NS record set itself.
+  #   type. type. Cloud DNS takes every type the Component offers, so this
+  #     Recipe refuses none. The Component refuses every other type itself,
+  #     ALIAS by name: Cloud DNS offers, in Preview, a record type of that
+  #     name at a public zone's apex, which answers A and AAAA queries with
+  #     the addresses of the name it points at, and this Recipe never writes
+  #     it.
+  #   ttl. ttl. Cloud DNS documents no range for a record set's time to live,
+  #     so this Recipe refuses none of the values the Component admits; one
+  #     Cloud DNS does not take fails the apply.
+  #   records. rrdatas, each entry as the locals above write it. The
+  #     Component halts on an entry not in its type's form, a second CNAME
+  #     entry, an MX preference or an SRV priority, weight or port outside 0
+  #     to 65535, and CAA flags other than 0 and 128. Cloud DNS documents no
+  #     rule for a CAA tag, so this Recipe refuses none.
+  #
+  # Cloud DNS's own limits, which the build does not hold: the record types
+  # page gives each TXT record 1,000 characters, a limit Google Cloud support
+  # raises on request; the quotas page gives the records of a record set and
+  # the record sets of a zone as the project's quotas, which the build cannot
+  # read. Whether Cloud DNS reports a TXT text back in the strings this
+  # Recipe divides it into, which the provider compares in lower case with
+  # the outer quotation marks removed, is not measured.
+  #
+  # A record set of the same name and type already in the zone. The
+  # provider, at 8.11.0, lists the zone's record sets when it creates one and
+  # deletes any of the same name and type in the same change
+  # (resourceDnsRecordSetCreate, which calls itself authoritative), so such a
+  # record set, made outside the Release, is replaced and taken into the
+  # state, and a destroy deletes the record set this one replaced. The
+  # provider offers no argument that changes this.
+  #
+  # Deletion and replacement. A destroy, or removing the component, deletes
+  # the record set. name, managed_zone and project force a new record set,
+  # so changing values.name, managed_zone or project_id deletes the record
+  # set and creates it again; a change of values.type, values.records or
+  # values.ttl updates it in place. Renaming the component, which changes
+  # the module's address, deletes the record set and creates it again.
+  #
+  # Every Component value and infra key is honoured, refused below by name,
+  # or not read:
+  #   honoured — values.name, values.type, values.ttl and values.records; and
+  #     the overrides above.
+  #   refused by this Recipe — managed_zone missing, not a string or not a
+  #     managed zone's name; project_id missing or not a string; and any
+  #     infra.overrides key not listed above.
+  #   refused by the Component, whichever Recipe binds — a values.type other
+  #     than A, AAAA, CAA, CNAME, MX, NS, PTR, SRV and TXT, ALIAS by name; an
+  #     entry of values.records not in its type's form, or a second CNAME
+  #     entry; a wildcard NS record set; a values.name longer than the DNS
+  #     standard allows.
+  #   not read — none.
+  #
+  # What the body writes beside these: nothing. No routing policy, so the
+  # record set is a static one answering with its records, and no
+  # deletion_policy, so the provider's DELETE stands. Credentials. A record
+  # set holds none; Terraform authenticates to Google Cloud with the
+  # credentials in the environment it runs in, so the rendered configuration
+  # names none. Backup. A record set is configuration of the zone, and this
+  # Recipe configures no backup of it.
+  assertions:
+    # The keys this Recipe reads under infra.overrides, and no other: a key
+    # spelt otherwise, or meant for another Recipe, would reach no byte of the
+    # output while the build reads as if it had been applied.
+    overrides_known: >-
+      {{- $known := list "managed_zone" "project_id" -}}
+      {{- range $k, $_ := (optional .infra "overrides" dict) -}}
+      {{- if not (has $k $known) -}}
+      {{- fail (printf "infra.overrides.%s is set, and this Recipe reads managed_zone and project_id from infra.overrides and no other key: correct its spelling, or remove infra.overrides.%s from the Release" $k $k) -}}
+      {{- end -}}
+      {{- end -}}
+    project_supplied: >-
+      {{- $v := optional (optional .infra "overrides" dict) "project_id" "" -}}
+      {{- if not (and (typeIs "string" $v) (regexMatch `^\S+$` $v)) -}}
+      {{- fail "this Release writes a DNS record set into a managed zone in the operator's own Google Cloud project, which this Recipe does not choose, but infra.overrides.project_id carries none: set infra.overrides.project_id in the Release to the project holding the zone" -}}
+      {{- end -}}
+    # Cloud DNS's reference of a managed zone gives its name as 1 to 63
+    # characters, beginning with a letter, ending with a letter or digit, of
+    # lowercase letters, digits and dashes.
+    managed_zone: >-
+      {{- $o := optional .infra "overrides" dict -}}
+      {{- if not (hasKey $o "managed_zone") -}}
+      {{- fail "infra.overrides.managed_zone is unset, and this Recipe writes the record set into the operator's own Cloud DNS managed zone, which it never creates: set infra.overrides.managed_zone in the Release to the name of the zone holding values.name" -}}
+      {{- end -}}
+      {{- $z := $o.managed_zone -}}
+      {{- if not (and (typeIs "string" $z) (regexMatch `^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$` $z)) -}}
+      {{- fail (printf "infra.overrides.managed_zone is %s, and Cloud DNS names a managed zone by the name it was created with, 1 to 63 lowercase letters, digits and dashes beginning with a letter, such as example-zone, not by its DNS name: set it in the Release to the name of the zone holding values.name" (toJson $z)) -}}
+      {{- end -}}
+
+  # required_providers pins hashicorp/google so the engine installs a
+  # provider whose resource schema this body was written against. It is a
+  # range rather than an exact version because every Google body in a
+  # boundary's root configuration shares one installed provider, and two
+  # exact pins that differ fail init. The constraint string is the one the
+  # catalog conventions' "One Google provider constraint for every Google
+  # body" section states; each Google body repeats it deliberately, because a
+  # library import cannot place a block inside an authored body. The body
+  # keeps to the Terraform 1.5 language, as that section asks.
+  #
+  # The body is the catalog's own, a full-body artifact named main.tf that
+  # emits verbatim as a standalone file alongside any other artifacts
+  # contributed at the same boundary: terraform-google-modules publishes no
+  # module for a single record set. The resource is named this, since each
+  # component's body renders into a module directory of its own. Every
+  # string is written as JSON, which Terraform reads as a string of the same
+  # characters; ${ and %{ inside a string are written $${ and %%{, which
+  # Terraform turns back into the characters written rather than reading an
+  # interpolation or a directive.
+  artifacts:
+    main.tf: |
+      {{- $o := optional .infra "overrides" dict -}}
+      terraform {
+        required_providers {
+          google = {
+            source  = "hashicorp/google"
+            version = "~> 8.8"
+          }
+        }
+      }
+
+      resource "google_dns_record_set" "this" {
+        name    = {{ toJson .locals.fqdn }}
+        type    = {{ toJson .values.type }}
+        ttl     = {{ int .values.ttl }}
+        rrdatas = {{ .locals.values | replace "${" "$${" | replace "%{" "%%{" }}
+
+        ## ── Provider-specific overrides ──────────────────────────
+        managed_zone = {{ toJson $o.managed_zone }}
+        project      = {{ toJson $o.project_id | replace "${" "$${" | replace "%{" "%%{" }}
+      }
+
+      output "host" {
+        value = trimsuffix(google_dns_record_set.this.name, ".")
+      }
